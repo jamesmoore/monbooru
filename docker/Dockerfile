@@ -33,7 +33,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
       arm64) ONNX_ARCH="aarch64"; ORT_SHA="${ORT_SHA256_AARCH64}" ;; \
       *) echo "Unsupported arch: $ARCH" && exit 1 ;; \
     esac && \
-    curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ONNX_ARCH}-${ORT_VERSION}.tgz" \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ONNX_ARCH}-${ORT_VERSION}.tgz" \
       -o /tmp/ort.tgz && \
     echo "${ORT_SHA}  /tmp/ort.tgz" | sha256sum -c - && \
     tar -xzf /tmp/ort.tgz -C /tmp && \
