@@ -130,6 +130,7 @@ func Sync(ctx context.Context, database *db.DB, galleryPath, thumbnailsPath stri
 	if err != nil {
 		return result, err
 	}
+	sortSyncFilesOldestFirst(found)
 
 	total := len(found)
 	progress(0, total, "Phase 2: reconciling...")
@@ -212,6 +213,18 @@ func Sync(ctx context.Context, database *db.DB, galleryPath, thumbnailsPath stri
 		result.Added, result.Removed, result.Moved, result.Duplicates))
 
 	return result, nil
+}
+
+// sortSyncFilesOldestFirst makes reconciliation and ingestion chronological.
+// Paths break ties so filesystems with coarse timestamp resolution still
+// produce a stable order.
+func sortSyncFilesOldestFirst(files []syncFileInfo) {
+	slices.SortFunc(files, func(a, b syncFileInfo) int {
+		if n := cmp.Compare(a.mtimeNano, b.mtimeNano); n != 0 {
+			return n
+		}
+		return cmp.Compare(a.path, b.path)
+	})
 }
 
 // nameIngested applies the operator's naming to the rows this run
