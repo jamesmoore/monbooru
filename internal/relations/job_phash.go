@@ -33,6 +33,11 @@ func BackfillPhashes(ctx context.Context, database *db.DB, thumbnailsPath string
 	// never generated). The walk logs and moves on; the row stays at NULL
 	// and the operator can retry after rebuilding thumbnails.
 	return gallery.BackfillWalk(ctx, ids, progress, "phash", "", func(id int64) error {
-		return gallery.RecomputeAndStorePhash(ctx, database, id, thumbnailsPath)
+		h, err := gallery.RecomputeAndStorePhash(ctx, database, id, thumbnailsPath)
+		if err != nil {
+			return err
+		}
+		PhashStored(database, id, h)
+		return nil
 	})
 }

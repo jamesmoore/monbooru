@@ -48,15 +48,7 @@ func (s *Server) syncTrigger(w http.ResponseWriter, r *http.Request) {
 		// can't drift from the contract (a future code path that
 		// returned early between the two would leave caches stale).
 		result, err := cx.Sync(ctx, maxFileSizeMB, s.ingestNaming(cx.Name), s.jobs.Update)
-		if ctx.Err() != nil {
-			s.jobs.Complete("sync cancelled")
-			return
-		}
-		if err != nil {
-			s.jobs.Fail(err.Error())
-			return
-		}
-		s.jobs.Complete(result.Summary())
+		_ = s.settleJob(ctx, err, "sync cancelled", result.Summary())
 	}()
 
 	redirectTo := sameOriginReferer(r)

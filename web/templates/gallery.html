@@ -103,15 +103,7 @@
     <input type="hidden" name="op" value="add">
     <div class="field" style="position:relative">
       <label>Tags (space-separated, <code>category:name</code> for non-general)</label>
-      <input type="text" name="tags" id="batch-tag-input" class="upload-wide-input" data-multi-tags="1"
-             placeholder="Add tag(s)..." autocomplete="off"
-             hx-get="/internal/tags/suggest"
-             hx-trigger="input changed delay:200ms"
-             hx-target="#batch-tag-suggest"
-             hx-swap="innerHTML"
-             hx-vals='js:{tag: document.getElementById("batch-tag-input").value.split(/\s+/).pop()}'
-             onkeydown="handleSuggestKey(event, 'batch-tag-suggest', 'batch-tag-input')">
-      <div id="batch-tag-suggest" class="suggest-dropdown tag-suggest-dropdown"></div>
+      {{template "multi_tag_suggest_input" dict "Name" "tags" "InputID" "batch-tag-input" "SuggestID" "batch-tag-suggest" "Placeholder" "Add tag(s)..." "Class" "upload-wide-input" "ValsKey" "tag"}}
     </div>
     <div id="batch-tag-flash"></div>
     {{template "dialog_actions" dict "ID" "batch-tag-dialog" "Submit" "Apply"}}
@@ -147,15 +139,7 @@
     <div class="field">
       <label style="display:block"><input type="radio" name="mode" value="specific" checked> Specific tags by name</label>
       <div class="field" style="position:relative; margin: 4px 0 8px 22px" id="batch-strip-specific-row">
-        <input type="text" name="tags" id="batch-strip-input" class="upload-wide-input" data-multi-tags="1"
-               placeholder="Tags to remove (space-separated, category:name)" autocomplete="off"
-               hx-get="/internal/tags/suggest"
-               hx-trigger="input changed delay:200ms"
-               hx-target="#batch-strip-suggest"
-               hx-swap="innerHTML"
-               hx-vals='js:{tag: document.getElementById("batch-strip-input").value.split(/\s+/).pop()}'
-               onkeydown="handleSuggestKey(event, 'batch-strip-suggest', 'batch-strip-input')">
-        <div id="batch-strip-suggest" class="suggest-dropdown tag-suggest-dropdown"></div>
+        {{template "multi_tag_suggest_input" dict "Name" "tags" "InputID" "batch-strip-input" "SuggestID" "batch-strip-suggest" "Placeholder" "Tags to remove (space-separated, category:name)" "Class" "upload-wide-input" "ValsKey" "tag"}}
       </div>
       {{if .SourceLabelCounts}}
       <label style="display:block"><input type="radio" name="mode" value="source-specific"> Specific source</label>

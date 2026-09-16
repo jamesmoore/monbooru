@@ -54,7 +54,7 @@ func ResolveSubdir(galleryPath, folder string) (string, error) {
 	return abs, nil
 }
 
-// PathInside reports whether target resolves inside root. Both arguments
+// PathInside reports whether target is named inside root. Both arguments
 // should be cleaned and absolute. Uses filepath.Rel so a sibling directory
 // sharing a literal prefix (`/data/gallery` vs `/data/gallery_backup`) is
 // correctly rejected. A target equal to root counts as inside.
@@ -69,11 +69,20 @@ func PathInside(root, target string) bool {
 	return !strings.HasPrefix(rel, "..")
 }
 
-// ResolvedInside resolves both paths before asking PathInside, which is the
-// gate every serve path runs before opening a stored file. A path that cannot
-// be resolved counts as outside: this decides whether arbitrary bytes leave
-// the box, so an unanswerable question is refused rather than guessed.
-func ResolvedInside(root, target string) bool {
+// NamedInside is PathInside for paths not already known to be absolute,
+// and is the gate every serve path runs before opening a stored file.
+// Under any profile the config hands those paths down absolute, and Rel
+// cleans what it is given, so the two answer alike today; a gallery path
+// that ever arrives relative is what this one still gets right.
+//
+// It stops at the name deliberately. A gallery folder may be a symlink and
+// may hold them, so bytes behind one belong to the gallery even though they
+// do not sit under the root - resolving the links here would refuse to
+// serve exactly those files. Traversal is still caught: the name has to
+// fall under the root, and only monbooru writes the paths this reads.
+// Where the bytes actually sit is the other question, and storedInside is
+// the one that asks it.
+func NamedInside(root, target string) bool {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return false
@@ -115,12 +124,16 @@ func uniquePathBy(dir, filename string, nameNth func(stem, ext string, i int) st
 // run have taken but not written yet, so a dry run numbers the way the run
 // will instead of promising every row the same name.
 func uniquePathIn(dir, filename string, claimed map[string]struct{}, nameNth func(stem, ext string, i int) string) string {
+	// Only a successful stat says the name is taken. A name the filesystem
+	// refuses outright - too long, a component that is not a directory -
+	// is not free at any suffix either, and numbering past it never ends;
+	// handing it back lets the write report what is actually wrong.
 	free := func(p string) bool {
 		if _, taken := claimed[p]; taken {
 			return false
 		}
 		_, err := os.Stat(p)
-		return os.IsNotExist(err)
+		return err != nil
 	}
 	dst := filepath.Join(dir, filename)
 	if free(dst) {
@@ -181,11 +194,11 @@ func HashFile(path string) (string, error) {
 // md5; sha256 remains the content address, and md5 is never a dedup key.
 func Md5File(path string) (string, error) { return hashFileWith(context.Background(), path, md5.New()) }
 
-// HashFileDigests computes both stored digests of the file at path in one
+// hashFileDigests computes both stored digests of the file at path in one
 // read. Every path that writes images.sha256 goes through here, so the two
 // columns cannot drift apart: an md5 describing bytes the row no longer
 // holds is what a later booru lookup would search for.
-func HashFileDigests(path string) (sha, sum string, err error) {
+func hashFileDigests(path string) (sha, sum string, err error) {
 	shaH, md5H := sha256.New(), md5.New()
 	if err := streamFile(context.Background(), path, io.MultiWriter(shaH, md5H)); err != nil {
 		return "", "", err
@@ -312,10 +325,10 @@ func IsVideoType(fileType string) bool {
 	return fileType == models.FileTypeMP4 || fileType == models.FileTypeWEBM
 }
 
-// ExtForFileType returns the extension a file of this type is named with,
+// extForFileType returns the extension a file of this type is named with,
 // or "" when unmapped. Only for files monbooru names itself; an
 // operator's own file keeps the name they gave it.
-func ExtForFileType(fileType string) string { return fileTypeMeta[fileType].ext }
+func extForFileType(fileType string) string { return fileTypeMeta[fileType].ext }
 
 // MIMEForFileType maps a stored file type to the media type to serve it
 // under, or "" when unmapped. Handlers set this explicitly because

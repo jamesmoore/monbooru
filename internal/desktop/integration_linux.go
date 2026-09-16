@@ -48,12 +48,12 @@ func autostartPath(app string) (string, error) {
 
 func menuEnabled(app string) bool {
 	path, err := menuEntryPath(app)
-	return err == nil && isFile(path)
+	return err == nil && fsx.IsFile(path)
 }
 
 func autostartEnabled(app string) bool {
 	path, err := autostartPath(app)
-	return err == nil && isFile(path)
+	return err == nil && fsx.IsFile(path)
 }
 
 func enableMenu(h Hook) error {

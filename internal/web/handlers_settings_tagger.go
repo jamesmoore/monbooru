@@ -1015,7 +1015,9 @@ func (s *Server) settingsTaggerDeletePost(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	dir := filepath.Join(s.modelPath(), name)
+	// Read off the held lock rather than through modelPath, which takes
+	// cfgMu for reading and deadlocks against the write lock above.
+	dir := filepath.Join(s.cfg.Paths.ModelPath, name)
 	s.cfgMu.Unlock()
 	// The folder goes first: dropping the entry before a removal that
 	// then fails leaves memory and the TOML disagreeing, and the next

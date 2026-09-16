@@ -527,6 +527,23 @@ func (s *Server) removeTagFromImage(w http.ResponseWriter, r *http.Request) {
 	s.renderTagListWithSidebar(w, r, id, "", "", okMsg, false)
 }
 
+// tagTokenLabel spells a parsed token as the (category, name) pair it was
+// looked up under. Always qualified, general included: a token that
+// matched nothing is most often one whose category was wrong, and a bare
+// name would name a tag the image visibly carries.
+func (s *Server) tagTokenLabel(ct catTag) string {
+	categories, err := s.categoryIDsByName()
+	if err != nil {
+		return ct.name
+	}
+	for name, id := range categories {
+		if id == ct.catID {
+			return name + ":" + ct.name
+		}
+	}
+	return ct.name
+}
+
 // joinLabeled renders "<label><items joined by sep>", or "" when there
 // is nothing to label.
 func joinLabeled(label, sep string, items []string) string {

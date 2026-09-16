@@ -12,9 +12,15 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/galleryio"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
+// errJobRunning is what every gallery mutation answers while the job lane
+// is busy. The lane is held for the mutation rather than merely checked
+// before it: a batch handler holds ctxMu read-locked while it claims the
+// lane and spawns, so a check taken ahead of the write lock can read a
+// free lane and publish the swap under a job that started behind it.
 var errJobRunning = errors.New("a job is running; try again when it finishes")
 
 // switchGallery changes the runtime-active gallery. The change is ephemeral:
@@ -22,9 +28,10 @@ var errJobRunning = errors.New("a job is running; try again when it finishes")
 // setDefault. Every gallery runs its own watcher for the whole process
 // lifetime, so the swap does not stop/start watchers or trigger a sync.
 func (s *Server) switchGallery(name string) error {
-	if s.jobs.IsRunning() {
+	if err := s.jobs.BeginSchedule(); err != nil {
 		return errJobRunning
 	}
+	defer s.jobs.EndSchedule()
 	s.ctxMu.Lock()
 	st := s.galleryState()
 	if name == st.active {
@@ -89,9 +96,10 @@ func (s *Server) addGallery(name, galleryPath string) error {
 	if _, err := os.ReadDir(galleryPath); err != nil {
 		return fmt.Errorf("gallery path %q is not readable: %w", galleryPath, err)
 	}
-	if s.jobs.IsRunning() {
+	if err := s.jobs.BeginSchedule(); err != nil {
 		return errJobRunning
 	}
+	defer s.jobs.EndSchedule()
 
 	s.ctxMu.Lock()
 	next := s.galleryState().clone()
@@ -110,7 +118,7 @@ func (s *Server) addGallery(name, galleryPath string) error {
 		DBPath:         dbPath,
 		ThumbnailsPath: thumbnailsPath,
 	}
-	cx, err := openGalleryCtx(g)
+	cx, err := library.Open(g)
 	if err != nil {
 		s.ctxMu.Unlock()
 		return err
@@ -121,7 +129,7 @@ func (s *Server) addGallery(name, galleryPath string) error {
 	s.cfg.Galleries = append(s.cfg.Galleries, g)
 	s.cfgMu.Unlock()
 	watch, maxMB := s.watcherSettings()
-	cx.startBackground(watch, maxMB, s.ingestNaming(cx.Name), s.jobs)
+	cx.StartBackground(watch, maxMB, s.ingestNaming(cx.Name), s.jobs)
 	s.ctxMu.Unlock()
 
 	if err := s.saveConfig(); err != nil {
@@ -135,9 +143,10 @@ func (s *Server) addGallery(name, galleryPath string) error {
 // When removeFolder is true, the gallery's source folder is also removed
 // (best-effort). Refuses to remove the active, default, or last gallery.
 func (s *Server) removeGallery(name string, removeFolder bool) error {
-	if s.jobs.IsRunning() {
+	if err := s.jobs.BeginSchedule(); err != nil {
 		return errJobRunning
 	}
+	defer s.jobs.EndSchedule()
 	s.ctxMu.Lock()
 	next := s.galleryState().clone()
 	cx, ok := next.contexts[name]
@@ -160,7 +169,7 @@ func (s *Server) removeGallery(name string, removeFolder bool) error {
 
 	galleryPath := cx.GalleryPath
 	dataDir := filepath.Dir(cx.DBPath) // /<data_path>/<name>
-	cx.close()
+	cx.Close()
 	delete(next.contexts, name)
 	s.galState.Store(next)
 	s.cfgMu.Lock()
@@ -205,9 +214,10 @@ func (s *Server) renameGallery(oldName, newName string) error {
 	if err := config.ValidateGalleryName(newName); err != nil {
 		return err
 	}
-	if s.jobs.IsRunning() {
+	if err := s.jobs.BeginSchedule(); err != nil {
 		return errJobRunning
 	}
+	defer s.jobs.EndSchedule()
 	s.ctxMu.Lock()
 	next := s.galleryState().clone()
 	cx, ok := next.contexts[oldName]
@@ -225,13 +235,13 @@ func (s *Server) renameGallery(oldName, newName string) error {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("data dir %q already exists", newDir)
 	}
-	cx.close()
+	cx.Close()
 	oldDir := filepath.Dir(cx.DBPath)
 	// restoreOld puts the gallery back the way it was found, background
 	// goroutines included: the close above already happened, so a refused
 	// rename would otherwise leave the map holding closed handles.
 	restoreOld := func() {
-		reopened, err := openGalleryCtx(config.Gallery{
+		reopened, err := library.Open(config.Gallery{
 			Name: oldName, GalleryPath: cx.GalleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath,
 		})
 		if err != nil {
@@ -241,7 +251,7 @@ func (s *Server) renameGallery(oldName, newName string) error {
 		next.contexts[oldName] = reopened
 		s.galState.Store(next)
 		watch, maxMB := s.watcherSettings()
-		reopened.startBackground(watch, maxMB, s.ingestNaming(oldName), s.jobs)
+		reopened.StartBackground(watch, maxMB, s.ingestNaming(oldName), s.jobs)
 	}
 	moved := false
 	if err := os.Rename(oldDir, newDir); err != nil {
@@ -253,7 +263,7 @@ func (s *Server) renameGallery(oldName, newName string) error {
 	} else {
 		moved = true
 	}
-	newCx, err := openGalleryCtx(config.Gallery{
+	newCx, err := library.Open(config.Gallery{
 		Name: newName, GalleryPath: cx.GalleryPath, DBPath: newDB, ThumbnailsPath: newThumbs,
 	})
 	if err != nil {
@@ -288,7 +298,7 @@ func (s *Server) renameGallery(oldName, newName string) error {
 	}
 	s.galState.Store(next)
 	watch, maxMB := s.watcherSettings()
-	newCx.startBackground(watch, maxMB, s.ingestNaming(newCx.Name), s.jobs)
+	newCx.StartBackground(watch, maxMB, s.ingestNaming(newCx.Name), s.jobs)
 	s.ctxMu.Unlock()
 
 	if err := s.saveConfig(); err != nil {
@@ -309,9 +319,10 @@ func (s *Server) repointGallery(name, galleryPath string) error {
 	if _, err := os.ReadDir(galleryPath); err != nil {
 		return fmt.Errorf("gallery path %q is not readable: %w", galleryPath, err)
 	}
-	if s.jobs.IsRunning() {
+	if err := s.jobs.BeginSchedule(); err != nil {
 		return errJobRunning
 	}
+	defer s.jobs.EndSchedule()
 	s.ctxMu.Lock()
 	next := s.galleryState().clone()
 	cx, ok := next.contexts[name]
@@ -326,14 +337,14 @@ func (s *Server) repointGallery(name, galleryPath string) error {
 	// Opened before the old one closes: a reopen that fails after the close
 	// would leave the map holding closed handles, and the wizard's only
 	// submit is what calls this.
-	newCx, err := openGalleryCtx(config.Gallery{
+	newCx, err := library.Open(config.Gallery{
 		Name: name, GalleryPath: galleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath,
 	})
 	if err != nil {
 		s.ctxMu.Unlock()
 		return err
 	}
-	cx.close()
+	cx.Close()
 	next.contexts[name] = newCx
 	s.galState.Store(next)
 	s.cfgMu.Lock()
@@ -342,7 +353,7 @@ func (s *Server) repointGallery(name, galleryPath string) error {
 	}
 	s.cfgMu.Unlock()
 	watch, maxMB := s.watcherSettings()
-	newCx.startBackground(watch, maxMB, s.ingestNaming(name), s.jobs)
+	newCx.StartBackground(watch, maxMB, s.ingestNaming(name), s.jobs)
 	s.ctxMu.Unlock()
 
 	if err := s.saveConfig(); err != nil {

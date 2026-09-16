@@ -49,6 +49,9 @@ func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, m
 		// If the target's file went missing, restore the bytes and clear the
 		// flag so the merge doesn't report success on a still-unviewable row.
 		if dstMissing == 1 {
+			if !gallery.NamedInside(dstCx.GalleryPath, dstCanon) {
+				return fmt.Errorf("refusing to restore %q outside gallery root %q", dstCanon, dstCx.GalleryPath)
+			}
 			if err := os.MkdirAll(filepath.Dir(dstCanon), 0o755); err != nil {
 				return fmt.Errorf("mkdir dest: %w", err)
 			}

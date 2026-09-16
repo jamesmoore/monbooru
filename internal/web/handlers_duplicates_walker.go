@@ -248,11 +248,13 @@ func (s *Server) sha256WalkerRemoveOnePost(w http.ResponseWriter, r *http.Reques
 		flashStatus(w, http.StatusBadRequest, "Invalid path id.")
 		return
 	}
-	var aliasPath string
+	var aliasPath, canonicalPath string
 	if err := s.db().Read.QueryRow(
-		`SELECT path FROM image_paths WHERE id = ? AND is_canonical = 0`,
+		`SELECT ip.path, i.canonical_path
+		 FROM image_paths ip JOIN images i ON i.id = ip.image_id
+		 WHERE ip.id = ? AND ip.is_canonical = 0`,
 		pathID,
-	).Scan(&aliasPath); err != nil {
+	).Scan(&aliasPath, &canonicalPath); err != nil {
 		flashStatus(w, http.StatusNotFound, "Not a non-canonical path.")
 		return
 	}
@@ -261,7 +263,7 @@ func (s *Server) sha256WalkerRemoveOnePost(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if aliasPath != "" {
-		if err := unlinkUnderGallery(s.galleryPath(), aliasPath); err != nil {
+		if err := unlinkAliasFile(s.galleryPath(), aliasPath, canonicalPath); err != nil {
 			logx.Warnf("sha256 walker unlink %q: %v", aliasPath, err)
 		}
 	}

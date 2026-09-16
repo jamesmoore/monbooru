@@ -108,10 +108,10 @@ func canonicalPair(a, b int64) (int64, int64) {
 func (s *Service) inWriteTx(work func(*sql.Tx) error) error { return db.InWriteTx(s.db.Write, work) }
 
 // addGroupRelation enrols a and b in a group of the given kind in a
-// single transaction. The other kind's group state is left untouched:
-// §9.2 holds a pair to at most one relation type, so making a and b
-// duplicates must not also enrol them as alternates of each other
-// (which folding their alt groups together would do).
+// single transaction. The other kind's group state is left untouched: a
+// pair carries at most one relation type, so making a and b duplicates
+// must not also enrol them as alternates of each other (which folding
+// their alt groups together would do).
 func (s *Service) addGroupRelation(a, b int64, label string, cfg groupMerge) error {
 	if a == b {
 		return ErrSelfRelation
@@ -1129,8 +1129,7 @@ func lookupGroupIDTx(tx *sql.Tx, table string, imageID int64) (sql.NullInt64, er
 // pairHasOtherRelationTx reports whether the pair already carries any
 // declared relation outside of `ignore` ("duplicate", "alternate",
 // "version", "derivative", "not_related"). Used by every Add* method
-// to short-circuit before mutating - the spec demands at most one
-// type per pair.
+// to short-circuit before mutating - a pair carries at most one type.
 func pairHasOtherRelationTx(tx *sql.Tx, a, b int64, ignore string) (bool, error) {
 	for _, p := range pairProbes {
 		if p.kind == ignore {
@@ -1345,9 +1344,9 @@ var altGroupMerge = groupMerge{
 	mergeGroups: mergeAltGroupsTx,
 }
 
-// mergeIntoGroupTx is the five-case group merge from §6.4: both
-// singletons, one existing member, the other existing member, same group
-// already (idempotent no-op), and two different groups.
+// mergeIntoGroupTx is the five-case group merge: both singletons, one
+// existing member, the other existing member, same group already
+// (idempotent no-op), and two different groups.
 func mergeIntoGroupTx(tx *sql.Tx, a, b int64, cfg groupMerge) error {
 	groupA, err := lookupGroupIDTx(tx, cfg.membersTbl, a)
 	if err != nil {

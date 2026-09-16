@@ -1,8 +1,6 @@
 package gallery
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -20,19 +18,19 @@ type MergeSummary struct {
 	SourceAdded  bool `json:"source_added"`
 }
 
-// WriteSourceProvenance records one origin row: membership plus its md5,
+// writeSourceProvenance records one origin row: membership plus its md5,
 // post-file facts and parent-URL columns, keyed by (source, postID).
-func WriteSourceProvenance(database *db.DB, imageID int64, source, postID, url, md5, parentURL string, post PostFile) error {
+func writeSourceProvenance(database *db.DB, imageID int64, source, postID, url, md5, parentURL string, post PostFile) error {
 	if err := AddSourceMembership(database, imageID, source, postID, url); err != nil {
 		return err
 	}
-	if err := SetSourceMD5(database, imageID, source, postID, md5); err != nil {
+	if err := setSourceMD5(database, imageID, source, postID, md5); err != nil {
 		return err
 	}
-	if err := SetSourcePostFile(database, imageID, source, postID, post); err != nil {
+	if err := setSourcePostFile(database, imageID, source, postID, post); err != nil {
 		return err
 	}
-	return SetSourceParentURL(database, imageID, source, postID, parentURL)
+	return setSourceParentURL(database, imageID, source, postID, parentURL)
 }
 
 // ApplySourceProvenance writes the per-source commentary, its translation,
@@ -72,7 +70,7 @@ func ApplySourceProvenance(database *db.DB, imageID int64, source, postID, comme
 // error.
 func ApplyCreateProvenance(database *db.DB, imageID int64, source, postID, url, md5, parentURL, collection, commentary, translated, original string, post PostFile, order *int) error {
 	if source != "" || url != "" {
-		if err := WriteSourceProvenance(database, imageID, source, postID, url, md5, parentURL, post); err != nil {
+		if err := writeSourceProvenance(database, imageID, source, postID, url, md5, parentURL, post); err != nil {
 			return err
 		}
 	}
@@ -101,7 +99,7 @@ func ApplyCreateProvenance(database *db.DB, imageID int64, source, postID, url, 
 func MergeSource(database *db.DB, tagSvc *tags.Service, imageID int64, source, postID, url, md5, parentURL string, post PostFile, rawTags []string) (MergeSummary, []string, error) {
 	var sum MergeSummary
 	if source != "" || url != "" {
-		if err := WriteSourceProvenance(database, imageID, source, postID, url, md5, parentURL, post); err != nil {
+		if err := writeSourceProvenance(database, imageID, source, postID, url, md5, parentURL, post); err != nil {
 			return sum, nil, err
 		}
 		if source != "" && !strings.EqualFold(source, "ptr") {
@@ -177,7 +175,7 @@ func ResolveTagNames(database *db.DB, tagSvc *tags.Service, rawTags []string, or
 func resolveCategoryTag(database *db.DB, input string) (int64, string, error) {
 	input = strings.TrimSpace(input)
 	if idx := strings.Index(input, ":"); idx > 0 {
-		catID, ok, err := CategoryIDByName(database, input[:idx])
+		catID, ok, err := tags.CategoryIDByName(database, input[:idx])
 		if err != nil {
 			return 0, "", err
 		}
@@ -185,7 +183,7 @@ func resolveCategoryTag(database *db.DB, input string) (int64, string, error) {
 			return catID, input[idx+1:], nil
 		}
 	}
-	catID, ok, err := CategoryIDByName(database, "general")
+	catID, ok, err := tags.CategoryIDByName(database, "general")
 	if err != nil {
 		return 0, "", err
 	}
@@ -193,18 +191,4 @@ func resolveCategoryTag(database *db.DB, input string) (int64, string, error) {
 		return 0, "", fmt.Errorf("unknown category %q", "general")
 	}
 	return catID, input, nil
-}
-
-// CategoryIDByName resolves a tag category by name, reporting whether it
-// exists rather than treating an unknown one as an error.
-func CategoryIDByName(database *db.DB, name string) (int64, bool, error) {
-	var id int64
-	err := database.Read.QueryRow(`SELECT id FROM tag_categories WHERE name = ?`, name).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	return id, true, nil
 }

@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -22,7 +21,7 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cx := s.active()
-	if cx == nil || cx.DB == nil || cx.bkTree == nil {
+	if cx == nil || cx.DB == nil || cx.BKTree == nil {
 		flashStatus(w, http.StatusInternalServerError, "No active gallery.")
 		return
 	}
@@ -53,7 +52,7 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	database := cx.DB
 	thumbnailsPath := cx.ThumbnailsPath
-	tree := cx.bkTree
+	tree := cx.BKTree
 	opts := relations.FindPairsOptions{
 		Distance:         distance,
 		Replace:          replace,
@@ -66,15 +65,9 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 		added, err := relations.FindPairs(ctx, database, tree, opts, func(processed, total int, phase string) {
 			s.jobs.Update(processed, total, fmt.Sprintf("find-pairs: %s", phase))
 		})
-		if err == context.Canceled || ctx.Err() != nil {
-			s.jobs.Complete(fmt.Sprintf("find-pairs cancelled (%d added)", added))
-			return
-		}
-		if err != nil {
-			s.jobs.Fail(err.Error())
-			return
-		}
-		s.jobs.Complete(fmt.Sprintf("find-pairs added %d candidate(s).", added))
+		_ = s.settleJob(ctx, err,
+			fmt.Sprintf("find-pairs cancelled (%d added)", added),
+			fmt.Sprintf("find-pairs added %d candidate(s).", added))
 	}()
 	writeInlineFlash(w, "ok", "Find-pairs started.")
 }

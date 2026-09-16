@@ -15,7 +15,7 @@ import (
 )
 
 // IncrementalProbeDistance is the Hamming distance the on-ingest
-// probe (fired from gallery.PhashHooks.OnStored) walks the BK-tree
+// probe (fired from relations.PhashStored) walks the BK-tree
 // for. Atomic so the config-edit path can flip it without a restart.
 var IncrementalProbeDistance atomic.Int32
 
@@ -49,9 +49,10 @@ type FindPairsOptions struct {
 type FindPairsProgress func(processed, total int, phase string)
 
 // FindPairs walks every visible image, computes any missing phash
-// inline (the lazy compute documented in §5.2), probes the per-gallery
-// BK-tree for candidates within opts.Distance, and inserts canonicalised
-// (a, b, distance) rows into potential_relation_pairs.
+// inline, probes the per-gallery BK-tree for candidates within
+// opts.Distance, and inserts canonicalised (a, b, distance) rows into
+// potential_relation_pairs. Computing inline is what lets the job
+// double as a phash backfill.
 //
 // Skips already-related pairs and pairs in not_related_pairs / the
 // existing queue (unless opts.Replace wipes the queue first). 500-row
@@ -144,15 +145,12 @@ func FindPairs(ctx context.Context, database *db.DB, tree *BKTree, opts FindPair
 		if progress != nil {
 			progress(idx, total, "phashing")
 		}
-		if err := gallery.RecomputeAndStorePhash(ctx, database, entries[idx].id, opts.ThumbnailsPath); err != nil {
+		h, err := gallery.RecomputeAndStorePhash(ctx, database, entries[idx].id, opts.ThumbnailsPath)
+		if err != nil {
 			logx.Debugf("find-pairs phash %d: %v", entries[idx].id, err)
 			continue
 		}
-		var phash sql.NullInt64
-		if err := database.Read.QueryRow(`SELECT phash FROM images WHERE id = ?`, entries[idx].id).Scan(&phash); err != nil {
-			logx.Debugf("find-pairs reread %d: %v", entries[idx].id, err)
-			continue
-		}
+		phash := sql.NullInt64{Int64: h, Valid: true}
 		if !phash.Valid {
 			continue
 		}

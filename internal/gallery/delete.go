@@ -150,10 +150,10 @@ func UnlinkAliasFiles(galleryPath string, id int64, copies []AliasCopy) {
 // RemoveAll for the static rows that never had one.
 func RemoveImageArtifacts(thumbnailsPath string, id int64, fileType string) {
 	_ = os.Remove(ThumbnailPath(thumbnailsPath, id))
-	_ = os.Remove(HoverPath(thumbnailsPath, id))
-	_ = os.Remove(ViewRenditionPath(thumbnailsPath, id))
+	_ = os.Remove(hoverPath(thumbnailsPath, id))
+	_ = os.Remove(viewRenditionPath(thumbnailsPath, id))
 	if fileType == "" || fileType == "cbz" {
-		RemoveMangaCache(thumbnailsPath, id)
+		removeMangaCache(thumbnailsPath, id)
 	}
 }
 

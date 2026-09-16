@@ -790,10 +790,7 @@ func applyTransferTags(database *db.DB, tagSvc *tags.Service, imageID int64, gro
 // otherwise the whole token is kept as a general name (native round-trip).
 func resolveImportTag(database *db.DB, token string, generalID int64, dropUnknownNamespace bool) (int64, string) {
 	if idx := strings.Index(token, ":"); idx > 0 {
-		var catID int64
-		if err := database.Read.QueryRow(
-			`SELECT id FROM tag_categories WHERE name = ?`, token[:idx],
-		).Scan(&catID); err == nil {
+		if catID, ok, err := tags.CategoryIDByName(database, token[:idx]); ok && err == nil {
 			return catID, token[idx+1:]
 		}
 		if dropUnknownNamespace {
@@ -803,9 +800,14 @@ func resolveImportTag(database *db.DB, token string, generalID int64, dropUnknow
 	return generalID, token
 }
 
+// LookupCategoryID is tags.CategoryIDByName for the import callers that
+// treat an unknown name and a failed read alike: both mean the general
+// category takes it.
 func LookupCategoryID(database *db.DB, name string) int64 {
-	var id int64
-	_ = database.Read.QueryRow(`SELECT id FROM tag_categories WHERE name = ?`, name).Scan(&id)
+	id, ok, err := tags.CategoryIDByName(database, name)
+	if !ok || err != nil {
+		return 0
+	}
 	return id
 }
 

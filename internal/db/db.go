@@ -1,3 +1,12 @@
+// Package db owns the SQLite handles and the schema. It opens one gallery
+// as a read pool and a single write connection - the split the WAL journal
+// wants - bootstraps and migrates the schema idempotently, registers the
+// scalar functions the search executor calls, and carries the small query
+// helpers every caller would otherwise hand-roll.
+//
+// It knows nothing about what the rows mean. A predicate like "visible" or
+// "untagged" is a domain question and lives with whoever owns the table,
+// which is why internal/counts exists beside this rather than inside it.
 package db
 
 import (

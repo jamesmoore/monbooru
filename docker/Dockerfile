@@ -1,5 +1,5 @@
 # Stage 1: build the binary.
-FROM golang:1.26-trixie AS build
+FROM golang:1.26.7-trixie AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

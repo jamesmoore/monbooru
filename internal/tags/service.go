@@ -1,3 +1,12 @@
+// Package tags owns the tag catalog and every image's membership in it:
+// the tags themselves, their categories, aliases, implications and the
+// image_tags rows that apply them. A write that changes what a tag means -
+// a merge, a rename, an implication - goes through here, because the
+// invariants that make it safe (the implied-row fan-out, the cycle check,
+// the usage counts) are not things a caller can be trusted to remember.
+//
+// It answers lookups as well as mutations. A consumer that wants the id
+// behind a category name asks this package rather than writing the SELECT.
 package tags
 
 import (

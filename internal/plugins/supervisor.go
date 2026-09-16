@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/procx"
 )
 
 // Launch is everything the supervisor needs to run one plugin: its name
@@ -222,6 +223,7 @@ func (m *managedPlugin) run() error {
 		return nil
 	}
 	cmd := exec.Command(m.command, m.args...)
+	procx.HideConsole(cmd)
 	cmd.Dir = m.dir
 	cmd.Env = append(os.Environ(), m.env...)
 	stdin, err := cmd.StdinPipe()

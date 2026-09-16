@@ -20,7 +20,7 @@ const (
 	phashBlock = 8
 )
 
-// ComputePhashFromThumb opens the static thumbnail JPEG at thumbPath
+// computePhashFromThumb opens the static thumbnail JPEG at thumbPath
 // and returns its canonicalised 64-bit perceptual hash as a signed
 // int64 (SQLite's INTEGER affinity). Returns a non-nil error when the
 // file is missing or undecodable; the caller leaves images.phash NULL
@@ -32,7 +32,7 @@ const (
 // and cbz uses the cover thumbnail. Hashing the thumbnail (not the
 // original) keeps the hashed pixels identical to what the operator
 // sees on the gallery grid.
-func ComputePhashFromThumb(thumbPath string) (int64, error) {
+func computePhashFromThumb(thumbPath string) (int64, error) {
 	f, err := os.Open(thumbPath)
 	if err != nil {
 		return 0, fmt.Errorf("open thumb: %w", err)
@@ -169,39 +169,39 @@ func init() {
 	}
 }
 
-// PhashHooks is the extension point a higher layer (internal/relations)
-// uses to keep its in-memory BK-tree consistent with what
-// RecomputeAndStorePhash just wrote. Set by the relations package's
-// init(); nil-safe when no hook is registered (tests, --tags variants).
-// gallery → relations would be a cycle, so the relations side
-// registers itself here rather than being called directly.
-var PhashHooks struct {
-	// OnStored fires after a successful UPDATE images SET phash = ?
-	// row. Database is the handle the UPDATE ran on, so the registry
-	// dispatch can find the right per-gallery tree.
-	OnStored func(database *db.DB, imageID, phash int64)
+// PhashSink is handed a phash the moment it is stored, so whoever holds
+// the in-memory near-duplicate index can keep it in step without this
+// package importing the one that owns it. A nil sink is a no-op, which is
+// every build and every test that runs no relations index.
+type PhashSink func(imageID, phash int64)
+
+// Stored forwards a phash a regeneration produced. A nil sink, or nothing
+// stored, forwards nothing.
+func (s PhashSink) Stored(imageID int64, phash *int64) {
+	if s == nil || phash == nil {
+		return
+	}
+	s(imageID, *phash)
 }
 
 // RecomputeAndStorePhash recomputes the phash from the image's static
-// thumbnail and writes it back. The ingest path calls this after
-// thumbnail generation; the re-extract maintenance loop calls it once
-// per image alongside its other recompute steps. When the thumbnail
-// is unreadable - missing because Generate failed, or undecodable
-// because the disk image is corrupt - the row's phash stays at its
-// previous value (or NULL on first compute). The relations system
-// then ignores the row until the operator rebuilds thumbnails and
-// re-runs the compute.
-func RecomputeAndStorePhash(ctx context.Context, database *db.DB, imageID int64, thumbnailsPath string) error {
+// thumbnail, writes it back, and returns what it stored so a caller
+// holding the in-memory index can keep it in step. The ingest path
+// calls this after thumbnail generation; the re-extract maintenance
+// loop calls it once per image alongside its other recompute steps.
+// When the thumbnail is unreadable - missing because Generate failed,
+// or undecodable because the disk image is corrupt - the row's phash
+// stays at its previous value (or NULL on first compute). The
+// relations system then ignores the row until the operator rebuilds
+// thumbnails and re-runs the compute.
+func RecomputeAndStorePhash(ctx context.Context, database *db.DB, imageID int64, thumbnailsPath string) (int64, error) {
 	thumb := ThumbnailPath(thumbnailsPath, imageID)
-	h, err := ComputePhashFromThumb(thumb)
+	h, err := computePhashFromThumb(thumb)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := database.Write.ExecContext(ctx, `UPDATE images SET phash = ? WHERE id = ?`, h, imageID); err != nil {
-		return fmt.Errorf("update phash: %w", err)
+		return 0, fmt.Errorf("update phash: %w", err)
 	}
-	if PhashHooks.OnStored != nil {
-		PhashHooks.OnStored(database, imageID, h)
-	}
-	return nil
+	return h, nil
 }

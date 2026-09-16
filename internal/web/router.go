@@ -1,3 +1,15 @@
+// Package web is the HTTP transport: the mux, the handlers, the templates
+// they render and the session, CSRF and rating-cookie plumbing around
+// them. It owns how a request becomes a response and nothing about what a
+// gallery is - that is internal/library, which this holds a pointer to and
+// every handler reaches its state through.
+//
+// The two things that still live here and read as though they should not:
+// the daily scheduler, because the loop needs the config lock and the job
+// manager as much as it needs the galleries; and the peer surfaces for
+// monloader and plugins, whose panels and receipts are transport but whose
+// catalog reconciliation is the tag domain. Moving either one means
+// threading the aggregate through the packages below it first.
 package web
 
 import (
@@ -28,6 +40,7 @@ import (
 	"github.com/monbooru/monbooru/internal/desktop"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
@@ -173,10 +186,10 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 
 	opened := &galleryState{contexts: map[string]*galleryCtx{}, active: cfg.DefaultGallery}
 	for _, g := range cfg.Galleries {
-		cx, err := openGalleryCtx(g)
+		cx, err := library.Open(g)
 		if err != nil {
 			for _, done := range opened.contexts {
-				done.close()
+				done.Close()
 			}
 			return nil, err
 		}
@@ -260,7 +273,7 @@ func (s *Server) runMemoryReclaim() {
 			ctxs := s.allContexts()
 			for _, cx := range ctxs {
 				dropped := counts.ReleaseIdleCountedTags(cx.DB, idleIndexReleaseAfter)
-				if cx.bkTree != nil && cx.bkTree.ReleaseIdle(idleIndexReleaseAfter) {
+				if cx.BKTree != nil && cx.BKTree.ReleaseIdle(idleIndexReleaseAfter) {
 					dropped = true
 				}
 				if dropped {
@@ -386,8 +399,8 @@ func (s *Server) StartWatchers() {
 	s.ctxMu.Lock()
 	defer s.ctxMu.Unlock()
 	for _, cx := range s.galleryState().contexts {
-		cx.startBackground(s.cfg.Gallery.WatchEnabled, s.cfg.Gallery.MaxFileSizeMB, s.ingestNaming(cx.Name), s.jobs)
-		go cx.warmCaches()
+		cx.StartBackground(s.cfg.Gallery.WatchEnabled, s.cfg.Gallery.MaxFileSizeMB, s.ingestNaming(cx.Name), s.jobs)
+		go cx.WarmCaches()
 	}
 }
 
@@ -651,7 +664,6 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.free("GET /tags/{id}/ptr-lookup-preview", s.tagPtrLookupPreview)
 	rt.free("GET /tags/{id}/ptr-lookup-search", s.tagPtrLookupSearch)
 	rt.read("POST /tags/{id}/ptr-lookup", s.ptrLookupTagPost)
-	rt.read("POST /internal/delete-folder", s.deleteFolderPost)
 	rt.read("GET /internal/tags/suggest", s.tagSuggest)
 	rt.read("GET /internal/search/suggest", s.searchSuggest)
 	rt.read("GET /internal/search/ids", s.searchIDs)
@@ -678,6 +690,11 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("GET /settings/galleries/{name}/export", s.settingsGalleryExport)
 	rt.write("POST /settings/galleries/{name}/import", s.settingsGalleryImport)
 
+	// The /api/v1 namespace's other three routes. They are here and not in
+	// internal/api because pairing writes the config and the plugin
+	// registry, which the REST handler does not hold - moving the routes
+	// would move that state. They answer through api.WriteJSON and
+	// api.SetCORS so a peer sees one namespace either way.
 	rt.read("POST /api/v1/pair/request", s.pairRequest)
 	rt.read("GET /api/v1/pair/status", s.pairStatus)
 	rt.read("POST /api/v1/pair/remove", s.pairTeardown)
@@ -1352,7 +1369,7 @@ func (s *Server) resolveMangaImage(idStr string) (string, bool) {
 	}
 	// Refuse a canonical_path that drifted outside the gallery root before
 	// the archive extractor opens it, mirroring serveImageFile.
-	if !gallery.ResolvedInside(cx.GalleryPath, canonPath) {
+	if !gallery.NamedInside(cx.GalleryPath, canonPath) {
 		return "", false
 	}
 	return canonPath, true
@@ -1439,11 +1456,9 @@ func (s *Server) serveImageBytes(w http.ResponseWriter, r *http.Request, scaled 
 		http.NotFound(w, r)
 		return
 	}
-	// Ensure resolved path is within the gallery directory to prevent serving
-	// arbitrary files. Use filepath.Rel so a sibling directory that shares a
-	// literal prefix with the gallery root (e.g. `/data/gallery_backup` vs
-	// `/data/gallery`) is correctly rejected.
-	if !gallery.ResolvedInside(cx.GalleryPath, canonPath) {
+	// A canonical_path that drifted outside the gallery root does not get
+	// opened, whatever put it there.
+	if !gallery.NamedInside(cx.GalleryPath, canonPath) {
 		http.NotFound(w, r)
 		return
 	}
@@ -1513,7 +1528,7 @@ func (s *Server) Close() {
 	s.ctxMu.Lock()
 	defer s.ctxMu.Unlock()
 	for _, cx := range s.galleryState().contexts {
-		cx.close()
+		cx.Close()
 	}
 }
 

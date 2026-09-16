@@ -2,6 +2,7 @@ package gallery
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +58,10 @@ func plan(database *db.DB, galleryPath string, id int64, folder, name *string, v
 		if p.base == "" || p.base != filepath.Base(p.base) || p.base == "." || p.base == ".." {
 			return p, fmt.Errorf("invalid file name %q", p.base)
 		}
+		// The naming templates bound every segment they render at
+		// maxNameBytes; a name typed into the dialog reaches the same
+		// filesystem and gets the same bound.
+		p.base = TruncateFilename(p.base, maxNameBytes)
 	}
 
 	oldCanonical, oldFolder, err := loadMoveSource(database, galleryPath, id, verb)
@@ -223,21 +228,28 @@ func loadMoveSource(database *db.DB, galleryPath string, id int64, verb string) 
 // constraint mid-tx with no useful diagnostic.
 func refuseAliasCollision(database *db.DB, id int64, newPath string) error {
 	var collidingImage int64
-	if err := database.Read.QueryRow(
+	switch err := database.Read.QueryRow(
 		`SELECT image_id FROM image_paths WHERE path = ? AND image_id != ?`,
 		newPath, id,
-	).Scan(&collidingImage); err == nil {
+	).Scan(&collidingImage); {
+	case err == nil:
 		return fmt.Errorf("destination collides with an existing alias on image %d", collidingImage)
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	default:
+		return fmt.Errorf("check destination for an alias collision: %w", err)
 	}
-	return nil
 }
 
-// commitRename repoints both path rows and renames the file inside the open
-// tx, so a rename failure rolls the row updates back automatically. The
+// commitRename repoints both path rows and moves the file inside the open
+// tx, so a failed move rolls the row updates back automatically. The
 // watcher suppresses events while the job runs, so the window where newPath
 // exists on disk before the commit does not race a concurrent ingest. A
-// commit failure (rare - SQLite COMMIT is essentially an fsync) reverses the
-// rename; if that fails too the library is wedged and needs a manual sync.
+// commit failure (rare - SQLite COMMIT is essentially an fsync) moves the
+// file back; if that fails too the library is wedged and needs a manual
+// sync. The move goes through moveIntoPlace rather than os.Rename: a
+// symlinked folder can put two folders of one gallery on different
+// filesystems, which the kernel refuses to rename across.
 // newFolder nil leaves folder_path alone, which is what a rename in place
 // wants.
 func commitRename(database *db.DB, verb string, id int64, oldCanonical, newPath string, newFolder *string) error {
@@ -261,12 +273,12 @@ func commitRename(database *db.DB, verb string, id int64, oldCanonical, newPath 
 		_ = tx.Rollback()
 		return fmt.Errorf("update image_paths row: %w", err)
 	}
-	if err := os.Rename(oldCanonical, newPath); err != nil {
+	if err := moveIntoPlace(oldCanonical, newPath); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("rename file: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		if rnErr := os.Rename(newPath, oldCanonical); rnErr != nil {
+		if rnErr := moveIntoPlace(newPath, oldCanonical); rnErr != nil {
 			logx.Errorf("%s: reverse rename for %d after commit fail: %v (original: %v)", verb, id, rnErr, err)
 		}
 		return fmt.Errorf("commit %s tx: %w", verb, err)

@@ -43,7 +43,7 @@ func containedCanonical(w http.ResponseWriter, g Gallery, id int64) (canonPath, 
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
 		return "", "", false
 	}
-	if !gallery.ResolvedInside(g.GalleryPath, canonPath) {
+	if !gallery.NamedInside(g.GalleryPath, canonPath) {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
 		return "", "", false
 	}

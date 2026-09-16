@@ -370,9 +370,9 @@ func (s *Server) imageTagAliases(imageTags []models.ImageTag) (byTag map[string]
 // ptrUnattributed lists the image's tags the repository also holds but
 // that the local ledger does not record it as having applied. Carrying
 // a tag is not the same as having it from the repository: one a booru
-// supplied leaves the repository absent from the by-source view (§5.8)
-// even though it vouches for the tag too, and a pull is what records
-// that. So these are work to offer even though no tag would be added.
+// supplied leaves the repository absent from the by-source view even
+// though it vouches for the tag too, and a pull is what records that.
+// So these are work to offer even though no tag would be added.
 func (s *Server) ptrUnattributed(id int64, preview *contribPreview) []string {
 	known := map[string]bool{}
 	for _, t := range preview.ToAdd {

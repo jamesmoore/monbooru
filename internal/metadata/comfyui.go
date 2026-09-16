@@ -429,6 +429,21 @@ func parseIntKey(s string) int {
 	return n
 }
 
+// nodeInput reads one of a node's declared inputs as T. Absent, or of
+// another shape than the node type promises, both read as "not carried" -
+// a workflow is whatever the graph that produced it wrote.
+func nodeInput[T any](inputs map[string]json.RawMessage, key string) (T, bool) {
+	var v T
+	raw, ok := inputs[key]
+	if !ok {
+		return v, false
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return v, false
+	}
+	return v, true
+}
+
 func applyComfyNodeInputs(nodeType string, inputs map[string]json.RawMessage, meta *models.ComfyUIMetadata, nodes map[string]comfyAPINode) {
 	switch nodeType {
 	case "CLIPTextEncode":
@@ -445,84 +460,56 @@ func applyComfyNodeInputs(nodeType string, inputs map[string]json.RawMessage, me
 				meta.Seed = &seed
 			}
 		}
-		if stepsRaw, ok := inputs["steps"]; ok && meta.Steps == nil {
-			var steps int
-			if err := json.Unmarshal(stepsRaw, &steps); err == nil {
-				meta.Steps = &steps
-			}
+		if steps, ok := nodeInput[int](inputs, "steps"); ok && meta.Steps == nil {
+			meta.Steps = &steps
 		}
-		if cfgRaw, ok := inputs["cfg"]; ok && meta.CFGScale == nil {
-			var cfg float64
-			if err := json.Unmarshal(cfgRaw, &cfg); err == nil {
-				meta.CFGScale = &cfg
-			}
+		if cfg, ok := nodeInput[float64](inputs, "cfg"); ok && meta.CFGScale == nil {
+			meta.CFGScale = &cfg
 		}
-		if samplerRaw, ok := inputs["sampler_name"]; ok && meta.Sampler == "" {
-			var sampler string
-			if err := json.Unmarshal(samplerRaw, &sampler); err == nil {
-				meta.Sampler = sampler
-			}
+		if sampler, ok := nodeInput[string](inputs, "sampler_name"); ok && meta.Sampler == "" {
+			meta.Sampler = sampler
 		}
-		if schedulerRaw, ok := inputs["scheduler"]; ok && meta.Sampler != "" {
-			var scheduler string
-			if err := json.Unmarshal(schedulerRaw, &scheduler); err == nil && scheduler != "" {
-				meta.Sampler += "/" + scheduler
-			}
+		if scheduler, ok := nodeInput[string](inputs, "scheduler"); ok && scheduler != "" && meta.Sampler != "" {
+			meta.Sampler += "/" + scheduler
 		}
 	case "CheckpointLoaderSimple", "CheckpointLoader", "unCLIPCheckpointLoader":
-		if ckptRaw, ok := inputs["ckpt_name"]; ok && meta.ModelCheckpoint == "" {
-			var ckpt string
-			if err := json.Unmarshal(ckptRaw, &ckpt); err == nil {
-				meta.ModelCheckpoint = ckpt
-			}
+		if ckpt, ok := nodeInput[string](inputs, "ckpt_name"); ok && meta.ModelCheckpoint == "" {
+			meta.ModelCheckpoint = ckpt
 		}
 	case "UNETLoader":
 		// Flux/SDXL flux-style separate unet+clip+vae loading
-		if unetRaw, ok := inputs["unet_name"]; ok && meta.ModelCheckpoint == "" {
-			var unet string
-			if err := json.Unmarshal(unetRaw, &unet); err == nil {
-				meta.ModelCheckpoint = unet
-			}
+		if unet, ok := nodeInput[string](inputs, "unet_name"); ok && meta.ModelCheckpoint == "" {
+			meta.ModelCheckpoint = unet
 		}
 	case "LoraLoader", "LoraLoaderModelOnly":
-		if loraRaw, ok := inputs["lora_name"]; ok {
-			var lora string
-			if err := json.Unmarshal(loraRaw, &lora); err == nil && lora != "" {
-				if meta.ModelCheckpoint != "" {
-					meta.ModelCheckpoint += " + " + lora
-				} else {
-					meta.ModelCheckpoint = lora
-				}
-			}
+		if lora, ok := nodeInput[string](inputs, "lora_name"); ok && lora != "" {
+			appendCheckpoint(meta, lora)
 		}
 	case "Lora Loader Stack (rgthree)":
 		// Multi-lora loader; collect every non-"None" slot.
 		for i := 1; i <= 10; i++ {
 			key := fmt.Sprintf("lora_%02d", i)
-			if loraRaw, ok := inputs[key]; ok {
-				var lora string
-				if err := json.Unmarshal(loraRaw, &lora); err == nil && lora != "" && lora != "None" {
-					if meta.ModelCheckpoint != "" {
-						meta.ModelCheckpoint += " + " + lora
-					} else {
-						meta.ModelCheckpoint = lora
-					}
-				}
+			if lora, ok := nodeInput[string](inputs, key); ok && lora != "" && lora != "None" {
+				appendCheckpoint(meta, lora)
 			}
 		}
 	case "Seed (rgthree)", "SeedNode", "RandomSeed":
-		if seedRaw, ok := inputs["seed"]; ok && meta.Seed == nil {
-			var seed int64
-			if err := json.Unmarshal(seedRaw, &seed); err == nil {
-				meta.Seed = &seed
-			}
+		if seed, ok := nodeInput[int64](inputs, "seed"); ok && meta.Seed == nil {
+			meta.Seed = &seed
 		}
 	case "easy fullLoader", "easy a1111Loader":
-		if ckptRaw, ok := inputs["ckpt_name"]; ok && meta.ModelCheckpoint == "" {
-			var ckpt string
-			if err := json.Unmarshal(ckptRaw, &ckpt); err == nil {
-				meta.ModelCheckpoint = ckpt
-			}
+		if ckpt, ok := nodeInput[string](inputs, "ckpt_name"); ok && meta.ModelCheckpoint == "" {
+			meta.ModelCheckpoint = ckpt
 		}
 	}
+}
+
+// appendCheckpoint records another loader's contribution to the model
+// line, which a lora stack builds one slot at a time.
+func appendCheckpoint(meta *models.ComfyUIMetadata, name string) {
+	if meta.ModelCheckpoint != "" {
+		meta.ModelCheckpoint += " + " + name
+		return
+	}
+	meta.ModelCheckpoint = name
 }

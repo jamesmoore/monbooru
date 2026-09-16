@@ -125,6 +125,16 @@ func writeFetchPending(w http.ResponseWriter, id, n int64) {
 		id, n+1, fetchPollDelayMs)
 }
 
+// respondFetchPending is the tail every enqueue-and-poll handler ends in:
+// the pending pill for an htmx caller, the image page for anyone else.
+func respondFetchPending(w http.ResponseWriter, r *http.Request, id int64) {
+	if isHTMXRequest(r) {
+		writeFetchPending(w, id, 0)
+		return
+	}
+	http.Redirect(w, r, "/images/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
+}
+
 // writeFetchOutcome swaps a terminal outcome into the top #fetch-status slot
 // out-of-band, leaving the main body empty so the pending pill clears wherever
 // the triggering button placed it (#fetch-status or #fetch-pending). body must

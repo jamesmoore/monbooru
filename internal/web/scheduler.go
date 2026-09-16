@@ -474,17 +474,10 @@ func (s *Server) scheduledFindRelationPairs(cx *galleryCtx) error {
 		TagPairs:         tagPairs,
 		TagPairThreshold: config.ClampTagPairThreshold(tagPairThreshold),
 	}
-	added, err := relations.FindPairs(ctx, cx.DB, cx.bkTree, opts, s.jobs.Update)
-	if err == context.Canceled || ctx.Err() != nil {
-		s.jobs.Complete(fmt.Sprintf("[%s] find-pairs cancelled (%d added)", cx.Name, added))
-		return nil
-	}
-	if err != nil {
-		s.jobs.Fail(err.Error())
-		return err
-	}
-	s.jobs.Complete(fmt.Sprintf("[%s] find-pairs added %d candidate(s).", cx.Name, added))
-	return nil
+	added, err := relations.FindPairs(ctx, cx.DB, cx.BKTree, opts, s.jobs.Update)
+	return s.settleJob(ctx, err,
+		fmt.Sprintf("[%s] find-pairs cancelled (%d added)", cx.Name, added),
+		fmt.Sprintf("[%s] find-pairs added %d candidate(s).", cx.Name, added))
 }
 
 func (s *Server) scheduledSync(cx *galleryCtx) error {
@@ -493,18 +486,12 @@ func (s *Server) scheduledSync(cx *galleryCtx) error {
 		return err
 	}
 	result, err := cx.Sync(ctx, s.maxFileSizeMB(), s.ingestNaming(cx.Name), s.jobs.Update)
-	// Match the user-trigger handlers' shape: ctx cancellation produces
-	// a clean Complete summary, only real failures fall to Fail().
-	if ctx.Err() != nil {
-		s.jobs.Complete(fmt.Sprintf("[%s] sync cancelled (%s)", cx.Name, result.Summary()))
-		return nil
-	}
-	if err != nil {
-		s.jobs.Fail(err.Error())
+	if err := s.settleJob(ctx, err,
+		fmt.Sprintf("[%s] sync cancelled (%s)", cx.Name, result.Summary()),
+		fmt.Sprintf("[%s] %s", cx.Name, result.Summary())); err != nil {
 		logx.Warnf("scheduler sync %q: %v", cx.Name, err)
 		return err
 	}
-	s.jobs.Complete(fmt.Sprintf("[%s] %s", cx.Name, result.Summary()))
 	return nil
 }
 
@@ -514,16 +501,13 @@ func (s *Server) scheduledRemoveOrphans(cx *galleryCtx) error {
 		return err
 	}
 	removed, processed, total, err := s.runOrphanSweep(ctx, cx)
+	s.finishJob(err, ctx.Err() != nil,
+		fmt.Sprintf("[%s] orphan sweep cancelled (%d/%d scanned, %d removed)", cx.Name, processed, total, removed),
+		fmt.Sprintf("[%s] removed %d orphaned thumbnail(s)", cx.Name, removed))
 	if err != nil {
-		s.jobs.Fail(err.Error())
 		logx.Warnf("scheduler orphans %q: %v", cx.Name, err)
 		return err
 	}
-	if ctx.Err() != nil {
-		s.jobs.Complete(fmt.Sprintf("[%s] orphan sweep cancelled (%d/%d scanned, %d removed)", cx.Name, processed, total, removed))
-		return nil
-	}
-	s.jobs.Complete(fmt.Sprintf("[%s] removed %d orphaned thumbnail(s)", cx.Name, removed))
 	logx.Infof("scheduler: [%s] removed %d orphaned thumbnail(s)", cx.Name, removed)
 	return nil
 }

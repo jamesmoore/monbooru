@@ -47,7 +47,7 @@ func (h *Handler) listTags(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if catName != "" {
-		catID, ok, err := categoryIDByName(g, catName)
+		catID, ok, err := tags.CategoryIDByName(g.DB, catName)
 		if serverError(w, err) {
 			return
 		}

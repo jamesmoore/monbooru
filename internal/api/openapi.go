@@ -297,10 +297,15 @@ func buildSpec(baseURL string) map[string]any {
 										"folder":                      map[string]any{"type": "string", "description": "Destination subfolder under the gallery root; missing directories are created. Leave blank for the gallery root."},
 										"autotag":                     map[string]any{"type": "string", "description": "Set to \"true\" to kick off an auto-tag job on the new image"},
 										"tagger_name":                 map[string]any{"type": "string", "description": "Optional auto-tagger name; when set with autotag, restricts the job to that tagger"},
-										"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier (app name, URL...). Stored as images.origin and attached to each initial tag via image_tags.tagger_name. Blank defaults images.origin to 'upload' for multipart mode."},
+										"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier (app name, URL...). Stored as images.origin and attached to each initial tag via image_tags.tagger_name, unless a non-empty source is sent, which takes the attribution instead so each source owns a prunable slice. Blank defaults images.origin to 'upload' for multipart mode."},
 										"source":                      map[string]any{"type": "string", "description": "Optional site label for the image's origin (site name, scraper...). Recorded as a source; on a duplicate-SHA push its tags and provenance merge into the existing image instead of being discarded."},
 										"url":                         map[string]any{"type": "string", "description": "Optional canonical web URL the image came from. Must start with http:// or https://. Recorded on the same origin as 'source'."},
 										"md5":                         map[string]any{"type": "string", "description": "Optional md5 the source claims for the file (<=64 chars). Recorded on the origin row as an audit trail; never a dedup key."},
+										"post_id":                     map[string]any{"type": "string", "description": "Optional post id at that source, recorded on the origin row."},
+										"post_width":                  map[string]any{"type": "string", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
+										"post_height":                 map[string]any{"type": "string", "description": "The same for height."},
+										"post_size":                   map[string]any{"type": "string", "description": "The same for the file size in bytes."},
+										"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
 										"parent_url":                  map[string]any{"type": "string", "description": "Optional canonical URL of the post this post declares as its parent. Must start with http:// or https://. Recorded on the same origin as 'source'; when the parent's post lands in the gallery too, the pair is linked as a derivative relation."},
 										"commentary":                  map[string]any{"type": "string", "description": "Optional artist commentary for the pushed source (<=10000 chars)."},
 										"commentary_translated":       map[string]any{"type": "string", "description": "Optional translation of that commentary (<=10000 chars)."},
@@ -323,10 +328,15 @@ func buildSpec(baseURL string) map[string]any {
 										"folder":                      map[string]any{"type": "string", "description": "Destination subfolder for relative paths"},
 										"autotag":                     map[string]any{"type": "boolean", "description": "Kick off an auto-tag job on the new image"},
 										"tagger_name":                 map[string]any{"type": "string", "description": "Optional auto-tagger name"},
-										"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier. Stored as images.origin and attached to each initial tag. Blank defaults images.origin to 'ingest' for JSON path-reference mode."},
+										"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier. Stored as images.origin and attached to each initial tag, unless a non-empty source is sent, which takes the attribution instead. Blank defaults images.origin to 'ingest' for JSON path-reference mode."},
 										"source":                      map[string]any{"type": "string", "description": "Optional site label for the image's origin (site name, scraper...). Recorded as a source; on a duplicate-SHA push its tags and provenance merge into the existing image instead of being discarded."},
 										"url":                         map[string]any{"type": "string", "description": "Optional canonical web URL the image came from. Must start with http:// or https://. Recorded on the same origin as 'source'."},
 										"md5":                         map[string]any{"type": "string", "description": "Optional md5 the source claims for the file (<=64 chars). Recorded on the origin row as an audit trail; never a dedup key."},
+										"post_id":                     map[string]any{"type": "string", "description": "Optional post id at that source, recorded on the origin row."},
+										"post_width":                  map[string]any{"type": "integer", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
+										"post_height":                 map[string]any{"type": "integer", "description": "The same for height."},
+										"post_size":                   map[string]any{"type": "integer", "description": "The same for the file size in bytes."},
+										"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
 										"parent_url":                  map[string]any{"type": "string", "description": "Optional canonical URL of the post this post declares as its parent. Must start with http:// or https://. Recorded on the same origin as 'source'; when the parent's post lands in the gallery too, the pair is linked as a derivative relation."},
 										"commentary":                  map[string]any{"type": "string", "description": "Optional artist commentary for the pushed source (<=10000 chars)."},
 										"commentary_translated":       map[string]any{"type": "string", "description": "Optional translation of that commentary (<=10000 chars)."},
@@ -350,10 +360,8 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 			},
 			"/images/search": map[string]any{
-				"get": map[string]any{
-					"summary":     "Search images",
-					"operationId": "searchImages",
-					"parameters": []map[string]any{
+				"get": op("Search images", "searchImages",
+					[]map[string]any{
 						galleryParam(),
 						queryParam("q", "Search query (tag list, filters, wildcards)"),
 						queryParam("sort", "Sort field: newest, filesize, order, random"),
@@ -362,10 +370,9 @@ func buildSpec(baseURL string) map[string]any {
 						queryParam("page", "Page number (1-based)"),
 						queryParam("limit", "Results per page (max 200)"),
 					},
-					"responses": map[string]any{
+					map[string]any{
 						"200": resp("Paginated image list", "#/components/schemas/PaginatedImages"),
-					},
-				},
+					}),
 			},
 			"/images/{id}": map[string]any{
 				"get": op("Get image metadata", "getImage",
@@ -396,21 +403,18 @@ func buildSpec(baseURL string) map[string]any {
 						"404": resp("Not found", "#/components/schemas/Error"),
 						"409": resp("Relabel collides with another origin the image already carries", "#/components/schemas/Error"),
 					}),
-				"delete": map[string]any{
-					"summary":     "Delete image from library",
-					"operationId": "deleteImage",
-					"parameters": []map[string]any{
+				"delete": op("Delete image from library", "deleteImage",
+					[]map[string]any{
 						pathParam("id", "Image ID"),
 						galleryParam(),
 						queryParam("delete_empty_folder", "Remove containing folder if empty after deletion"),
 					},
-					"responses": map[string]any{
+					map[string]any{
 						"200": map[string]any{"description": "Deleted (folder also removed)"},
 						"204": map[string]any{"description": "Deleted"},
 						"404": resp("Not found", "#/components/schemas/Error"),
 						"500": resp("Delete failed server-side", "#/components/schemas/Error"),
-					},
-				},
+					}),
 			},
 			"/images/{id}/enrich": map[string]any{
 				"post": map[string]any{
@@ -553,17 +557,23 @@ func buildSpec(baseURL string) map[string]any {
 									"type":     "object",
 									"required": []string{"file"},
 									"properties": map[string]any{
-										"file":                  map[string]any{"type": "string", "format": "binary"},
-										"tags":                  map[string]any{"type": "string", "description": "JSON array of tag names, merged like an enrich"},
-										"source":                map[string]any{"type": "string"},
-										"post_id":               map[string]any{"type": "string"},
-										"url":                   map[string]any{"type": "string"},
-										"md5":                   map[string]any{"type": "string", "description": "md5 the source claims; recorded on the origin row"},
-										"parent_url":            map[string]any{"type": "string"},
-										"commentary":            map[string]any{"type": "string"},
-										"commentary_translated": map[string]any{"type": "string"},
-										"original":              map[string]any{"type": "string"},
-										"notes":                 map[string]any{"type": "string", "description": "JSON array of positional note boxes"},
+										"file":                        map[string]any{"type": "string", "format": "binary"},
+										"tags":                        map[string]any{"type": "string", "description": "JSON array of tag names, merged like an enrich"},
+										"source":                      map[string]any{"type": "string"},
+										"post_id":                     map[string]any{"type": "string"},
+										"url":                         map[string]any{"type": "string"},
+										"md5":                         map[string]any{"type": "string", "description": "md5 the source claims; recorded on the origin row"},
+										"post_width":                  map[string]any{"type": "string", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
+										"post_height":                 map[string]any{"type": "string", "description": "The same for height."},
+										"post_size":                   map[string]any{"type": "string", "description": "The same for the file size in bytes."},
+										"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
+										"parent_url":                  map[string]any{"type": "string"},
+										"commentary":                  map[string]any{"type": "string"},
+										"commentary_translated":       map[string]any{"type": "string"},
+										"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
+										"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
+										"original":                    map[string]any{"type": "string"},
+										"notes":                       map[string]any{"type": "string", "description": "JSON array of positional note boxes"},
 									},
 								},
 							},
@@ -648,10 +658,8 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 			},
 			"/tags": map[string]any{
-				"get": map[string]any{
-					"summary":     "List tags",
-					"operationId": "listTags",
-					"parameters": []map[string]any{
+				"get": op("List tags", "listTags",
+					[]map[string]any{
 						galleryParam(),
 						queryParam("q", "Name filter; prefix match, or * as a wildcard anywhere"),
 						queryParam("category", "Filter by category name"),
@@ -662,10 +670,9 @@ func buildSpec(baseURL string) map[string]any {
 						queryParam("origin", "Filter by stored creation origin ('user', a booru site, 'ptr', an auto-tagger name, ...). The legacy 'alias' value narrows to alias rows. Empty (default) returns every tag."),
 						queryParam("type", "Structural filter: 'tag' (non-alias rows), 'alias' (alias rows). Empty (default) returns both."),
 					},
-					"responses": map[string]any{
+					map[string]any{
 						"200": resp("Paginated tag list", "#/components/schemas/PaginatedTags"),
-					},
-				},
+					}),
 				"post": opBody("Create a tag (get-or-create)", "createTag",
 					[]map[string]any{galleryParam()},
 					jsonBodySchema(true, map[string]any{
@@ -1186,15 +1193,15 @@ var docsTemplate = template.Must(template.New("api-docs").Parse(`<!DOCTYPE html>
  </tbody>
 </table>{{end}}
 <body>
- <p class="muted"><a href="/">← Back</a></p>
+ <p class="muted"><a href="/">‹ Back</a></p>
  <h1>{{.Title}}</h1>
  <p class="muted">Version {{.Version}} · base URL <code>{{.BaseURL}}</code></p>
  {{if .APIEnabled}}
- <p style="color:#22aa44;border:1px solid #22aa44;padding:4px 8px;">API is active - authenticate with your bearer token from Settings → Authentication.</p>
+ <p style="color:#22aa44;border:1px solid #22aa44;padding:4px 8px;">API is active - authenticate with your bearer token from Settings -&gt; Authentication.</p>
  {{else}}
- <p style="color:#ffaa00;border:1px solid #ffaa00;padding:4px 8px;">API is disabled - generate a token in Settings → Authentication to enable it. All endpoints currently return <code>503 api_disabled</code>.</p>
+ <p style="color:#ffaa00;border:1px solid #ffaa00;padding:4px 8px;">API is disabled - generate a token in Settings -&gt; Authentication to enable it. All endpoints currently return <code>503 api_disabled</code>.</p>
  {{end}}
- <p>Every endpoint except <code>/docs</code> and <code>/openapi.json</code> requires <code>Authorization: Bearer &lt;token&gt;</code>. Create a named token in Settings → Authentication; while none exists every authenticated endpoint returns <code>503 api_disabled</code>. Tokens are scoped (read/write/delete); a request whose token lacks the scope gets <code>403 insufficient_scope</code>.</p>
+ <p>Every endpoint except <code>/docs</code> and <code>/openapi.json</code> requires <code>Authorization: Bearer &lt;token&gt;</code>. Create a named token in Settings -&gt; Authentication; while none exists every authenticated endpoint returns <code>503 api_disabled</code>. Tokens are scoped (read/write/delete); a request whose token lacks the scope gets <code>403 insufficient_scope</code>.</p>
  <p>Endpoints take an optional <code>?gallery=&lt;name&gt;</code> (or <code>X-Monbooru-Gallery</code> header) to target a specific gallery; omit both for the active one.</p>
  <p>From a browser, the address you reached this page on can call the API. {{if .CORSOrigins}}So can: {{range $i, $o := .CORSOrigins}}{{if $i}}, {{end}}<code>{{$o}}</code>{{end}}.{{else}}Add others to <code>server.cors_origins</code> in <code>monbooru.toml</code>.{{end}}</p>
  <p class="muted">Raw spec: <a href="/api/v1/openapi.json">openapi.json</a></p>

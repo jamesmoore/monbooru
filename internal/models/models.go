@@ -1,3 +1,11 @@
+// Package models is the vocabulary the other packages share: the row
+// structs, the column list and scanner every image read goes through, and
+// the job and origin constants more than one package names. It is the
+// bottom of the graph and imports nothing of ours.
+//
+// A type earns a place here by being spoken by two packages that should
+// not import each other. A type only one package uses belongs in that
+// package, however row-shaped it looks.
 package models
 
 import (

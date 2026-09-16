@@ -280,11 +280,11 @@ func (s *Server) imageRelationsPage(w http.ResponseWriter, r *http.Request) {
 // cell - the same lead-with-self framing the version chain and
 // derivative tree already apply via the relations-tree-current accent.
 func reorderSelfFirst(members []int64, self int64) []int64 {
-	if !slices.Contains(members, self) {
-		return slices.Clone(members)
+	out := slices.Clone(members)
+	if i := slices.Index(out, self); i > 0 {
+		out = append([]int64{self}, slices.Delete(out, i, i+1)...)
 	}
-	rest := slices.DeleteFunc(slices.Clone(members), func(m int64) bool { return m == self })
-	return append([]int64{self}, rest...)
+	return out
 }
 
 // relationRoot is the top of the parentCol -> childCol chain above start,
@@ -484,7 +484,8 @@ func (s *Server) recomputePhashPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := gallery.RecomputeAndStorePhash(r.Context(), cx.DB, id, cx.ThumbnailsPath); err != nil {
+	h, err := gallery.RecomputeAndStorePhash(r.Context(), cx.DB, id, cx.ThumbnailsPath)
+	if err != nil {
 		logx.Warnf("recompute phash %d: %v", id, err)
 		// Flash at 200: htmx ignores HX-Trigger on a non-2xx response and
 		// the form is hx-swap="none", so a 500 here gives no feedback.
@@ -492,6 +493,7 @@ func (s *Server) recomputePhashPost(w http.ResponseWriter, r *http.Request) {
 		setFlashHeader(w, "phash recompute failed (is the thumbnail present?)", "err", nil)
 		return
 	}
+	relations.PhashStored(cx.DB, id, h)
 	cx.InvalidatePhashMissing()
 	hxDone(w, r, "phash recomputed.", "", "/images/"+strconv.FormatInt(id, 10))
 }
@@ -963,42 +965,28 @@ func (s *Server) dissolveGroupsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	kind := r.URL.Query().Get("kind")
 	kind = cmp.Or(kind, r.FormValue("kind"))
-	switch kind {
-	case "duplicate", "alternate", "version", "derivative", "not_related":
-	default:
-		flashStatus(w, http.StatusBadRequest, "Unknown dissolve kind.")
-		return
+	// The four group-shaped kinds differ only in the field they read and
+	// the method they call. One table for them keeps the accepted set and
+	// the dispatch from drifting apart, which two switches could.
+	byRoot := map[string]struct {
+		field    string
+		dissolve func(int64) error
+	}{
+		"duplicate":  {"group_id", cx.RelationsSvc.DissolveDupGroup},
+		"alternate":  {"group_id", cx.RelationsSvc.DissolveAltGroup},
+		"version":    {"root_id", cx.RelationsSvc.DissolveVersionChain},
+		"derivative": {"root_id", cx.RelationsSvc.DissolveDerivativeTree},
 	}
-	switch kind {
-	case "duplicate":
-		for _, gid := range parseIDList(r.Form["group_id"]) {
-			if err := cx.RelationsSvc.DissolveDupGroup(gid); err != nil {
+	switch entry, uniform := byRoot[kind]; {
+	case uniform:
+		for _, id := range parseIDList(r.Form[entry.field]) {
+			if err := entry.dissolve(id); err != nil {
 				writeRelationError(w, err)
 				return
 			}
 		}
-	case "alternate":
-		for _, gid := range parseIDList(r.Form["group_id"]) {
-			if err := cx.RelationsSvc.DissolveAltGroup(gid); err != nil {
-				writeRelationError(w, err)
-				return
-			}
-		}
-	case "version":
-		for _, rid := range parseIDList(r.Form["root_id"]) {
-			if err := cx.RelationsSvc.DissolveVersionChain(rid); err != nil {
-				writeRelationError(w, err)
-				return
-			}
-		}
-	case "derivative":
-		for _, rid := range parseIDList(r.Form["root_id"]) {
-			if err := cx.RelationsSvc.DissolveDerivativeTree(rid); err != nil {
-				writeRelationError(w, err)
-				return
-			}
-		}
-	case "not_related":
+	// not_related is the one kind keyed by a pair rather than a root.
+	case kind == "not_related":
 		for _, raw := range r.Form["pair"] {
 			a, b, ok := parsePairValue(raw)
 			if !ok {
@@ -1009,6 +997,9 @@ func (s *Server) dissolveGroupsPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	default:
+		flashStatus(w, http.StatusBadRequest, "Unknown dissolve kind.")
+		return
 	}
 	cx.InvalidateCaches()
 	target := "/relations/browse?kind=" + kind
@@ -1021,13 +1012,19 @@ func (s *Server) dissolveGroupsPost(w http.ResponseWriter, r *http.Request) {
 func parseIDList(raw []string) []int64 {
 	seen := map[int64]bool{}
 	out := make([]int64, 0, len(raw))
-	for _, s := range raw {
-		v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-		if err != nil || seen[v] {
-			continue
+	for _, field := range raw {
+		// One field per id and one comma-joined field both arrive here:
+		// htmx flattens an array value that way, and so does the batch
+		// bar, whose selection can outrun net/url's 10000-parameter cap
+		// on a form otherwise.
+		for _, s := range strings.Split(field, ",") {
+			v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+			if err != nil || seen[v] {
+				continue
+			}
+			seen[v] = true
+			out = append(out, v)
 		}
-		seen[v] = true
-		out = append(out, v)
 	}
 	return out
 }

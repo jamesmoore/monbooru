@@ -1,3 +1,11 @@
+// Package config is the TOML file, the environment overrides that layer on
+// top of it, the defaults underneath, the validation between them, and the
+// atomic save back. One Config describes a whole instance: its galleries,
+// its paths, its taggers, its peers and the schedule.
+//
+// It holds no lock. A running server reads and rewrites this under its own
+// mutex, because when a value takes effect is the server's question, not
+// the file format's.
 package config
 
 import (
@@ -601,7 +609,7 @@ type ScheduleConfig struct {
 	RemoveOrphans     bool   `toml:"remove_orphans"`
 	RunAutoTaggers    bool   `toml:"run_auto_taggers"`
 	FindRelationPairs bool   `toml:"find_relation_pairs"`
-	// The two hash-lookup phases over the images with no source (§7.13).
+	// The two hash-lookup phases over the images with no source.
 	// LookupPTR reads monloader's local index in batches and costs nothing;
 	// LookupBooru spends monloader's daily budget on the online walk.
 	LookupPTR   bool `toml:"lookup_ptr"`
@@ -617,7 +625,7 @@ func (sc ScheduleConfig) EffectiveMode() string {
 	return ScheduleAtTime
 }
 
-// Default returns a fully populated config with all spec defaults.
+// Default returns a fully populated config: every field at its default.
 func Default() *Config {
 	return &Config{
 		DefaultGallery: "default",

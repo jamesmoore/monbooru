@@ -173,14 +173,13 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 	catIDStr := q.Get("cat")
 	prefix := q.Get("q")
 	// `?q=character:` (a category prefix with no tag-name suffix) is a
-	// dead end against tags.name (no tag carries a colon by spec). Mirror
+	// dead end against tags.name (no tag name may contain a colon). Mirror
 	// the autocomplete's branch and route to the category-only filter so
 	// the user's intent surfaces instead of "No tags found".
 	if catIDStr == "" && prefix != "" && strings.HasSuffix(prefix, ":") && strings.Count(prefix, ":") == 1 {
 		catName := strings.TrimSuffix(prefix, ":")
 		if catName != "" && s.categoryExists(catName) {
-			var catID int64
-			if err := s.db().Read.QueryRow(`SELECT id FROM tag_categories WHERE name = ?`, catName).Scan(&catID); err == nil {
+			if catID, ok, err := tags.CategoryIDByName(s.db(), catName); ok && err == nil {
 				dst := r.URL
 				vals := dst.Query()
 				vals.Del("q")
@@ -444,10 +443,8 @@ func (s *Server) resolveCanonicalTagInput(input string, create bool) (int64, str
 		if tagName == "" {
 			return 0, "Tag name is required after the category prefix."
 		}
-		var catID int64
-		if err := s.db().Read.QueryRow(
-			`SELECT id FROM tag_categories WHERE name = ?`, catName,
-		).Scan(&catID); err != nil {
+		catID, ok, err := tags.CategoryIDByName(s.db(), catName)
+		if !ok || err != nil {
 			return 0, "Category not found: " + catName
 		}
 		if !create {

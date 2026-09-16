@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/fsx"
+	"github.com/monbooru/monbooru/internal/procx"
 )
 
 var (
@@ -72,6 +73,7 @@ func runFFmpeg(combinedOutput bool, name string, args ...string) ([]byte, error)
 	ctx, cancel := context.WithTimeout(context.Background(), ffmpegTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
+	procx.HideConsole(cmd)
 	if combinedOutput {
 		return cmd.CombinedOutput()
 	}
@@ -137,13 +139,21 @@ func NormalizeImage(srcPath string) error {
 	})
 }
 
-// generateVideoThumb extracts a frame at ~10% of the video's duration.
-func generateVideoThumb(srcPath, dstPath string) error {
+// tenPercentOffset is the -ss value both video renditions seek to, as
+// ffmpeg wants it. One place so the thumbnail and the hover preview agree
+// by construction rather than by having been written the same way twice; a
+// duration ffprobe would not give seeks to the start.
+func tenPercentOffset(srcPath string) string {
 	duration, err := probeDuration(srcPath)
 	if err != nil || duration <= 0 {
 		duration = 0
 	}
-	offsetStr := strconv.FormatFloat(duration*0.10, 'f', 3, 64)
+	return strconv.FormatFloat(duration*0.10, 'f', 3, 64)
+}
+
+// generateVideoThumb extracts a frame at ~10% of the video's duration.
+func generateVideoThumb(srcPath, dstPath string) error {
+	offsetStr := tenPercentOffset(srcPath)
 	return runFFmpegToFile(dstPath, ".vthumb.*.jpg", "thumbnail", func(tmp string) []string {
 		return []string{
 			"-y",
@@ -160,11 +170,7 @@ func generateVideoThumb(srcPath, dstPath string) error {
 
 // generateVideoHover writes a ~4-second animated WebP hover preview.
 func generateVideoHover(srcPath, dstPath string) error {
-	duration, err := probeDuration(srcPath)
-	if err != nil || duration <= 0 {
-		duration = 0
-	}
-	offsetStr := strconv.FormatFloat(duration*0.10, 'f', 3, 64)
+	offsetStr := tenPercentOffset(srcPath)
 	return runFFmpegToFile(dstPath, ".vhover.*.webp", "hover", func(tmp string) []string {
 		return []string{
 			"-y",

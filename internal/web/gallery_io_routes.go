@@ -17,6 +17,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/galleryio"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 )
@@ -111,13 +112,13 @@ func (s *Server) replaceGalleryFromUpload(name, format string, upload io.Reader)
 
 	// Close the target DB and stop its watcher before touching on-disk state.
 	s.ctxMu.Lock()
-	cx.close()
+	cx.Close()
 	s.ctxMu.Unlock()
 
 	applyErr := galleryio.ApplyImport(format, tmpPath, dbPath, thumbsPath, galleryPath, s.maxFileSizeMB())
 
 	// Reopen regardless so we leave the gallery usable even after a failed import.
-	newCx, openErr := openGalleryCtx(config.Gallery{
+	newCx, openErr := library.Open(config.Gallery{
 		Name: name, GalleryPath: galleryPath, DBPath: dbPath, ThumbnailsPath: thumbsPath,
 	})
 	if openErr != nil {
@@ -131,10 +132,10 @@ func (s *Server) replaceGalleryFromUpload(name, format string, upload io.Reader)
 	next.contexts[name] = newCx
 	s.galState.Store(next)
 	watch, maxMB := s.watcherSettings()
-	newCx.startBackground(watch, maxMB, s.ingestNaming(newCx.Name), s.jobs)
+	newCx.StartBackground(watch, maxMB, s.ingestNaming(newCx.Name), s.jobs)
 	s.ctxMu.Unlock()
 
-	go newCx.warmCaches()
+	go newCx.WarmCaches()
 	return newCx, applyErr
 }
 
@@ -416,7 +417,7 @@ func (s *Server) exportGalleryDB(name string, w io.Writer) error {
 }
 
 func (s *Server) exportGalleryJSON(name string, w io.Writer) error {
-	return s.exportGallery(name, func(cx *galleryCtx) error { return galleryio.ExportGalleryJSON(cx.Handle, w) })
+	return s.exportGallery(name, func(cx *galleryCtx) error { return galleryio.ExportGalleryJSON(cx.Handle, w, nil) })
 }
 
 func (s *Server) exportGalleryArchive(name, format string, w io.Writer) error {

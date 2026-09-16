@@ -12,31 +12,38 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// init wires gallery.PhashHooks.OnStored to the registry's per-DB
-// Insert path so every successful phash store keeps the in-memory
-// tree (when one is built) in lockstep with the row that just
-// changed. When IncrementalProbeEnabled is set, the same hook also
-// probes the BK-tree for near-duplicates of the newly-stored row
-// and inserts them into potential_relation_pairs - the §5.3
-// "incremental on ingest" path.
+// PhashStored keeps the in-memory tree in lockstep with a phash the
+// caller just wrote, and, when IncrementalProbeEnabled is set, probes it
+// for near-duplicates of that row and records them in
+// potential_relation_pairs - one probe at the configured distance, with
+// no full rescan behind it.
 //
-// Tests that don't register a tree see both halves short-circuit
-// on Lookup nil.
-func init() {
-	gallery.PhashHooks.OnStored = func(database *db.DB, id, phash int64) {
-		tree := DefaultRegistry.Lookup(database)
-		if tree == nil || !tree.Built() {
-			return
-		}
-		tree.Insert(id, phash)
-		if !IncrementalProbeEnabled.Load() {
-			return
-		}
-		distance := int(IncrementalProbeDistance.Load())
-		if err := incrementalProbe(database, tree, id, phash, distance); err != nil {
-			logx.Debugf("incremental probe %d: %v", id, err)
-		}
+// Called by whoever stored the hash rather than fired from a package
+// global the gallery published and this package filled from init(): that
+// made the two behaviourally mutually dependent with nothing in the
+// import graph to show it, and one wiring for the whole process. A
+// database with no tree registered is a no-op, which is what every build
+// running no relations index sees.
+func PhashStored(database *db.DB, id, phash int64) {
+	tree := DefaultRegistry.Lookup(database)
+	if tree == nil || !tree.Built() {
+		return
 	}
+	tree.Insert(id, phash)
+	if !IncrementalProbeEnabled.Load() {
+		return
+	}
+	distance := int(IncrementalProbeDistance.Load())
+	if err := incrementalProbe(database, tree, id, phash, distance); err != nil {
+		logx.Debugf("incremental probe %d: %v", id, err)
+	}
+}
+
+// PhashSink is PhashStored bound to one database, the shape the gallery's
+// ingest and sync paths take so they can publish without importing this
+// package.
+func PhashSink(database *db.DB) gallery.PhashSink {
+	return func(id, phash int64) { PhashStored(database, id, phash) }
 }
 
 // EnsureBuilt builds the tree against database when it isn't already
@@ -268,9 +275,8 @@ type Registry struct {
 	trees map[*db.DB]*BKTree
 }
 
-// DefaultRegistry is the process-wide registry the hooks in
-// gallery.RecomputeAndStorePhash and Service.OnImageDeleteTx route
-// through.
+// DefaultRegistry is the process-wide registry PhashStored and
+// Service.OnImageDeleteTx route through.
 var DefaultRegistry = &Registry{trees: map[*db.DB]*BKTree{}}
 
 // Register attaches tree to database. A subsequent ingest's

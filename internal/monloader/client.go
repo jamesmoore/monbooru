@@ -1,11 +1,17 @@
 // Package monloader is monbooru's outbound half of the pair: the HTTP
 // client that talks to the operator's monloader instance and nothing else.
 //
-// It exists as its own package because it is the one place monbooru reaches
-// the network on purpose, and because it holds no HTTP-server concern - the
-// routes, the status cache and the config reads stay in the web layer, which
-// hands this the address and the token as functions so a re-pair or a pause
-// takes effect on the next call without a restart.
+// It exists as its own package because it holds no HTTP-server concern -
+// the routes, the status cache and the config reads stay in the web layer,
+// which hands this the address and the token as functions so a re-pair or
+// a pause takes effect on the next call without a restart.
+//
+// It is not the only outbound client. The web layer keeps two of its own
+// for the peer surfaces that belong to the transport rather than to a
+// protocol: peerHTTPClient probes a peer's /health while pairing on a
+// 5-second budget, and pluginClient probes and relays to third-party
+// plugins on 15. Everything the app speaks to is one of those three, and
+// every one of them is a peer the operator approved.
 package monloader
 
 import (

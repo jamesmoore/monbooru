@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/api"
@@ -74,18 +73,23 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 		s.startBulkDelete(w, nil)
 		return
 	}
-	// Single IN query feeds every target through one round-trip; a
-	// 1000-checkbox selection used to pay 1000 reads here. The order
-	// returned by the SELECT is undefined under SQLite without an
-	// ORDER BY, so re-emit in the caller's input order via a map.
-	placeholders, args := db.InPlaceholders(ids)
-	loaded, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (search.DeleteTarget, error) {
-		var t search.DeleteTarget
-		var isMissing int
-		err := rows.Scan(&t.ID, &t.CanonicalPath, &t.FolderPath, &isMissing)
-		t.IsMissing = isMissing == 1
-		return t, err
-	}, `SELECT id, canonical_path, folder_path, is_missing FROM images WHERE id IN (`+placeholders+`)`, args...)
+	// One IN query per 500 ids: a row at a time would pay 1000 reads for a
+	// 1000-checkbox selection, and one list of them all runs out of SQLite
+	// parameters at 32766. The order the SELECT returns is undefined
+	// without an ORDER BY, so re-emit in the caller's input order via a map.
+	var loaded []search.DeleteTarget
+	err := db.Chunked(ids, 500, func(chunk []int64) error {
+		placeholders, args := db.InPlaceholders(chunk)
+		part, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (search.DeleteTarget, error) {
+			var t search.DeleteTarget
+			var isMissing int
+			err := rows.Scan(&t.ID, &t.CanonicalPath, &t.FolderPath, &isMissing)
+			t.IsMissing = isMissing == 1
+			return t, err
+		}, `SELECT id, canonical_path, folder_path, is_missing FROM images WHERE id IN (`+placeholders+`)`, args...)
+		loaded = append(loaded, part...)
+		return err
+	})
 	if err != nil {
 		// startBulkDelete(nil) would 202 with nothing queued, which the
 		// client reads as success - so surface the failure instead.
@@ -124,7 +128,7 @@ func (s *Server) deleteSearchPost(w http.ResponseWriter, r *http.Request) {
 	// don't allocate a second intermediate copy on top of whatever the
 	// bulk-delete worker holds.
 	var targets []search.DeleteTarget
-	err := search.ExecuteForDeleteStream(s.db(), expr, func(t search.DeleteTarget) error {
+	err := search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
 		targets = append(targets, t)
 		return nil
 	})
@@ -239,7 +243,7 @@ func (s *Server) runBulkDelete(targets []search.DeleteTarget) {
 // job runs so the Rename pairs don't flap the images as missing in transit.
 //
 // scope=search materialises ids by streaming the search result through
-// search.ExecuteForDeleteStream (same idiom as batchTag and deleteSearchPost);
+// search.Scope.Stream (same idiom as batchTag and deleteSearchPost);
 // scope=selection (or empty) reads ids[] from the form.
 func (s *Server) batchPlace(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
@@ -536,6 +540,7 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 	// batch bar precisely so they do not open every image to check, and a
 	// typo carrying * or " would otherwise land as plain success.
 	var refused skipReasons
+	var unmatched []string
 	if op == "add" {
 		for _, ct := range catTags {
 			t, err := s.tagSvc().GetOrCreateTag(ct.name, ct.catID)
@@ -553,7 +558,12 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 				`SELECT id FROM tags WHERE name = ? AND category_id = ?`, ct.name, ct.catID,
 			).Scan(&id)
 			if err != nil {
-				continue // unknown tag; nothing to remove
+				// A token that named no tag has to be said out loud: the
+				// wrong category qualifier is the natural mistake with this
+				// syntax, and a partly-ineffective removal otherwise reads
+				// exactly like a complete one.
+				unmatched = append(unmatched, s.tagTokenLabel(ct))
+				continue
 			}
 			resolved = append(resolved, resolvedTag{id, ct.name})
 		}
@@ -631,6 +641,9 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 	}
 	if refused.any() {
 		done += " Refused: " + refused.String() + "."
+	}
+	if note := joinLabeled("no tag matched: ", ", ", unmatched); note != "" {
+		done += " " + note + "."
 	}
 	if reRated > 0 {
 		done += fmt.Sprintf(" Replaced the rating on %d image(s).", reRated)
@@ -1255,47 +1268,4 @@ func (s *Server) enqueueSourceFetches(ctx context.Context, cx *galleryCtx, id in
 		queued++
 	}
 	return queued, nil
-}
-
-func (s *Server) deleteFolderPost(w http.ResponseWriter, r *http.Request) {
-	if !parseFormOK(w, r) {
-		return
-	}
-	folderPath := r.FormValue("folder")
-
-	if folderPath == "" {
-		http.Error(w, "invalid folder path", http.StatusBadRequest)
-		return
-	}
-
-	// Reuse the gallery-root validator from the upload path: filepath.Rel
-	// rejects sibling directories that share the gallery prefix (e.g.
-	// `/data/gallery_backup`) without false-positiving on `foo..bar`.
-	absPath, err := gallery.ResolveSubdir(s.galleryPath(), folderPath)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if err := os.Remove(absPath); err != nil {
-		// Treat "already gone" as success so a stale UI can re-issue the
-		// delete without an error toast. ENOTEMPTY (raised by Linux when
-		// the directory still has children) maps to the same 409 the UI
-		// already surfaces. Anything else is a real failure - permission
-		// denied, busy, etc. - and must not silently masquerade as a
-		// successful redirect.
-		switch {
-		case os.IsNotExist(err):
-			// nothing to do - fall through to the success redirect
-		case errors.Is(err, syscall.ENOTEMPTY):
-			http.Error(w, "directory not empty", http.StatusConflict)
-			return
-		default:
-			logx.Warnf("delete folder %q: %v", absPath, err)
-			http.Error(w, "could not delete folder: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-
-	hxRedirect(w, r, "/")
 }

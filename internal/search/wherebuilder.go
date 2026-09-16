@@ -220,6 +220,16 @@ func columnFilterIndexHint(expr Expr, sort string) string {
 		if strings.ToLower(f.Val) == "never" {
 			return sortHint()
 		}
+	case "relation":
+		// collection / any / none each match most of a library that uses
+		// relations at all, so the EXISTS union has nothing to narrow and
+		// the planner falls back on idx_images_missing plus a temp sort.
+		// The named kinds stay unpinned: each seeks one relation table
+		// and matches few rows.
+		switch strings.ToLower(f.Val) {
+		case "collection", "any", "none":
+			return sortHint()
+		}
 	}
 	return ""
 }
@@ -1332,7 +1342,7 @@ func (b *whereBuilder) buildHashFilter(e FilterExpr) string {
 	}
 	b.args = append(b.args, val)
 	if len(val) == md5HexLen {
-		return "i.md5 = ?"
+		return md5Exact
 	}
 	return "i.sha256 = ?"
 }
@@ -1348,12 +1358,17 @@ func (b *whereBuilder) buildMD5Filter(e FilterExpr) string {
 		return "1=0"
 	}
 	b.args = append(b.args, val)
-	return "i.md5 = ?"
+	return md5Exact
 }
 
 const (
 	md5HexLen    = 32
 	sha256HexLen = 64
+
+	// idx_images_md5 is partial on md5 != '', which a bound parameter
+	// cannot prove on its own, so the planner skips it and temp-sorts
+	// the visible set instead. Spelling the predicate restores the seek.
+	md5Exact = "i.md5 != '' AND i.md5 = ?"
 )
 
 func isHexDigest(s string, want int) bool {
@@ -1708,14 +1723,13 @@ func (b *whereBuilder) buildDefaultFilter(e FilterExpr) string {
 // dateFilterRe matches the documented date filter shapes: YYYY,
 // YYYY-MM, YYYY-MM-DD, plus the optional time component used by the
 // inbox-cluster links: YYYY-MM-DDTHH, YYYY-MM-DDTHH:MM, and
-// YYYY-MM-DDTHH:MM:SS. The HELP.md examples show YYYY-MM ranges
-// (`date:2024-01..2024-06`) which lexicographically string-compare
-// correctly against the ISO-8601 ingested_at column. `buildDateFilter`
-// accepts each component (after stripping the optional comparison or
-// range syntax) and rejects malformed input with `1=0` rather than
-// passing it into a SQL comparison verbatim, which produced silent
-// zero-result answers indistinguishable from a real "no images on
-// that date" result.
+// YYYY-MM-DDTHH:MM:SS. A YYYY-MM range (`date:2024-01..2024-06`)
+// lexicographically string-compares correctly against the ISO-8601
+// ingested_at column. `buildDateFilter` accepts each component (after
+// stripping the optional comparison or range syntax) and rejects
+// malformed input with `1=0` rather than passing it into a SQL
+// comparison verbatim, which produced silent zero-result answers
+// indistinguishable from a real "no images on that date" result.
 var dateFilterRe = regexp.MustCompile(`^\d{4}(-\d{2}(-\d{2}(T\d{2}(:\d{2}(:\d{2})?)?)?)?)?$`)
 
 // parseDatePrecision reads a date filter value at whatever precision the

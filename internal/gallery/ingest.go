@@ -41,11 +41,11 @@ func FolderPath(galleryPath, filePath string) string {
 // origin records how the file got in ("ingest" / "upload" / caller-supplied
 // string); empty defaults to "ingest".
 func Ingest(database *db.DB, galleryPath, thumbnailsPath, path, origin string) (*models.Image, bool, error) {
-	hash, sum, err := HashFileDigests(path)
+	hash, sum, err := hashFileDigests(path)
 	if err != nil {
 		return nil, false, fmt.Errorf("hashing file: %w", err)
 	}
-	ClaimOwnership(path)
+	claimOwnership(galleryPath, path)
 	return ingestWithHash(database, galleryPath, thumbnailsPath, path, hash, sum, origin)
 }
 
@@ -65,8 +65,8 @@ func decodeImageDimensions(path string) (w, h *int) {
 	return &cfg.Width, &cfg.Height
 }
 
-// ingestWithHash is the body of Ingest minus the HashFileDigests +
-// ClaimOwnership preamble. Sync uses it directly to avoid double-hashing
+// ingestWithHash is the body of Ingest minus the hashFileDigests +
+// claimOwnership preamble. Sync uses it directly to avoid double-hashing
 // the same file on large libraries.
 func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, sum, origin string) (*models.Image, bool, error) {
 	origin = cmp.Or(origin, models.OriginIngest)
@@ -193,13 +193,14 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		`SELECT image_id, is_canonical FROM image_paths WHERE path = ?`, path,
 	).Scan(&prevID, &prevCanonical); {
 	case pathErr == nil && prevCanonical == 1:
-		if editErr := applyInPlaceEdit(database, thumbnailsPath, path, hash, sum,
-			fi.ModTime().Unix(), fi.ModTime().UnixNano(), fi.Size()); editErr != nil {
+		phash, editErr := applyInPlaceEdit(database, thumbnailsPath, path, hash, sum,
+			fi.ModTime().Unix(), fi.ModTime().UnixNano(), fi.Size())
+		if editErr != nil {
 			return nil, false, editErr
 		}
 		return &models.Image{
 			ID: prevID, SHA256: hash, MD5: sum, CanonicalPath: path, FolderPath: folderPath,
-			FileType: fileType, FileSize: fi.Size(),
+			FileType: fileType, FileSize: fi.Size(), Phash: phash,
 		}, false, nil
 	case pathErr == nil:
 		// An alias path whose bytes no longer match the image it was a copy
@@ -235,7 +236,7 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			logx.Warnf("ingest: skip manga %q: %v", path, openErr)
 			return nil, false, fmt.Errorf("ingest manga: %w", openErr)
 		}
-		w, h, dimErr := archive.CoverDimensions()
+		w, h, dimErr := archive.coverDimensions()
 		if dimErr == nil {
 			imgWidth, imgHeight = &w, &h
 		} else {
@@ -347,9 +348,10 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		return nil, false, fmt.Errorf("committing ingest: %w", err)
 	}
 
-	RegenerateDerived(database, thumbnailsPath, path, imgID, fileType, "ingest")
+	phash := regenerateDerived(database, thumbnailsPath, path, imgID, fileType, "ingest")
 
 	img := &models.Image{
+		Phash:         phash,
 		ID:            imgID,
 		SHA256:        hash,
 		CanonicalPath: path,
@@ -462,10 +464,22 @@ func insertMangaMeta(tx *sql.Tx, m *models.MangaMetadata) error {
 
 // DropDuplicateCopy removes the file and the alias row an ingest recorded for
 // bytes the gallery already holds under another path. A re-uploaded archive
-// would otherwise cost its own size again with no UI to reclaim it. logCtx
-// names the caller in the warnings; failures are logged, never fatal, since
-// the row the caller keeps is already correct.
+// would otherwise cost its own size again with no UI to reclaim it. The row's
+// own canonical path is not another path - an ingest reads bytes the caller
+// just wrote back there as a duplicate - and unlinking it would take the
+// image's only copy. logCtx names the caller in the warnings; failures are
+// logged, never fatal, since the row the caller keeps is already correct.
 func DropDuplicateCopy(database *db.DB, imageID int64, path, logCtx string) {
+	var canonical string
+	if err := database.Read.QueryRow(
+		`SELECT canonical_path FROM images WHERE id = ?`, imageID,
+	).Scan(&canonical); err != nil {
+		logx.Warnf("%s: canonical path for image %d: %v", logCtx, imageID, err)
+		return
+	}
+	if canonical == path {
+		return
+	}
 	if _, err := database.Write.Exec(
 		`DELETE FROM image_paths WHERE image_id = ? AND path = ? AND is_canonical = 0`,
 		imageID, path,

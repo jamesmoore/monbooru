@@ -57,19 +57,28 @@ func (s *Server) implicationsDialogHandler(w http.ResponseWriter, r *http.Reques
 // the way the detail-page tag input does (space-separated multi-add,
 // "category:name", quoted spans) and declares one edge per token. edge
 // turns a resolved tag id into the (parent, implied) pair, which is the
-// only thing the two directions disagree on. Returns how many edges were
-// new and the per-token failures; a nil return means it already answered
-// the request with a parse error.
-func (s *Server) declareImplications(w http.ResponseWriter, r *http.Request, field string, edge func(tagID int64) (parent, implied int64)) (added int, failures []string, ok bool) {
+// only thing the two directions disagree on. Returns the new edges, whose
+// image-side fan-out the caller now owns the job lane for, and the
+// per-token failures; ok is false when it already answered the request.
+//
+// The lane is claimed after the parse and before the first write. The
+// fan-out is what makes a declaration true, so an edge is not written
+// unless it can run: a declaration that stored the edge and dropped the
+// propagation left the catalog and the images permanently disagreeing,
+// under a green "1 implication added."
+func (s *Server) declareImplications(w http.ResponseWriter, r *http.Request, field string, edge func(tagID int64) (parent, implied int64)) (added int, edges []models.Implication, failures []string, ok bool) {
 	raw := strings.TrimSpace(r.FormValue(field))
 	if raw == "" {
 		writeInlineFlash(w, "err", "Tag name is required.")
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 	catTags, _, parseErrMsg := s.parseTagInput(raw)
 	if parseErrMsg != "" {
 		writeInlineFlash(w, "err", parseErrMsg)
-		return 0, nil, false
+		return 0, nil, nil, false
+	}
+	if !s.startJob(w, models.JobTypeTag) {
+		return 0, nil, nil, false
 	}
 	for _, ct := range catTags {
 		tag, err := s.tagSvc().GetOrCreateTag(ct.name, ct.catID)
@@ -85,7 +94,7 @@ func (s *Server) declareImplications(w http.ResponseWriter, r *http.Request, fie
 		}
 		if isNew {
 			added++
-			s.startImplicationPropagation(parent, implied, "add")
+			edges = append(edges, models.Implication{ParentID: parent, ImpliedID: implied})
 		}
 	}
 	if added > 0 {
@@ -93,7 +102,17 @@ func (s *Server) declareImplications(w http.ResponseWriter, r *http.Request, fie
 		// cached tag count is stale until the next render.
 		s.active().InvalidateCaches()
 	}
-	return added, failures, true
+	return added, edges, failures, true
+}
+
+// propagateDeclared hands the claimed lane to the propagation, or gives it
+// back when the request turned out to have nothing to propagate.
+func (s *Server) propagateDeclared(edges []models.Implication, op string) {
+	if len(edges) == 0 {
+		s.jobs.Complete("no implication to propagate")
+		return
+	}
+	go s.runImplicationEdges(edges, op)
 }
 
 // implicationsAddedMsg is the success line both directions report.
@@ -130,11 +149,12 @@ func (s *Server) addImplicationPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	added, failures, ok := s.declareImplications(w, r, "implied_id",
+	added, edges, failures, ok := s.declareImplications(w, r, "implied_id",
 		func(tagID int64) (int64, int64) { return parentID, tagID })
 	if !ok {
 		return
 	}
+	s.propagateDeclared(edges, "add")
 	if added > 0 {
 		// implication-added drives the dialog's after-request hook
 		// (re-fetch body without closing the modal); monbooru:flash rides
@@ -157,11 +177,12 @@ func (s *Server) addImpliedByPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	added, failures, ok := s.declareImplications(w, r, "parent_id",
+	added, edges, failures, ok := s.declareImplications(w, r, "parent_id",
 		func(tagID int64) (int64, int64) { return tagID, impliedID })
 	if !ok {
 		return
 	}
+	s.propagateDeclared(edges, "add")
 	if !writeImplicationFailures(w, added, failures) {
 		hxDone(w, r, implicationsAddedMsg(added), "", fmt.Sprintf("/tags/%d", impliedID))
 	}
@@ -176,11 +197,18 @@ func (s *Server) removeImplicationDelete(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	// Claimed before the edge goes: the sweep of the implied rows it
+	// justified is the other half of the removal, and dropping it leaves
+	// rows on the images that no edge explains.
+	if !s.startJob(w, models.JobTypeTag) {
+		return
+	}
 	if err := s.tagSvc().RemoveImplication(parentID, impliedID); err != nil {
+		s.jobs.Fail(err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.startImplicationPropagation(parentID, impliedID, "remove")
+	s.propagateDeclared([]models.Implication{{ParentID: parentID, ImpliedID: impliedID}}, "remove")
 	// Seed the cross-navigation flash slot; the dialog stays open and the
 	// /tags reload on close surfaces this above the table.
 	setFlashHeader(w, "Implication removed.", "ok",
@@ -213,6 +241,9 @@ func (s *Server) removeImplicationGroup(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if !s.startJob(w, models.JobTypeTag) {
+		return
+	}
 	var removed []models.Implication
 	for _, im := range edges {
 		if im.Origin != origin || im.Stale != stale {
@@ -225,7 +256,9 @@ func (s *Server) removeImplicationGroup(w http.ResponseWriter, r *http.Request, 
 		removed = append(removed, im)
 	}
 	if len(removed) > 0 {
-		s.startImplicationGroupSweep(removed)
+		go s.runImplicationGroupSweep(removed)
+	} else {
+		s.jobs.Complete("no implication to propagate")
 	}
 	noun := "implication"
 	if len(removed) != 1 {
@@ -234,14 +267,6 @@ func (s *Server) removeImplicationGroup(w http.ResponseWriter, r *http.Request, 
 	setFlashHeader(w, strconv.Itoa(len(removed))+" "+noun+" removed.", "ok",
 		map[string]any{"tag-relations-changed": ""})
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) startImplicationGroupSweep(edges []models.Implication) {
-	if err := s.jobs.Start(models.JobTypeTag); err != nil {
-		logx.Warnf("implication group sweep skipped: %v", err)
-		return
-	}
-	go s.runImplicationGroupSweep(edges)
 }
 
 // runImplicationGroupSweep drops the implied rows the removed edges no longer
@@ -286,20 +311,6 @@ func (s *Server) runImplicationGroupSweep(edges []models.Implication) {
 	s.finishJob(nil, cancelled,
 		fmt.Sprintf("implication sweep cancelled (%d/%d)", processed, total),
 		fmt.Sprintf("swept %d removed implication(s)", processed))
-}
-
-// startImplicationPropagation kicks off the background job that fans
-// out (op="add") or sweeps (op="remove") the parent → implied edge
-// across every image carrying parent. Skipped when a job is already
-// running; the user can re-trigger by editing the implication again
-// (the in-DB edge is independent of this propagation, so search and
-// future adds still see it through the synchronous transitive walk).
-func (s *Server) startImplicationPropagation(parentID, impliedID int64, op string) {
-	if err := s.jobs.Start(models.JobTypeTag); err != nil {
-		logx.Warnf("implication %s skipped: %v", op, err)
-		return
-	}
-	go s.runImplicationPropagation(parentID, impliedID, op)
 }
 
 // resolveRemoveClosure walks the removed target's transitive implied
@@ -357,32 +368,65 @@ func (s *Server) chunkImageTagsByParent(ctx context.Context, parentID int64, per
 	return nil
 }
 
-func (s *Server) runImplicationPropagation(parentID, impliedID int64, op string) {
+// runImplicationEdges fans out (op="add") or sweeps (op="remove") every
+// edge the request declared, inside the lane the handler already claimed.
+// One job for the whole request rather than one per edge: a second
+// jobs.Start is refused by the first, so one job per edge would keep only
+// the leading fan-out of a multi-token declaration.
+func (s *Server) runImplicationEdges(edges []models.Implication, op string) {
 	ctx := s.jobs.Context()
-	const chunkSize = 500
-
-	ids, err := s.imageIDsWithTag(ctx, parentID)
-	if err != nil {
-		s.jobs.Fail(err.Error())
-		return
-	}
-
 	verb := "applying implication"
 	if op == "remove" {
 		verb = "removing implication"
 	}
-
-	var removeClosure []int64
-	if op == "remove" {
-		var err error
-		removeClosure, err = s.resolveRemoveClosure(impliedID)
+	var processed, total int
+	cancelled := false
+	implied := make([]int64, 0, len(edges))
+	for _, e := range edges {
+		done, seen, stopped, err := s.propagateImplicationEdge(ctx, e.ParentID, e.ImpliedID, op, verb)
+		processed += done
+		total += seen
+		implied = append(implied, e.ImpliedID)
 		if err != nil {
 			s.jobs.Fail(err.Error())
 			return
 		}
+		if stopped {
+			cancelled = true
+			break
+		}
+	}
+	if !cancelled {
+		if err := s.tagSvc().RecalcIDs(implied); err != nil {
+			logx.Warnf("implication propagation recalc: %v", err)
+		}
+		s.active().InvalidateCaches()
+	}
+	s.finishJob(nil, cancelled,
+		fmt.Sprintf("%s cancelled (%d/%d)", verb, processed, total),
+		fmt.Sprintf("%s applied to %d image(s)", verb, processed))
+}
+
+// propagateImplicationEdge walks the images carrying one edge's parent,
+// reporting progress into the job the caller holds. Its terminal state is
+// the caller's to write, so several edges can share one job.
+func (s *Server) propagateImplicationEdge(ctx context.Context, parentID, impliedID int64, op, verb string) (processed, total int, cancelled bool, err error) {
+	const chunkSize = 500
+
+	ids, err := s.imageIDsWithTag(ctx, parentID)
+	if err != nil {
+		return 0, 0, false, err
 	}
 
-	processed, cancelled, err := jobs.Chunked(ctx, s.jobs, ids, chunkSize, verb, func(chunk []int64) error {
+	var removeClosure []int64
+	if op == "remove" {
+		removeClosure, err = s.resolveRemoveClosure(impliedID)
+		if err != nil {
+			return 0, len(ids), false, err
+		}
+	}
+
+	processed, cancelled, err = jobs.Chunked(ctx, s.jobs, ids, chunkSize, verb, func(chunk []int64) error {
 		tx, err := s.db().Write.Begin()
 		if err != nil {
 			return err
@@ -403,20 +447,7 @@ func (s *Server) runImplicationPropagation(parentID, impliedID int64, op string)
 		}
 		return tx.Commit()
 	})
-	if err != nil {
-		s.jobs.Fail(err.Error())
-		return
-	}
-	if cancelled {
-		s.jobs.Complete(fmt.Sprintf("%s cancelled (%d/%d)", verb, processed, len(ids)))
-		return
-	}
-
-	if err := s.tagSvc().RecalcIDs([]int64{impliedID}); err != nil {
-		logx.Warnf("implication propagation recalc: %v", err)
-	}
-	s.active().InvalidateCaches()
-	s.jobs.Complete(fmt.Sprintf("%s applied to %d image(s)", verb, processed))
+	return processed, len(ids), cancelled, err
 }
 
 // propagateAddImplication backfills implied rows for the parent on the

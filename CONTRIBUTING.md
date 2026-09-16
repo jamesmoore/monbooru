@@ -1,12 +1,15 @@
 # Contributing
 
 This file covers monbooru and its companion repos (monloader,
-monsender, mondocs, monbooru-plugins). Open issues and pull requests in the repo relevant to the change: app behavior here, downloading and site support in
+monsender, mondocs, monbooru-plugins, ffmpeg-builds). Open issues and pull requests in the repo relevant to the change: app behavior here, downloading and site support in
 [monloader](https://github.com/monbooru/monloader), the browser
 extension in [monsender](https://github.com/monbooru/monsender),
 documentation in [mondocs](https://github.com/monbooru/mondocs),
 plugin and theme listings in
-[monbooru-plugins](https://github.com/monbooru/monbooru-plugins).
+[monbooru-plugins](https://github.com/monbooru/monbooru-plugins),
+the trimmed ffmpeg and ffprobe builds every artifact ships and the flags
+they are built with in
+[ffmpeg-builds](https://github.com/monbooru/ffmpeg-builds).
 
 ## Bug reports and feature requests
 

@@ -1,3 +1,12 @@
+// Package metadata reads what a file says about itself: Stable Diffusion
+// parameters from A1111 and Forge, ComfyUI workflows in both the API and
+// the workflow shape, EXIF, and ComicInfo out of an archive. Every input
+// is a file somebody else wrote, so nothing here trusts a length, an
+// offset or a type, and a malformed one is a miss rather than a failure.
+//
+// It is pure: it takes bytes and returns structs. Storing what it found is
+// internal/gallery's job, which is why this package has no database import
+// and no knowledge of an image id.
 package metadata
 
 import (

@@ -227,7 +227,13 @@ func (b *whereBuilder) relationAnyClauseForPresence() string {
 	if len(parts) == 0 {
 		return "1=0"
 	}
-	return strings.Join(parts, " OR ")
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	// The caller ANDs the visible guard onto whatever comes back, and AND
+	// binds tighter than OR, so an unwrapped union would leave every leg
+	// but the last matching missing rows.
+	return "(" + strings.Join(parts, " OR ") + ")"
 }
 
 // relationNoneClauseForPresence rewrites the NOT IN (UNION ...) so

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -47,6 +48,12 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 	if limit < 1 {
 		limit = 40
 	}
+	// page arrives off a query string with no upper bound, and three
+	// offsets below derive from it as ints: the data SELECT's, the slice
+	// bound into the cached id list, and the id bound's page*limit*margin.
+	// Past the point where that arithmetic fits, the page addresses no row
+	// anyway; wrapping negative slices out of range.
+	page = min(page, math.MaxInt/limit/driverIDBoundMargin)
 
 	// Cache fast path: when the gallery's match-id list is already in the
 	// adjacency cache, slice it for the requested page and reread row data
@@ -817,22 +824,6 @@ type DeleteTarget struct {
 	IsMissing     bool
 }
 
-// ExecuteForDeleteStream invokes visit for each matching row, streaming
-// directly off the cursor so very large result sets never materialise.
-// visit returning a non-nil error aborts iteration.
-func ExecuteForDeleteStream(database *db.DB, expr Expr, visit func(DeleteTarget) error) error {
-	return streamScope(database, expr, "ORDER BY i.id", visit)
-}
-
-// ExecuteForScopeStream is ExecuteForDeleteStream walked in the order the
-// gallery renders, for the jobs whose result depends on each row's position
-// in the scope rather than only on the set. The others keep the id order:
-// a sort with no covering index temp-sorts the whole match set, and they
-// would pay it for a sequence nothing reads.
-func ExecuteForScopeStream(database *db.DB, expr Expr, sort, order string, randomSeed int64, visit func(DeleteTarget) error) error {
-	return streamScope(database, expr, buildOrder(sort, order, randomSeed), visit)
-}
-
 // Scope names a set of images by query rather than by id: an expression
 // with any ceiling already applied, plus the order a consumer that cares
 // about position needs. It exists so the id set behind "act on the
@@ -848,18 +839,31 @@ type Scope struct {
 	RandomSeed int64
 }
 
+// Stream invokes visit for each row in the scope, off the cursor so a
+// very large result set never materialises; visit returning a non-nil
+// error aborts the walk. ViewOrder walks the order the gallery renders,
+// which a sort with no covering index temp-sorts the whole match set for -
+// the set-valued consumers keep the id order and do not pay it.
+//
+// Every destructive consumer goes through here rather than taking a raw
+// expression, so "did this caller remember the ceiling" is answered by
+// the type it was handed instead of being re-asked per call site.
+func (sc Scope) Stream(database *db.DB, visit func(DeleteTarget) error) error {
+	order := "ORDER BY i.id"
+	if sc.ViewOrder {
+		order = buildOrder(sc.Sort, sc.Order, sc.RandomSeed)
+	}
+	return streamScope(database, sc.Expr, order, visit)
+}
+
 // IDs materialises the scope. The caller owns the ceiling: an expression
 // that did not have one applied selects rows the operator cannot see.
 func (sc Scope) IDs(database *db.DB) ([]int64, error) {
 	var ids []int64
-	collect := func(t DeleteTarget) error {
+	return ids, sc.Stream(database, func(t DeleteTarget) error {
 		ids = append(ids, t.ID)
 		return nil
-	}
-	if sc.ViewOrder {
-		return ids, ExecuteForScopeStream(database, sc.Expr, sc.Sort, sc.Order, sc.RandomSeed, collect)
-	}
-	return ids, ExecuteForDeleteStream(database, sc.Expr, collect)
+	})
 }
 
 func streamScope(database *db.DB, expr Expr, orderBy string, visit func(DeleteTarget) error) error {

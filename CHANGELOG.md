@@ -1,5 +1,35 @@
 # Changelog
 
+## [v1.21.1] - 2026-09-16
+### Added
+- A gallery follows symlinked folders. ([#139](https://github.com/monbooru/monbooru/issues/139))
+- The Windows bundled downloads carry the DirectML runtime, so that provider runs unpacked. ([#137](https://github.com/monbooru/monbooru/issues/137))
+
+### Changed
+- The CUDA and OpenVINO images move up to newer accelerator runtimes.
+
+### Fixed
+- A library-wide auto-tag run shows progress from the start and stores tags as it goes. ([#137](https://github.com/monbooru/monbooru/issues/137))
+- ffmpeg and plugin subprocesses no longer flash a console window on Windows. ([#138](https://github.com/monbooru/monbooru/issues/138))
+- A push that restores a row's missing file no longer deletes it as a duplicate. ([#140](https://github.com/monbooru/monbooru/issues/140))
+- Deleting a tagger in Settings can no longer deadlock the process.
+- Switching, adding, renaming or repointing a gallery no longer races a running job.
+- A rename no longer collapses repeated separators inside a name the operator typed.
+- A name the filesystem refuses stops the collision numbering instead of holding the job lane.
+- A huge `?page=` clamps to the last page instead of dropping the connection.
+- `relation:any` no longer matches images whose file is gone.
+- `relation:` and md5 searches resolve faster.
+- Cycling the sort off random drops the seed, so Save search stores none.
+- A bulk tag removal names the tokens that matched nothing.
+- A replace through the API keeps the commentary markup a push keeps.
+- The bundled Docker compose points monloader at monbooru via environment variables.
+- Sidebar and tag rows line their counts and buttons up with the name.
+
+Thanks to @dabori-creator for the report (https://github.com/monbooru/monbooru/issues/137).
+Thanks to @JakubGrobelny for the report (https://github.com/monbooru/monbooru/issues/138).
+Thanks to @Mar2ck for the report (https://github.com/monbooru/monbooru/issues/139).
+Thanks to @GenCreamer for the report (https://github.com/monbooru/monbooru/issues/140).
+
 ## [v1.21.0] - 2026-09-08
 ### Added
 - Select mode, drag-to-select and invert selection. ([#107](https://github.com/monbooru/monbooru/issues/107))

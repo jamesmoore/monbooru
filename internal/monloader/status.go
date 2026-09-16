@@ -53,7 +53,9 @@ func (c *StatusCache) Store(st Status) {
 }
 
 // Expire drops the freshness window without dropping what the cache holds,
-// so the next read re-probes.
+// so the next read re-probes. Exported for the transport's tests, which
+// reach the window through this rather than by sleeping out the TTL; the
+// application never expires a probe early.
 func (c *StatusCache) Expire() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

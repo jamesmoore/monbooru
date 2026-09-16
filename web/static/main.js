@@ -307,6 +307,13 @@ function applySortChange(sortEl) {
     var orderEl = document.querySelector('#search-form select[name="order"]');
     if (orderEl) orderEl.value = 'asc';
   }
+  // The seed belongs to the random sort. Left on the form it rides into
+  // the pushed URL, where the pagination links have already dropped it and
+  // Save search would store it against the schema's own rule.
+  if (sortEl.value !== 'random') {
+    var seedEl = document.querySelector('#search-form input[name="seed"]');
+    if (seedEl) seedEl.remove();
+  }
   return submitSearch();
 }
 
@@ -2267,9 +2274,12 @@ function openSaveSearchDialog() {
   var ss = document.getElementById('save-search-sort');
   var so = document.getElementById('save-search-order');
   var se = document.getElementById('save-search-seed');
-  if (ss) ss.value = url.searchParams.get('sort') || '';
+  var savedSort = url.searchParams.get('sort') || '';
+  if (ss) ss.value = savedSort;
   if (so) so.value = url.searchParams.get('order') || '';
-  if (se) se.value = url.searchParams.get('seed') || '';
+  // Empty under any other sort: nothing reads a seed there, and the row
+  // would carry a value the schema says it does not.
+  if (se) se.value = savedSort === 'random' ? (url.searchParams.get('seed') || '') : '';
   dlg.showModal();
   return true;
 }
@@ -3298,10 +3308,13 @@ function selectedImageIds() {
 
 // selectionScopeIds returns the checked-thumb id parts. Returns null
 // when nothing is checked (caller writes the flash and aborts).
+// One comma-joined parameter rather than one per id: a selection built up
+// across pages can pass net/url's 10000-parameter cap, and the form parser
+// refuses the whole request before a handler sees it.
 function selectionScopeIds() {
   var ids = selectedImageIds();
   if (ids.length === 0) return null;
-  return ids.map(function(v) { return 'ids=' + encodeURIComponent(v); });
+  return ['ids=' + encodeURIComponent(ids.join(','))];
 }
 
 // batchScopeParams resolves a batch dialog's scope into request params: the

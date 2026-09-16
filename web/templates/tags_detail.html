@@ -123,15 +123,7 @@
           <h3>Implied by</h3>
           {{if .ImpliedBy}}
           {{range groupImplicationsByOrigin .ImpliedBy}}
-          <p class="relation-origin-sub">{{if .Stale}}stale, {{end}}added by {{originLabel $kinds .Origin}}
-            {{if gt (len .Implications) 1}}<button type="button" class="btn-link-accent"
-                    hx-delete="/tags/{{$.Tag.ID}}/implied-by/group?origin={{urlQ .Origin}}&stale={{if .Stale}}1{{else}}0{{end}}"
-                    hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
-                    hx-confirm="Remove all {{len .Implications}} {{if .Stale}}stale {{end}}implications added by {{originLabel $kinds .Origin}}?"
-                    data-confirm-danger="Nothing records which tags they implied."
-                    data-confirm-ok="Remove"
-                    hx-on::after-request="if(event.detail.successful){pruneRelationGroup(this)}"
-                    title="Remove every implication in this group">[×]</button>{{end}}</p>
+          {{template "partials/implication_group_header.html" (dict "Group" . "OriginKinds" $kinds "CSRFToken" $csrf "BaseURL" (printf "/tags/%d/implied-by/group" $.Tag.ID))}}
           <ul class="tag-list">
             {{range .Implications}}
             <li class="tag-item">
@@ -154,16 +146,7 @@
                 hx-target="#implied-by-add-flash" hx-swap="innerHTML">
             <input type="hidden" name="_csrf" value="{{$csrf}}">
             <div class="add-tag-input-wrap">
-              <input type="text" name="parent_id" id="implied-by-add-input"
-                     placeholder="Implied by tag(s)..." required autocomplete="off"
-                     data-multi-tags="1"
-                     hx-get="/internal/tags/suggest"
-                     hx-trigger="input changed delay:200ms"
-                     hx-target="#implied-by-add-suggest"
-                     hx-swap="innerHTML"
-                     hx-vals='js:{q: (document.getElementById("implied-by-add-input").value || "").split(/\s+/).pop()}'
-                     onkeydown="handleSuggestKey(event, 'implied-by-add-suggest', 'implied-by-add-input')">
-              <div id="implied-by-add-suggest" class="suggest-dropdown tag-suggest-dropdown"></div>
+              {{template "multi_tag_suggest_input" dict "Name" "parent_id" "InputID" "implied-by-add-input" "SuggestID" "implied-by-add-suggest" "Placeholder" "Implied by tag(s)..." "Required" true "ValsKey" "q"}}
             </div>
             <button type="submit" class="btn-sm">Add</button>
           </form>

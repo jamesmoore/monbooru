@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
@@ -21,12 +20,11 @@ import (
 
 // autotagSearchScopeCap bounds the scope=search materialisation so a
 // clean-sweep autotag against an unbounded result set can't fill RAM
-// with the ids slice plus the matching per-image frame state
-// tagger.RunWithTaggers builds. Operators with a larger working set
-// re-run the autotag job over narrower searches.
+// with the ids slice. Operators with a larger working set re-run the
+// autotag job over narrower searches.
 const autotagSearchScopeCap = 50000
 
-// errAutotagOverCap is the sentinel the ExecuteForDeleteStream callback
+// errAutotagOverCap is the sentinel the Scope.Stream callback
 // returns once autotagSearchScopeCap is reached, so the caller can
 // distinguish "over cap" from a real cursor error.
 var errAutotagOverCap = errors.New("autotag: search-scope cap reached")
@@ -311,7 +309,7 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 
 	// Optionally kick off auto-tagging on the newly uploaded images.
 	if autotagAfter && len(addedIDs) > 0 && tagger.IsAvailable(cfg) {
-		selected, selErr := selectTaggers(cfg, s.activeGallery(), taggerName)
+		selected, selErr := tagger.SelectForGallery(cfg, s.activeGallery(), taggerName)
 		if selErr != nil {
 			fmt.Fprintf(&msg, " (autotag skipped: %s)", html.EscapeString(selErr.Error()))
 		} else if err := s.jobs.Start(models.JobTypeAutotag); err != nil {
@@ -367,7 +365,7 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 	scope := strings.TrimSpace(r.FormValue("scope"))
 	taggerName := strings.TrimSpace(r.FormValue("tagger_name"))
 
-	selected, selErr := selectTaggers(cfg, s.activeGallery(), taggerName)
+	selected, selErr := tagger.SelectForGallery(cfg, s.activeGallery(), taggerName)
 	if selErr != nil {
 		externalErr(w, r, selErr.Error(), http.StatusBadRequest)
 		return
@@ -376,8 +374,8 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 	var ids []int64
 	if scope == "search" {
 		// Mirror batchTag's search-side materialisation: parse q, stream
-		// matching ids off ExecuteForDeleteStream so the cursor walks the
-		// result set without buffering an extra copy.
+		// matching ids off Scope.Stream so the cursor walks the result
+		// set without buffering an extra copy.
 		expr, parseErr := search.Parse(r.FormValue("q"))
 		if parseErr != nil {
 			hxErr(w, r, "Could not parse search: "+parseErr.Error(), parseErr.Error(), http.StatusBadRequest)
@@ -389,7 +387,7 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 		// matching per-image frame-extraction state in tagger.RunWithTaggers.
 		// errAutotagOverCap stops the stream cleanly and surfaces a
 		// "narrow your search" flash to the operator.
-		err := search.ExecuteForDeleteStream(s.db(), expr, func(t search.DeleteTarget) error {
+		err := search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
 			if len(ids) >= autotagSearchScopeCap {
 				return errAutotagOverCap
 			}
@@ -449,7 +447,7 @@ func (s *Server) autotagImage(w http.ResponseWriter, r *http.Request) {
 	}
 	taggerName := strings.TrimSpace(r.FormValue("tagger_name"))
 
-	selected, selErr := selectTaggers(cfg, s.activeGallery(), taggerName)
+	selected, selErr := tagger.SelectForGallery(cfg, s.activeGallery(), taggerName)
 	if selErr != nil {
 		externalErr(w, r, selErr.Error(), http.StatusBadRequest)
 		return
@@ -496,22 +494,4 @@ func (s *Server) autotagImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/images/%d", id), http.StatusSeeOther)
-}
-
-// selectTaggers resolves a user-supplied tagger_name to the concrete
-// TaggerStatus list to run on the named gallery. Empty name means
-// every tagger enabled + available + applicable to that gallery.
-// Returns an error if the requested tagger is not enabled, unavailable,
-// or restricted to a different gallery.
-func selectTaggers(cfg *config.Config, gallery, name string) ([]tagger.TaggerStatus, error) {
-	enabled := tagger.EnabledTaggersForGallery(cfg, gallery)
-	if name == "" {
-		return enabled, nil
-	}
-	for _, t := range enabled {
-		if t.Name == name {
-			return []tagger.TaggerStatus{t}, nil
-		}
-	}
-	return nil, fmt.Errorf("tagger %q is not enabled or available for gallery %q", name, gallery)
 }

@@ -18,8 +18,7 @@ func init() {
 		".mp4":  "video/mp4",
 		".webm": "video/webm",
 	} {
-		if err := mime.AddExtensionType(ext, typ); err != nil {
-			panic(err)
-		}
+		// The only failure is an extension not starting with a dot.
+		_ = mime.AddExtensionType(ext, typ)
 	}
 }

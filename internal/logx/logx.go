@@ -2,6 +2,9 @@
 //
 // Three levels: "warn" (default), "info", "debug". Warnings, errors, and
 // fatals always fire; only Infof and Debugf respect the gate.
+//
+// Copied into monloader and kept in step by hand; a fix here belongs
+// there too.
 package logx
 
 import (

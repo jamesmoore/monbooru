@@ -42,7 +42,7 @@ type CBZMember struct {
 func WriteCollectionCBZ(ctx context.Context, dstPath string, members []CBZMember, title string, progress func(processed, total int, message string)) (pages, skipped int, err error) {
 	for _, m := range members {
 		if models.MediaKind(m.FileType) != "image" {
-			return 0, 0, fmt.Errorf("%s is an animated image, video or archive: it cannot be a cbz page", filepath.Base(m.Path))
+			return 0, 0, fmt.Errorf("%s has file type %q, not an image: it cannot be a cbz page", filepath.Base(m.Path), m.FileType)
 		}
 	}
 	total := len(members)

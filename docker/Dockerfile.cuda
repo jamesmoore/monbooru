@@ -3,7 +3,7 @@
 # on CPU when tagger.use_cuda=false, so this image works for both.
 
 # Stage 1: build the binary. 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.26.7-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -14,7 +14,7 @@ RUN . ./packaging/release-env.sh && \
     -o /monbooru ./cmd/monbooru
 
 # Stage 2: runtime -- NVIDIA CUDA 12.6 + cuDNN 9 runtime (x86_64 only).
-FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu22.04
 
 # Take the base's pending updates, drop the CUDA forward-compat libs
 # (the host driver is used via the NVIDIA container runtime) and the apt

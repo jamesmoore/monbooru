@@ -113,9 +113,9 @@ func (m *Manga) Reader() *zip.Reader {
 	return &m.zr.Reader
 }
 
-// PageReader opens an io.ReadCloser for the n-th page (0-based).
+// pageReader opens an io.ReadCloser for the n-th page (0-based).
 // Callers must Close it.
-func (m *Manga) PageReader(n int) (io.ReadCloser, error) {
+func (m *Manga) pageReader(n int) (io.ReadCloser, error) {
 	if n < 0 || n >= len(m.Pages) {
 		return nil, fmt.Errorf("page %d out of range [1,%d]", n+1, len(m.Pages))
 	}
@@ -126,11 +126,11 @@ func (m *Manga) PageReader(n int) (io.ReadCloser, error) {
 	return f.Open()
 }
 
-// ExtractPage writes page n's bytes to dst via a temp file + atomic
+// extractPage writes page n's bytes to dst via a temp file + atomic
 // rename so a concurrent reader never sees a partial file. dst's parent
 // directory must already exist.
-func (m *Manga) ExtractPage(n int, dst string) error {
-	rc, err := m.PageReader(n)
+func (m *Manga) extractPage(n int, dst string) error {
+	rc, err := m.pageReader(n)
 	if err != nil {
 		return err
 	}
@@ -143,10 +143,10 @@ func (m *Manga) ExtractPage(n int, dst string) error {
 	})
 }
 
-// CoverImage decodes page 1 (entry 0 of the sorted list) into an
+// coverImage decodes page 1 (entry 0 of the sorted list) into an
 // image.Image suitable for the gallery thumbnail pipeline.
-func (m *Manga) CoverImage() (image.Image, error) {
-	rc, err := m.PageReader(0)
+func (m *Manga) coverImage() (image.Image, error) {
+	rc, err := m.pageReader(0)
 	if err != nil {
 		return nil, err
 	}
@@ -158,11 +158,11 @@ func (m *Manga) CoverImage() (image.Image, error) {
 	return img, nil
 }
 
-// CoverDimensions reads page 1's dimensions without decoding the full
+// coverDimensions reads page 1's dimensions without decoding the full
 // pixel buffer. Used at ingest to populate images.width/height with the
 // cover's geometry.
-func (m *Manga) CoverDimensions() (int, int, error) {
-	rc, err := m.PageReader(0)
+func (m *Manga) coverDimensions() (int, int, error) {
+	rc, err := m.pageReader(0)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -174,10 +174,10 @@ func (m *Manga) CoverDimensions() (int, int, error) {
 	return cfg.Width, cfg.Height, nil
 }
 
-// PageCacheExt returns the extension to use for the n-th cached page
+// pageCacheExt returns the extension to use for the n-th cached page
 // file: the archive entry's lowercase extension, with a leading dot.
-// Callers compose the full filename via PageCachePath.
-func (m *Manga) PageCacheExt(n int) string {
+// Callers compose the full filename via mangaPagePath.
+func (m *Manga) pageCacheExt(n int) string {
 	if n < 0 || n >= len(m.Pages) {
 		return ""
 	}

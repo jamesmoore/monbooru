@@ -45,10 +45,8 @@ func (v pluginSlotView) Any() bool { return len(v.Groups) > 0 }
 // relay buttons carries no pop-in it would never show.
 func (v pluginSlotView) AnyOpen() bool {
 	for _, g := range v.Groups {
-		for _, b := range g.Buttons {
-			if b.Mode == config.ModeOpen {
-				return true
-			}
+		if slices.ContainsFunc(g.Buttons, func(b pluginButtonView) bool { return b.Mode == config.ModeOpen }) {
+			return true
 		}
 	}
 	return false

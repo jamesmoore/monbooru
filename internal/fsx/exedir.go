@@ -21,3 +21,10 @@ func ExeDir() string {
 	}
 	return filepath.Dir(exe)
 }
+
+// IsFile reports whether path exists and is a regular file - the stat both a
+// bundled-tool probe and the sandbox check make.
+func IsFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
+}

@@ -2,7 +2,6 @@ package api
 
 import (
 	"cmp"
-	"database/sql"
 	"errors"
 	"net/http"
 	"strings"
@@ -37,24 +36,7 @@ func toTagResponse(t *models.Tag) tagResponse {
 func resolveCategoryID(g Gallery, name string) (int64, bool, error) {
 	name = strings.TrimSpace(name)
 	name = cmp.Or(name, "general")
-	return categoryIDByName(g, name)
-}
-
-// categoryIDByName looks up a tag category id by exact name, with no
-// empty-name default; resolveCategoryID layers the "general" fallback.
-// A read failure is reported separately from a name that matched nothing:
-// answering "unknown category" to a broken read would blame the caller for
-// the server's fault.
-func categoryIDByName(g Gallery, name string) (int64, bool, error) {
-	var id int64
-	err := g.DB.Read.QueryRow(`SELECT id FROM tag_categories WHERE name = ?`, name).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	return id, true, nil
+	return tags.CategoryIDByName(g.DB, name)
 }
 
 // sentinelStatus maps one service sentinel to its API status/code pair.

@@ -1,5 +1,16 @@
 //go:build tagger
 
+// Package tagger runs ONNX models over images and turns what they emit
+// into tags. It owns the model catalog, the per-tagger thresholds and
+// category mapping, the preprocessing, the inference, and the aggregation
+// across several taggers - everything between "here is an image" and "here
+// are the labels to apply".
+//
+// It does not apply them: the write goes through internal/tags so a
+// machine-made tag lands under the same fan-out and usage accounting a
+// hand-typed one does. The whole package is behind the `tagger` build tag,
+// and the default backend runs the model in a subprocess so the parent
+// never loads the runtime.
 package tagger
 
 import (
@@ -118,6 +129,11 @@ func ReleaseAll() {
 		b.ReleaseAll()
 	}
 }
+
+// autotagChunkSize bounds one backend round trip: a whole-library scope
+// would otherwise extract every video's frames, and hold them on disk,
+// before the first tag lands.
+const autotagChunkSize = 200
 
 // RunWithTaggers tags ids through the supplied taggers, merging
 // results so each image ends up with one row per unique tag. Callers
@@ -251,83 +267,100 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 		taggerNames = append(taggerNames, t.Name)
 	}
 
-	// Build the batch payload: look up each id's canonical path and
+	// Build one chunk's payload: look up each id's canonical path and
 	// file type, extract frames (videos, cbz pages), and ship the
-	// resolved paths to the backend. Frame cleanup runs after the
-	// backend returns this image's slot in the response.
+	// resolved paths to the backend. Frame cleanup runs once the
+	// backend has answered for the chunk.
 	var skipped atomic.Int64
-	requests := make([]BackendImageRequest, 0, len(ids))
-	cleanups := make([]func(), 0, len(ids))
-	for _, imageID := range ids {
+	prepared := 0
+	runChunk := func(chunk []int64) error {
+		requests := make([]BackendImageRequest, 0, len(chunk))
+		cleanups := make([]func(), 0, len(chunk))
+		defer func() {
+			for _, c := range cleanups {
+				c()
+			}
+		}()
+		for _, imageID := range chunk {
+			if ctx.Err() != nil {
+				break
+			}
+			// Extraction is minutes of ffmpeg on a video-heavy scope;
+			// without this the bar sits on the caller's starting line.
+			prepared++
+			mgr.Update(int(completed.Load()), total, fmt.Sprintf("preparing %d/%d", prepared, total))
+			var canonPath, fileType string
+			if err := database.Read.QueryRowContext(ctx,
+				`SELECT canonical_path, file_type FROM images WHERE id = ?`, imageID,
+			).Scan(&canonPath, &fileType); err != nil {
+				logx.Warnf("tagger: skip image %d: lookup failed: %v", imageID, err)
+				skipped.Add(1)
+				continue
+			}
+			framePaths, cleanup := framesForTagging(canonPath, fileType, mangaCacheDir, imageID)
+			if len(framePaths) == 0 {
+				logx.Warnf("tagger: skip image %d: no frames available (missing file, archive, or ffmpeg)", imageID)
+				skipped.Add(1)
+				cleanup()
+				continue
+			}
+			requests = append(requests, BackendImageRequest{
+				ID:            imageID,
+				FramePaths:    framePaths,
+				MangaProgress: fileType == "cbz" && len(framePaths) > 1,
+			})
+			cleanups = append(cleanups, cleanup)
+		}
+
+		resp, err := backend.Run(ctx, RunRequest{
+			Cfg:            cfg,
+			Taggers:        taggers,
+			Provider:       provider,
+			CatIDs:         catIDs,
+			GeneralCatID:   generalCatID,
+			InferredCats:   inferredCats,
+			MinHitFraction: cfg.Tagger.Aggregation.MinHitFraction,
+			Parallel:       parallel,
+			Images:         requests,
+			OnProgress: func(workerIdx int, msg string) {
+				// The backend's per-image-done convention is OnProgress
+				// with an empty msg; non-empty msg is per-page cbz
+				// status. Use the empty-msg event to drive the live
+				// counter so the flash shows N/total during the run
+				// instead of jumping from 0 to total at completion.
+				if msg == "" {
+					completed.Add(1)
+				}
+				emitStatus(workerIdx, msg)
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		for _, r := range resp.Results {
+			if r.Err != "" {
+				skipped.Add(1)
+				continue
+			}
+			if r.Tags == nil {
+				// Cancelled mid-image - skip writing partial state.
+				continue
+			}
+			if storeErr := storeResults(ctx, database, r.ID, r.Tags, taggerNames, catIDs["rating"]); storeErr != nil {
+				logx.Warnf("tagger: store results for image %d: %v", r.ID, storeErr)
+				skipped.Add(1)
+			}
+		}
+		return nil
+	}
+
+	for start := 0; start < total; start += autotagChunkSize {
 		if ctx.Err() != nil {
 			break
 		}
-		var canonPath, fileType string
-		if err := database.Read.QueryRowContext(ctx,
-			`SELECT canonical_path, file_type FROM images WHERE id = ?`, imageID,
-		).Scan(&canonPath, &fileType); err != nil {
-			logx.Warnf("tagger: skip image %d: lookup failed: %v", imageID, err)
-			skipped.Add(1)
-			continue
-		}
-		framePaths, cleanup := framesForTagging(canonPath, fileType, mangaCacheDir, imageID)
-		if len(framePaths) == 0 {
-			logx.Warnf("tagger: skip image %d: no frames available (missing file, archive, or ffmpeg)", imageID)
-			skipped.Add(1)
-			cleanup()
-			continue
-		}
-		requests = append(requests, BackendImageRequest{
-			ID:            imageID,
-			FramePaths:    framePaths,
-			MangaProgress: fileType == "cbz" && len(framePaths) > 1,
-		})
-		cleanups = append(cleanups, cleanup)
-	}
-	defer func() {
-		for _, c := range cleanups {
-			c()
-		}
-	}()
-
-	resp, err := backend.Run(ctx, RunRequest{
-		Cfg:            cfg,
-		Taggers:        taggers,
-		Provider:       provider,
-		CatIDs:         catIDs,
-		GeneralCatID:   generalCatID,
-		InferredCats:   inferredCats,
-		MinHitFraction: cfg.Tagger.Aggregation.MinHitFraction,
-		Parallel:       parallel,
-		Images:         requests,
-		OnProgress: func(workerIdx int, msg string) {
-			// The backend's per-image-done convention is OnProgress
-			// with an empty msg; non-empty msg is per-page cbz
-			// status. Use the empty-msg event to drive the live
-			// counter so the flash shows N/total during the run
-			// instead of jumping from 0 to total at completion.
-			if msg == "" {
-				completed.Add(1)
-			}
-			emitStatus(workerIdx, msg)
-		},
-	})
-	if err != nil {
-		return int(skipped.Load()), err
-	}
-
-	for _, r := range resp.Results {
-		if r.Err != "" {
-			skipped.Add(1)
-			continue
-		}
-		if r.Tags == nil {
-			// Cancelled mid-image - skip writing partial state.
-			continue
-		}
-		if storeErr := storeResults(ctx, database, r.ID, r.Tags, taggerNames, catIDs["rating"]); storeErr != nil {
-			logx.Warnf("tagger: store results for image %d: %v", r.ID, storeErr)
-			skipped.Add(1)
+		if err := runChunk(ids[start:min(start+autotagChunkSize, total)]); err != nil {
+			return int(skipped.Load()), err
 		}
 	}
 

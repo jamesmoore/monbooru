@@ -135,6 +135,24 @@ func statMissing(path string) bool {
 // instead.
 func EnabledTaggers(cfg *config.Config) []TaggerStatus { return enabledTaggers(cfg, nil) }
 
+// SelectForGallery resolves a user-supplied tagger name to the concrete
+// TaggerStatus list to run on the named gallery. An empty name means
+// every tagger enabled, available and applicable to that gallery.
+// Returns an error when the requested tagger is not enabled, unavailable,
+// or restricted to a different gallery.
+func SelectForGallery(cfg *config.Config, gallery, name string) ([]TaggerStatus, error) {
+	enabled := EnabledTaggersForGallery(cfg, gallery)
+	if name == "" {
+		return enabled, nil
+	}
+	for _, t := range enabled {
+		if t.Name == name {
+			return []TaggerStatus{t}, nil
+		}
+	}
+	return nil, fmt.Errorf("tagger %q is not enabled or available for gallery %q", name, gallery)
+}
+
 // EnabledTaggersForGallery filters EnabledTaggers down to the rows whose
 // per-tagger Galleries list either is empty (applies to every gallery,
 // the legacy behaviour) or contains the named gallery. Used by every

@@ -597,7 +597,7 @@
               <label><input type="radio" name="execution_provider" value="{{.Name}}"{{if eq $cfg.Tagger.ExecutionProvider .Name}} checked{{end}}> {{.Label}}</label>
               {{end}}
             </div>
-            <p class="field-hint">CPU works everywhere; other providers need a matching ONNX Runtime library.</p>
+            <p class="field-hint">Providers need a matching ONNX Runtime library.</p>
           </div>
           {{template "partials/range_field.html" dict "Name" "parallel" "Label" "Parallel workers" "Min" 1 "Max" 16 "Step" 1 "Value" $cfg.Tagger.Parallel "Ticks" (list 1 2 4 8 12 16) "Hint" "Images tagged in parallel."}}
           {{template "partials/range_field.html" dict "Name" "idle_release_after_minutes" "Label" "Tagger RAM/VRAM idle release (minutes)" "Min" 0 "Max" 60 "Step" 1 "Value" $cfg.Tagger.IdleReleaseAfterMinutes "Ticks" (list 0 15 30 45 60) "Hint" "Use 0 to free it just after inference."}}

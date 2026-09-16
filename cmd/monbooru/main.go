@@ -1,3 +1,12 @@
+// Command monbooru is the binary: it reads the config, resolves the
+// profile (server, desktop or portable), opens the galleries, starts the
+// HTTP server and the desktop integration around it, and handles the
+// subcommands and the restart-in-place the tray and the Settings page ask
+// for.
+//
+// Everything it does is wiring. A decision that outlives one launch
+// belongs in a package under internal/, so this file stays the list of
+// what gets connected to what.
 package main
 
 import (

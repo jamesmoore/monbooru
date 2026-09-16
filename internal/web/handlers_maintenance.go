@@ -106,15 +106,9 @@ func (s *Server) pruneOrphanedThumbnailsPost(w http.ResponseWriter, r *http.Requ
 	go func() {
 		ctx := s.jobs.Context()
 		removed, processed, total, err := s.runOrphanSweep(ctx, cx)
-		if err != nil {
-			s.jobs.Fail(err.Error())
-			return
-		}
-		if ctx.Err() != nil {
-			s.jobs.Complete(fmt.Sprintf("orphan sweep cancelled (%d/%d scanned, %d removed)", processed, total, removed))
-			return
-		}
-		s.jobs.Complete(fmt.Sprintf("Removed %d orphaned thumbnail(s).", removed))
+		s.finishJob(err, ctx.Err() != nil,
+			fmt.Sprintf("orphan sweep cancelled (%d/%d scanned, %d removed)", processed, total, removed),
+			fmt.Sprintf("Removed %d orphaned thumbnail(s).", removed))
 	}()
 	writeInlineFlash(w, "ok", "Thumbnail prune started.")
 }
@@ -306,7 +300,7 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 		// that filter here so "Delete all duplicate files" can't wipe
 		// aliases the operator can't see.
 		query = `
-			SELECT ip.id, ip.path
+			SELECT ip.id, ip.path, i.canonical_path
 			FROM image_paths ip
 			JOIN images i ON i.id = ip.image_id
 			WHERE ip.is_canonical = 0`
@@ -330,17 +324,19 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 		}
 		var placeholders string
 		placeholders, args = db.InPlaceholders(ids)
-		query = `SELECT ip.id, ip.path FROM image_paths ip
+		query = `SELECT ip.id, ip.path, i.canonical_path FROM image_paths ip
+			 JOIN images i ON i.id = ip.image_id
 			 WHERE ip.is_canonical = 0 AND ip.id IN (` + placeholders + `)`
 	}
 
 	type pathRow struct {
-		ID   int64
-		Path string
+		ID        int64
+		Path      string
+		Canonical string
 	}
 	paths, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (pathRow, error) {
 		var p pathRow
-		err := rows.Scan(&p.ID, &p.Path)
+		err := rows.Scan(&p.ID, &p.Path, &p.Canonical)
 		return p, err
 	}, query, args...)
 	if err != nil {
@@ -368,10 +364,10 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 		removed := 0
 		const chunkSize = 500
 		pathIDs := make([]int64, len(paths))
-		byID := make(map[int64]string, len(paths))
+		byID := make(map[int64]pathRow, len(paths))
 		for i, p := range paths {
 			pathIDs[i] = p.ID
-			byID[p.ID] = p.Path
+			byID[p.ID] = p
 		}
 		// Batch DELETEs by chunk in one transaction each so the writer
 		// pool sees one Exec per 500 rows instead of one per row.
@@ -381,13 +377,13 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			for _, id := range chunk {
-				path := byID[id]
-				if path == "" {
+				row := byID[id]
+				if row.Path == "" {
 					removed++
 					continue
 				}
-				if err := unlinkUnderGallery(galleryRoot, path); err != nil {
-					logx.Warnf("remove duplicate %q: %v", path, err)
+				if err := unlinkAliasFile(galleryRoot, row.Path, row.Canonical); err != nil {
+					logx.Warnf("remove duplicate %q: %v", row.Path, err)
 				}
 				removed++
 			}
@@ -535,7 +531,7 @@ func (s *Server) computeHashesPost(w http.ResponseWriter, r *http.Request) {
 	database := s.db()
 	thumbnailsPath := s.thumbnailsPath()
 	active := s.active()
-	tree := active.bkTree
+	tree := active.BKTree
 	go func() {
 		ctx := s.jobs.Context()
 		phashed, phashUpdated, err := relations.BackfillPhashes(ctx, database, thumbnailsPath, func(p, total int, _ string) {
@@ -727,7 +723,9 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 			// failure (missing thumbnail, corrupt jpg) leaves the
 			// previous value in place; the operator can rebuild
 			// thumbnails first if they care about that row.
-			if err := gallery.RecomputeAndStorePhash(ctx, database, img.ID, thumbnailsPath); err != nil {
+			if h, err := gallery.RecomputeAndStorePhash(ctx, database, img.ID, thumbnailsPath); err == nil {
+				relations.PhashStored(database, img.ID, h)
+			} else {
 				logx.Debugf("re-extract phash %d: %v", img.ID, err)
 			}
 			sdMeta, comfyMeta, _ := meta.Extract(img.Path, img.FileType)

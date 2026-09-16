@@ -1,0 +1,11 @@
+{{define "partials/implication_group_header.html"}}
+<p class="relation-origin-sub">{{if .Group.Stale}}stale, {{end}}added by {{originLabel .OriginKinds .Group.Origin}}
+  {{if gt (len .Group.Implications) 1}}<button type="button" class="btn-link-accent"
+          hx-delete="{{.BaseURL}}?origin={{urlQ .Group.Origin}}&stale={{if .Group.Stale}}1{{else}}0{{end}}"
+          hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'
+          hx-confirm="Remove all {{len .Group.Implications}} {{if .Group.Stale}}stale {{end}}implications added by {{originLabel .OriginKinds .Group.Origin}}?"
+          data-confirm-danger="Nothing records which tags they implied."
+          data-confirm-ok="Remove"
+          hx-on::after-request="if(event.detail.successful){pruneRelationGroup(this)}"
+          title="Remove every implication in this group">[×]</button>{{end}}</p>
+{{end}}

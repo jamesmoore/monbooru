@@ -1,3 +1,12 @@
+// Package jobs is the one background job at a time: the state machine, its
+// progress and cancellation, and the chunking loop the long runs walk their
+// work in. One lane, deliberately - the deployment is a home box, and two
+// jobs writing the same SQLite file would spend their time contending
+// rather than finishing.
+//
+// It owns when a job may start and how it reports; what a job does belongs
+// to whoever asked for it. That is why this package imports only
+// internal/models and is the leaf the rest of the tree can depend on.
 package jobs
 
 import (

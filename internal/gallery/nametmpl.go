@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -197,10 +198,8 @@ func readsMD5(tmpls []*NameTemplate) bool {
 		if t == nil {
 			continue
 		}
-		for _, p := range t.parts {
-			if p.tok == tokMD5 {
-				return true
-			}
+		if slices.ContainsFunc(t.parts, func(p namePart) bool { return p.tok == tokMD5 }) {
+			return true
 		}
 	}
 	return false
@@ -278,20 +277,26 @@ func LoadNameFacts(ctx context.Context, database *db.DB, galleryName string, id 
 // render is a refusal: filing a whole scope under its ids, or flattening it
 // into the root, is not a guess worth making.
 func (t *NameTemplate) Render(f NameFacts) (string, error) {
-	var b strings.Builder
+	var b []byte
 	for _, p := range t.parts {
-		switch p.tok {
-		case tokLiteral:
-			b.WriteString(p.lit)
-		case tokFolder:
+		v := p.lit
+		if p.tok != tokLiteral {
 			// The row's own directory is already root-bounded, and
 			// tidyNamePath cleans each of its segments.
-			b.WriteString(p.value(f))
-		default:
-			b.WriteString(SanitizeFilename(p.value(f)))
+			if v = p.value(f); p.tok != tokFolder {
+				v = SanitizeFilename(v)
+			}
+			if v == "" {
+				// The separator on each side of a token belongs to the
+				// token, so one of them goes with it: {artist} - {name}
+				// on a row with no artist is the name, not " - name".
+				b = trimSeparatorSuffix(b)
+				continue
+			}
 		}
+		b = append(b, v...)
 	}
-	out := tidyNamePath(b.String())
+	out := tidyNamePath(string(b))
 	switch {
 	case out != "":
 		return out, nil
@@ -308,12 +313,7 @@ func (t *NameTemplate) Render(f NameFacts) (string, error) {
 
 // namesFolder reports whether the template carries {folder}.
 func (t *NameTemplate) namesFolder() bool {
-	for _, p := range t.parts {
-		if p.tok == tokFolder {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(t.parts, func(p namePart) bool { return p.tok == tokFolder })
 }
 
 // identityTokens name one row and no other. Everything else a template can
@@ -409,28 +409,19 @@ func tidyNamePath(s string) string {
 	for _, seg := range segs {
 		// Per segment, not per token: a template's own literal text reaches
 		// the path too, and the filesystem refuses it for the same reasons.
-		if seg = TruncateFilename(tidyNameSegment(SanitizeFilename(seg)), maxNameBytes); seg != "" {
+		seg = strings.Trim(SanitizeFilename(seg), "-_ ")
+		if seg = TruncateFilename(seg, maxNameBytes); seg != "" {
 			kept = append(kept, seg)
 		}
 	}
 	return strings.Join(kept, "/")
 }
 
-// tidyNameSegment collapses a separator doubled by a token that rendered
-// nothing. Only a repeat of the same one: "a - b" is three separators the
-// template asked for, and eating the hyphen there would be rewriting a
-// name that renders exactly as it was written.
-func tidyNameSegment(s string) string {
-	var b strings.Builder
-	var prev rune
-	for _, r := range s {
-		if r == prev && (r == '-' || r == '_' || r == ' ') {
-			continue
-		}
-		prev = r
-		b.WriteRune(r)
-	}
-	return strings.Trim(b.String(), "-_ ")
+// trimSeparatorSuffix drops the separator run a token that rendered
+// nothing was about to be joined to. Runs inside a rendered value are left
+// alone: my--file was typed that way, and {name} is what it is called.
+func trimSeparatorSuffix(b []byte) []byte {
+	return []byte(strings.TrimRight(string(b), "-_ "))
 }
 
 // SanitizeFilename folds what a filesystem would refuse in one path

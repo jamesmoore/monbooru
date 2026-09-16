@@ -299,14 +299,9 @@ func (s *Server) receivedNaming(galleryName string) (writeDir string, n gallery.
 
 // namePreviewIDs takes the ids the caller named, capped at want, or falls
 // back to the newest row so the settings fields have something real to
-// render against without the page knowing an id. htmx flattens an array
-// value into one comma-joined parameter, so both shapes are read.
+// render against without the page knowing an id.
 func (s *Server) namePreviewIDs(raw []string, want int) []int64 {
-	flat := make([]string, 0, len(raw))
-	for _, v := range raw {
-		flat = append(flat, strings.Split(v, ",")...)
-	}
-	ids := parseIDList(flat)
+	ids := parseIDList(raw)
 	if len(ids) > want {
 		ids = ids[:want]
 	}

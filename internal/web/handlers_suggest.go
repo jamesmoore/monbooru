@@ -392,7 +392,7 @@ func (s *Server) searchIDs(w http.ResponseWriter, r *http.Request) {
 	// a row the grid would not have shown them.
 	expr = resolveCeiling(r, s.active()).Apply(expr)
 	ids := []int64{}
-	err = search.ExecuteForDeleteStream(s.db(), expr, func(t search.DeleteTarget) error {
+	err = search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
 		ids = append(ids, t.ID)
 		if len(ids) >= searchIDsCap {
 			return errSearchIDsFull

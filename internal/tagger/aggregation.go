@@ -115,10 +115,10 @@ type AggregateOpts struct {
 	DisabledCategories []string
 }
 
-// AggregateInferenceScores applies the §2 merge to per-frame label
-// scores. perFrame[fIdx][labelIdx] is the label's score on that frame
-// (zero / missing = no hit). labels[labelIdx] gives the post-routing
-// metadata. The function:
+// AggregateInferenceScores merges per-frame label scores.
+// perFrame[fIdx][labelIdx] is the label's score on that frame (zero /
+// missing = no hit). labels[labelIdx] gives the post-routing metadata.
+// The function:
 //
 //  1. drops near-zero scores (pre-floor 0.001).
 //  2. tracks sum + hit count per label across every frame.

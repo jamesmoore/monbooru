@@ -971,8 +971,8 @@ func (s *Service) isRatingTag(id int64) bool {
 // isLockedRatingTag reports whether the tag with this id is one of the
 // four canonical rating rows. Those are the rows the vocabulary is made
 // of; a rating-category row under any other name only reaches the
-// catalog through a raw import (§13.5 normalizes colours and the alias
-// graph, not rating names) and stays repairable.
+// catalog through a raw import, which normalizes colours and the alias
+// graph but not rating names, and stays repairable.
 func (s *Service) isLockedRatingTag(id int64) bool {
 	name, ok := s.ratingRowName(id)
 	return ok && IsCanonicalRating(name)

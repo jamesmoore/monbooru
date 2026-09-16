@@ -411,16 +411,14 @@ func fastCountFilter(database *db.DB, e FilterExpr) (int, bool) {
 	// Category-qualified single tag (e.g. character:miku) or a
 	// literal-tag fallback (e.g. nier:automata). Match buildFilterExpr's
 	// categoryExists branch by looking the category up first.
-	var catID int64
-	if err := database.Read.QueryRow(
-		`SELECT id FROM tag_categories WHERE name = ?`, e.Key,
-	).Scan(&catID); err != nil {
+	catID, ok, err := tags.CategoryIDByName(database, e.Key)
+	if !ok || err != nil {
 		// Not a real category; the slow path falls back to a literal-
 		// tag-name match for the whole "key:val" string. Bail.
 		return 0, false
 	}
 	var n int
-	err := database.Read.QueryRow(
+	err = database.Read.QueryRow(
 		`SELECT canon.usage_count FROM tags t
 		 JOIN tags canon ON canon.id = COALESCE(t.canonical_tag_id, t.id)
 		 WHERE t.name = ? AND t.category_id = ?

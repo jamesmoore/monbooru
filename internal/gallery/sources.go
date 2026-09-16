@@ -93,9 +93,9 @@ func AddSourceMembership(database *db.DB, imageID int64, site, postID, url strin
 	})
 }
 
-// SetSourceMD5 records the md5 the source claimed for one origin (the audit
+// setSourceMD5 records the md5 the source claimed for one origin (the audit
 // trail; never a dedup key). An empty incoming value keeps the stored one.
-func SetSourceMD5(database *db.DB, imageID int64, site, postID, md5 string) error {
+func setSourceMD5(database *db.DB, imageID int64, site, postID, md5 string) error {
 	md5 = strings.TrimSpace(md5)
 	if md5 == "" {
 		return nil
@@ -103,10 +103,10 @@ func SetSourceMD5(database *db.DB, imageID int64, site, postID, md5 string) erro
 	return updateSourceField(database, imageID, site, postID, "md5", md5)
 }
 
-// SetSourceParentURL records the canonical URL of the post one origin
+// setSourceParentURL records the canonical URL of the post one origin
 // declared as its parent (booru parent/child). An empty incoming value keeps
 // the stored one, so a parentless re-push never clears it.
-func SetSourceParentURL(database *db.DB, imageID int64, site, postID, parentURL string) error {
+func setSourceParentURL(database *db.DB, imageID int64, site, postID, parentURL string) error {
 	parentURL = strings.TrimSpace(parentURL)
 	if parentURL == "" {
 		return nil
@@ -187,11 +187,11 @@ type PostFile struct {
 	Ext           string
 }
 
-// SetSourcePostFile records what the post claims its file is. Each field
+// setSourcePostFile records what the post claims its file is. Each field
 // keeps its stored value when the incoming one is empty, like the md5 and
 // commentary setters: a site that publishes dimensions but no size must not
 // wipe a size an earlier fetch got from somewhere else.
-func SetSourcePostFile(database *db.DB, imageID int64, site, postID string, f PostFile) error {
+func setSourcePostFile(database *db.DB, imageID int64, site, postID string, f PostFile) error {
 	if f.Width <= 0 && f.Height <= 0 && f.Size <= 0 && strings.TrimSpace(f.Ext) == "" {
 		return nil
 	}

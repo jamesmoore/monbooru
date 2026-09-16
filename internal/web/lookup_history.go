@@ -155,13 +155,8 @@ func scheduledLookupBackend(r *http.Request) string {
 // scheduledLookupPost flips the operator's per-image opt-out for one backend
 // and re-renders the control for an htmx swap.
 func (s *Server) scheduledLookupPost(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, cx, _, ok := s.imageAndGallery(w, r)
 	if !ok {
-		return
-	}
-	cx := s.active()
-	if cx == nil {
-		externalErr(w, r, "no active gallery", http.StatusServiceUnavailable)
 		return
 	}
 	backend := scheduledLookupBackend(r)
@@ -192,13 +187,8 @@ func (s *Server) scheduledLookupPost(w http.ResponseWriter, r *http.Request) {
 // image is due immediately, while the history stays so the page can still
 // say when it was last looked up.
 func (s *Server) scheduledLookupResetPost(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, cx, _, ok := s.imageAndGallery(w, r)
 	if !ok {
-		return
-	}
-	cx := s.active()
-	if cx == nil {
-		externalErr(w, r, "no active gallery", http.StatusServiceUnavailable)
 		return
 	}
 	if err := lookup.Reset(cx.DB, id, scheduledLookupBackend(r), time.Now()); err != nil {

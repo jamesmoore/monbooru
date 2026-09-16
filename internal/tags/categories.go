@@ -2,12 +2,30 @@ package tags
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/models"
 )
+
+// CategoryIDByName resolves a category by name. The package that owns
+// tag_categories answers the question, so a consumer does not have to
+// re-spell the SELECT. A name that matched nothing is reported apart
+// from a read that failed: answering "unknown category" to a broken
+// read blames the caller for the server's fault.
+func CategoryIDByName(database *db.DB, name string) (int64, bool, error) {
+	var id int64
+	err := database.Read.QueryRow(`SELECT id FROM tag_categories WHERE name = ?`, name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
 
 // Tag-category vocabulary: listing, create/rename/recolor, and the
 // move-or-delete teardown.

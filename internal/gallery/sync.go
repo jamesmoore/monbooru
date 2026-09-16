@@ -109,7 +109,7 @@ type syncBySHARow struct {
 // progress receives (processed, total, message) tuples shaped to match
 // jobs.Manager.Update so the handler can forward the call verbatim.
 // maxFileSizeMB <= 0 disables the per-file cap.
-func Sync(ctx context.Context, database *db.DB, galleryPath, thumbnailsPath string, maxFileSizeMB int, naming Naming, progress func(processed, total int, message string)) (SyncResult, error) {
+func Sync(ctx context.Context, database *db.DB, galleryPath, thumbnailsPath string, maxFileSizeMB int, naming Naming, progress func(processed, total int, message string), onPhash PhashSink) (SyncResult, error) {
 	var result SyncResult
 
 	// The root is only probed for degraded mode when a gallery is
@@ -125,6 +125,12 @@ func Sync(ctx context.Context, database *db.DB, galleryPath, thumbnailsPath stri
 	known, err := loadKnownPaths(database)
 	if err != nil {
 		return result, err
+	}
+	// Same failure as the root's, one level down: the walk reads a linked
+	// subtree whose target went away as gone, and phase 3 would flag every
+	// row behind it missing while the files sit intact on the other side.
+	if link := danglingLinkOver(galleryPath, known); link != "" {
+		return result, fmt.Errorf("linked folder %q does not resolve", link)
 	}
 	found, err := walkGalleryFiles(ctx, galleryPath, int64(maxFileSizeMB)*1024*1024, known)
 	if err != nil {
@@ -161,7 +167,7 @@ func Sync(ctx context.Context, database *db.DB, galleryPath, thumbnailsPath stri
 		if i%50 == 0 || i == total-1 {
 			progress(i, total, "Phase 2: reconciling...")
 		}
-		if id := reconcileFile(database, galleryPath, thumbnailsPath, fi, known, bySHA, &result, &reactivated); id != 0 {
+		if id := reconcileFile(database, galleryPath, thumbnailsPath, fi, known, bySHA, &result, &reactivated, onPhash); id != 0 {
 			ingested = append(ingested, id)
 		}
 	}
@@ -248,6 +254,30 @@ func nameIngested(ctx context.Context, database *db.DB, galleryPath string, nami
 	}
 }
 
+// danglingLinkOver returns the first symlink on the way to a known path
+// whose target no longer resolves, or "" when every known path is still
+// reachable. A folder the operator simply deleted lstats as absent and
+// is not one of these - those rows are meant to go missing.
+func danglingLinkOver(galleryPath string, known map[string]syncKnownEntry) string {
+	checked := map[string]struct{}{}
+	for path := range known {
+		for dir := filepath.Dir(path); dir != galleryPath && PathInside(galleryPath, dir); dir = filepath.Dir(dir) {
+			if _, seen := checked[dir]; seen {
+				break
+			}
+			checked[dir] = struct{}{}
+			info, err := os.Lstat(dir)
+			if err != nil || info.Mode()&os.ModeSymlink == 0 {
+				continue
+			}
+			if _, err := os.Stat(dir); err != nil {
+				return dir
+			}
+		}
+	}
+	return ""
+}
+
 // loadKnownPaths preloads (path, size, sha256, mtime) for every
 // image_paths row, used by the walker's unchanged-shortcut.
 func loadKnownPaths(database *db.DB) (map[string]syncKnownEntry, error) {
@@ -280,7 +310,7 @@ func loadKnownPaths(database *db.DB) (map[string]syncKnownEntry, error) {
 // ownership claimed.
 func walkGalleryFiles(ctx context.Context, galleryPath string, maxBytes int64, known map[string]syncKnownEntry) ([]syncFileInfo, error) {
 	var found []syncFileInfo
-	err := filepath.WalkDir(galleryPath, func(path string, d os.DirEntry, err error) error {
+	err := WalkTree(galleryPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable dirs
 		}
@@ -311,7 +341,7 @@ func walkGalleryFiles(ctx context.Context, galleryPath string, maxBytes int64, k
 			// left to the backfill rather than re-reading every file here.
 			hash = k.sha256
 		} else {
-			h, m, hashErr := HashFileDigests(path)
+			h, m, hashErr := hashFileDigests(path)
 			if hashErr != nil {
 				logx.Warnf("hash failed for %q: %v", path, hashErr)
 				return nil
@@ -319,7 +349,7 @@ func walkGalleryFiles(ctx context.Context, galleryPath string, maxBytes int64, k
 			hash, sum = h, m
 			// Only chown when we just hashed; files reused from `known`
 			// were already claimed by a previous sync.
-			ClaimOwnership(path)
+			claimOwnership(galleryPath, path)
 		}
 		found = append(found, syncFileInfo{path: path, sha256: hash, md5: sum, size: info.Size(), mtime: mtimeUnix, mtimeNano: mtimeNano})
 		return nil
@@ -365,7 +395,7 @@ func loadImagesBySHA(database *db.DB) (map[string]syncBySHARow, error) {
 // maps so a later same-SHA walk entry falls into the right branch.
 // Returns the id of a row this walk entry created, so the caller can name
 // it once the reconcile pass is done; 0 for every other branch.
-func reconcileFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncFileInfo, known map[string]syncKnownEntry, bySHA map[string]syncBySHARow, result *SyncResult, reactivated *int) int64 {
+func reconcileFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncFileInfo, known map[string]syncKnownEntry, bySHA map[string]syncBySHARow, result *SyncResult, reactivated *int, onPhash PhashSink) int64 {
 	// In-place edit: same path on disk, but the freshly hashed SHA
 	// differs from what image_paths last saw. The mtime gate forced
 	// a re-hash; apply the new SHA / size / dimensions / metadata to
@@ -381,7 +411,8 @@ func reconcileFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncF
 			result.Conflicts++
 			return 0
 		}
-		if err := applyInPlaceEdit(database, thumbnailsPath, fi.path, fi.sha256, fi.md5, fi.mtime, fi.mtimeNano, fi.size); err != nil {
+		phash, err := applyInPlaceEdit(database, thumbnailsPath, fi.path, fi.sha256, fi.md5, fi.mtime, fi.mtimeNano, fi.size)
+		if err != nil {
 			logx.Warnf("sync: in-place edit %q: %v", fi.path, err)
 			return 0
 		}
@@ -391,6 +422,7 @@ func reconcileFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncF
 		var imgID int64
 		if err := database.Read.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, fi.sha256).Scan(&imgID); err == nil {
 			bySHA[fi.sha256] = syncBySHARow{id: imgID, canonicalPath: fi.path, isMissing: 0}
+			onPhash.Stored(imgID, phash)
 		}
 		delete(bySHA, k.sha256)
 		known[fi.path] = syncKnownEntry{size: fi.size, sha256: fi.sha256, mtime: fi.mtime}
@@ -399,7 +431,7 @@ func reconcileFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncF
 
 	row, ok := bySHA[fi.sha256]
 	if !ok {
-		return reconcileNewFile(database, galleryPath, thumbnailsPath, fi, bySHA, result)
+		return reconcileNewFile(database, galleryPath, thumbnailsPath, fi, bySHA, result, onPhash)
 	}
 	reconcileExistingSHA(database, galleryPath, fi, row, bySHA, known, result, reactivated)
 	return 0
@@ -407,7 +439,7 @@ func reconcileFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncF
 
 // reconcileNewFile handles the new-SHA branch: a fresh ingest reusing
 // the Phase-1 hash so Ingest doesn't hash twice. Returns the new row's id.
-func reconcileNewFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncFileInfo, bySHA map[string]syncBySHARow, result *SyncResult) int64 {
+func reconcileNewFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncFileInfo, bySHA map[string]syncBySHARow, result *SyncResult, onPhash PhashSink) int64 {
 	img, _, ingestErr := ingestWithHash(database, galleryPath, thumbnailsPath, fi.path, fi.sha256, fi.md5, "")
 	if ingestErr != nil {
 		logx.Warnf("ingest failed for %q: %v", fi.path, ingestErr)
@@ -417,6 +449,7 @@ func reconcileNewFile(database *db.DB, galleryPath, thumbnailsPath string, fi sy
 	if img == nil {
 		return 0
 	}
+	onPhash.Stored(img.ID, img.Phash)
 	bySHA[fi.sha256] = syncBySHARow{id: img.ID, canonicalPath: fi.path, isMissing: 0}
 	return img.ID
 }
@@ -623,12 +656,12 @@ func pruneStaleAliasPaths(ctx context.Context, database *db.DB, foundPaths map[s
 // on disk, and the thumbnail is regenerated. The mtime gate at the top
 // of the walk is what triggers entry; the corresponding image_paths
 // row's mtime is updated here so the next sync's shortcut can fire.
-func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 string, newMtime, newMtimeNano, newSize int64) error {
+func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 string, newMtime, newMtimeNano, newSize int64) (*int64, error) {
 	var imageID int64
 	if err := database.Read.QueryRow(
 		`SELECT image_id FROM image_paths WHERE path = ?`, path,
 	).Scan(&imageID); err != nil {
-		return fmt.Errorf("locate image for path %q: %w", path, err)
+		return nil, fmt.Errorf("locate image for path %q: %w", path, err)
 	}
 
 	// The rewrite can change the type under a name that never moved, and
@@ -636,7 +669,7 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 	// used to be rather than a row with no dimensions and no thumbnail.
 	fileType, err := detectMagicType(path)
 	if err != nil {
-		return fmt.Errorf("contents of %q are not a supported media type: %w", path, err)
+		return nil, fmt.Errorf("contents of %q are not a supported media type: %w", path, err)
 	}
 
 	var imgWidth, imgHeight *int
@@ -644,7 +677,7 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 	if fileType == "cbz" {
 		archive, openErr := OpenManga(path)
 		if openErr == nil {
-			if w, h, dimErr := archive.CoverDimensions(); dimErr == nil {
+			if w, h, dimErr := archive.coverDimensions(); dimErr == nil {
 				imgWidth, imgHeight = &w, &h
 			}
 			pcVal := len(archive.Pages)
@@ -662,7 +695,7 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 
 	tx, err := database.Write.Begin()
 	if err != nil {
-		return fmt.Errorf("begin in-place edit tx: %w", err)
+		return nil, fmt.Errorf("begin in-place edit tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -670,23 +703,23 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 		`UPDATE images SET sha256 = ?, md5 = ?, file_size = ?, file_type = ?, width = ?, height = ?, page_count = ?, source_type = ? WHERE id = ?`,
 		newSHA, newMD5, newSize, fileType, toNullInt(imgWidth), toNullInt(imgHeight), toNullInt(pageCount), sourceType, imageID,
 	); err != nil {
-		return fmt.Errorf("update images row: %w", err)
+		return nil, fmt.Errorf("update images row: %w", err)
 	}
 	if _, err := tx.Exec(
 		`UPDATE image_paths SET mtime_unix = ?, mtime_nsec = ? WHERE path = ?`, newMtime, newMtimeNano, path,
 	); err != nil {
-		return fmt.Errorf("update image_paths mtime: %w", err)
+		return nil, fmt.Errorf("update image_paths mtime: %w", err)
 	}
 	// The recorded lookup misses are about bytes this row no longer has.
 	if err := lookup.DeleteForImage(tx, imageID); err != nil {
-		return fmt.Errorf("clear lookup history: %w", err)
+		return nil, fmt.Errorf("clear lookup history: %w", err)
 	}
 	if err := ReplaceGenerationMetadata(context.Background(), tx, imageID, sdMeta, comfyMeta); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit in-place edit: %w", err)
+		return nil, fmt.Errorf("commit in-place edit: %w", err)
 	}
 
 	// A cbz whose bytes changed can have a different page count or order,
@@ -695,12 +728,12 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 	// Drop the whole per-image cache; Generate below re-renders the page
 	// thumbnails and the raw pages re-extract on the next read.
 	if fileType == "cbz" {
-		RemoveMangaCache(thumbnailsPath, imageID)
+		removeMangaCache(thumbnailsPath, imageID)
 	}
 
-	RegenerateDerived(database, thumbnailsPath, path, imageID, fileType, "in-place edit")
+	phash := regenerateDerived(database, thumbnailsPath, path, imageID, fileType, "in-place edit")
 	logx.Infof("in-place edit: image id=%d at %q now carries sha %s", imageID, path, newSHA)
-	return nil
+	return phash, nil
 }
 
 // FolderTree builds the folder tree from images. Each node's Count rolls

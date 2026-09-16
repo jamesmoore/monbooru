@@ -417,11 +417,7 @@ func (s *Server) fetchSource(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "could not reach monloader: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	if isHTMXRequest(r) {
-		writeFetchPending(w, id, 0)
-		return
-	}
-	http.Redirect(w, r, "/images/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
+	respondFetchPending(w, r, id)
 }
 
 // lookupImage enqueues a hash lookup on monloader: backend "all" runs every
@@ -433,7 +429,7 @@ func (s *Server) fetchSource(w http.ResponseWriter, r *http.Request) {
 // through the same enrich / fetch-status callbacks as a source refetch, so
 // the pending pill and its poll are reused unchanged.
 func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, cx, galleryName, ok := s.imageAndGallery(w, r)
 	if !ok {
 		return
 	}
@@ -442,15 +438,6 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "unknown lookup backend", http.StatusBadRequest)
 		return
 	}
-	// The route is gallery-free so the outbound call never runs under ctxMu;
-	// snapshot the gallery once so the row read and the enqueue name can't
-	// straddle a concurrent switch.
-	cx := s.active()
-	if cx == nil {
-		externalErr(w, r, "no active gallery", http.StatusServiceUnavailable)
-		return
-	}
-	galleryName := cx.Name
 	var sha, storedMD5 string
 	if err := cx.DB.Read.QueryRow(
 		`SELECT sha256, md5 FROM images WHERE id = ?`, id,
@@ -485,11 +472,7 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordLookupEnqueued(cx, id, backend, jobID)
-	if isHTMXRequest(r) {
-		writeFetchPending(w, id, 0)
-		return
-	}
-	http.Redirect(w, r, "/images/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
+	respondFetchPending(w, r, id)
 }
 
 // replaceImage enqueues a replace job on monloader: download the origin's
@@ -501,21 +484,12 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 // Replacing bytes is the strongest fetch action, so a request while any
 // fetch is pending on the image is refused instead of stacked.
 func (s *Server) replaceImage(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, cx, galleryName, ok := s.imageAndGallery(w, r)
 	if !ok {
 		return
 	}
 	site := strings.TrimSpace(r.FormValue("site"))
 	postID := strings.TrimSpace(r.FormValue("post_id"))
-	// The route is gallery-free so the outbound call never runs under ctxMu;
-	// snapshot the gallery once so the row read and the enqueue name can't
-	// straddle a concurrent switch.
-	cx := s.active()
-	if cx == nil {
-		externalErr(w, r, "no active gallery", http.StatusServiceUnavailable)
-		return
-	}
-	galleryName := cx.Name
 	src := models.ImageSource{Site: site, PostID: postID}
 	if err := cx.DB.Read.QueryRow(
 		`SELECT url, similarity, md5_match, upgrade_kept FROM image_sources WHERE image_id = ? AND site = ? AND post_id = ?`,
@@ -538,11 +512,25 @@ func (s *Server) replaceImage(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "could not reach monloader: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	if isHTMXRequest(r) {
-		writeFetchPending(w, id, 0)
-		return
+	respondFetchPending(w, r, id)
+}
+
+// imageAndGallery is imageIDForm plus the active gallery, the prologue of
+// every per-image handler that reads a row and then talks to a peer. The
+// name is returned beside the context because these routes are registered
+// gallery-free: they must not hold ctxMu across an outbound call, so they
+// snapshot instead.
+func (s *Server) imageAndGallery(w http.ResponseWriter, r *http.Request) (int64, *galleryCtx, string, bool) {
+	id, ok := imageIDForm(w, r)
+	if !ok {
+		return 0, nil, "", false
 	}
-	http.Redirect(w, r, "/images/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
+	cx := s.active()
+	if cx == nil {
+		externalErr(w, r, "no active gallery", http.StatusServiceUnavailable)
+		return 0, nil, "", false
+	}
+	return id, cx, cx.Name, true
 }
 
 // imageIDForm parses the {id} path segment plus the form body shared by the
@@ -857,9 +845,12 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 	// first, otherwise the image would lose its on-disk reference entirely.
 	var isCanon int
 	var aliasPath string
+	var canonicalPath string
 	if err := s.db().Read.QueryRow(
-		`SELECT is_canonical, path FROM image_paths WHERE id = ? AND image_id = ?`, pathID, id,
-	).Scan(&isCanon, &aliasPath); err != nil {
+		`SELECT ip.is_canonical, ip.path, i.canonical_path
+		 FROM image_paths ip JOIN images i ON i.id = ip.image_id
+		 WHERE ip.id = ? AND ip.image_id = ?`, pathID, id,
+	).Scan(&isCanon, &aliasPath, &canonicalPath); err != nil {
 		http.Error(w, "alias path not found", http.StatusNotFound)
 		return
 	}
@@ -881,7 +872,7 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 		// compatibility translator that forgets the relative-path rule
 		// would otherwise let this os.Remove unlink any file the process
 		// can reach.
-		if err := unlinkUnderGallery(s.galleryPath(), aliasPath); err != nil {
+		if err := unlinkAliasFile(s.galleryPath(), aliasPath, canonicalPath); err != nil {
 			logx.Warnf("delete alias file %q: %v", aliasPath, err)
 		}
 	}
@@ -895,25 +886,54 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/images/%d", id), http.StatusSeeOther)
 }
 
-// unlinkUnderGallery is os.Remove gated on gallery.PathInside so a
-// stray absolute path in image_paths can never let an alias-deletion
-// or duplicate-prune handler unlink files outside the active gallery.
-func unlinkUnderGallery(galleryRoot, victim string) error {
+// unlinkAliasFile is os.Remove gated on gallery.PathInside so a stray
+// absolute path in image_paths can never let an alias-deletion or
+// duplicate-prune handler unlink files outside the active gallery, and
+// gated on the row's canonical path so an alias that is the canonical
+// entry under another name takes the row and leaves the file. A link
+// that re-entered the gallery wrote exactly those rows before the walk
+// refused it, and they outlive the fix.
+func unlinkAliasFile(galleryRoot, aliasPath, canonicalPath string) error {
 	galleryAbs, err := filepath.Abs(galleryRoot)
 	if err != nil {
 		return fmt.Errorf("resolve gallery root: %w", err)
 	}
-	victimAbs, err := filepath.Abs(victim)
+	aliasAbs, err := filepath.Abs(aliasPath)
 	if err != nil {
-		return fmt.Errorf("resolve victim: %w", err)
+		return fmt.Errorf("resolve alias: %w", err)
 	}
-	if !gallery.PathInside(galleryAbs, victimAbs) {
-		return fmt.Errorf("refuse: path %q is outside gallery root", victim)
+	if !gallery.PathInside(galleryAbs, aliasAbs) {
+		return fmt.Errorf("refuse: path %q is outside gallery root", aliasPath)
 	}
-	if err := os.Remove(victim); err != nil && !os.IsNotExist(err) {
+	if isCanonicalEntry(aliasPath, canonicalPath) {
+		return fmt.Errorf("refuse: path %q reaches the canonical file through a link", aliasPath)
+	}
+	if err := os.Remove(aliasPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
+}
+
+// isCanonicalEntry reports whether unlinking aliasPath would take the
+// canonical file with it. A symlink never can - os.Remove takes the link -
+// and a hard link has a directory entry of its own, so the question is
+// whether the two names resolve to one entry rather than to one inode.
+func isCanonicalEntry(aliasPath, canonicalPath string) bool {
+	if canonicalPath == "" {
+		return false
+	}
+	if info, err := os.Lstat(aliasPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	alias, err := filepath.EvalSymlinks(aliasPath)
+	if err != nil {
+		return false
+	}
+	canonical, err := filepath.EvalSymlinks(canonicalPath)
+	if err != nil {
+		return false
+	}
+	return alias == canonical
 }
 
 // singleImageMoveJob is the shell the per-image file operation runs in. A

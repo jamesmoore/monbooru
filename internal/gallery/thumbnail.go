@@ -40,9 +40,9 @@ const (
 	ViewMaxDim    = 4000
 )
 
-// ViewRenditionPath is where an image's bounded display rendition is cached,
+// viewRenditionPath is where an image's bounded display rendition is cached,
 // beside its thumbnail.
-func ViewRenditionPath(dir string, imageID int64) string {
+func viewRenditionPath(dir string, imageID int64) string {
 	return filepath.Join(dir, fmt.Sprintf("%d_view.jpg", imageID))
 }
 
@@ -58,7 +58,7 @@ func NeedsViewRendition(width, height int) bool { return int64(width)*int64(heig
 // needs one at all: producing it at ingest would write a second file per
 // image for a ceiling almost nothing reaches.
 func EnsureViewRendition(srcPath, dstDir string, imageID int64) (string, error) {
-	dst := ViewRenditionPath(dstDir, imageID)
+	dst := viewRenditionPath(dstDir, imageID)
 	if _, err := os.Stat(dst); err == nil {
 		return dst, nil
 	}
@@ -173,7 +173,7 @@ func ThumbnailPath(dir string, imageID int64) string {
 	return filepath.Join(dir, fmt.Sprintf("%d.jpg", imageID))
 }
 
-func HoverPath(dir string, imageID int64) string {
+func hoverPath(dir string, imageID int64) string {
 	return filepath.Join(dir, fmt.Sprintf("%d_hover.webp", imageID))
 }
 
@@ -186,7 +186,7 @@ func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
 	// Both renditions come off the same bytes, so anything that rewrites the
 	// thumbnail - a replace, a re-ingest, a rebuild - leaves the display
 	// rendition showing the picture the file no longer holds.
-	_ = os.Remove(ViewRenditionPath(dstDir, imageID))
+	_ = os.Remove(viewRenditionPath(dstDir, imageID))
 
 	dstPath := ThumbnailPath(dstDir, imageID)
 
@@ -194,7 +194,7 @@ func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
 		if err := generateVideoThumb(srcPath, dstPath); err != nil {
 			return err
 		}
-		hoverDst := HoverPath(dstDir, imageID)
+		hoverDst := hoverPath(dstDir, imageID)
 		if err := generateVideoHover(srcPath, hoverDst); err != nil {
 			logx.Warnf("hover preview for %q: %v", srcPath, err)
 		}
@@ -207,7 +207,7 @@ func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
 		return err
 	}
 	if fileType == "gif" {
-		hoverDst := HoverPath(dstDir, imageID)
+		hoverDst := hoverPath(dstDir, imageID)
 		if err := generateGIFHover(srcPath, hoverDst); err != nil {
 			logx.Warnf("hover preview for %q: %v", srcPath, err)
 		}
@@ -216,7 +216,7 @@ func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
 }
 
 // generateMangaThumbnails writes the cover thumbnail (`<dstDir>/<id>.jpg`)
-// and hands the per-page set (`MangaImageDir/page_NNNN_thumb.jpg`) to a
+// and hands the per-page set (`mangaImageDir/page_NNNN_thumb.jpg`) to a
 // bounded background worker. The cover is the phash input, so it stays on
 // the ingest path; pre-generating every page turns the first /pages render
 // into a static-file serve but takes minutes on a large archive, which
@@ -230,7 +230,7 @@ func generateMangaThumbnails(srcPath, dstDir string, imageID int64) error {
 	}
 	defer func() { _ = archive.Close() }()
 
-	cover, err := archive.CoverImage()
+	cover, err := archive.coverImage()
 	if err != nil {
 		return fmt.Errorf("decode manga cover: %w", err)
 	}
@@ -238,7 +238,7 @@ func generateMangaThumbnails(srcPath, dstDir string, imageID int64) error {
 		return err
 	}
 
-	imageDir := MangaImageDir(dstDir, imageID)
+	imageDir := mangaImageDir(dstDir, imageID)
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return fmt.Errorf("create manga thumb dir: %w", err)
 	}
@@ -293,7 +293,7 @@ func pregenerateMangaPageThumbs(srcPath, imageDir string) {
 	defer func() { _ = archive.Close() }()
 
 	for i := range archive.Pages {
-		// RemoveMangaCache drops this directory when the image is deleted
+		// removeMangaCache drops this directory when the image is deleted
 		// or its bytes are replaced. Both can land mid-loop, and grinding
 		// on through a long archive would burn the worker and log a
 		// failure per page for a row that no longer wants them.
@@ -301,7 +301,7 @@ func pregenerateMangaPageThumbs(srcPath, imageDir string) {
 			return
 		}
 		pageNum := i + 1
-		thumbPath := MangaPageThumbPath(imageDir, pageNum)
+		thumbPath := mangaPageThumbPath(imageDir, pageNum)
 		if err := generateOneMangaPageThumb(archive, i, thumbPath); err != nil {
 			logx.Warnf("manga page thumb %d for %q: %v", pageNum, srcPath, err)
 		}
@@ -312,7 +312,7 @@ func pregenerateMangaPageThumbs(srcPath, imageDir string) {
 // (no raw-bytes cache write) and writes the thumbnail. Keeps the
 // per-page footprint to one file on disk - the raw bytes stay lazy.
 func generateOneMangaPageThumb(archive *Manga, idx int, dstPath string) error {
-	rc, err := archive.PageReader(idx)
+	rc, err := archive.pageReader(idx)
 	if err != nil {
 		return err
 	}
@@ -385,14 +385,21 @@ func writeJPEGAtomic(img image.Image, path string, quality int) error {
 	})
 }
 
-// RegenerateDerived renders the thumbnail and, on success, the phash. Neither
-// failure is fatal: a missing thumbnail is regenerated on demand, and a NULL
-// phash keeps the row out of the relations system until a recompute lands
-// rather than leaving a stale value behind. logCtx names the caller.
-func RegenerateDerived(database *db.DB, thumbnailsPath, path string, imageID int64, fileType, logCtx string) {
+// regenerateDerived renders the thumbnail and, on success, the phash, and
+// returns the phash it stored so the caller can pass it to whatever holds
+// the in-memory index. Neither failure is fatal: a missing thumbnail is
+// regenerated on demand, and a NULL phash keeps the row out of the
+// relations system until a recompute lands rather than leaving a stale
+// value behind. logCtx names the caller.
+func regenerateDerived(database *db.DB, thumbnailsPath, path string, imageID int64, fileType, logCtx string) *int64 {
 	if err := Generate(path, thumbnailsPath, imageID, fileType); err != nil {
 		logx.Warnf("%s: thumbnail for %q: %v", logCtx, path, err)
-	} else if err := RecomputeAndStorePhash(context.Background(), database, imageID, thumbnailsPath); err != nil {
-		logx.Warnf("%s: phash for %q: %v", logCtx, path, err)
+		return nil
 	}
+	h, err := RecomputeAndStorePhash(context.Background(), database, imageID, thumbnailsPath)
+	if err != nil {
+		logx.Warnf("%s: phash for %q: %v", logCtx, path, err)
+		return nil
+	}
+	return &h
 }

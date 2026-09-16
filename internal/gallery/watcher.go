@@ -29,6 +29,10 @@ type Watcher struct {
 	jobs           *jobs.Manager
 	OnEvent        func(msg string) // callback for status notifications (may be nil)
 	OnChange       func()           // callback fired after any image add/remove (may be nil)
+	// OnPhash receives a phash an ingest just stored, so the near-duplicate
+	// index a higher layer owns keeps up with a file dropped into the tree.
+	// May be nil.
+	OnPhash PhashSink
 	// Naming renames what the watcher picks up, when the operator opted
 	// in. Zero value leaves a dropped file under the name it arrived with.
 	Naming Naming
@@ -92,7 +96,7 @@ func NewWatcher(galleryName, galleryPath, thumbnailsPath string, maxFileSizeMB i
 	// Walk and watch every subdirectory, stopping gracefully on inotify limits.
 	watchCount := 1
 	limitHit := false
-	if walkErr := filepath.WalkDir(galleryPath, func(path string, d os.DirEntry, err error) error {
+	if walkErr := WalkTree(galleryPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil || !d.IsDir() || path == galleryPath {
 			return nil
 		}
@@ -120,11 +124,11 @@ func NewWatcher(galleryName, galleryPath, thumbnailsPath string, maxFileSizeMB i
 		}
 		return nil
 	}); walkErr != nil {
-		// A WalkDir error here means the outer traversal could not
-		// finish - typically a permission denied at the gallery root or
-		// a vanished symlink. Surface it at warn so the operator can
-		// fix the access rights; the partially-built watcher still
-		// works for the dirs it did register.
+		// A walk error here means the outer traversal could not finish -
+		// typically a permission denied at the gallery root. Surface it
+		// at warn so the operator can fix the access rights; the
+		// partially-built watcher still works for the dirs it did
+		// register.
 		logx.Warnf("watcher: walk %q: %v", galleryPath, walkErr)
 	}
 
@@ -216,7 +220,10 @@ func (w *Watcher) eventPrefix() string {
 // predate the watch emit no further event and would otherwise wait for the
 // next manual sync.
 func (w *Watcher) registerTree(dir string) {
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	if !w.linkWorthFollowing(dir) {
+		return
+	}
+	_ = WalkTreeUnder(dir, w.galleryPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -229,6 +236,28 @@ func (w *Watcher) registerTree(dir string) {
 		w.debounce(path)
 		return nil
 	})
+}
+
+// linkWorthFollowing answers, for a directory that just appeared in the
+// gallery, whether the gallery's own walk would have descended into it. A
+// plain directory always is; a link is not when it resolves inside the
+// gallery or onto a tree the gallery sits in, which is the walk's rule and
+// has to be applied here because registerTree starts at the link rather
+// than at the gallery.
+func (w *Watcher) linkWorthFollowing(dir string) bool {
+	info, err := os.Lstat(dir)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return true
+	}
+	root, err := filepath.EvalSymlinks(w.galleryPath)
+	if err != nil {
+		root = filepath.Clean(w.galleryPath)
+	}
+	target, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
+	return !PathInside(root, target) && !PathInside(target, root)
 }
 
 // jobSuppressesIngest reports whether a running manual sync, move,
@@ -396,6 +425,9 @@ func (w *Watcher) ingestFile(path string) {
 	} else {
 		if !w.Naming.Empty() && img != nil {
 			path = w.renameIngested(img.ID, path)
+		}
+		if img != nil {
+			w.OnPhash.Stored(img.ID, img.Phash)
 		}
 		logx.Infof("watcher: ingested %q", path)
 		if w.OnEvent != nil {

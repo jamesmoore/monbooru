@@ -587,10 +587,7 @@ func (s *Server) splitCategoryTag(input string) (catID int64, bare string, ok bo
 	}
 	if idx := strings.Index(input, ":"); idx > 0 {
 		if name := input[idx+1:]; name != "" {
-			var id int64
-			if err := s.db().Read.QueryRow(
-				`SELECT id FROM tag_categories WHERE name = ?`, input[:idx],
-			).Scan(&id); err == nil {
+			if id, ok, err := tags.CategoryIDByName(s.db(), input[:idx]); ok && err == nil {
 				return id, name, true
 			}
 		}

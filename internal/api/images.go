@@ -391,8 +391,11 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	}
 	claimedMD5 := strings.TrimSpace(r.FormValue("md5"))
 	parentURL := strings.TrimSpace(r.FormValue("parent_url"))
-	commentary := strings.TrimSpace(r.FormValue("commentary"))
-	translated := strings.TrimSpace(r.FormValue("commentary_translated"))
+	if !checkCommentaryDText(w, r.FormValue("commentary_dtext"), r.FormValue("commentary_translated_dtext")) {
+		return
+	}
+	commentary := commentaryFromInput(r.FormValue("commentary"), r.FormValue("commentary_dtext"))
+	translated := commentaryFromInput(r.FormValue("commentary_translated"), r.FormValue("commentary_translated_dtext"))
 	original := strings.TrimSpace(r.FormValue("original"))
 	notes := parseNotesField(r.FormValue("notes"), url)
 	var tags []string
@@ -537,13 +540,15 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := gallery.ApplyReplacedFile(g.DB, g.ThumbnailsPath, id, stagedPath, newSHA, newMD5, newType); err != nil {
+	phash, err := gallery.ApplyReplacedFile(g.DB, g.GalleryPath, g.ThumbnailsPath, id, stagedPath, newSHA, newMD5, newType)
+	if err != nil {
 		discardStaged()
 		logx.Warnf("api replace image %d: %v", id, err)
 		g.recordFetch(id, "error", "the file replacement failed")
 		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
+	relations.PhashSink(g.DB).Stored(id, phash)
 
 	sum, tagWarnings, ok := applyMeta()
 	if !ok {
@@ -1241,6 +1246,9 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	img, isDuplicate, err := gallery.Ingest(g.DB, g.GalleryPath, g.ThumbnailsPath, in.imgPath, origin)
+	if err == nil && img != nil {
+		relations.PhashSink(g.DB).Stored(img.ID, img.Phash)
+	}
 	if err != nil {
 		if in.uploadedToDisk {
 			_ = os.Remove(in.imgPath)
@@ -1333,7 +1341,7 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 		if !tagger.IsAvailable(cfg) {
 			autotagNote = "autotag skipped: tagger not available"
 		} else {
-			selected, selErr := h.selectedTaggers(g.Name, in.taggerName)
+			selected, selErr := tagger.SelectForGallery(h.cfg(), g.Name, in.taggerName)
 			if selErr != nil {
 				autotagNote = "autotag skipped: " + selErr.Error()
 			} else if err := h.jobs.Start("autotag"); err != nil {
@@ -1384,22 +1392,6 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusCreated, resp)
 }
 
-// selectedTaggers resolves a caller-supplied tagger_name to a concrete
-// list of taggers running on the named gallery. Empty name means every
-// tagger enabled + available + applicable to that gallery.
-func (h *Handler) selectedTaggers(gallery, name string) ([]tagger.TaggerStatus, error) {
-	enabled := tagger.EnabledTaggersForGallery(h.cfg(), gallery)
-	if name == "" {
-		return enabled, nil
-	}
-	for _, t := range enabled {
-		if t.Name == name {
-			return []tagger.TaggerStatus{t}, nil
-		}
-	}
-	return nil, fmt.Errorf("tagger %q is not enabled or available for gallery %q", name, gallery)
-}
-
 func isTrue(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "1", "true", "yes", "on":
@@ -1437,8 +1429,8 @@ func (h *Handler) deleteImage(w http.ResponseWriter, r *http.Request) {
 
 	// Empty-source-folder cleanup is opt-in via ?delete_empty_folder=true.
 	// Operators create folders deliberately, so a delete leaves an emptied
-	// folder in place by default, matching the UI (§7.6); when asked, prune
-	// it and report the removal in a structured 200.
+	// folder in place by default, matching the UI; when asked, prune it
+	// and report the removal in a structured 200.
 	folderRemoved := false
 	if r.URL.Query().Get("delete_empty_folder") == "true" && !result.IsMissing && result.FolderPath != "" {
 		fullFolderPath := filepath.Join(g.GalleryPath, result.FolderPath)
@@ -1486,7 +1478,7 @@ func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
 	}
 	// Stable random ordering across paginated calls relies on the caller
 	// passing the same seed back; without one, every call reseeds and
-	// pages overlap. Spec §8.3.
+	// pages overlap.
 	var randomSeed int64
 	if seedStr := q.Get("seed"); seedStr != "" {
 		if s, err := strconv.ParseInt(seedStr, 10, 64); err == nil && s != 0 {
@@ -1803,7 +1795,7 @@ func (h *Handler) resolveImageTagID(g Gallery, imageID int64, tagName string) (i
 	tagName = strings.TrimSpace(tagName)
 	if idx := strings.Index(tagName, ":"); idx > 0 {
 		catName := tagName[:idx]
-		_, ok, err := categoryIDByName(g, catName)
+		_, ok, err := tags.CategoryIDByName(g.DB, catName)
 		if err != nil {
 			return 0, err
 		}

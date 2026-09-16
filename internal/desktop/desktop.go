@@ -2,6 +2,9 @@
 // behaviour the -desktop profile needs. It knows nothing about the app it
 // serves beyond the name it is handed, so both halves of the pair can use
 // the same shape without sharing a config.
+//
+// Copied into monloader, this package and internal/fsx/exedir.go with it,
+// and kept in step by hand; a fix here belongs there too.
 package desktop
 
 import (
@@ -11,6 +14,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/monbooru/monbooru/internal/fsx"
 )
 
 // Layout is where one app keeps its files under the desktop profile.
@@ -45,7 +50,7 @@ func Resolve(app, explicitConfig string) (Layout, error) {
 		// sandbox, whose directories are already private to the install.
 		if !Sandboxed() {
 			if dir := InstallDir(); dir != "" {
-				if p := filepath.Join(dir, app+".toml"); isFile(p) {
+				if p := filepath.Join(dir, app+".toml"); fsx.IsFile(p) {
 					l.ConfigPath, l.Portable = p, true
 					l.DataDir = filepath.Join(dir, "data")
 				}
@@ -123,7 +128,7 @@ func Sandboxed() bool {
 	if os.Getenv("FLATPAK_ID") != "" {
 		return true
 	}
-	return isFile("/.flatpak-info")
+	return fsx.IsFile("/.flatpak-info")
 }
 
 // PicturesDir is where a fresh install proposes to look for images.
@@ -177,9 +182,4 @@ func xdgUserDir(key, home string) string {
 		}
 	}
 	return ""
-}
-
-func isFile(path string) bool {
-	fi, err := os.Stat(path)
-	return err == nil && !fi.IsDir()
 }

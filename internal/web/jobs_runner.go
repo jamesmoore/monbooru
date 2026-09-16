@@ -1,6 +1,8 @@
 package web
 
 import (
+	"context"
+	"errors"
 	"net/http"
 )
 
@@ -14,6 +16,24 @@ func (s *Server) startJob(w http.ResponseWriter, jobType string) bool {
 		return false
 	}
 	return true
+}
+
+// settleJob is finishJob for a worker driven by the job context, where a
+// cancel outranks the error: a cancelled worker returns context.Canceled
+// as its error, and reporting that as a failure would put a red cross in
+// the status bar for a button the operator pressed. Returns the error so a
+// scheduled phase can stop its own chain; a handler goroutine ignores it.
+func (s *Server) settleJob(ctx context.Context, err error, cancelMsg, doneMsg string) error {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		s.jobs.Complete(cancelMsg)
+		return nil
+	}
+	if err != nil {
+		s.jobs.Fail(err.Error())
+		return err
+	}
+	s.jobs.Complete(doneMsg)
+	return nil
 }
 
 // finishJob writes a chunked job's terminal state: the failure, the
