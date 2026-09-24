@@ -299,6 +299,20 @@
   var slotLeft = document.getElementById('compare-slot-left');
   var slotRight = document.getElementById('compare-slot-right');
   var divider = document.getElementById('compare-divider');
+  var compareZoom = { scale: 1, x: 0, y: 0 };
+  function applyCompareZoom() {
+    [slotLeft, slotRight].forEach(function(slot) {
+      if (!slot || !slot.firstElementChild) return;
+      slot.firstElementChild.style.transform =
+        'translate(' + compareZoom.x + 'px, ' + compareZoom.y + 'px) scale(' + compareZoom.scale + ')';
+    });
+  }
+  function resetCompareZoom() {
+    compareZoom.scale = 1;
+    compareZoom.x = 0;
+    compareZoom.y = 0;
+    applyCompareZoom();
+  }
   function setSplit(pct) {
     if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
     if (slotRight) slotRight.style.clipPath = 'inset(0 0 0 ' + pct + '%)';
@@ -340,6 +354,7 @@
     if (capL) capL.textContent = '#' + leftID;
     if (capR) capR.textContent = '#' + rightID;
     setSplit(50);
+    resetCompareZoom();
     compareDlg.showModal();
   }
   if (compareBtn) compareBtn.addEventListener('click', openCompare);
@@ -372,6 +387,29 @@
     document.addEventListener('mouseup', function() { dragging = false; });
     compareStage.addEventListener('touchstart', function(e) { trackSplit(e); }, {passive: true});
     compareStage.addEventListener('touchmove',  function(e) { trackSplit(e); }, {passive: true});
+    compareStage.addEventListener('wheel', function(e) {
+      e.preventDefault();
+      var rect = compareStage.getBoundingClientRect();
+      var cx = e.clientX - rect.left;
+      var cy = e.clientY - rect.top;
+      var oldScale = compareZoom.scale;
+      var factor = e.deltaY < 0 ? 1.2 : 1 / 1.2;
+      var newScale = Math.max(1, Math.min(8, oldScale * factor));
+      if (newScale === oldScale) return;
+
+      if (newScale === 1) {
+        resetCompareZoom();
+        return;
+      }
+
+      // Keep the point beneath the cursor stationary while both layers
+      // receive the same transform and therefore remain aligned.
+      var ratio = newScale / oldScale;
+      compareZoom.x = cx - (cx - compareZoom.x) * ratio;
+      compareZoom.y = cy - (cy - compareZoom.y) * ratio;
+      compareZoom.scale = newScale;
+      applyCompareZoom();
+    }, {passive: false});
   }
 
   // Post-decide modal hook. The decision form's hx-on::after-request
