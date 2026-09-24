@@ -397,6 +397,11 @@
       var newScale = Math.max(1, Math.min(8, oldScale * factor));
       if (newScale === oldScale) return;
 
+      if (newScale === 1) {
+        resetCompareZoom();
+        return;
+      }
+
       // Keep the point beneath the cursor stationary while both layers
       // receive the same transform and therefore remain aligned.
       var ratio = newScale / oldScale;
