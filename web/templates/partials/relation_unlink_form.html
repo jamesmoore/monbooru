@@ -1,6 +1,6 @@
 {{define "partials/relation_unlink_form.html"}}
-<form hx-post="/relations/remove" hx-swap="none"
-      hx-on::after-request="if(event.detail.successful){window.location.reload()}" {{with .ExtraClass}}class="{{.}}" {{end}}{{with .Edge}}data-edge="{{.}}" {{end}}style="display:inline"
+<form hx-post="/relations/remove" hx-target="#detail-flash" hx-swap="innerHTML"
+      hx-on::after-request="if(event.detail.successful && event.detail.xhr.responseText.indexOf('flash-err') === -1){window.location.reload()}" {{with .ExtraClass}}class="{{.}}" {{end}}{{with .Edge}}data-edge="{{.}}" {{end}}style="display:inline"
       {{with .Confirm}}hx-confirm="{{.}}"{{end}}>
   <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
   <input type="hidden" name="type" value="{{.Type}}">

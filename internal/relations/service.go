@@ -1,10 +1,4 @@
-// Package relations manages the operator-declared graph between images:
-// duplicate groups, alternate groups, directed version chains, directed
-// derivative trees, and the "not related" rejection set.
-//
-// The Service is the only thing the rest of the codebase calls to mutate
-// the graph; each mutation runs inside a single transaction so partial
-// states never surface.
+// Package relations manages the operator-declared graph between images.
 package relations
 
 import (
@@ -16,57 +10,45 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/tags"
 )
 
 var (
-	// ErrSelfRelation is returned when both ends of a relation point at
-	// the same image.
 	ErrSelfRelation = errors.New("relations: pair refers to a single image")
 
-	// ErrRelationConflict is returned when a pair already carries a
-	// relation of a different type. The operator must explicitly
-	// remove the existing relation before declaring a new one.
 	ErrRelationConflict = errors.New("relations: pair already has a different relation")
 
-	// ErrIndirectRelation is returned when a pair sits on one
-	// root-to-leaf path of a version chain or derivative tree without a
-	// direct edge between the two: there is no edge to overwrite, so the
-	// operator has to unlink the path instead.
 	ErrIndirectRelation = errors.New("relations: pair is already related through another image")
 
-	// ErrVersionExists is returned when adding a version edge would
-	// give a child a second parent or a parent a second child. Strict
-	// chains, not trees.
 	ErrVersionExists = errors.New("relations: version edge already exists on one side")
 
-	// ErrDerivativeCycle is returned when adding a derivative edge would
-	// make the two images descend from each other.
 	ErrDerivativeCycle = errors.New("relations: source already descends from the derivative")
 
-	// ErrChainTooDeep is returned when adding a version or derivative
-	// edge would make the chain / tree deeper than MaxVersionChainDepth,
-	// the horizon every capped walker (dissolve, render) trusts.
 	ErrChainTooDeep = errors.New("relations: chain would exceed the depth limit")
 
-	// ErrNotInGroup is returned by PromoteToOriginal when the named
-	// image isn't currently a member of the target dup group.
 	ErrNotInGroup = errors.New("relations: image is not a member of the group")
 )
 
-// FriendlyError carries an operator-facing message and the HTTP status
-// code a transport-layer error writer should surface for one of the
-// Service's typed errors.
-type FriendlyError struct {
-	Status  int    // HTTP status the caller should write (400, 409, ...)
-	Code    string // short identifier for JSON error envelopes
-	Message string // the line the operator sees
+// CrossConflictError names a pair, other than the one being related, that
+// a join, merge or edge would give a second kind of relation.
+type CrossConflictError struct{ A, B int64 }
+
+func (e *CrossConflictError) Error() string {
+	return fmt.Sprintf("relations: images %d and %d are already related another way", e.A, e.B)
 }
 
-// FriendlyErrorFor maps a Service error to the operator-facing message
-// shared by every transport. Returns nil when err is not one of the
-// recognised sentinels so the caller can fall back to a generic 500.
+type FriendlyError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
 func FriendlyErrorFor(err error) *FriendlyError {
+	var cross *CrossConflictError
 	switch {
+	case errors.As(err, &cross):
+		return &FriendlyError{Status: 409, Code: "conflict", Message: fmt.Sprintf(
+			"That would also relate #%d and #%d, which are related another way; unlink them first.", cross.A, cross.B)}
 	case errors.Is(err, ErrSelfRelation):
 		return &FriendlyError{Status: 400, Code: "invalid_request", Message: "Cannot relate an image to itself."}
 	case errors.Is(err, ErrRelationConflict):
@@ -85,19 +67,15 @@ func FriendlyErrorFor(err error) *FriendlyError {
 	return nil
 }
 
-// Service is the transactional boundary for relations mutations.
 type Service struct {
 	db *db.DB
 }
 
-// New returns a Service backed by the provided database.
 func New(database *db.DB) *Service { return &Service{db: database} }
 
 func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
 
-// canonicalPair returns (min, max) so symmetric relations
-// (not_related, in particular) live as a single canonical row
-// regardless of caller argument order.
+// not_related_pairs and the queue store each pair once, as (lo, hi).
 func canonicalPair(a, b int64) (int64, int64) {
 	if a < b {
 		return a, b
@@ -107,49 +85,69 @@ func canonicalPair(a, b int64) (int64, int64) {
 
 func (s *Service) inWriteTx(work func(*sql.Tx) error) error { return db.InWriteTx(s.db.Write, work) }
 
-// addGroupRelation enrols a and b in a group of the given kind in a
-// single transaction. The other kind's group state is left untouched: a
-// pair carries at most one relation type, so making a and b duplicates
-// must not also enrol them as alternates of each other (which folding
-// their alt groups together would do).
+// Leaves the other kind's groups alone: a pair carries one relation type,
+// and folding those too would give it two.
 func (s *Service) addGroupRelation(a, b int64, label string, cfg groupMerge) error {
 	if a == b {
 		return ErrSelfRelation
 	}
-	return s.inWriteTx(func(tx *sql.Tx) error {
-		if err := pairConflictTx(tx, a, b, label); err != nil {
-			return err
-		}
-		if err := mergeIntoGroupTx(tx, a, b, cfg); err != nil {
-			return err
-		}
-		return pruneQueueForGroupTx(tx, cfg.membersTbl, a)
-	})
+	return s.inWriteTx(func(tx *sql.Tx) error { return addGroupRelationTx(tx, a, b, label, cfg) })
 }
 
-// AddDuplicate marks images a and b as duplicates.
+func addGroupRelationTx(tx *sql.Tx, a, b int64, label string, cfg groupMerge) error {
+	if err := pairConflictTx(tx, a, b, label); err != nil {
+		return err
+	}
+	sideA, err := groupSideTx(tx, cfg.membersTbl, a)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(sideA, b) {
+		sideB, err := groupSideTx(tx, cfg.membersTbl, b)
+		if err != nil {
+			return err
+		}
+		if err := crossConflictTx(tx, sideA, sideB, label); err != nil {
+			return err
+		}
+	}
+	if err := mergeIntoGroupTx(tx, a, b, cfg); err != nil {
+		return err
+	}
+	return pruneQueueForGroupTx(tx, cfg.membersTbl, a)
+}
+
+// AddDuplicate makes a the original when it creates a group; an existing
+// group keeps its own.
 func (s *Service) AddDuplicate(a, b int64) error {
 	return s.addGroupRelation(a, b, "duplicate", dupGroupMerge)
 }
 
-// AddAlternate marks images a and b as alternates.
+// AddDuplicateOf never leaves dup as its group's original, but keeps an
+// original the group already had among the others.
+func (s *Service) AddDuplicateOf(original, dup int64) error {
+	if original == dup {
+		return ErrSelfRelation
+	}
+	return s.inWriteTx(func(tx *sql.Tx) error {
+		if err := addGroupRelationTx(tx, original, dup, "duplicate", dupGroupMerge); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`UPDATE dup_groups SET original_image_id = ? WHERE original_image_id = ?`, original, dup)
+		return err
+	})
+}
+
 func (s *Service) AddAlternate(a, b int64) error {
 	return s.addGroupRelation(a, b, "alternate", altGroupMerge)
 }
 
-// MaxVersionChainDepth is the maximum edge depth of a version chain or
-// derivative tree, enforced by Add*Edge, and the walk budget of every
-// depth-capped traversal here and in the web renderers. Enforcing it at
-// add time is what lets those walkers trust that a capped walk covers
-// the whole component. Mirrors the implications walker's depth budget.
+// MaxVersionChainDepth is enforced when an edge is added, so a walk
+// capped at it covers the whole chain or tree.
 const MaxVersionChainDepth = 16
 
-// ChainPath walks the single-parent chain in table upward from start,
-// reading selectCol via whereCol, and returns the nodes above it
-// nearest-first (empty when start has none). version_edges makes the
-// read side a primary key, so every step is a point seek onto at most
-// one row. Depth-capped so a malformed cycle in the data can't spin; q
-// is a transaction or the read pool.
+// ChainPath returns the nodes past start, nearest first. It follows one
+// row per step, so whereCol must be unique in table.
 func ChainPath(q db.Querier, table, selectCol, whereCol string, start int64) ([]int64, error) {
 	var path []int64
 	cur := start
@@ -167,9 +165,7 @@ func ChainPath(q db.Querier, table, selectCol, whereCol string, start int64) ([]
 	return path, nil
 }
 
-// chainRoot is the top of the chain above start, or start itself when it
-// has none.
-func chainRoot(q db.Querier, table, parentCol, childCol string, start int64) (int64, error) {
+func ChainRoot(q db.Querier, table, parentCol, childCol string, start int64) (int64, error) {
 	path, err := ChainPath(q, table, parentCol, childCol, start)
 	if err != nil {
 		return 0, err
@@ -180,7 +176,6 @@ func chainRoot(q db.Querier, table, parentCol, childCol string, start int64) (in
 	return path[len(path)-1], nil
 }
 
-// chainReachesTx reports whether target sits anywhere above start.
 func chainReachesTx(tx *sql.Tx, table, parentCol, childCol string, start, target int64) (bool, error) {
 	above, _, err := chainSpan(tx, table, parentCol, childCol, start)
 	if err != nil {
@@ -189,9 +184,6 @@ func chainReachesTx(tx *sql.Tx, table, parentCol, childCol string, start, target
 	return slices.Contains(above[1:], target), nil
 }
 
-// chainRelatesTx reports whether one of a and b sits above the other in
-// the table's edges, any number of steps apart. The pair carries no
-// orientation, so both directions are walked.
 func chainRelatesTx(tx *sql.Tx, table, parentCol, childCol string, a, b int64) (bool, error) {
 	if up, err := chainReachesTx(tx, table, parentCol, childCol, a, b); err != nil || up {
 		return up, err
@@ -199,21 +191,14 @@ func chainRelatesTx(tx *sql.Tx, table, parentCol, childCol string, a, b int64) (
 	return chainReachesTx(tx, table, parentCol, childCol, b, a)
 }
 
-// chainDepthTx counts the levels in table on one side of start: selecting
-// parentCol via childCol counts ancestors, the reverse counts
-// descendants. Capped at MaxVersionChainDepth like the other walks; the
-// callers only need to know whether the joined chain would exceed it.
+// Saturates at MaxVersionChainDepth, which is all the depth check needs.
 func chainDepthTx(tx *sql.Tx, table, selectCol, whereCol string, start int64) (int, error) {
 	_, levels, err := chainSpan(tx, table, selectCol, whereCol, start)
 	return levels, err
 }
 
-// chainSpan collects start plus everything reachable from it through
-// selectCol/whereCol: the ancestors when the columns read upward, the
-// descendants when they read downward. Level-capped like the other
-// walks, and deduplicated - a derivative names several sources, so
-// without the visited set two paths onto one image would enqueue it
-// once per path and the frontier would double at every shared level.
+// The visited set matters: a derivative names several sources, and
+// without it the frontier doubles at every shared level.
 func chainSpan(q db.Querier, table, selectCol, whereCol string, start int64) ([]int64, int, error) {
 	span := []int64{start}
 	seen := map[int64]bool{start: true}
@@ -245,10 +230,8 @@ func chainSpan(q db.Querier, table, selectCol, whereCol string, start int64) ([]
 	return span, levels, nil
 }
 
-// derivativeComponent collects every image joined to start by derivative
-// edges in either direction. A derivative can name several sources, so
-// the graph has no single root to walk up to; the visited set is what
-// bounds the walk.
+// Uncapped: several sources per derivative mean no single root, and the
+// visited set bounds the walk.
 func derivativeComponent(q db.Querier, start int64) ([]int64, error) {
 	members := []int64{start}
 	seen := map[int64]bool{start: true}
@@ -273,10 +256,6 @@ func derivativeComponent(q db.Querier, start int64) ([]int64, error) {
 	return members, nil
 }
 
-// DerivativeComponent returns every image joined to imageID by derivative
-// edges in either direction, the walk order it was reached in. Nil when the
-// image sits on no edge, which is what tells a renderer there is nothing to
-// draw.
 func DerivativeComponent(q db.Querier, imageID int64) ([]int64, error) {
 	members, err := derivativeComponent(q, imageID)
 	if err != nil || len(members) < 2 {
@@ -285,24 +264,14 @@ func DerivativeComponent(q db.Querier, imageID int64) ([]int64, error) {
 	return members, nil
 }
 
-// walkToRootTx follows the single-parent chain in table upward from start
-// and returns the root - start itself when it has no parent.
 func walkToRootTx(tx *sql.Tx, table, parentCol, childCol string, start int64) (int64, error) {
-	return chainRoot(tx, table, parentCol, childCol, start)
+	return ChainRoot(tx, table, parentCol, childCol, start)
 }
 
-// edgeSpec is what an add-edge differs in: the table and its two
-// columns, the sentinel a refusal answers with, and the predicate that
-// says the endpoints are already spoken for. The shared body is
-// addEdge, next to the dissolveEdges the two Dissolve methods already
-// share.
 type edgeSpec struct {
 	table, parentCol, childCol string
 	exists                     error
-	// occupied reports whether either endpoint already carries an edge
-	// this one would conflict with. Nil for a kind with no per-side
-	// uniqueness to violate.
-	occupied func(tx *sql.Tx, parent, child int64) (bool, error)
+	occupied                   func(tx *sql.Tx, parent, child int64) (bool, error)
 }
 
 var versionEdge = edgeSpec{
@@ -323,135 +292,129 @@ var derivativeEdge = edgeSpec{
 	exists: ErrDerivativeCycle,
 }
 
-// AddVersionEdge declares child as the newer version of parent. The
-// chain is strict: each image has at most one parent (PK on
-// child_image_id) and at most one child (UNIQUE on parent_image_id), so
-// the only forbidden configurations are (a) child already has a parent,
-// (b) parent already has a child, or (c) adding the edge would close a
-// loop with an existing ancestor chain.
+// AddVersionEdge makes child the newer version of parent. A chain is
+// strict: one parent and one child per image.
 func (s *Service) AddVersionEdge(parent, child int64) error {
 	return s.addEdge(versionEdge, "version", parent, child)
 }
 
-// AddDerivativeEdge declares derivative was made from source. Both
-// sides fan out: a composite names one edge per image it was made
-// from, and a source carries one per image made from it. Refuses only
-// when the edge would close a cycle or push the graph past the depth
-// cap.
+// AddDerivativeEdge records that derivative was made from source; unlike
+// a version chain, both sides fan out.
 func (s *Service) AddDerivativeEdge(source, derivative int64) error {
 	return s.addEdge(derivativeEdge, "derivative", source, derivative)
 }
 
-// addEdge is the body both declarations share. kind names the relation
-// for the cross-kind conflict check.
 func (s *Service) addEdge(spec edgeSpec, kind string, parent, child int64) error {
 	if parent == child {
 		return ErrSelfRelation
 	}
-	return s.inWriteTx(func(tx *sql.Tx) error {
-		if err := pairConflictTx(tx, parent, child, kind); err != nil {
-			return err
-		}
-		prune := func() error {
-			return pruneQueueForChainTx(tx, spec.table, spec.parentCol, spec.childCol, parent, child)
-		}
-		// Idempotent re-add: the same pair already declared is a silent
-		// success so REST retries against a flaky network don't have to
-		// distinguish "first call landed but the response was lost" from a
-		// real cycle / direction conflict. Still prunes: a queue row can
-		// predate the edge.
-		var exact int
-		if err := tx.QueryRow(
-			`SELECT 1 FROM `+spec.table+` WHERE `+spec.childCol+` = ? AND `+spec.parentCol+` = ?`,
-			child, parent,
-		).Scan(&exact); err == nil {
-			return prune()
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if spec.occupied != nil {
-			switch occupied, err := spec.occupied(tx, parent, child); {
-			case err != nil:
-				return err
-			case occupied:
-				return spec.exists
-			}
-		}
-		// Walk parent's own chain upwards; if child is anywhere up there,
-		// the new edge would close a cycle.
-		if reaches, err := chainReachesTx(tx, spec.table, spec.parentCol, spec.childCol, parent, child); err != nil {
-			return err
-		} else if reaches {
-			return spec.exists
-		}
-		// The new edge joins what is above parent to what hangs under
-		// child; the combined depth must stay within the walkers' horizon.
-		up, err := chainDepthTx(tx, spec.table, spec.parentCol, spec.childCol, parent)
-		if err != nil {
-			return err
-		}
-		down, err := chainDepthTx(tx, spec.table, spec.childCol, spec.parentCol, child)
-		if err != nil {
-			return err
-		}
-		if up+down+1 > MaxVersionChainDepth {
-			return ErrChainTooDeep
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO `+spec.table+` (`+spec.childCol+`, `+spec.parentCol+`, created_at) VALUES (?, ?, ?)`,
-			child, parent, nowISO(),
-		); err != nil {
-			return err
-		}
-		return prune()
-	})
+	return s.inWriteTx(func(tx *sql.Tx) error { return addEdgeTx(tx, spec, kind, parent, child) })
 }
 
-// AddNotRelated records the canonicalised pair so it never surfaces in
-// the find-pairs queue again.
+func addEdgeTx(tx *sql.Tx, spec edgeSpec, kind string, parent, child int64) error {
+	if err := pairConflictTx(tx, parent, child, kind); err != nil {
+		return err
+	}
+	prune := func() error {
+		return pruneQueueForChainTx(tx, spec.table, spec.parentCol, spec.childCol, parent, child)
+	}
+	// A re-add succeeds so a retried request cannot read as a
+	// conflict. It still prunes: a queue row can predate the edge.
+	var exact int
+	if err := tx.QueryRow(
+		`SELECT 1 FROM `+spec.table+` WHERE `+spec.childCol+` = ? AND `+spec.parentCol+` = ?`,
+		child, parent,
+	).Scan(&exact); err == nil {
+		return prune()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if spec.occupied != nil {
+		switch occupied, err := spec.occupied(tx, parent, child); {
+		case err != nil:
+			return err
+		case occupied:
+			return spec.exists
+		}
+	}
+	// child already above parent would close a cycle.
+	if reaches, err := chainReachesTx(tx, spec.table, spec.parentCol, spec.childCol, parent, child); err != nil {
+		return err
+	} else if reaches {
+		return spec.exists
+	}
+	// The edge joins parent's ancestors to child's descendants, so
+	// their depths add.
+	up, err := chainDepthTx(tx, spec.table, spec.parentCol, spec.childCol, parent)
+	if err != nil {
+		return err
+	}
+	down, err := chainDepthTx(tx, spec.table, spec.childCol, spec.parentCol, child)
+	if err != nil {
+		return err
+	}
+	if up+down+1 > MaxVersionChainDepth {
+		return ErrChainTooDeep
+	}
+	// The edge puts every ancestor of parent on one path with every
+	// descendant of child.
+	above, _, err := chainSpan(tx, spec.table, spec.parentCol, spec.childCol, parent)
+	if err != nil {
+		return err
+	}
+	below, _, err := chainSpan(tx, spec.table, spec.childCol, spec.parentCol, child)
+	if err != nil {
+		return err
+	}
+	if err := crossConflictTx(tx, above, below, kind); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO `+spec.table+` (`+spec.childCol+`, `+spec.parentCol+`, created_at) VALUES (?, ?, ?)`,
+		child, parent, nowISO(),
+	); err != nil {
+		return err
+	}
+	return prune()
+}
+
 func (s *Service) AddNotRelated(a, b int64) error {
 	if a == b {
 		return ErrSelfRelation
 	}
-	return s.inWriteTx(func(tx *sql.Tx) error {
-		if err := pairConflictTx(tx, a, b, "not_related"); err != nil {
-			return err
-		}
-		lo, hi := canonicalPair(a, b)
-		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO not_related_pairs (a_image_id, b_image_id, created_at) VALUES (?, ?, ?)`,
-			lo, hi, nowISO(),
-		); err != nil {
-			return err
-		}
-		return pruneQueuePairTx(tx, a, b)
-	})
+	return s.inWriteTx(func(tx *sql.Tx) error { return addNotRelatedTx(tx, a, b) })
 }
 
-// RemoveDupMember unlinks one image from its duplicate group. Idempotent:
-// a no-op when the image isn't in a group. If the removal would leave
-// the group with a single member, the group is dissolved. If the removed
-// image was the original, the largest remaining member is promoted.
+func addNotRelatedTx(tx *sql.Tx, a, b int64) error {
+	if err := pairConflictTx(tx, a, b, "not_related"); err != nil {
+		return err
+	}
+	lo, hi := canonicalPair(a, b)
+	if _, err := tx.Exec(
+		`INSERT OR IGNORE INTO not_related_pairs (a_image_id, b_image_id, created_at) VALUES (?, ?, ?)`,
+		lo, hi, nowISO(),
+	); err != nil {
+		return err
+	}
+	return pruneQueuePairTx(tx, a, b)
+}
+
+// RemoveDupMember dissolves a group it would leave with one member, and
+// re-picks the original when the original leaves.
 func (s *Service) RemoveDupMember(imageID int64) error {
 	return s.inWriteTx(func(tx *sql.Tx) error { return removeDupMemberTx(tx, imageID) })
 }
 
-// nextDupOriginalQuery picks a dup group's next original (largest file,
-// then highest id) from the members that are not leaving. %s carries the
-// placeholders for the leaving set - one for a single unlink, the whole
-// chunk when a bulk delete decides the group once. Shared so the unlink
-// preview and the promotion sites stay byte-identical.
+// %s takes the leaving set's placeholders. Shared so the unlink preview
+// names the member the promotion will pick.
 const nextDupOriginalQuery = `SELECT m.image_id FROM dup_group_members m
 	JOIN images i ON i.id = m.image_id
 	WHERE m.group_id = ? AND m.image_id NOT IN (%s)
 	ORDER BY i.file_size DESC, m.image_id DESC
 	LIMIT 1`
 
-// dissolveOrKeepGroupTx resolves imageID's group in memberTable and, when
-// the member leaving would shrink it past viability (<= 2 members), drops
-// the group row - the CASCADE or the caller's member DELETE clears the
-// rest. keep is true when the group survives and gid names it; gid == 0
-// with keep == false means no membership or a dissolved group.
+// When the group is kept, the caller deletes the member row; a dissolved
+// group's rows go by CASCADE.
 func dissolveOrKeepGroupTx(tx *sql.Tx, memberTable, groupTable string, imageID int64) (gid int64, keep bool, err error) {
 	g, err := lookupGroupIDTx(tx, memberTable, imageID)
 	if err != nil || !g.Valid {
@@ -468,8 +431,6 @@ func dissolveOrKeepGroupTx(tx *sql.Tx, memberTable, groupTable string, imageID i
 	return g.Int64, true, nil
 }
 
-// promoteNextOriginalTx re-points a dup group's original at the next best
-// member when leaverID currently holds it.
 func promoteNextOriginalTx(tx *sql.Tx, gid, leaverID int64) error {
 	var current int64
 	if err := tx.QueryRow(`SELECT original_image_id FROM dup_groups WHERE id = ?`, gid).Scan(&current); err != nil {
@@ -498,19 +459,13 @@ func removeDupMemberTx(tx *sql.Tx, imageID int64) error {
 	return err
 }
 
-// DissolveDupGroup drops the entire duplicate group. CASCADE clears
-// every member row. Idempotent.
 func (s *Service) DissolveDupGroup(groupID int64) error {
 	_, err := s.db.Write.Exec(`DELETE FROM dup_groups WHERE id = ?`, groupID)
 	return err
 }
 
-// NextOriginalIfRemoved returns the id removeDupMemberTx would promote
-// to original if `removeID` left `groupID`. Same ORDER BY as the
-// promotion itself so the preview the UI shows the operator matches
-// what the unlink will commit. Returns (0, nil) when the group has
-// fewer than three members - the group dissolves and there is no
-// new original to name.
+// NextOriginalIfRemoved names the member that would replace removeID as
+// original, or 0 when the group would dissolve.
 func (s *Service) NextOriginalIfRemoved(groupID, removeID int64) (int64, error) {
 	var n int
 	if err := s.db.Read.QueryRow(
@@ -529,8 +484,6 @@ func (s *Service) NextOriginalIfRemoved(groupID, removeID int64) (int64, error) 
 	return nextID, nil
 }
 
-// PromoteToOriginal sets imageID as the original of groupID. Errors
-// with ErrNotInGroup when imageID isn't a member of the group.
 func (s *Service) PromoteToOriginal(groupID, imageID int64) error {
 	return s.inWriteTx(func(tx *sql.Tx) error {
 		var n int
@@ -547,8 +500,7 @@ func (s *Service) PromoteToOriginal(groupID, imageID int64) error {
 	})
 }
 
-// RemoveAltMember unlinks one image from its alternate group.
-// Idempotent. Dissolves the group when reduced to a singleton.
+// RemoveAltMember dissolves a group it would leave with one member.
 func (s *Service) RemoveAltMember(imageID int64) error {
 	return s.inWriteTx(func(tx *sql.Tx) error { return removeAltMemberTx(tx, imageID) })
 }
@@ -562,41 +514,46 @@ func removeAltMemberTx(tx *sql.Tx, imageID int64) error {
 	return err
 }
 
-// DissolveAltGroup drops the entire alternate group. CASCADE clears
-// every member row. Idempotent.
 func (s *Service) DissolveAltGroup(groupID int64) error {
 	_, err := s.db.Write.Exec(`DELETE FROM alt_groups WHERE id = ?`, groupID)
 	return err
 }
 
-// MergeAltGroups consolidates N alt groups into one. The lowest id is
-// the survivor; every alt_group_members.group_id pointing at the
-// others is repointed at the survivor; the now-empty alt_groups rows
-// are deleted. Idempotent on a single-group input.
+// MergeAltGroups keeps the lowest group id.
 func (s *Service) MergeAltGroups(groupIDs []int64) error {
 	groupIDs = dedupAndSortInt64(groupIDs)
 	if len(groupIDs) <= 1 {
 		return nil
 	}
-	return s.inWriteTx(func(tx *sql.Tx) error { return mergeAltGroupsTx(tx, groupIDs) })
+	return s.inWriteTx(func(tx *sql.Tx) error {
+		if err := groupsCrossConflictTx(tx, "alt_group_members", groupIDs, "alternate"); err != nil {
+			return err
+		}
+		if err := mergeAltGroupsTx(tx, groupIDs); err != nil {
+			return err
+		}
+		return pruneQueueInGroupTx(tx, "alt_group_members", groupIDs[0])
+	})
 }
 
-// MergeDupGroups consolidates N dup groups into one. The lowest id is
-// the survivor; member rows from the others are repointed; the
-// survivor's original_image_id is taken from the group named by
-// keepOriginalFrom. Pass 0 to keep the survivor's existing original.
-// Idempotent on a single-group input.
+// MergeDupGroups keeps the lowest group id and takes the original from
+// keepOriginalFrom's group, or keeps the survivor's when it is 0.
 func (s *Service) MergeDupGroups(groupIDs []int64, keepOriginalFrom int64) error {
 	groupIDs = dedupAndSortInt64(groupIDs)
 	if len(groupIDs) <= 1 {
 		return nil
 	}
-	return s.inWriteTx(func(tx *sql.Tx) error { return mergeDupGroupsTx(tx, groupIDs, keepOriginalFrom) })
+	return s.inWriteTx(func(tx *sql.Tx) error {
+		if err := groupsCrossConflictTx(tx, "dup_group_members", groupIDs, "duplicate"); err != nil {
+			return err
+		}
+		if err := mergeDupGroupsTx(tx, groupIDs, keepOriginalFrom); err != nil {
+			return err
+		}
+		return pruneQueueInGroupTx(tx, "dup_group_members", groupIDs[0])
+	})
 }
 
-// dedupAndSortInt64 returns the input sorted ascending with duplicates
-// removed. The merge primitives use this so the lowest id is always at
-// index 0 (the survivor) regardless of caller argument order.
 func dedupAndSortInt64(ids []int64) []int64 {
 	if len(ids) == 0 {
 		return nil
@@ -605,8 +562,7 @@ func dedupAndSortInt64(ids []int64) []int64 {
 	return slices.Compact(ids)
 }
 
-// mergeAltGroupsTx implements MergeAltGroups inside an existing
-// transaction. groupIDs must be deduplicated and sorted ascending.
+// groupIDs must be deduplicated and ascending; the first survives.
 func mergeAltGroupsTx(tx *sql.Tx, groupIDs []int64) error {
 	if len(groupIDs) <= 1 {
 		return nil
@@ -626,11 +582,7 @@ func mergeAltGroupsTx(tx *sql.Tx, groupIDs []int64) error {
 	return nil
 }
 
-// mergeDupGroupsTx implements MergeDupGroups inside an existing
-// transaction. groupIDs must be deduplicated and sorted ascending.
-// keepOriginalFrom names which group's original_image_id is copied
-// onto the survivor; 0 (or an id not in groupIDs) means "keep the
-// survivor's existing original".
+// groupIDs must be deduplicated and ascending; the first survives.
 func mergeDupGroupsTx(tx *sql.Tx, groupIDs []int64, keepOriginalFrom int64) error {
 	if len(groupIDs) <= 1 {
 		return nil
@@ -638,8 +590,6 @@ func mergeDupGroupsTx(tx *sql.Tx, groupIDs []int64, keepOriginalFrom int64) erro
 	survivor := groupIDs[0]
 	others := groupIDs[1:]
 	if keepOriginalFrom != 0 && keepOriginalFrom != survivor {
-		// Caller asked to inherit a non-survivor's original. Copy it onto
-		// the survivor row before we delete the source group.
 		if slices.Contains(others, keepOriginalFrom) {
 			var original int64
 			if err := tx.QueryRow(
@@ -667,12 +617,8 @@ func mergeDupGroupsTx(tx *sql.Tx, groupIDs []int64, keepOriginalFrom int64) erro
 	return nil
 }
 
-// RemoveVersionEdge deletes the edge between parent and child if one
-// exists, regardless of which side is which. The schema stores a
-// directed (parent, child) row but the operator-facing UI labels both
-// "earlier" and "later" buttons with the same form, so a hand-crafted
-// post that swaps the sides still drops the edge the operator clicked
-// on. Idempotent on a missing edge.
+// RemoveVersionEdge matches either orientation, so a post with the sides
+// swapped still drops the edge.
 func (s *Service) RemoveVersionEdge(a, b int64) error {
 	_, err := s.db.Write.Exec(
 		`DELETE FROM version_edges
@@ -683,14 +629,8 @@ func (s *Service) RemoveVersionEdge(a, b int64) error {
 	return err
 }
 
-// ReverseVersionEdge swaps the parent/child of the named edge in one
-// transaction so the chain points the other way. Idempotent on a
-// missing edge. The new (child=parent, parent=child) row must not
-// collide with the per-side uniqueness of an adjacent chain entry; if
-// it would (mid-chain reversal), the function returns ErrVersionExists
-// so writeRelationError surfaces the operator-facing "remove the
-// adjacent edge first" message rather than the raw SQLite constraint
-// error.
+// ReverseVersionEdge refuses a mid-chain reversal with ErrVersionExists
+// rather than a raw constraint error.
 func (s *Service) ReverseVersionEdge(parent, child int64) error {
 	if parent == child {
 		return ErrSelfRelation
@@ -705,10 +645,6 @@ func (s *Service) ReverseVersionEdge(parent, child int64) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return nil
 		}
-		// After the delete, the swapped row (parent, child) -> (child, parent)
-		// must not clash with the schema's per-side UNIQUE constraints. Either
-		// side already standing on the new role means an adjacent edge would
-		// block the insert.
 		var blocked int
 		if err := tx.QueryRow(
 			`SELECT EXISTS (
@@ -730,10 +666,8 @@ func (s *Service) ReverseVersionEdge(parent, child int64) error {
 	})
 }
 
-// RemoveDerivativeEdge deletes the edge between the two images if one
-// exists, regardless of which side is the source and which the
-// derivative. A hand-crafted post that swaps the sides still drops the
-// edge the operator clicked on. Idempotent on a missing edge.
+// RemoveDerivativeEdge matches either orientation, so a post with the
+// sides swapped still drops the edge.
 func (s *Service) RemoveDerivativeEdge(a, b int64) error {
 	_, err := s.db.Write.Exec(
 		`DELETE FROM derivative_edges
@@ -744,27 +678,14 @@ func (s *Service) RemoveDerivativeEdge(a, b int64) error {
 	return err
 }
 
-// DissolveVersionChain drops every version_edge in the chain that
-// contains anyMember. Walks up via child_image_id to the root, then
-// down via parent_image_id collecting every member, then DELETEs in
-// one statement using `parent_image_id IN (...) OR child_image_id IN
-// (...)`. Idempotent on an image with no edges. Depth-capped at
-// MaxVersionChainDepth on each side so a malformed cycle can't loop.
 func (s *Service) DissolveVersionChain(anyMember int64) error {
 	return s.dissolveEdges(anyMember, collectVersionChainMembersTx, "version_edges", "parent_image_id", "child_image_id")
 }
 
-// DissolveDerivativeTree drops every derivative_edge joined to
-// anyMember. Collects the component around it, then DELETEs in one
-// statement using `source_image_id IN (...) OR derivative_image_id IN
-// (...)`. Idempotent on an image with no edges.
 func (s *Service) DissolveDerivativeTree(anyMember int64) error {
 	return s.dissolveEdges(anyMember, collectDerivativeTreeMembersTx, "derivative_edges", "source_image_id", "derivative_image_id")
 }
 
-// dissolveEdges is the body the two Dissolve methods share: collect the
-// group anyMember belongs to, then drop every edge with a member on
-// either end. Nothing to do when anyMember sits on no edge.
 func (s *Service) dissolveEdges(
 	anyMember int64,
 	collect func(*sql.Tx, int64) ([]int64, error),
@@ -782,11 +703,6 @@ func (s *Service) dissolveEdges(
 	})
 }
 
-// collectVersionChainMembersTx walks the chain containing anyMember
-// and returns every member id, or nil when anyMember sits on no
-// version edge. Up-walk and down-walk each run at most
-// MaxVersionChainDepth steps so a malformed cycle in the data can't
-// spin indefinitely.
 func collectVersionChainMembersTx(tx *sql.Tx, anyMember int64) ([]int64, error) {
 	var has int
 	if err := tx.QueryRow(
@@ -802,8 +718,7 @@ func collectVersionChainMembersTx(tx *sql.Tx, anyMember int64) ([]int64, error) 
 	if err != nil {
 		return nil, err
 	}
-	// parent_image_id is UNIQUE, so the descent is the same point seek the
-	// upward walk makes, one child per step.
+	// parent_image_id is UNIQUE, so ChainPath can walk down as well.
 	below, err := ChainPath(tx, "version_edges", "child_image_id", "parent_image_id", root)
 	if err != nil {
 		return nil, err
@@ -811,10 +726,6 @@ func collectVersionChainMembersTx(tx *sql.Tx, anyMember int64) ([]int64, error) 
 	return append([]int64{root}, below...), nil
 }
 
-// collectDerivativeTreeMembersTx returns every image joined to
-// anyMember by derivative edges, or nil when it sits on none. Several
-// sources per derivative means several roots, so the walk crosses both
-// columns rather than climbing to one.
 func collectDerivativeTreeMembersTx(tx *sql.Tx, anyMember int64) ([]int64, error) {
 	members, err := derivativeComponent(tx, anyMember)
 	if err != nil || len(members) < 2 {
@@ -823,10 +734,6 @@ func collectDerivativeTreeMembersTx(tx *sql.Tx, anyMember int64) ([]int64, error
 	return members, nil
 }
 
-// deleteEdgesByEndpointsTx removes every row in `table` whose `colA` or
-// `colB` is one of `ids`. Used by the version-chain and derivative-tree
-// dissolve methods to drop every edge between any pair of chain
-// members in one statement.
 func deleteEdgesByEndpointsTx(tx *sql.Tx, table, colA, colB string, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
@@ -838,11 +745,8 @@ func deleteEdgesByEndpointsTx(tx *sql.Tx, table, colA, colB string, ids []int64)
 	return err
 }
 
-// ReverseDerivativeEdge swaps the source and derivative sides of the
-// named edge in one transaction. Idempotent on a missing edge. When
-// another path still leads from the derivative down to the source, the
-// swapped row would close a loop and the function returns
-// ErrDerivativeCycle.
+// ReverseDerivativeEdge refuses with ErrDerivativeCycle when source still
+// reaches derivative through another path.
 func (s *Service) ReverseDerivativeEdge(source, derivative int64) error {
 	if source == derivative {
 		return ErrSelfRelation
@@ -872,11 +776,8 @@ func (s *Service) ReverseDerivativeEdge(source, derivative int64) error {
 	})
 }
 
-// RemoveNotRelated forgets a previously-rejected pair so it becomes
-// eligible to resurface in find-pairs again. Idempotent. Both
-// orientations go: the writers here canonicalise, but a restored
-// document can carry the row either way round and a survivor would keep
-// the pair out of the queue with nothing to show for it.
+// RemoveNotRelated drops both orientations: a restored document can carry
+// the row either way round.
 func (s *Service) RemoveNotRelated(a, b int64) error {
 	_, err := s.db.Write.Exec(
 		`DELETE FROM not_related_pairs
@@ -886,10 +787,8 @@ func (s *Service) RemoveNotRelated(a, b int64) error {
 	return err
 }
 
-// QueueForReview puts a pair back on the find-pairs queue at distance 0,
-// keeping any existing row at its real distance. The source is the
-// operator asking to see it again, not a detector: claiming a phash match
-// that never happened would misread on the session card.
+// QueueForReview files the pair as SourceReview so the card claims no
+// phash match; a row already queued keeps its distance.
 func (s *Service) QueueForReview(a, b int64) error {
 	lo, hi := canonicalPair(a, b)
 	_, err := s.db.Write.Exec(
@@ -900,9 +799,6 @@ func (s *Service) QueueForReview(a, b int64) error {
 	return err
 }
 
-// ResetSkipped clears skipped_at on every queued pair so previously
-// skipped ones surface again at the front of the queue, and reports how
-// many it freed.
 func (s *Service) ResetSkipped(ctx context.Context) (int64, error) {
 	res, err := s.db.Write.ExecContext(ctx,
 		`UPDATE potential_relation_pairs SET skipped_at = NULL WHERE skipped_at IS NOT NULL`)
@@ -913,101 +809,111 @@ func (s *Service) ResetSkipped(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
-// ClearVersionEdgeConflictsFor drops only the version_edge rows that
-// would block an AddVersionEdge(parent, child) insert: the row where
-// `child` is already a child (second parent for it) and the row where
-// `parent` is already a parent (second child for it). Edges between
-// either endpoint and a third image that don't violate the per-row
-// uniqueness keep standing, so the operator's "Replace existing
-// version edge" click only sacrifices the directly-conflicting links
-// and the rest of the chain stays intact.
-func (s *Service) ClearVersionEdgeConflictsFor(parent, child int64) error {
-	_, err := s.db.Write.Exec(
-		`DELETE FROM version_edges WHERE child_image_id = ? OR parent_image_id = ?`,
-		child, parent,
-	)
-	return err
+var overwriteRelationTx = map[string]func(tx *sql.Tx, a, b int64) error{
+	"duplicate": func(tx *sql.Tx, a, b int64) error {
+		return addGroupRelationTx(tx, a, b, "duplicate", dupGroupMerge)
+	},
+	"alternate": func(tx *sql.Tx, a, b int64) error {
+		return addGroupRelationTx(tx, a, b, "alternate", altGroupMerge)
+	},
+	"version": func(tx *sql.Tx, a, b int64) error {
+		// Only a's child edge and b's parent edge block the insert; the
+		// rest of both chains stays.
+		if _, err := tx.Exec(
+			`DELETE FROM version_edges WHERE child_image_id = ? OR parent_image_id = ?`, b, a,
+		); err != nil {
+			return err
+		}
+		return addEdgeTx(tx, versionEdge, "version", a, b)
+	},
+	"derivative": func(tx *sql.Tx, a, b int64) error {
+		return addEdgeTx(tx, derivativeEdge, "derivative", a, b)
+	},
+	"not_related": addNotRelatedTx,
 }
 
-// ClearBetween drops every relation row that connects a and b, in one
-// transaction. Group-shaped relations (duplicate, alternate) keep the
-// rest of the group intact - only b's membership goes if the two
-// shared a group. Used by the detail-page "Overwrite" affordance so a
-// follow-up Add* succeeds without first asking the operator to unlink
-// the previous relation by hand.
-func (s *Service) ClearBetween(a, b int64) error {
+// Overwrite replaces whatever relates a and b with kind in one
+// transaction, so a refused add leaves the old relation in place.
+func (s *Service) Overwrite(kind string, a, b int64) error {
+	add, ok := overwriteRelationTx[kind]
+	if !ok {
+		return fmt.Errorf("relations: unknown kind %q", kind)
+	}
 	if a == b {
 		return ErrSelfRelation
 	}
 	return s.inWriteTx(func(tx *sql.Tx) error {
-		if share, err := pairShareGroupTx(tx, "dup_group_members", a, b); err != nil {
-			return err
-		} else if share {
-			if err := removeDupMemberTx(tx, b); err != nil {
-				return err
-			}
-		}
-		if share, err := pairShareGroupTx(tx, "alt_group_members", a, b); err != nil {
-			return err
-		} else if share {
-			if err := removeAltMemberTx(tx, b); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(
-			`DELETE FROM version_edges WHERE (child_image_id = ? AND parent_image_id = ?) OR (child_image_id = ? AND parent_image_id = ?)`,
-			a, b, b, a,
-		); err != nil {
+		if err := clearBetweenTx(tx, a, b); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(
-			`DELETE FROM derivative_edges WHERE (derivative_image_id = ? AND source_image_id = ?) OR (derivative_image_id = ? AND source_image_id = ?)`,
-			a, b, b, a,
-		); err != nil {
-			return err
-		}
-		lo, hi := canonicalPair(a, b)
-		_, err := tx.Exec(`DELETE FROM not_related_pairs WHERE a_image_id = ? AND b_image_id = ?`, lo, hi)
-		return err
+		return add(tx, a, b)
 	})
 }
 
-// CopyTagsFromDuplicatesToOriginal inserts every image_tag carried by
-// a non-original member of groupID onto the original. Rating tags are
-// excluded (the rating system has highest-wins semantics, so a copy
-// would silently bump the original's level). INSERT OR IGNORE makes
-// the operation idempotent. Returns the count of newly added rows
-// across the group. Runs in one transaction so the per-tag usage_count
-// refresh stays consistent.
+// b leaves a group the two share; the rest of the group stays.
+func clearBetweenTx(tx *sql.Tx, a, b int64) error {
+	if share, err := pairShareGroupTx(tx, "dup_group_members", a, b); err != nil {
+		return err
+	} else if share {
+		if err := removeDupMemberTx(tx, b); err != nil {
+			return err
+		}
+	}
+	if share, err := pairShareGroupTx(tx, "alt_group_members", a, b); err != nil {
+		return err
+	} else if share {
+		if err := removeAltMemberTx(tx, b); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM version_edges WHERE (child_image_id = ? AND parent_image_id = ?) OR (child_image_id = ? AND parent_image_id = ?)`,
+		a, b, b, a,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM derivative_edges WHERE (derivative_image_id = ? AND source_image_id = ?) OR (derivative_image_id = ? AND source_image_id = ?)`,
+		a, b, b, a,
+	); err != nil {
+		return err
+	}
+	lo, hi := canonicalPair(a, b)
+	_, err := tx.Exec(`DELETE FROM not_related_pairs WHERE a_image_id = ? AND b_image_id = ?`, lo, hi)
+	return err
+}
+
+// CopyTagsFromDuplicatesToOriginal skips rating tags: ratings are
+// highest-wins, so a copy would raise the original's. Implied rows are
+// left to the fan-out of the tags that imply them.
 func (s *Service) CopyTagsFromDuplicatesToOriginal(groupID int64) (int, error) {
-	var added int64
+	var added int
 	err := s.inWriteTx(func(tx *sql.Tx) error {
 		var original int64
 		if err := tx.QueryRow(`SELECT original_image_id FROM dup_groups WHERE id = ?`, groupID).Scan(&original); err != nil {
 			return err
 		}
-		// Find the rating category id once; we use it to exclude rating
-		// tags from the copy (highest-wins semantics handles them already).
 		var ratingCatID sql.NullInt64
 		if err := tx.QueryRow(`SELECT id FROM tag_categories WHERE name = 'rating'`).Scan(&ratingCatID); err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		res, err := tx.Exec(`
-			INSERT OR IGNORE INTO image_tags (image_id, tag_id, is_auto, is_implied, confidence, tagger_name, created_at)
-			SELECT ?, it.tag_id, 0, 0, NULL, NULL, ?
+		ids, err := db.QueryIDs(tx, `
+			SELECT DISTINCT it.tag_id
 			FROM image_tags it
 			JOIN dup_group_members m ON m.image_id = it.image_id
 			LEFT JOIN tags t ON t.id = it.tag_id
-			WHERE m.group_id = ? AND m.image_id != ?
-			  AND (? IS NULL OR t.category_id != ?)`,
-			original, nowISO(), groupID, original, ratingCatID, ratingCatID,
+			WHERE m.group_id = ? AND m.image_id != ? AND it.is_implied = 0
+			  AND (? IS NULL OR t.category_id != ?)
+			  AND NOT EXISTS (SELECT 1 FROM image_tags o WHERE o.image_id = ? AND o.tag_id = it.tag_id)`,
+			groupID, original, ratingCatID, ratingCatID, original,
 		)
-		if err != nil {
+		if err != nil || len(ids) == 0 {
 			return err
 		}
-		added, _ = res.RowsAffected()
-		// Recount usage_count for the copied tags from non-missing images,
-		// the same convention RecalcDB uses; the INSERT above doesn't touch it.
+		// As the operator's own add: a user row and ledger claim, with the fan-out.
+		if added, _, err = tags.New(s.db).BatchAddTagsTx(tx, []int64{original}, ids); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`
 			UPDATE tags SET usage_count = (
 				SELECT COUNT(*) FROM image_tags it
@@ -1023,28 +929,17 @@ func (s *Service) CopyTagsFromDuplicatesToOriginal(groupID int64) (int, error) {
 		}
 		return nil
 	})
-	return int(added), err
+	return added, err
 }
 
-// OnImageDeleteTx fixes up dup_groups.original_image_id (no FK CASCADE)
-// and dissolves singleton groups so the caller's subsequent
-// `DELETE FROM images WHERE id = ?` doesn't fail on the NOT NULL FK.
-// Runs on a caller-held transaction so the image-delete path commits
-// the graph fixups alongside the row delete; the FK CASCADE on the
-// member tables takes care of the dependent rows. Also drops the image
-// from this gallery's in-memory BK-tree (if one is built) so subsequent
-// phash queries don't surface a stale id. That drop has no undo, but it
-// is rebuildable and the row it describes is on its way out either way.
+// OnImageDeleteTx must run in the delete's transaction before the images
+// row goes: dup_groups.original_image_id has no CASCADE.
 func (s *Service) OnImageDeleteTx(tx *sql.Tx, imageID int64) error {
 	return s.OnImagesDeleteTx(tx, []int64{imageID})
 }
 
-// OnImagesDeleteTx is OnImageDeleteTx for a whole delete chunk. Looping
-// the per-image form here would not do: with two members of a
-// three-member group in the same chunk it can promote a member the
-// chunk is about to remove, and the FK on dup_groups.original_image_id
-// then fails the whole transaction. Each touched group is decided once
-// against the membership that survives the chunk.
+// OnImagesDeleteTx decides each group once against the chunk's survivors;
+// per image it could promote a member the chunk also deletes.
 func (s *Service) OnImagesDeleteTx(tx *sql.Tx, imageIDs []int64) error {
 	if len(imageIDs) == 0 {
 		return nil
@@ -1063,10 +958,6 @@ func (s *Service) OnImagesDeleteTx(tx *sql.Tx, imageIDs []int64) error {
 	return nil
 }
 
-// groupsOnBatchDeleteTx drops every touched group the chunk would leave
-// with fewer than two members and, for dup groups, re-points an original
-// that is leaving at the best survivor. The membership rows themselves
-// go with the caller's DELETE through the FK CASCADE.
 func groupsOnBatchDeleteTx(tx *sql.Tx, memberTbl, groupTbl string, imageIDs []int64, promoteOriginal bool) error {
 	placeholders, args := db.InPlaceholders(imageIDs)
 	groupIDs, err := db.QueryIDs(tx,
@@ -1110,9 +1001,6 @@ func groupsOnBatchDeleteTx(tx *sql.Tx, memberTbl, groupTbl string, imageIDs []in
 	return nil
 }
 
-// lookupGroupIDTx returns the dup_group_members.group_id or
-// alt_group_members.group_id for imageID. sql.NullInt64{Valid:false}
-// when the image isn't currently in any group of that type.
 func lookupGroupIDTx(tx *sql.Tx, table string, imageID int64) (sql.NullInt64, error) {
 	var gid sql.NullInt64
 	q := fmt.Sprintf(`SELECT group_id FROM %s WHERE image_id = ?`, table)
@@ -1126,10 +1014,6 @@ func lookupGroupIDTx(tx *sql.Tx, table string, imageID int64) (sql.NullInt64, er
 	return gid, nil
 }
 
-// pairHasOtherRelationTx reports whether the pair already carries any
-// declared relation outside of `ignore` ("duplicate", "alternate",
-// "version", "derivative", "not_related"). Used by every Add* method
-// to short-circuit before mutating - a pair carries at most one type.
 func pairHasOtherRelationTx(tx *sql.Tx, a, b int64, ignore string) (bool, error) {
 	for _, p := range pairProbes {
 		if p.kind == ignore {
@@ -1143,9 +1027,7 @@ func pairHasOtherRelationTx(tx *sql.Tx, a, b int64, ignore string) (bool, error)
 	return false, nil
 }
 
-// pairProbes is one existence test per relation kind, in the order
-// pairHasOtherRelationTx runs them. The order is not load-bearing - the
-// answer is a disjunction - but the cheap group joins come first.
+// The cheap group joins go first; the order does not change the answer.
 var pairProbes = []struct {
 	kind  string
 	probe func(*sql.Tx, int64, int64) (bool, error)
@@ -1172,10 +1054,7 @@ var pairProbes = []struct {
 	}},
 }
 
-// pairEdgeExistsTx reports whether an edge table holds the pair, in either
-// orientation. The table and both column names are compile-time constants,
-// never input, and the OR covers both directions so which column is named
-// first does not change the answer.
+// table and the column names are constants, never input.
 func pairEdgeExistsTx(tx *sql.Tx, table, colA, colB string, a, b int64) (bool, error) {
 	var n int
 	err := tx.QueryRow(fmt.Sprintf(
@@ -1184,10 +1063,6 @@ func pairEdgeExistsTx(tx *sql.Tx, table, colA, colB string, a, b int64) (bool, e
 	return n > 0, err
 }
 
-// pairChainRelatedTx reports whether a and b already sit on one
-// root-to-leaf path of a version chain or a derivative tree. The edge
-// tables hold single steps, so testing them for a direct edge alone
-// reads two images three steps apart as strangers.
 func pairChainRelatedTx(tx *sql.Tx, a, b int64, ignore string) (bool, error) {
 	if ignore != "version" {
 		ok, err := chainRelatesTx(tx, "version_edges", "parent_image_id", "child_image_id", a, b)
@@ -1201,11 +1076,8 @@ func pairChainRelatedTx(tx *sql.Tx, a, b int64, ignore string) (bool, error) {
 	return chainRelatesTx(tx, "derivative_edges", "source_image_id", "derivative_image_id", a, b)
 }
 
-// pairConflictTx returns the error declaring `label` on the pair would
-// violate, or nil when the pair is free. A direct relation is
-// overwritable and reports ErrRelationConflict; a link through a third
-// image leaves nothing between the two to drop, so it reports
-// ErrIndirectRelation and the Overwrite affordance stays hidden.
+// A link through a third image has no edge between the two to overwrite,
+// hence ErrIndirectRelation.
 func pairConflictTx(tx *sql.Tx, a, b int64, label string) error {
 	if conflict, err := pairHasOtherRelationTx(tx, a, b, label); err != nil {
 		return err
@@ -1220,9 +1092,94 @@ func pairConflictTx(tx *sql.Tx, a, b int64, label string) error {
 	return nil
 }
 
-// pairSettledTx reports whether the pair already has an answer: a
-// declared relation, a not-related mark, or a place on one root-to-leaf
-// path. What the detectors check before queueing a candidate.
+// Relating every image of left to every image of right as label must not
+// give a pair another kind of relation too.
+func crossConflictTx(tx *sql.Tx, left, right []int64, label string) error {
+	lIn, lArgs := db.InPlaceholders(left)
+	rIn, rArgs := db.InPlaceholders(right)
+	sharedGroup := func(table string) string {
+		return `SELECT m1.image_id, m2.image_id FROM ` + table + ` m1
+		        JOIN ` + table + ` m2 ON m1.group_id = m2.group_id
+		        WHERE m1.image_id IN (` + lIn + `) AND m2.image_id IN (` + rIn + `)`
+	}
+	probes := []struct {
+		kind, query string
+		args        []any
+	}{
+		{"duplicate", sharedGroup("dup_group_members"), slices.Concat(lArgs, rArgs)},
+		{"alternate", sharedGroup("alt_group_members"), slices.Concat(lArgs, rArgs)},
+		{"not_related", `SELECT a_image_id, b_image_id FROM not_related_pairs
+		                 WHERE (a_image_id IN (` + lIn + `) AND b_image_id IN (` + rIn + `))
+		                    OR (a_image_id IN (` + rIn + `) AND b_image_id IN (` + lIn + `))`,
+			slices.Concat(lArgs, rArgs, rArgs, lArgs)},
+	}
+	for _, p := range probes {
+		if p.kind == label {
+			continue
+		}
+		var x, y int64
+		switch err := tx.QueryRow(p.query+` LIMIT 1`, p.args...).Scan(&x, &y); {
+		case err == nil:
+			return &CrossConflictError{A: x, B: y}
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+	}
+	// A chain relates its members through other images too, direct edges
+	// included.
+	for _, c := range []struct{ kind, table, parentCol, childCol string }{
+		{"version", "version_edges", "parent_image_id", "child_image_id"},
+		{"derivative", "derivative_edges", "source_image_id", "derivative_image_id"},
+	} {
+		if c.kind == label {
+			continue
+		}
+		for _, x := range left {
+			above, _, err := chainSpan(tx, c.table, c.parentCol, c.childCol, x)
+			if err != nil {
+				return err
+			}
+			below, _, err := chainSpan(tx, c.table, c.childCol, c.parentCol, x)
+			if err != nil {
+				return err
+			}
+			for _, y := range slices.Concat(above[1:], below[1:]) {
+				if slices.Contains(right, y) {
+					return &CrossConflictError{A: x, B: y}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func groupsCrossConflictTx(tx *sql.Tx, table string, groupIDs []int64, label string) error {
+	sides := make([][]int64, len(groupIDs))
+	for i, gid := range groupIDs {
+		members, err := db.QueryIDs(tx, `SELECT image_id FROM `+table+` WHERE group_id = ?`, gid)
+		if err != nil {
+			return err
+		}
+		sides[i] = members
+	}
+	for i := range sides {
+		for j := i + 1; j < len(sides); j++ {
+			if err := crossConflictTx(tx, sides[i], sides[j], label); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func groupSideTx(tx *sql.Tx, table string, imageID int64) ([]int64, error) {
+	gid, err := lookupGroupIDTx(tx, table, imageID)
+	if err != nil || !gid.Valid {
+		return []int64{imageID}, err
+	}
+	return db.QueryIDs(tx, `SELECT image_id FROM `+table+` WHERE group_id = ?`, gid.Int64)
+}
+
 func pairSettledTx(tx *sql.Tx, a, b int64) (bool, error) {
 	if got, err := pairHasOtherRelationTx(tx, a, b, ""); err != nil || got {
 		return got, err
@@ -1230,35 +1187,27 @@ func pairSettledTx(tx *sql.Tx, a, b int64) (bool, error) {
 	return pairChainRelatedTx(tx, a, b, "")
 }
 
-// pruneQueueForGroupTx deletes potential_relation_pairs rows whose
-// endpoints are both members of the group that `anchor` now belongs
-// to. Resolving one pair in a group can make other queue rows
-// redundant (their endpoints land in the same group via the merge);
-// this sweeps them so the session UI never asks the operator to
-// re-decide a pair that is already inside a declared group. `anchor`
-// being a non-member is a quiet no-op.
+// A merge can settle queued pairs beyond a and b, so every pair inside
+// anchor's group goes.
 func pruneQueueForGroupTx(tx *sql.Tx, table string, anchor int64) error {
 	gid, err := lookupGroupIDTx(tx, table, anchor)
-	if err != nil {
+	if err != nil || !gid.Valid {
 		return err
 	}
-	if !gid.Valid {
-		return nil
-	}
+	return pruneQueueInGroupTx(tx, table, gid.Int64)
+}
+
+func pruneQueueInGroupTx(tx *sql.Tx, table string, gid int64) error {
 	q := fmt.Sprintf(`
 		DELETE FROM potential_relation_pairs
 		WHERE a_image_id IN (SELECT image_id FROM %s WHERE group_id = ?)
 		  AND b_image_id IN (SELECT image_id FROM %s WHERE group_id = ?)`, table, table)
-	_, err = tx.Exec(q, gid.Int64, gid.Int64)
+	_, err := tx.Exec(q, gid, gid)
 	return err
 }
 
-// pruneQueueForChainTx drops the queue rows a new edge answers: every
-// pair joining one of parent's ancestors (parent included) to a node in
-// child's subtree (child included), since those two sets now sit on one
-// root-to-leaf path. Clearing only the edge's own pair left the rest
-// queued, and the session went on asking about images the tree already
-// related.
+// The edge relates every ancestor of parent to every descendant of child,
+// so all those pairs go.
 func pruneQueueForChainTx(tx *sql.Tx, table, parentCol, childCol string, parent, child int64) error {
 	above, _, err := chainSpan(tx, table, parentCol, childCol, parent)
 	if err != nil {
@@ -1278,11 +1227,6 @@ func pruneQueueForChainTx(tx *sql.Tx, table, parentCol, childCol string, parent,
 	return err
 }
 
-// pruneQueuePairTx drops the canonical queue row for a pair that just
-// gained an edge relation. Used by the rejection, which relates nothing
-// beyond the two images; the edge adds sweep their whole path through
-// pruneQueueForChainTx and the group methods through
-// pruneQueueForGroupTx.
 func pruneQueuePairTx(tx *sql.Tx, a, b int64) error {
 	lo, hi := canonicalPair(a, b)
 	_, err := tx.Exec(
@@ -1291,8 +1235,6 @@ func pruneQueuePairTx(tx *sql.Tx, a, b int64) error {
 	return err
 }
 
-// pairShareGroupTx reports whether a and b sit in the same group of
-// the given membership table (dup_group_members or alt_group_members).
 func pairShareGroupTx(tx *sql.Tx, table string, a, b int64) (bool, error) {
 	q := fmt.Sprintf(`
 		SELECT COUNT(*) FROM %s m1
@@ -1305,21 +1247,12 @@ func pairShareGroupTx(tx *sql.Tx, table string, a, b int64) (bool, error) {
 	return n > 0, nil
 }
 
-// groupMerge names the per-kind pieces of the group merge: the
-// membership table, how a fresh group row is created (dup_groups carries
-// original_image_id, alt_groups does not), and how two existing groups
-// are folded together.
 type groupMerge struct {
 	membersTbl  string
 	insertGroup func(tx *sql.Tx, original int64) (int64, error)
 	mergeGroups func(tx *sql.Tx, ids []int64) error
 }
 
-// dupGroupMerge folds duplicates. The caller has already decided which
-// side is the original by passing it first; the session UI puts the
-// bigger-filesize image in slot `a` by default. Existing-group cases
-// preserve whichever original is already in place, and the operator can
-// flip it from the browse-groups Merge dialog.
 var dupGroupMerge = groupMerge{
 	membersTbl: "dup_group_members",
 	insertGroup: func(tx *sql.Tx, original int64) (int64, error) {
@@ -1333,7 +1266,6 @@ var dupGroupMerge = groupMerge{
 	mergeGroups: func(tx *sql.Tx, ids []int64) error { return mergeDupGroupsTx(tx, ids, 0) },
 }
 
-// altGroupMerge folds variants. Alt groups carry no original.
 var altGroupMerge = groupMerge{
 	membersTbl: "alt_group_members",
 	insertGroup: func(tx *sql.Tx, _ int64) (int64, error) {
@@ -1344,9 +1276,6 @@ var altGroupMerge = groupMerge{
 	mergeGroups: mergeAltGroupsTx,
 }
 
-// mergeIntoGroupTx is the five-case group merge: both singletons, one
-// existing member, the other existing member, same group already
-// (idempotent no-op), and two different groups.
 func mergeIntoGroupTx(tx *sql.Tx, a, b int64, cfg groupMerge) error {
 	groupA, err := lookupGroupIDTx(tx, cfg.membersTbl, a)
 	if err != nil {
@@ -1387,7 +1316,6 @@ func mergeIntoGroupTx(tx *sql.Tx, a, b int64, cfg groupMerge) error {
 		if hi < lo {
 			lo, hi = hi, lo
 		}
-		// The merge helpers require ascending ids so the lowest survives.
 		return cfg.mergeGroups(tx, []int64{lo, hi})
 	}
 	return nil

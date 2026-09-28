@@ -20,8 +20,6 @@ func init() {
 	})
 }
 
-// blombooruBackup is the relevant subset of the JSON document blombooru
-// emits as `backup.json` at the archive root.
 type blombooruBackup struct {
 	Version int                    `json:"version"`
 	Type    string                 `json:"type"`
@@ -35,8 +33,6 @@ type blombooruBackupMedia struct {
 	ArchivePath string   `json:"archive_path"`
 }
 
-// detectBlombooru: a Blombooru full backup carries `backup.json` at the
-// archive root and at least one entry under `media/`.
 func detectBlombooru(entries []NormalizedEntry) bool {
 	hasBackup, hasMedia := false, false
 	for _, e := range entries {
@@ -53,9 +49,6 @@ func detectBlombooru(entries []NormalizedEntry) bool {
 	return false
 }
 
-// translateBlombooru parses backup.json (mandatory) plus tags.csv
-// (optional, supplies category attribution) and emits the light-shaped
-// manifest plus the media files map.
 func translateBlombooru(entries []NormalizedEntry) (Result, error) {
 	var backupFile, tagsCSV *zip.File
 	media := map[string]*zip.File{}
@@ -91,8 +84,6 @@ func translateBlombooru(entries []NormalizedEntry) (Result, error) {
 
 	out := Result{Files: map[string]*zip.File{}}
 	for _, m := range bb.Media {
-		// archive_path is "media/<filename>"; route the file under the
-		// same basename in the target gallery root.
 		rel := strings.TrimPrefix(m.ArchivePath, "media/")
 		rel = cmp.Or(rel, m.Filename)
 		if rel == "" {
@@ -110,10 +101,6 @@ func translateBlombooru(entries []NormalizedEntry) (Result, error) {
 	return out, nil
 }
 
-// blombooruTagTokens turns a record's plain-string tag list into the
-// `name` / `category:name` token form the apply path expects, using the
-// (tag → category) map built from tags.csv. Tags missing from the map
-// fall through as `general` (no prefix).
 func blombooruTagTokens(names []string, catByTag map[string]string) []string {
 	out := make([]string, 0, len(names))
 	for _, t := range names {
@@ -135,10 +122,8 @@ func blombooruTagTokens(names []string, catByTag map[string]string) []string {
 	return out
 }
 
-// readBlombooruTagsCSV builds a (tag-name → category-name) map from a
-// blombooru tags.csv. Schema: `name, category_id [, ...]`. Best-effort:
-// a missing or malformed file yields an empty map so every tag falls
-// back to general.
+// Rows are name, category_id[, ...]; a malformed row ends the read,
+// keeping the rows before it.
 func readBlombooruTagsCSV(tagsFile *zip.File) (map[string]string, error) {
 	if tagsFile == nil {
 		return map[string]string{}, nil
@@ -171,10 +156,6 @@ func readBlombooruTagsCSV(tagsFile *zip.File) (map[string]string, error) {
 	return out, nil
 }
 
-// blombooruCategoryByID maps the blombooru category enum to monbooru's
-// built-in category names. Anything unrecognised falls through to
-// `general` so a future blombooru schema change degrades gracefully
-// rather than dropping tags.
 func blombooruCategoryByID(id string) string {
 	switch id {
 	case "0":

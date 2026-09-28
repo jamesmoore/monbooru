@@ -10,11 +10,9 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// images.series / series_order mirror one "home" membership so the
-// global order-sort and the adjacency cursor keep riding the scalar
-// columns. The invariant: series != '' iff the image has at least one
-// membership, and when set it equals the home row in image_collections.
-// The helpers below maintain that invariant.
+// images.series and series_order mirror one "home" membership so the
+// order sort and the adjacency cursor can ride scalar columns:
+// series != '' iff the image has a membership, and then names one of them.
 
 func orderValue(order *int) any {
 	if order == nil {
@@ -23,9 +21,6 @@ func orderValue(order *int) any {
 	return *order
 }
 
-// CollectionsForImage returns every membership of imageID, ordered as the
-// detail page renders them: positioned rows first (ascending), then the
-// unordered ones by name.
 func CollectionsForImage(database *db.DB, imageID int64) ([]models.Collection, error) {
 	return db.QueryAll(database.Read, func(rows *sql.Rows) (models.Collection, error) {
 		var c models.Collection
@@ -40,9 +35,6 @@ func CollectionsForImage(database *db.DB, imageID int64) ([]models.Collection, e
 		 ORDER BY position IS NULL, position, name`, imageID)
 }
 
-// AddCollectionMembership upserts a membership (adding it or just updating
-// its position) and keeps the home mirror in step: an image with no home
-// adopts this one; re-setting the home's own position updates the mirror.
 func AddCollectionMembership(database *db.DB, imageID int64, name string, order *int) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -75,8 +67,6 @@ func addMembershipTx(tx *sql.Tx, imageID int64, name string, order *int) error {
 	return err
 }
 
-// RemoveCollectionMembership drops a membership; when it was the home the
-// next membership is promoted (or the mirror cleared if none remain).
 func RemoveCollectionMembership(database *db.DB, imageID int64, name string) error {
 	return db.InWriteTx(database.Write, func(tx *sql.Tx) error {
 		return removeMembershipTx(tx, imageID, name)
@@ -91,9 +81,6 @@ func removeMembershipTx(tx *sql.Tx, imageID int64, name string) error {
 	return rebindHomeTx(tx, imageID, name)
 }
 
-// RenameCollectionMembership relabels imageID's membership from prev to
-// name in one transaction. Split across two writes, a failure on the
-// second leaves the image in neither collection with nothing saying so.
 func RenameCollectionMembership(database *db.DB, imageID int64, prev, name string, order *int) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -107,14 +94,8 @@ func RenameCollectionMembership(database *db.DB, imageID int64, prev, name strin
 	})
 }
 
-// SetHomeCollection points imageID's home at name with the given order,
-// renaming or clearing the previous home and keeping image_collections in
-// sync. Used by the API and ingest, which carry a single collection field.
-// An empty name clears the home, promoting another membership if one is
-// left so the series != "" invariant holds. Pointing the home at a label
-// the image already belongs to promotes that membership in place and
-// leaves the former home as an extra; only relabelling onto a new name
-// (or clearing) drops the old home.
+// SetHomeCollection promotes a name the image already holds and keeps the
+// old home as a membership; a new name, or "", drops the old home.
 func SetHomeCollection(database *db.DB, imageID int64, name string, order *int) error {
 	name = strings.TrimSpace(name)
 	tx, err := database.Write.Begin()
@@ -132,7 +113,7 @@ func SetHomeCollection(database *db.DB, imageID int64, name string, order *int) 
 		switch err := tx.QueryRow(
 			`SELECT 1 FROM image_collections WHERE image_id = ? AND name = ?`, imageID, name).Scan(&x); {
 		case err == nil:
-			relabel = false // target already a member: promote, don't drop the old home
+			relabel = false
 		case !errors.Is(err, sql.ErrNoRows):
 			return err
 		}
@@ -176,9 +157,7 @@ func homeName(tx *sql.Tx, imageID int64) (string, error) {
 	return home.String, nil
 }
 
-// rebindHomeTx repoints the mirror after changedName left the membership
-// set. A no-op unless changedName was the home; then it promotes the next
-// membership or clears the mirror when none remain.
+// Runs after changedName's row is deleted, or it could promote that row again.
 func rebindHomeTx(tx *sql.Tx, imageID int64, changedName string) error {
 	home, err := homeName(tx, imageID)
 	if err != nil {
@@ -208,10 +187,6 @@ func rebindHomeTx(tx *sql.Tx, imageID int64, changedName string) error {
 	return e
 }
 
-// CollectionSummary is one row of the collections management page: a
-// label, its visible member count, and a few members for the preview.
-// FindRelations reports the collection's opt-in to the relations
-// session surfacing pairs among its own members.
 type CollectionSummary struct {
 	Name          string
 	Count         int
@@ -219,18 +194,12 @@ type CollectionSummary struct {
 	Samples       []CollectionSample
 }
 
-// CollectionSample is one preview tile: the image id, its position within the
-// collection (nil when the membership is unordered), and its filename for the
-// reorder dialog's filename mode / tooltip.
 type CollectionSample struct {
 	ID       int64
 	Order    *int
 	Filename string
 }
 
-// collectionFilterWhere returns the substring-match fragment (and its
-// args) for a non-empty name filter against col, empty otherwise so it
-// splices into a WHERE clause without juggling the boundary.
 func collectionFilterWhere(col, nameFilter string) (string, []any) {
 	if nameFilter == "" {
 		return "", nil
@@ -238,19 +207,13 @@ func collectionFilterWhere(col, nameFilter string) (string, []any) {
 	return ` AND ` + col + ` LIKE ? ESCAPE '\'`, []any{"%" + db.EscapeLike(nameFilter) + "%"}
 }
 
-// ListCollections returns one page of collection labels with their
-// visible (non-missing) member counts. sort "name" orders alphabetically;
-// any other value orders by member count descending, name as tiebreaker.
-// Members carrying a tag in excludeIDs (the rating ceiling) drop from the
-// count, so a collection with no visible member left falls off the page.
 func ListCollections(database *db.DB, nameFilter, sort string, limit, offset int, excludeIDs []int64) ([]CollectionSummary, error) {
 	where, filterArgs := collectionFilterWhere("c.name", nameFilter)
 	var query string
 	var args []any
 	if len(excludeIDs) == 0 {
-		// No ceiling: the trigger-maintained per-label counts make the
-		// listing one row per label instead of a walk over every
-		// membership with a per-row visibility probe.
+		// The trigger-maintained counts read one row per label instead of
+		// walking every membership.
 		orderBy := "c.visible_count DESC, c.name ASC"
 		if sort == "name" {
 			orderBy = "c.name ASC"
@@ -262,10 +225,9 @@ func ListCollections(database *db.DB, nameFilter, sort string, limit, offset int
 		 ORDER BY ` + orderBy + ` LIMIT ? OFFSET ?`
 		args = append(filterArgs, limit, offset)
 	} else {
-		// Ceiling active: the stored counts are ceiling-blind, so fall
-		// back to the aggregation. EXISTS visibility (vs a join to
-		// images) lets the GROUP BY stream off idx_image_collections_name
-		// instead of a temp B-tree over every member.
+		// The stored counts are ceiling-blind. EXISTS rather than a join
+		// lets the GROUP BY stream off idx_image_collections_name instead
+		// of temp-sorting every member.
 		exclude, excludeArgs := excludeNotExists("c.image_id", excludeIDs)
 		orderBy := "cnt DESC, c.name ASC"
 		if sort == "name" {
@@ -285,8 +247,6 @@ func ListCollections(database *db.DB, nameFilter, sort string, limit, offset int
 	}, query, args...)
 }
 
-// SetCollectionFindRelations flips a collection's find-relations opt-in.
-// The flag is a bare presence row; disabling just deletes it.
 func SetCollectionFindRelations(database *db.DB, name string, enabled bool) error {
 	if enabled {
 		_, err := database.Write.Exec(
@@ -298,9 +258,6 @@ func SetCollectionFindRelations(database *db.DB, name string, enabled bool) erro
 	return err
 }
 
-// CountCollections returns the number of distinct collection labels with
-// at least one visible member, honoring the same substring filter and the
-// rating ceiling (excludeIDs).
 func CountCollections(database *db.DB, nameFilter string, excludeIDs []int64) (int, error) {
 	var n int
 	if len(excludeIDs) == 0 {
@@ -309,10 +266,8 @@ func CountCollections(database *db.DB, nameFilter string, excludeIDs []int64) (i
 			`SELECT COUNT(*) FROM collection_counts WHERE visible_count > 0`+where, args...).Scan(&n)
 		return n, err
 	}
-	// Ceiling active: enumerate distinct labels off the name index and
-	// keep those with a visible, ceiling-clear member; the per-label
-	// EXISTS short-circuits, so cost tracks the label count, not the
-	// membership count.
+	// The per-label EXISTS stops at the first visible member, so the cost
+	// tracks labels, not memberships.
 	exclude, args := excludeNotExists("c.image_id", excludeIDs)
 	where, filterArgs := collectionFilterWhere("d.name", nameFilter)
 	args = append(args, filterArgs...)
@@ -323,14 +278,9 @@ func CountCollections(database *db.DB, nameFilter string, excludeIDs []int64) (i
 	return n, err
 }
 
-// CollectionSamples returns up to per visible members for each named
-// collection, in reading order (position first with NULLs last, then id).
-// Members above the rating ceiling (excludeIDs) are skipped so the preview
-// matches the listing. The map is keyed by lower-cased label so a single
-// key survives images that stored the same NOCASE label in different cases.
-// One LIMITed query per name: the reading index stops each walk after the
-// first per visible members, where a single ROW_NUMBER window would rank
-// every member of every listed label first.
+// CollectionSamples keys by the lower-cased label: NOCASE labels may be
+// stored in several cases. A LIMITed query per name stops each index walk
+// early, where a ROW_NUMBER window would rank every member.
 func CollectionSamples(database *db.DB, names []string, per int, excludeIDs []int64) (map[string][]CollectionSample, error) {
 	out := make(map[string][]CollectionSample, len(names))
 	if len(names) == 0 || per <= 0 {
@@ -349,9 +299,8 @@ func CollectionSamples(database *db.DB, names []string, per int, excludeIDs []in
 	return out, nil
 }
 
-// CollectionMembers reads one window of name's visible members in reading
-// order, riding idx_image_collections_reading so the LIMIT stops the
-// scan early instead of sorting the whole label.
+// CollectionMembers' ORDER BY matches idx_image_collections_reading, so
+// the LIMIT stops the scan early instead of sorting the whole label.
 func CollectionMembers(database *db.DB, name string, excludeIDs []int64, limit, offset int) ([]CollectionSample, error) {
 	exclude, args := excludeNotExists("i.id", excludeIDs)
 	args = append([]any{name}, args...)
@@ -372,13 +321,8 @@ func CollectionMembers(database *db.DB, name string, excludeIDs []int64, limit, 
 		 ORDER BY c.position IS NULL, c.position, c.image_id LIMIT ? OFFSET ?`, args...)
 }
 
-// ReorderCollection rewrites name's ordering from ids: 1-based positions
-// in slice order, every other membership cleared to unordered. Ids not
-// filed under name are no-ops. The home mirror follows for rows homed on
-// the collection, the same resync shape the rename job uses. A list that
-// fits one chunk (the click-order path, capped at the 200 window) runs in a
-// single atomic transaction; a larger filename sort splits the position
-// writes into 500-id chunks so the write tx stays bounded.
+// ReorderCollection leaves the members missing from ids unordered. Past
+// one chunk the writes are split, so a large reorder is not atomic.
 func ReorderCollection(database *db.DB, name string, ids []int64) error {
 	const chunkSize = 500
 	const clearAll = `UPDATE image_collections SET position = NULL WHERE name = ?`
@@ -427,10 +371,6 @@ func ReorderCollection(database *db.DB, name string, ids []int64) error {
 	})
 }
 
-// SortCollectionByFilename orders every non-missing member of name by filename
-// (natural order over the basename), ceiling-blind over the whole collection
-// rather than just the reorder window, and applies the result through
-// ReorderCollection.
 func SortCollectionByFilename(database *db.DB, name string) error {
 	type member struct {
 		id       int64
@@ -442,7 +382,8 @@ func SortCollectionByFilename(database *db.DB, name string) error {
 		return m, err
 	}, `SELECT c.image_id, basename(i.canonical_path)
 		 FROM image_collections c JOIN images i ON i.id = c.image_id
-		 WHERE c.name = ? AND i.is_missing = 0`, name)
+		 WHERE c.name = ? AND i.is_missing = 0
+		 ORDER BY c.image_id`, name)
 	if err != nil {
 		return err
 	}
@@ -456,9 +397,6 @@ func SortCollectionByFilename(database *db.DB, name string) error {
 	return ReorderCollection(database, name, ids)
 }
 
-// CollectionCeilingHidden returns how many of name's visible members the rating
-// ceiling (excludeIDs) hides: the ceiling-blind visible count minus the
-// ceiling-filtered count. Zero when no ceiling is active or none are hidden.
 func CollectionCeilingHidden(database *db.DB, name string, excludeIDs []int64) (int, error) {
 	if len(excludeIDs) == 0 {
 		return 0, nil
@@ -486,12 +424,9 @@ func CollectionCeilingHidden(database *db.DB, name string, excludeIDs []int64) (
 	return blind - filtered, nil
 }
 
-// CollectionHiddenOrderedIDs returns the positioned members of name the
-// rating ceiling (excludeIDs) hides, in their stored reading order. The
-// click-order reorder appends them behind what the operator arranged:
-// a dialog filtered by the ceiling cannot offer those tiles, so without
-// this the clear would drop the position of every row it never showed.
-// Empty when no ceiling is active.
+// CollectionHiddenOrderedIDs must be appended to a ceiling-filtered
+// reorder's ids, or ReorderCollection clears positions the dialog never
+// showed.
 func CollectionHiddenOrderedIDs(database *db.DB, name string, excludeIDs []int64) ([]int64, error) {
 	if len(excludeIDs) == 0 {
 		return nil, nil
@@ -505,18 +440,13 @@ func CollectionHiddenOrderedIDs(database *db.DB, name string, excludeIDs []int64
 		append([]any{name}, args...)...)
 }
 
-// CollectionMemberIDs returns every image id filed under name (case-
-// insensitive), missing rows included, so a rename or dissolve reaches
-// the whole collection rather than only its visible members.
+// CollectionMemberIDs includes missing rows, so a rename or dissolve
+// reaches the whole collection.
 func CollectionMemberIDs(database *db.DB, name string) ([]int64, error) {
 	return db.QueryIDs(database.Read,
 		`SELECT image_id FROM image_collections WHERE name = ? COLLATE NOCASE`, name)
 }
 
-// CollectionCBZMembers returns every visible member of name (NOCASE) in
-// generation order: positioned members first by position, then unordered
-// members by natural filename order. Like rename and dissolve, the
-// rating ceiling does not filter the result.
 func CollectionCBZMembers(database *db.DB, name string) ([]CBZMember, error) {
 	rows, err := database.Read.Query(
 		`SELECT i.canonical_path, i.file_type, basename(i.canonical_path), c.position
@@ -540,21 +470,12 @@ func CollectionCBZMembers(database *db.DB, name string) ([]CBZMember, error) {
 			unordered = append(unordered, m)
 		}
 	}
-	// Numbered order wins; members without a position fall back to
-	// natural filename order.
 	sort.SliceStable(unordered, func(i, j int) bool {
 		return NaturalLess(strings.ToLower(unordered[i].filename), strings.ToLower(unordered[j].filename))
 	})
 	return append(out, unordered...), rows.Err()
 }
 
-// The three writes below take a chunk of image ids rather than one image,
-// because their callers are background jobs walking a whole scope 500 rows
-// at a time. Each is one transaction, and each maintains the home-mirror
-// invariant the per-image helpers above keep.
-
-// AddCollectionToImages files every id under name, leaving an image that
-// already carries the label alone. An image with no home yet takes this one.
 func AddCollectionToImages(database *db.DB, ids []int64, name string) error {
 	placeholders, args := db.InPlaceholders(ids)
 	labelArgs := append([]any{name}, args...)
@@ -576,8 +497,6 @@ func AddCollectionToImages(database *db.DB, ids []int64, name string) error {
 	})
 }
 
-// RemoveCollectionFromImages drops name from every id, rebinding the home
-// mirror of the rows whose home it was to whatever membership survives.
 func RemoveCollectionFromImages(database *db.DB, ids []int64, name string) error {
 	placeholders, args := db.InPlaceholders(ids)
 	labelArgs := append([]any{name}, args...)
@@ -601,10 +520,9 @@ func RemoveCollectionFromImages(database *db.DB, ids []int64, name string) error
 	})
 }
 
-// RenameCollectionForImages relabels oldName to newName across the chunk,
-// shifting positions by posOffset. merging drops a membership the image
-// already holds under newName first, so the rename cannot collide; the
-// pre-existing target's position then wins the home resync.
+// RenameCollectionForImages, when merging, first drops oldName where the
+// image already holds newName, so the rename cannot collide and the
+// existing position wins the home resync.
 func RenameCollectionForImages(database *db.DB, ids []int64, oldName, newName string, posOffset int, merging bool) error {
 	placeholders, args := db.InPlaceholders(ids)
 	return db.InWriteTx(database.Write, func(tx *sql.Tx) error {

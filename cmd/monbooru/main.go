@@ -1,12 +1,5 @@
-// Command monbooru is the binary: it reads the config, resolves the
-// profile (server, desktop or portable), opens the galleries, starts the
-// HTTP server and the desktop integration around it, and handles the
-// subcommands and the restart-in-place the tray and the Settings page ask
-// for.
-//
-// Everything it does is wiring. A decision that outlives one launch
-// belongs in a package under internal/, so this file stays the list of
-// what gets connected to what.
+// Command monbooru serves the galleries, in the server, desktop or
+// portable profile.
 package main
 
 import (
@@ -30,12 +23,9 @@ import (
 )
 
 func main() {
-	// Before anything prints: the Windows artifacts are linked for the GUI
-	// subsystem, which is handed no console at all.
+	// Before anything prints: a Windows GUI build starts with no console.
 	desktop.AttachConsole()
 
-	// Subcommand dispatch happens before flag.Parse so the
-	// subcommand's own flag set gets the argv tail unchanged.
 	if len(os.Args) >= 2 && os.Args[1] == "tagger-worker" {
 		runWorker(os.Args[2:])
 		return
@@ -66,9 +56,8 @@ func main() {
 		return
 	}
 
-	// Registered before every other defer, so a startup failure still exits
-	// non-zero once the rest of the chain has flushed the database pools,
-	// stopped the watchers and closed the log.
+	// Registered first so it runs last, once the other defers have
+	// flushed the pools, stopped the watchers and closed the log.
 	exitCode := 0
 	defer func() {
 		if exitCode != 0 {
@@ -76,9 +65,8 @@ func main() {
 		}
 	}()
 
-	// Registered before every other defer below, so a Restart's fresh
-	// process starts only once this one has released the port, the database
-	// and the log file.
+	// Runs after the defers below, so the new process finds the port, the
+	// database and the log file released.
 	restartOnExit := false
 	defer func() {
 		if restartOnExit {
@@ -151,12 +139,11 @@ func main() {
 	srv.StartWatchers()
 
 	httpSrv := &http.Server{
-		Addr:        cfg.Server.BindAddress,
-		Handler:     srv.Handler(),
-		ReadTimeout: 30 * time.Second,
-		// WriteTimeout is intentionally unset: bulk operations like delete-all
-		// or re-extract can run for many minutes on large libraries. Slow
-		// handlers are bounded by DB and filesystem latency.
+		Addr:    cfg.Server.BindAddress,
+		Handler: srv.Handler(),
+		// Headers only: an upload or import body can take minutes on a slow link.
+		ReadHeaderTimeout: 30 * time.Second,
+		// No WriteTimeout: some responses run for minutes on a large library.
 		IdleTimeout: 120 * time.Second,
 	}
 
@@ -182,8 +169,8 @@ func main() {
 		}
 	}
 
-	// Report a bind failure through the channel rather than log.Fatalf so the
-	// deferred srv.Close() still flushes the DB pools and stops the watchers.
+	// A bind failure comes back through srvErr, not log.Fatalf, so the
+	// deferred srv.Close still runs.
 	select {
 	case <-quit:
 		logx.Infof("shutting down...")
@@ -193,8 +180,8 @@ func main() {
 		logx.Errorf("FATAL HTTP server: %v", err)
 		exitCode = 1
 		if *desktopMode {
-			// Closes the race between two launches that both probed an empty
-			// port: whoever lost the bind asks again and gets the winner.
+			// Two launches can both probe an empty port; the one that
+			// lost the bind asks again and finds the winner.
 			if msg, _ := claimPort(cfg.Server.BindAddress, !*noBrowser); msg != "" {
 				reportFatal(msg)
 			}

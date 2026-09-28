@@ -1,17 +1,4 @@
-// Package monloader is monbooru's outbound half of the pair: the HTTP
-// client that talks to the operator's monloader instance and nothing else.
-//
-// It exists as its own package because it holds no HTTP-server concern -
-// the routes, the status cache and the config reads stay in the web layer,
-// which hands this the address and the token as functions so a re-pair or
-// a pause takes effect on the next call without a restart.
-//
-// It is not the only outbound client. The web layer keeps two of its own
-// for the peer surfaces that belong to the transport rather than to a
-// protocol: peerHTTPClient probes a peer's /health while pairing on a
-// 5-second budget, and pluginClient probes and relays to third-party
-// plugins on 15. Everything the app speaks to is one of those three, and
-// every one of them is a peer the operator approved.
+// Package monloader is the client for the paired monloader instance.
 package monloader
 
 import (
@@ -28,31 +15,20 @@ import (
 // App is the peer's name in pairing records and error text.
 const App = "monloader"
 
-// httpClient is the only outbound HTTP client in monbooru's own code, and it
-// is only ever pointed at the configured instance.
-// Per-call deadlines belong to the request contexts (probes 4-5 s,
-// contribution previews 8 s, sends 10 s); the client timeout is only a
-// backstop for the callers that pass an unbounded context, and must stay
-// above the largest per-call deadline or it aborts a send monloader may
-// still commit.
+// A backstop for callers with an unbounded context: it must stay above every
+// per-call deadline, or it cuts off a send monloader may still commit.
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
-// ErrUnconfigured is what every outbound call answers before any I/O when
-// no link is set up.
+// ErrUnconfigured is returned before any I/O when no link is set up.
 var ErrUnconfigured = errors.New("monloader is not configured")
 
-// Client issues authed calls to one monloader. Base and Token are read per
-// call rather than captured, so a re-pair, a paused link or an address
-// change lands without rebuilding anything. Base answers "" when the link is
-// paused or unset, which is what makes ErrUnconfigured the first answer.
+// Client reads Base and Token on every call so a re-pair or a pause lands
+// without rebuilding it. Base must return "" while the link is paused.
 type Client struct {
 	Base  func() string
 	Token func() string
 }
 
-// Do issues one authed request to a monloader API path and returns the live
-// response for the caller to map. A nil body sends no payload and no content
-// type.
 func (c *Client) Do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
 	base := strings.TrimRight(c.Base(), "/")
 	token := c.Token()
@@ -74,7 +50,6 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte) (*htt
 	return httpClient.Do(req)
 }
 
-// Post sends one JSON body to a monloader API path.
 func (c *Client) Post(ctx context.Context, path string, payload map[string]any) (*http.Response, error) {
 	body, _ := json.Marshal(payload)
 	return c.Do(ctx, http.MethodPost, path, body)

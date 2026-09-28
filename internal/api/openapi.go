@@ -11,11 +11,11 @@ import (
 )
 
 func buildSpec(baseURL string) map[string]any {
-	return map[string]any{
+	spec := map[string]any{
 		"openapi": "3.0.3",
 		"info": map[string]any{
 			"title":       "Monbooru API",
-			"description": "REST API for monbooru image library",
+			"description": "REST API for monbooru image library. Any operation can answer 500 internal_error on a server-side failure.",
 			"version":     "1.1.0",
 		},
 		"servers": []map[string]any{
@@ -59,6 +59,21 @@ func buildSpec(baseURL string) map[string]any {
 						"is_alias":     map[string]any{"type": "boolean"},
 						"origin":       map[string]any{"type": "string", "description": "Creation provenance label: 'user', a booru site, 'ptr', an auto-tagger name, an import label. Empty on rows predating the column."},
 						"last_used_at": map[string]any{"type": "string", "description": "ISO 8601; most recent application to an image. Absent when never applied."},
+					},
+				},
+				"TagDetail": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":           map[string]any{"type": "integer"},
+						"name":         map[string]any{"type": "string"},
+						"category":     map[string]any{"type": "string"},
+						"color":        map[string]any{"type": "string"},
+						"usage_count":  map[string]any{"type": "integer"},
+						"is_alias":     map[string]any{"type": "boolean"},
+						"origin":       map[string]any{"type": "string", "description": "Creation provenance label, as on TagRow."},
+						"last_used_at": map[string]any{"type": "string", "description": "ISO 8601; absent when never applied."},
+						"note":         map[string]any{"type": "string", "description": "The operator's note on the tag, in annotation markup; empty when none. An alias has none."},
+						"links":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "The tag's links as stored, one entry per line; a leading '-' marks a dead link."},
 					},
 				},
 				"Implication": map[string]any{
@@ -119,7 +134,7 @@ func buildSpec(baseURL string) map[string]any {
 				},
 				"MergeSummary": map[string]any{
 					"type":        "object",
-					"description": "What a duplicate push or enrich folded into the existing image. The merge reconciles the source's own tag slice to the pushed set; tags owned by the operator, the auto-tagger, or another source are never touched.",
+					"description": "What a duplicate push or enrich folded into the existing image. The merge reconciles the source's own tag slice to the pushed set; tags owned by the operator, the auto-tagger, or another source are never touched. Tags pushed without a source are only added, and tags_added counts them too.",
 					"properties": map[string]any{
 						"tags_added":    map[string]any{"type": "integer"},
 						"tags_retired":  map[string]any{"type": "integer", "description": "Tags this source contributed earlier and no longer lists, kept but flagged stale"},
@@ -220,6 +235,8 @@ func buildSpec(baseURL string) map[string]any {
 							"items": map[string]any{
 								"type": "object",
 								"properties": map[string]any{
+									"site":      map[string]any{"type": "string", "description": "The source site the note came from."},
+									"post_id":   map[string]any{"type": "string", "description": "The post on that site; omitted when the source has none."},
 									"x":         map[string]any{"type": "integer"},
 									"y":         map[string]any{"type": "integer"},
 									"w":         map[string]any{"type": "integer"},
@@ -312,7 +329,7 @@ func buildSpec(baseURL string) map[string]any {
 										"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
 										"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
 										"original":                    map[string]any{"type": "string", "description": "Optional upstream artist source the post declared (<=2048 chars, newline-joined when several). Recorded on the same origin as 'source'."},
-										"notes":                       map[string]any{"type": "string", "description": "Optional JSON-encoded array of positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, converted to monbooru's markup on the way in) for the pushed source."},
+										"notes":                       map[string]any{"type": "string", "description": "Optional JSON-encoded array of positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters) for the pushed source."},
 										"collection":                  map[string]any{"type": "string", "description": "Optional collection label (images.series). Written on the new row; on a duplicate-SHA push added as a membership that never displaces the existing home."},
 										"collection_order":            map[string]any{"type": "string", "description": "Optional 1-based position within the collection. Requires a non-empty collection in the same request."},
 									},
@@ -323,7 +340,7 @@ func buildSpec(baseURL string) map[string]any {
 									"type":     "object",
 									"required": []string{"path"},
 									"properties": map[string]any{
-										"path":                        map[string]any{"type": "string", "description": "Path to a file already on disk. Absolute paths are used verbatim; relative paths are resolved under gallery/<folder> when folder is set, otherwise under the gallery root. WARNING: absolute paths give a token holder read access to anything the monbooru process can stat."},
+										"path":                        map[string]any{"type": "string", "description": "Path to a file already inside the gallery. Absolute paths are used as given; a relative path resolves under gallery/<folder> when folder is set, and otherwise against the server's working directory, so send an absolute path or a folder. The file must sit inside the gallery root, in a folder the gallery indexes, or the request is refused with 400."},
 										"tags":                        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 										"folder":                      map[string]any{"type": "string", "description": "Destination subfolder for relative paths"},
 										"autotag":                     map[string]any{"type": "boolean", "description": "Kick off an auto-tag job on the new image"},
@@ -343,7 +360,7 @@ func buildSpec(baseURL string) map[string]any {
 										"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
 										"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
 										"original":                    map[string]any{"type": "string", "description": "Optional upstream artist source the post declared (<=2048 chars, newline-joined when several). Recorded on the same origin as 'source'."},
-										"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Optional positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, converted to monbooru's markup on the way in) for the pushed source."},
+										"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Optional positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters) for the pushed source."},
 										"collection":                  map[string]any{"type": "string", "description": "Optional collection label (images.series). Written on the new row; on a duplicate-SHA push added as a membership that never displaces the existing home."},
 										"collection_order":            map[string]any{"type": "integer", "description": "Optional 1-based position within the collection. Requires a non-empty collection in the same request."},
 									},
@@ -356,6 +373,7 @@ func buildSpec(baseURL string) map[string]any {
 						"201": resp("Image created", "#/components/schemas/CreateImageResponse"),
 						"400": resp("Invalid request or unsupported file type", "#/components/schemas/Error"),
 						"413": resp("File exceeds max size", "#/components/schemas/Error"),
+						"415": resp("The file does not decode as an image", "#/components/schemas/Error"),
 						"500": resp("Ingest failure", "#/components/schemas/Error"),
 					}),
 			},
@@ -441,7 +459,7 @@ func buildSpec(baseURL string) map[string]any {
 							"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
 							"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
 							"original":                    map[string]any{"type": "string", "description": "Upstream artist source the post declared (<=2048 chars, newline-joined when several). A non-empty value overwrites the stored one."},
-							"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, converted to monbooru's markup on the way in); a non-empty array replaces the set this origin contributed."},
+							"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters); a non-empty array replaces the set this origin contributed."},
 						},
 					}),
 					"responses": map[string]any{
@@ -497,6 +515,8 @@ func buildSpec(baseURL string) map[string]any {
 						},
 					}),
 					map[string]any{
+						"400": resp("Invalid request (invalid JSON, no tags, or a malformed via)", "#/components/schemas/Error"),
+						"404": resp("Image not found", "#/components/schemas/Error"),
 						"200": map[string]any{
 							"description": "Bare TagArray on success; wrapped in {tags, tag_warnings} when any tag failed validation.",
 							"content": map[string]any{
@@ -581,8 +601,12 @@ func buildSpec(baseURL string) map[string]any {
 					},
 					"responses": map[string]any{
 						"200": resp("Replace outcome", "#/components/schemas/ReplaceFileResponse"),
+						"400": resp("Invalid request (not multipart, no file field, a field over its limit, or an unsupported file type)", "#/components/schemas/Error"),
 						"404": resp("Not found", "#/components/schemas/Error"),
-						"409": resp("wrong_type for an archive/video row or a non-image upload; already_exists when the uploaded bytes are another image (the pair is recorded as potential duplicates)", "#/components/schemas/Error"),
+						"413": resp("File exceeds max size", "#/components/schemas/Error"),
+						"415": resp("The file does not decode as an image", "#/components/schemas/Error"),
+						"500": resp("The replacement failed server-side", "#/components/schemas/Error"),
+						"409": resp("wrong_type for an archive/video row or a non-image upload; already_exists when the uploaded bytes are another image (the pair is recorded as potential duplicates); conflict when the image's file is not this gallery's to rewrite (outside its root, or in a folder it leaves out)", "#/components/schemas/Error"),
 					},
 				},
 			},
@@ -636,6 +660,7 @@ func buildSpec(baseURL string) map[string]any {
 					map[string]any{
 						"201": map[string]any{"description": "Relation created"},
 						"400": resp("Invalid request (self-relation, unknown type, missing ids)", "#/components/schemas/Error"),
+						"404": resp("a or b names no image", "#/components/schemas/Error"),
 						"409": resp("Pair carries a conflicting relation already; remove it first.", "#/components/schemas/Error"),
 					}),
 				"delete": opBody("Remove a declared relation", "removeRelation",
@@ -689,6 +714,12 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 			},
 			"/tags/{id}": map[string]any{
+				"get": op("Get a tag with its note and links", "getTag",
+					[]map[string]any{pathParam("id", "Tag ID"), galleryParam()},
+					map[string]any{
+						"200": resp("The tag", "#/components/schemas/TagDetail"),
+						"404": resp("Tag not found", "#/components/schemas/Error"),
+					}),
 				"patch": opBody("Rename a tag and/or move it to another category", "patchTag",
 					[]map[string]any{pathParam("id", "Tag ID"), galleryParam()},
 					jsonBodySchema(true, map[string]any{
@@ -848,13 +879,42 @@ func buildSpec(baseURL string) map[string]any {
 			},
 		},
 	}
+	declareRequestErrors(spec["paths"].(map[string]any))
+	return spec
 }
 
-// op builds one path operation. Every entry in the paths map above is the
-// same four fields in the same order; spelling them out 33 times is how a
-// mis-keyed one hides. Operations carrying a requestBody keep their
-// literal, since the body is the bulk of those.
-// opBody is op for an operation that carries a request body.
+func declareRequestErrors(paths map[string]any) {
+	for _, item := range paths {
+		for _, raw := range item.(map[string]any) {
+			op := raw.(map[string]any)
+			params, _ := op["parameters"].([]map[string]any)
+			var reasons []string
+			scoped := false
+			for _, p := range params {
+				switch {
+				case p["name"] == "gallery":
+					scoped = true
+					reasons = append(reasons, "an unknown gallery (invalid_gallery)")
+				case p["in"] == "path":
+					reasons = append(reasons, "a non-numeric "+p["name"].(string))
+				}
+			}
+			if len(reasons) == 0 {
+				continue
+			}
+			responses := op["responses"].(map[string]any)
+			if bad, ok := responses["400"].(map[string]any); ok {
+				bad["description"] = bad["description"].(string) + "; also " + strings.Join(reasons, " or ")
+			} else {
+				responses["400"] = resp("Invalid request: "+strings.Join(reasons, " or "), "#/components/schemas/Error")
+			}
+			if _, ok := responses["503"]; scoped && !ok {
+				responses["503"] = resp("No active gallery", "#/components/schemas/Error")
+			}
+		}
+	}
+}
+
 func opBody(summary, id string, params []map[string]any, body, responses map[string]any) map[string]any {
 	m := op(summary, id, params, responses)
 	m["requestBody"] = body
@@ -922,13 +982,10 @@ func queryParam(name, desc string) map[string]any {
 	}
 }
 
-// galleryParam is the shared ?gallery=<name> selector. Omitted means
-// the active gallery.
 func galleryParam() map[string]any {
 	return queryParam("gallery", "Target gallery name; omit for the active gallery (also accepted as X-Monbooru-Gallery header)")
 }
 
-// openAPIJSON serves the raw OpenAPI JSON spec.
 func (h *Handler) openAPIJSON(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg()
 	if !SetCORS(w, r, cfg) {
@@ -940,9 +997,7 @@ func (h *Handler) openAPIJSON(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(spec)
 }
 
-// openAPIDocs serves a self-contained HTML page rendered from the
-// OpenAPI spec served at /api/v1/openapi.json. No external assets are
-// loaded at runtime, so the page works offline.
+// No external assets, so the page works offline.
 func (h *Handler) openAPIDocs(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg()
 	if !SetCORS(w, r, cfg) {
@@ -1011,11 +1066,8 @@ type schemaView struct {
 	Properties []propertyView
 }
 
-// methodOrder controls how HTTP methods are ordered for each path.
 var methodOrder = []string{"get", "post", "put", "patch", "delete"}
 
-// extractDocsView flattens the OpenAPI spec into the template view.
-// It assumes the shape buildSpec produces; unknown keys are ignored.
 func extractDocsView(spec map[string]any) docsView {
 	view := docsView{}
 	if info, ok := spec["info"].(map[string]any); ok {
@@ -1150,8 +1202,6 @@ func anchorize(s string) string {
 	return r
 }
 
-// docsTemplate renders the API documentation with inline CSS matching
-// the rest of the UI.
 var docsTemplate = template.Must(template.New("api-docs").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>

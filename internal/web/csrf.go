@@ -12,10 +12,6 @@ import (
 	"strings"
 )
 
-// mustRandBytes returns n cryptographically-random bytes and terminates the
-// process if the system RNG is unavailable; the CSRF secret is computed once
-// at server startup so failing loudly is preferable to silently rolling a
-// deterministic value.
 func mustRandBytes(n int) []byte {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -24,26 +20,17 @@ func mustRandBytes(n int) []byte {
 	return b
 }
 
-// csrfToken computes a token for the given session ID using HMAC-SHA256
-// with the Server's per-instance secret.
 func (s *Server) csrfToken(sessionID string) string {
 	mac := hmac.New(sha256.New, s.csrfSecret)
 	mac.Write([]byte(sessionID))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// validateCSRF checks whether the token matches the session ID.
 func (s *Server) validateCSRF(sessionID, token string) bool {
 	expected := s.csrfToken(sessionID)
 	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 }
 
-// parseFormOK wraps r.ParseForm and surfaces a malformed body as a 400
-// instead of letting the caller silently observe blank form values.
-// Returns false when the body could not be parsed; the response has
-// already been written so the caller should just `return`. HTMX
-// requests get a flash-err so the partial swap shows the failure
-// inline, everything else gets a plain http.Error.
 func parseFormOK(w http.ResponseWriter, r *http.Request) bool {
 	if err := r.ParseForm(); err != nil {
 		flashErr(w, r, "Bad form data: "+err.Error())
@@ -52,10 +39,6 @@ func parseFormOK(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// requiredFormFlash reads a trimmed form value, answering msg as an inline
-// flash-err when it is empty. requiredFormExternal is the same read for the
-// handlers whose refusals go out through externalErr. Both report false only
-// after writing, so the caller just returns.
 func requiredFormFlash(w http.ResponseWriter, r *http.Request, field, msg string) (string, bool) {
 	v := strings.TrimSpace(r.FormValue(field))
 	if v == "" {
@@ -74,8 +57,21 @@ func requiredFormExternal(w http.ResponseWriter, r *http.Request, field, msg str
 	return v, true
 }
 
-// cSRFMiddleware validates the CSRF token on mutating requests.
-// /api/v1/ routes are exempt (bearer token serves as CSRF mitigation).
+// A page rendered before a restart, or under a session since replaced,
+// holds a token that no longer validates; a browser that says the request
+// comes from this origin is no forgery either way.
+var sameOrigin http.CrossOriginProtection
+
+// Without either header nothing vouches for the request (a script), so it
+// still needs the token.
+func browserSameOrigin(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Site") == "" && r.Header.Get("Origin") == "" {
+		return false
+	}
+	return sameOrigin.Check(r) == nil
+}
+
+// /api/v1/ is exempt: its bearer token is the CSRF mitigation.
 func (s *Server) cSRFMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
@@ -88,33 +84,29 @@ func (s *Server) cSRFMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// So is a mounted plugin's own page: its forms are the peer's, with
-		// no monbooru token to carry. The mount is session-gated and reaches
-		// nothing but a peer the operator approved.
+		// A mounted plugin's forms carry no monbooru token, and with login
+		// off no session gates the mount either.
 		if strings.HasPrefix(r.URL.Path, pluginMountPrefix) {
+			if sameOrigin.Check(r) != nil {
+				http.Error(w, "cross-origin request refused", http.StatusForbidden)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		sessID := sessionFromContext(r.Context())
 
-		// Header first so a caller can skip implicit form parsing, which
-		// would otherwise drain the entire body before the handler can
-		// validate sensitive fields (the gallery import path's
-		// type-to-confirm gate is the canonical example). Fall back to
-		// the hidden form input so existing form submissions still work.
+		// Header first: FormValue parses the body, and on multipart it
+		// drains up to 32 MiB past any handler's MaxBytesReader, so
+		// multipart callers must send the header.
 		token := r.Header.Get("X-CSRF-Token")
 		if token == "" && !isMultipart(r) {
-			// r.FormValue on multipart drains the entire body through
-			// stdlib's 32 MiB ParseMultipartForm, defeating any handler-
-			// side MaxBytesReader. Multipart callers must supply the
-			// token via the header (set by htmx-on-multipart hx-headers
-			// or by an explicit XHR header).
 			token = r.FormValue("_csrf")
 		}
 
-		if !s.validateCSRF(sessID, token) {
-			http.Error(w, "CSRF token invalid", http.StatusForbidden)
+		if !s.validateCSRF(sessID, token) && !browserSameOrigin(r) {
+			http.Error(w, "This page's form token is no longer valid. Copy anything unsaved, then reload the page.", http.StatusForbidden)
 			return
 		}
 
@@ -122,9 +114,6 @@ func (s *Server) cSRFMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isMultipart returns true when the request's Content-Type top-level
-// type is multipart (multipart/form-data, multipart/related, etc.).
-// Used to skip the body-draining FormValue fallback in cSRFMiddleware.
 func isMultipart(r *http.Request) bool {
 	ct := r.Header.Get("Content-Type")
 	if ct == "" {

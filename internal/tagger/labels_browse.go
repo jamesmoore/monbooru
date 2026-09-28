@@ -5,10 +5,8 @@ import (
 	"sort"
 )
 
-// LabelView is one row of the settings mappings browser: a model label
-// and where it effectively lands. Rule names the layer that produced
-// the routing - "" (the model's own), "default" (embedded rule) or
-// "custom" (overlay rule).
+// Rule is "" for the model's own routing, "default" for an embedded rule
+// and "custom" for an overlay rule.
 type LabelView struct {
 	Source  string
 	CatName string // effective category; "" when Muted
@@ -17,13 +15,8 @@ type LabelView struct {
 	Rule    string
 }
 
-// BrowseLabels loads the tagger's label file and resolves every
-// non-placeholder label through the same dispatch-then-scheme chain
-// the inference pipeline uses, returning the rows source-sorted.
-// catIDs is the gallery's category name→id map; rules pointing at a
-// category the gallery lacks fall through exactly like LoadDispatch.
-// The single_general inferred-category lift is a per-job DB lookup and
-// is not applied here - those labels read as their static routing.
+// The single_general inferred-category lift needs a job's database, so
+// those labels show their static routing.
 func BrowseLabels(modelPath, taggerName, tagsFile string, catIDs map[string]int64) ([]LabelView, error) {
 	profile, err := ResolveProfile(modelPath, taggerName, tagsFile)
 	if err != nil {

@@ -70,8 +70,8 @@
 </dialog>
 
 <script>
-// A recolour swaps its row, so the row's own buttons are bound through
-// the list rather than on the elements the page shipped with.
+// Bound on the list: a recolour swaps its row, dropping listeners on the
+// row's own buttons.
 document.getElementById('cat-list').addEventListener('click', function(e) {
   var rename = e.target.closest('.btn-cat-rename-trigger');
   if (rename) { openCatRenameDialog(rename.dataset.id, rename.dataset.name); return; }
@@ -79,27 +79,26 @@ document.getElementById('cat-list').addEventListener('click', function(e) {
   if (del) openCatDeleteDialog(del.dataset.id, del.dataset.name);
 });
 
-// Escape restores the stored colour before the shared handler blurs the
-// field, so leaving it that way carries no change to commit.
+// Restored before the global Escape handler blurs the field, so the blur
+// commits no change.
 document.getElementById('cat-list').addEventListener('keydown', function(e) {
   if (e.key === 'Escape' && e.target.classList.contains('cat-hex')) {
     e.target.value = e.target.defaultValue;
   }
 });
 
-// A refused value never reached the server, so the field would otherwise
-// keep showing a colour the row is not on.
+// A refused value never reached the server, so the field goes back to the
+// row's colour.
 document.getElementById('cat-list').addEventListener('htmx:validation:halted', function(e) {
   e.target.value = e.target.defaultValue;
 });
 
-// The add form's pair has no row to swap it back into agreement.
 var addSwatch = document.getElementById('add-cat-swatch');
 var addHex = document.getElementById('add-cat-hex');
 addSwatch.addEventListener('change', function() { addHex.value = addSwatch.value; });
 addHex.addEventListener('change', function() {
   if (!addHex.checkValidity()) return;
-  // The picker only displays the six-digit form the save expands to.
+  // A color input only takes #rrggbb, so a three-digit value is expanded.
   var v = addHex.value.toLowerCase();
   addSwatch.value = v.length === 4 ? '#' + v[1] + v[1] + v[2] + v[2] + v[3] + v[3] : v;
 });
@@ -160,8 +159,8 @@ function openCatDeleteDialog(catId, catName) {
       document.getElementById('delete-cat-dialog').showModal();
     })
     .catch(function() {
-      showConfirm('Delete category "' + catName + '"?', function() {
-        doDeleteCategory(catId, 'delete_all', null);
+      showConfirm('Delete category "' + catName + '"? Its tags move to general.', function() {
+        doDeleteCategory(catId, 'move', null);
       }, '', 'Delete');
     });
 }
@@ -173,9 +172,8 @@ function doDeleteCategory(catId, action, targetCatId) {
     method: 'DELETE',
     catchMsg: null,
     onOK: function() {
-      // The handler also writes HX-Trigger for the htmx path, but raw
-      // fetch doesn't process it; seed the shared stash directly so the
-      // /categories reload picks up the flash.
+      // A raw fetch does not process HX-Trigger, so the flash is stashed
+      // by hand.
       stashActionFlash('Category deleted.', 'ok');
       document.getElementById('delete-cat-dialog').close();
       window.location.href = window.location.pathname + window.location.search;

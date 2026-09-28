@@ -7,27 +7,21 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// Expr is the interface for AST nodes.
 type Expr interface {
 	exprNode()
 }
 
-// AndExpr is an implicit AND (space-separated terms).
 type AndExpr struct{ Left, Right Expr }
 
-// OrExpr is an explicit OR.
 type OrExpr struct{ Left, Right Expr }
 
-// NotExpr negates its child (`-` or `NOT`).
 type NotExpr struct{ Expr Expr }
 
-// TagExpr matches a literal or wildcard tag name.
 type TagExpr struct {
 	Tag      string // normalized lowercase
 	Wildcard string // "" | "prefix" | "suffix" | "substring"
 }
 
-// FilterExpr is a `key:value` filter.
 type FilterExpr struct {
 	Key string
 	Val string
@@ -39,18 +33,17 @@ func (NotExpr) exprNode()    {}
 func (TagExpr) exprNode()    {}
 func (FilterExpr) exprNode() {}
 
-// Parse parses a query string into an AST.
-func Parse(query string) (Expr, error) {
+func Parse(query string) Expr {
 	p := &parser{tokens: tokenize(query)}
 	exprs := p.parseAll()
 	if len(exprs) == 0 {
-		return nil, nil
+		return nil
 	}
 	result := exprs[0]
 	for _, e := range exprs[1:] {
 		result = AndExpr{Left: result, Right: e}
 	}
-	return result, nil
+	return result
 }
 
 type tokenKind int
@@ -64,7 +57,7 @@ const (
 
 type token struct {
 	kind tokenKind
-	val  string // raw value
+	val  string
 }
 
 func tokenize(query string) []token {
@@ -93,13 +86,6 @@ func tokenize(query string) []token {
 			continue
 		}
 
-		// Read a term up to whitespace, supporting quoted filter values
-		// like `folder:"my set 1"` and bare quoted tag tokens like
-		// `"red hair"` whose internal spaces are collapsed to
-		// underscores in parseTerm. Backslash escapes (`\"`, `\\`) are
-		// honored inside the quoted run so an operator can embed a
-		// literal quote in a folder / source / collection value
-		// without the scanner ending the token at the inner quote.
 		j := i
 		if query[j] == '"' {
 			j++
@@ -111,12 +97,12 @@ func tokenize(query string) []token {
 				j++
 			}
 			if j < len(query) {
-				j++ // skip closing "
+				j++
 			}
 		} else {
 			for j < len(query) && query[j] != ' ' && query[j] != '\t' {
 				if query[j] == ':' && j+1 < len(query) && query[j+1] == '"' {
-					j += 2 // skip :"
+					j += 2
 					for j < len(query) && query[j] != '"' {
 						if query[j] == '\\' && j+1 < len(query) {
 							j += 2
@@ -125,7 +111,7 @@ func tokenize(query string) []token {
 						j++
 					}
 					if j < len(query) {
-						j++ // skip closing "
+						j++
 					}
 					break
 				}
@@ -139,19 +125,11 @@ func tokenize(query string) []token {
 			tokens = append(tokens, token{kind: tokOR, val: "OR"})
 			continue
 		}
-		// Literal `AND` is the implicit space-AND in long-hand form; some
-		// users paste in queries from booru engines that require the
-		// keyword. Drop the token so `a AND b` parses identically to
-		// `a b`. Otherwise it would lowercase into a tag named "and"
-		// and intersect a never-matching leaf into the expression.
 		if strings.EqualFold(term, "and") {
 			continue
 		}
 
-		// Any `key:value` is a filter token. Known filter keys get
-		// special handling in buildFilterExpr; unknown keys fall back
-		// to a category-qualified tag search.
-		if colonIdx := strings.IndexByte(term, ':'); colonIdx > 0 {
+		if colonIdx := strings.IndexByte(term, ':'); colonIdx > 0 && term[0] != '"' {
 			tokens = append(tokens, token{kind: tokFilter, val: term})
 			continue
 		}
@@ -201,11 +179,8 @@ func (p *parser) parseAll() []Expr {
 			continue
 		}
 
-		// A bare leading `OR` (or a chain of them) has no left operand.
-		// Drop the token and keep parsing so the right-hand expression
-		// stands on its own; otherwise parseTerm returns nil at the OR
-		// and parseAll falls out of the loop with an empty expression
-		// slice, which the executor treats as match-all.
+		// parseTerm returns nil at an OR, which would end the loop and
+		// drop the rest of the query.
 		if t.kind == tokOR {
 			p.next()
 			continue
@@ -216,8 +191,6 @@ func (p *parser) parseAll() []Expr {
 			break
 		}
 
-		// Fold any chained OR terms into a left-leaning OrExpr so
-		// `a OR b OR c` produces three leaves.
 		if or := p.peek(); or != nil && or.kind == tokOR {
 			expr := left
 			for {
@@ -241,11 +214,7 @@ func (p *parser) parseAll() []Expr {
 	return exprs
 }
 
-// parseOperand reads one right-hand side of an OR, consuming a leading
-// NOT. parseTerm stops dead at one, which used to abandon the fold and
-// leave the negation to be picked up as a fresh top-level term that
-// Parse ANDs onto everything else - so `a OR -b` answered with the
-// intersection the operator asked to exclude.
+// parseTerm stops at a NOT, so without this `a OR -b` would parse as `a -b`.
 func (p *parser) parseOperand() Expr {
 	if t := p.peek(); t != nil && t.kind == tokNot {
 		p.next()
@@ -280,22 +249,12 @@ func (p *parser) parseTerm() Expr {
 
 	case tokTag:
 		tag := t.val
-		// Bare quoted tokens like `"red hair"` and `"red_hair"` are the
-		// documented multi-word tag-input form. Strip the wrapping
-		// quotes so the normalizer folds the internal whitespace like
-		// any other tag literal.
 		if len(tag) >= 2 && tag[0] == '"' && tag[len(tag)-1] == '"' {
 			tag = unescapeQuoted(tag[1 : len(tag)-1])
 		}
-		// Normalize to the stored form (lowercase, whitespace folded to
-		// `_`, control runes dropped); the reserved `*` survives so the
-		// wildcard checks below still see it.
+		// Keeps the reserved `*` for the wildcard checks below.
 		tag = tags.NormalizeTagName(tag)
-		// All-asterisks tokens (`*`, `**`, `***`...) would otherwise
-		// build a `LIKE '%' ESCAPE '\'` and match every tag - a
-		// "select all" alias the documented syntax doesn't expose.
-		// Collapse to a literal-no-match so they compose predictably
-		// with the rest of the query.
+		// Otherwise an all-* token becomes LIKE '%' and matches every tag.
 		if strings.Trim(tag, "*") == "" {
 			return TagExpr{Tag: "", Wildcard: ""}
 		}
@@ -319,9 +278,6 @@ func trimWildcards(s string) string {
 	return s
 }
 
-// unescapeQuoted resolves the backslash escapes the tokenizer kept
-// inside a quoted run: `\"` -> `"`, `\\` -> `\`. A trailing lone
-// backslash stays as-is so the operator sees what they typed.
 func unescapeQuoted(s string) string {
 	if !strings.ContainsRune(s, '\\') {
 		return s
@@ -342,11 +298,8 @@ func unescapeQuoted(s string) string {
 	return b.String()
 }
 
-// QuoteValue is the inverse of unescapeQuoted: it backslash-escapes the
-// characters that would otherwise end or corrupt a quoted run, so a
-// label interpolated into a `key:"<value>"` search term round-trips
-// back to itself through the parser. Backslash is escaped first so an
-// already-present backslash isn't mistaken for an escape of the quote.
+// QuoteValue escapes s so a key:"<s>" term parses back to s. Backslashes
+// go first, or the escapes added for quotes would be escaped again.
 func QuoteValue(s string) string {
 	if !strings.ContainsAny(s, "\\\"") {
 		return s

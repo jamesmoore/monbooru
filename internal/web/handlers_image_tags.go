@@ -17,33 +17,17 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// catTag pairs a resolved category ID with a tag name for creation/application.
 type catTag struct {
 	catID int64
 	name  string
 }
 
-// parseTagInput parses multi-token tag input.
-//
-// Tokens are separated by whitespace. Each token becomes its own tag: a
-// bare word, a "category:name" pair, or a double-quoted span whose
-// internal spaces are collapsed to underscores (so `"red hair"` →
-// `red_hair`). Quotes can follow a category prefix
-// (`artist:"john doe"`).
-//
-// Examples:
-//
-//	red hair                 -> [{general, "red"}, {general, "hair"}]
-//	"red hair" blue_eyes     -> [{general, "red_hair"}, {general, "blue_eyes"}]
-//	artist:"john doe" 1girl  -> [{artist, "john_doe"}, {general, "1girl"}]
 func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
 	tokens, err := splitTagTokens(tagInput)
 	if err != nil {
 		return nil, nil, err.Error()
 	}
 
-	// general category id is cached on galleryCtx at open time so this
-	// hot path doesn't re-query the immutable built-in row.
 	var generalID int64
 	if cx := s.active(); cx != nil {
 		generalID = cx.GeneralCategoryID
@@ -56,10 +40,7 @@ func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
 
 	var catTags []catTag
 	var rejected []string
-	// A prefix that names no category is a literal tag name by design
-	// ("nier:automata"), and it is also what a mistyped category looks
-	// like. The caller says which reading it took rather than leaving the
-	// operator with a catalog row they did not mean to create.
+	// Unknown prefixes stay in the name and get reported: they may be typos.
 	var unknownCats []string
 	for _, name := range tokens {
 		if idx := strings.Index(name, ":"); idx > 0 {
@@ -67,17 +48,12 @@ func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
 			tagName := name[idx+1:]
 			if catID, ok := categories[catName]; ok {
 				if tagName == "" {
-					// `general:` (known category, empty name) was a silent
-					// drop; surface it like the other malformed-token cases
-					// so the user sees what their input did.
 					rejected = append(rejected, "rejected: "+name+": empty tag name after category prefix")
 					continue
 				}
 				catTags = append(catTags, catTag{catID, tagName})
 				continue
 			}
-			// Prefix isn't a known category; treat the whole token as a
-			// literal general-category tag (e.g. "nier:automata").
 			if !slices.Contains(unknownCats, catName) {
 				unknownCats = append(unknownCats, catName)
 			}
@@ -88,19 +64,11 @@ func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
 	return catTags, unknownCats, strings.Join(rejected, "; ")
 }
 
-// unknownCategoryNote names the prefixes parseTagInput read as part of a
-// tag name rather than as a category.
 func unknownCategoryNote(unknownCats []string) string {
 	return joinLabeled("no category named ", ", ", unknownCats)
 }
 
-// categoryIDsByName preloads every category in one read so a
-// multi-token paste with category prefixes doesn't pay N read-pool
-// round-trips. The tag_categories row count is tiny (single-digit
-// builtins + a handful of user rows) so the map fits in a single small
-// alloc. A truncated read would drop a category and silently reparse
-// `character:foo` as a literal general tag, so a cursor error is
-// surfaced rather than swallowed.
+// Errors propagate: a dropped category would reparse character:foo as general.
 func (s *Server) categoryIDsByName() (map[string]int64, error) {
 	type catRow struct {
 		id   int64
@@ -121,11 +89,6 @@ func (s *Server) categoryIDsByName() (map[string]int64, error) {
 	return out, nil
 }
 
-// splitTagTokens splits tag-input into whitespace-separated tokens while
-// respecting double-quoted spans. Inside a quoted span, internal spaces
-// are replaced with underscores. Quoted spans may be preceded by a
-// category prefix (`artist:"john doe"`). Unterminated quotes return an
-// error.
 func splitTagTokens(s string) ([]string, error) {
 	var tokens []string
 	var buf strings.Builder
@@ -187,13 +150,13 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	var displacedRatings []string
 	mutated := false
 
-	// Resolve every token up front so the inserts ride one writer
-	// round-trip; a 50-token paste pays one transaction instead of N.
+	// Resolved first so the inserts share one transaction.
 	type resolved struct {
 		name string
 		tag  *models.Tag
 	}
 	prepared := make([]resolved, 0, len(catTags))
+	seen := make(map[int64]bool, len(catTags))
 	for _, ct := range catTags {
 		tag, err := s.tagSvc().GetOrCreateTag(ct.name, ct.catID)
 		if err != nil {
@@ -201,6 +164,10 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 			rejected = append(rejected, ct.name+": "+err.Error())
 			continue
 		}
+		if seen[tag.ID] {
+			continue
+		}
+		seen[tag.ID] = true
 		prepared = append(prepared, resolved{name: ct.name, tag: tag})
 	}
 
@@ -212,14 +179,12 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 		results, err := s.tagSvc().AddTagsToOneImage(id, tagIDs, "")
 		if err != nil {
 			logx.Warnf("batch add tags to image %d: %v", id, err)
-			// On batch failure surface a single rejection covering every
-			// prepared token so the user knows none landed.
 			for _, p := range prepared {
 				rejected = append(rejected, p.name+": "+err.Error())
 			}
 		} else {
 			for i, res := range results {
-				name := prepared[i].name
+				name := prepared[i].tag.Name
 				if res.Added || res.Promoted {
 					mutated = true
 				}
@@ -242,17 +207,6 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("HX-Trigger", "tags-changed")
 	}
 
-	// Distinguish "everything went in" from "some tokens failed" so a
-	// pasted multi-token input doesn't leave the user diffing the under-
-	// image list against their string. The input is cleared on full
-	// success and on a clean partial (some applied, some duplicates):
-	// the user can read the live tag list to confirm what's there. It
-	// stays populated only when at least one token was rejected, so the
-	// user can edit and resubmit.
-	//
-	// Three flash buckets the template renders in three colours: red
-	// (errors only), orange (mixed success + reject), green (success
-	// only). Build the parts once, then route them.
 	addedPart := joinLabeled("added: ", ", ", added)
 	promotedPart := joinLabeled("promoted to user tag: ", ", ", promotedTokens)
 	dupesPart := ""
@@ -272,14 +226,10 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	case parseErrMsg != "" && !mutated && len(rejected) == 0:
 		addErrMsg = parseErrMsg
 	case mutated && (len(rejected) > 0 || parseErrMsg != ""):
-		// Mixed outcome: render in warn-orange and surface both
-		// successes and the rejected tokens.
 		addWarnMsg = joinNonEmpty(parseErrMsg, addedPart, promotedPart, dupesPart, displacedPart, unknownPart, rejectedPart)
 	case len(rejected) > 0:
 		addErrMsg = joinNonEmpty(parseErrMsg, rejectedPart)
 	case len(dupes) > 0 && !mutated && parseErrMsg == "":
-		// Whole submit hit only existing tags; preserve the prior
-		// soft-error feedback so the user sees something happened.
 		addErrMsg = "tag already on image: " + strings.Join(dupes, ", ")
 	default:
 		addOkMsg = joinNonEmpty(addedPart, promotedPart, dupesPart, displacedPart, unknownPart)
@@ -287,16 +237,9 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	s.renderTagListWithSidebar(w, r, id, addErrMsg, addWarnMsg, addOkMsg, len(rejected) == 0 && parseErrMsg == "")
 }
 
-// renderTagListWithSidebar renders the image tag list partial and always emits
-// OOB swaps of the detail sidebar and danger zone so tag groups and remove-tag
-// buttons stay in sync without a page reload.
-// errMsg / warnMsg / okMsg are shown as inline flashes if non-empty (red,
-// orange, green); clearInput resets the add-tag input.
 func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request, id int64, errMsg, warnMsg, okMsg string, clearInput bool) {
 	folderPath, imageTags, _ := s.tagSvc().GetImageTags(id)
 	csrfToken := s.csrfToken(sessionFromContext(r.Context()))
-	// The sidebar's grouping toggle rides this refresh: an explicit
-	// tagmode switches the view and is stored for the next render.
 	tagMode := readTagModeCookie(r)
 	if requested := r.URL.Query().Get("tagmode"); requested != "" {
 		tagMode = normalizeTagMode(requested)
@@ -304,19 +247,14 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 	}
 	hasUserTags, hasStaleTags := userAndStaleTags(imageTags)
 	back := parseBackContext(r)
-	// The footer's tally is a per-render snapshot everywhere else; here
-	// the swap that lands the tag can move it, so it rides along. The
-	// callers invalidate before rendering, so this reads post-write.
+	// Callers invalidate first, so this tally reads post-write.
 	tagCount := 0
 	if cx := s.active(); cx != nil {
 		tagCount, _ = cx.TagCount()
 	}
 	var canonicalPath string
 	_ = s.db().Read.QueryRow(`SELECT canonical_path FROM images WHERE id = ?`, id).Scan(&canonicalPath)
-	// The delete confirm names the copies that go with the row, and this
-	// fragment re-renders it out of band. Counted the way the Duplicates
-	// panel counts, so the two never disagree.
-	extraPaths := extraImagePaths(loadImagePaths(r.Context(), s.db(), id))
+	extraPaths := extraImagePaths(loadImagePaths(r.Context(), s.db(), s.boundary(), id))
 	filename := ""
 	if canonicalPath != "" {
 		filename = filepath.Base(canonicalPath)
@@ -351,9 +289,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// trimmedValues normalises a repeated query parameter: whitespace is
-// stripped and empty entries drop out. Repeated rather than
-// comma-joined so a label carrying a comma survives the round trip.
+// Repeated params, not comma-joined: a label can carry a comma.
 func trimmedValues(raw []string) []string {
 	var out []string
 	for _, v := range raw {
@@ -364,9 +300,6 @@ func trimmedValues(raw []string) []string {
 	return out
 }
 
-// removeAutoTagsFromImageHandler removes auto-tagged rows from one image,
-// optionally filtered by repeated `taggers` query parameters. An absent
-// filter removes every auto-tag.
 func (s *Server) removeAutoTagsFromImageHandler(w http.ResponseWriter, r *http.Request) {
 	names := trimmedValues(r.URL.Query()["taggers"])
 	s.removeImageTagsHandler(w, r, func(id int64) (int, error) {
@@ -374,10 +307,6 @@ func (s *Server) removeAutoTagsFromImageHandler(w http.ResponseWriter, r *http.R
 	})
 }
 
-// removeSourceTagsFromImageHandler removes the tags one or more external
-// sources contributed to one image, filtered by repeated `sources` query
-// parameters. The optional `stale` value ("1" / "0") narrows to one of
-// the source's two detail-page groups.
 func (s *Server) removeSourceTagsFromImageHandler(w http.ResponseWriter, r *http.Request) {
 	names := trimmedValues(r.URL.Query()["sources"])
 	stale := r.URL.Query().Get("stale")
@@ -389,8 +318,6 @@ func (s *Server) removeSourceTagsFromImageHandler(w http.ResponseWriter, r *http
 	})
 }
 
-// removeCategoryTagsFromImageHandler removes the image's own tags in one
-// category, the sidebar's per-category bulk action.
 func (s *Server) removeCategoryTagsFromImageHandler(w http.ResponseWriter, r *http.Request) {
 	category := strings.TrimSpace(r.URL.Query().Get("cat"))
 	s.removeImageTagsHandler(w, r, func(id int64) (int, error) {
@@ -401,11 +328,6 @@ func (s *Server) removeCategoryTagsFromImageHandler(w http.ResponseWriter, r *ht
 	})
 }
 
-// dropSourceContributionHandler withdraws one source's claim on the
-// image's tags - the by-source sidebar's group and row buttons. An
-// optional repeated `tag` narrows it to those tags; without one the
-// whole source backs out. A tag another source also vouches for stays
-// on the image and only leaves that source's group.
 func (s *Server) dropSourceContributionHandler(w http.ResponseWriter, r *http.Request) {
 	source := strings.TrimSpace(r.URL.Query().Get("source"))
 	var tagIDs []int64
@@ -423,9 +345,7 @@ func (s *Server) dropSourceContributionHandler(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// droppedSourceMsg names what a withdrawal did: tags that lost their
-// last source left the image, the rest only left that source's group,
-// and the two counts are what tells them apart.
+// covered: tags the source let go; removed: those that lost their last source.
 func droppedSourceMsg(source string, covered, removed int) string {
 	switch {
 	case covered == 0:
@@ -444,8 +364,6 @@ func (s *Server) removeUserTagsFromImageHandler(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) removeAllTagsFromImageHandler(w http.ResponseWriter, r *http.Request) {
-	// RemoveAllTagsFromImage drops the rows in one statement (it is also the
-	// image-delete callback), so the count for the flash comes from a probe.
 	s.removeImageTagsHandler(w, r, func(id int64) (int, error) {
 		var n int
 		if err := s.db().Read.QueryRow(`SELECT COUNT(*) FROM image_tags WHERE image_id = ?`, id).Scan(&n); err != nil {
@@ -459,8 +377,6 @@ func (s *Server) removeStaleTagsFromImageHandler(w http.ResponseWriter, r *http.
 	s.removeImageTagsHandler(w, r, s.tagSvc().RemoveStaleTagsFromImage)
 }
 
-// removedTagsMsg is the removal counterpart of the add path's
-// "added: ..." flash. A removal that matched nothing says nothing.
 func removedTagsMsg(removed int) string {
 	switch removed {
 	case 0:
@@ -472,9 +388,6 @@ func removedTagsMsg(removed int) string {
 	}
 }
 
-// removeImageTagsHandler is the parse-id / call-remove / refresh body
-// shared by the bulk-remove tag handlers; remove names the underlying
-// service method.
 func (s *Server) removeImageTagsHandler(w http.ResponseWriter, r *http.Request, remove func(int64) (int, error)) {
 	s.removeImageTagsWithMsg(w, r, func(id int64) (string, error) {
 		removed, err := remove(id)
@@ -482,8 +395,6 @@ func (s *Server) removeImageTagsHandler(w http.ResponseWriter, r *http.Request, 
 	})
 }
 
-// removeImageTagsWithMsg is removeImageTagsHandler for the paths whose
-// flash is more than a count of removed rows.
 func (s *Server) removeImageTagsWithMsg(w http.ResponseWriter, r *http.Request, remove func(int64) (string, error)) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
@@ -509,8 +420,6 @@ func (s *Server) removeTagFromImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read the name first: the flash names what the click removed, the way
-	// the add path names what it added.
 	var name string
 	_ = s.db().Read.QueryRow(`SELECT name FROM tags WHERE id = ?`, tagID).Scan(&name)
 
@@ -527,10 +436,7 @@ func (s *Server) removeTagFromImage(w http.ResponseWriter, r *http.Request) {
 	s.renderTagListWithSidebar(w, r, id, "", "", okMsg, false)
 }
 
-// tagTokenLabel spells a parsed token as the (category, name) pair it was
-// looked up under. Always qualified, general included: a token that
-// matched nothing is most often one whose category was wrong, and a bare
-// name would name a tag the image visibly carries.
+// Always category-qualified: a miss is usually a wrong category.
 func (s *Server) tagTokenLabel(ct catTag) string {
 	categories, err := s.categoryIDsByName()
 	if err != nil {
@@ -544,13 +450,25 @@ func (s *Server) tagTokenLabel(ct catTag) string {
 	return ct.name
 }
 
-// joinLabeled renders "<label><items joined by sep>", or "" when there
-// is nothing to label.
 func joinLabeled(label, sep string, items []string) string {
 	if len(items) == 0 {
 		return ""
 	}
 	return label + strings.Join(items, sep)
+}
+
+func tagCategoryStatus(err error) int {
+	var coll *tags.ErrCategoryCollision
+	switch {
+	case errors.Is(err, tags.ErrTagNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, tags.ErrCategoryNotFound), errors.Is(err, tags.ErrRatingCategoryClosed),
+		errors.Is(err, tags.ErrRatingTagImmutable):
+		return http.StatusBadRequest
+	case errors.As(err, &coll):
+		return http.StatusConflict
+	}
+	return http.StatusInternalServerError
 }
 
 func (s *Server) changeTagCategory(w http.ResponseWriter, r *http.Request) {
@@ -564,7 +482,6 @@ func (s *Server) changeTagCategory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad category_id", http.StatusBadRequest)
 		return
 	}
-	// Route through the tag service for validation and consistency.
 	var svcErr error
 	merged := false
 	if r.FormValue("merge") == "1" {
@@ -575,8 +492,6 @@ func (s *Server) changeTagCategory(w http.ResponseWriter, r *http.Request) {
 	if svcErr != nil {
 		var coll *tags.ErrCategoryCollision
 		if errors.As(svcErr, &coll) && isHTMXRequest(r) {
-			// Offer the merge instead of dead-ending: the survivor keeps
-			// the images, the moving tag becomes its alias.
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = fmt.Fprintf(w,
 				`<div class="flash flash-err">%s <button type="button" class="btn-sm" onclick="mergeCategoryCollision(%d, %d)">Merge into it</button></div>`,
@@ -587,12 +502,10 @@ func (s *Server) changeTagCategory(w http.ResponseWriter, r *http.Request) {
 			writeInlineFlash(w, "err", svcErr.Error())
 			return
 		}
-		http.Error(w, svcErr.Error(), http.StatusInternalServerError)
+		http.Error(w, svcErr.Error(), tagCategoryStatus(svcErr))
 		return
 	}
-	// cat:/category-qualified searches resolve via the moved tag's
-	// new category, so cached match-id lists for those queries can't
-	// survive the move.
+	// cat: and category-qualified searches match differently after the move.
 	s.active().InvalidateCaches()
 	if isHTMXRequest(r) {
 		if merged {

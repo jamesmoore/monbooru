@@ -18,20 +18,11 @@ import (
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
-// autotagSearchScopeCap bounds the scope=search materialisation so a
-// clean-sweep autotag against an unbounded result set can't fill RAM
-// with the ids slice. Operators with a larger working set re-run the
-// autotag job over narrower searches.
+// The whole scope and its per-image tagger state sit in memory.
 const autotagSearchScopeCap = 50000
 
-// errAutotagOverCap is the sentinel the Scope.Stream callback
-// returns once autotagSearchScopeCap is reached, so the caller can
-// distinguish "over cap" from a real cursor error.
 var errAutotagOverCap = errors.New("autotag: search-scope cap reached")
 
-// spawnAutoTagJob runs RunWithTaggers in a goroutine, flushes per-DB
-// caches, and posts the completion summary. itemNoun ("" or
-// "uploaded ") splices into the success / partial summaries.
 func (s *Server) spawnAutoTagJob(ids []int64, selected []tagger.TaggerStatus, logScope, itemNoun string) {
 	cfg := s.cfgSnapshot()
 	database := s.db()
@@ -44,15 +35,9 @@ func (s *Server) spawnAutoTagJob(ids []int64, selected []tagger.TaggerStatus, lo
 	}()
 }
 
-// completeAutotagRun writes a finished tagger run's terminal job state:
-// caches dropped, then the cancelled / failed / partial / full summary.
-// prefix ("" or "[gallery] ") and itemNoun ("" or "uploaded ") splice
-// into the summaries the two callers surface. Returns err so the
-// scheduler can log and propagate it.
 func (s *Server) completeAutotagRun(cx *galleryCtx, ctx context.Context, prefix, itemNoun, logScope string, total, skipped int, baseline uint64, err error) error {
-	// New tags are commonly created by a tagger run, so the cached tag
-	// count is stale once the worker returns regardless of outcome
-	// (cancelled runs still wrote rows for completed images).
+	// Unconditional: a cancelled or failed run still wrote rows for the
+	// images it finished.
 	cx.InvalidateCaches()
 	if ctx.Err() != nil {
 		s.jobs.Complete(fmt.Sprintf("%sauto-tagging cancelled (%d image(s) queued)", prefix, total))
@@ -71,13 +56,6 @@ func (s *Server) completeAutotagRun(cx *galleryCtx, ctx context.Context, prefix,
 	return nil
 }
 
-// logAutotagPeak writes the peak-RSS-delta for a finished autotag run
-// at INFO level. baselineRSS is sampled before the run; post-run we
-// read VmHWM (the kernel's RSS high-water mark) and subtract. No-op
-// when the sample is missing or no peak over baseline is observed.
-// scope identifies the run (e.g. the gallery name, image id, batch
-// size) so operators reading logs can match deltas to the job that
-// caused them.
 func logAutotagPeak(scope string, baselineRSS uint64) {
 	if baselineRSS == 0 {
 		return
@@ -89,31 +67,31 @@ func logAutotagPeak(scope string, baselineRSS uint64) {
 	logx.Infof("autotag %s: peak RSS +%s", scope, humanBytesFmt(int64(peak-baselineRSS)))
 }
 
-// uploadPost handles the multi-file form submit. Per-file size, tagging and
-// optional autotag-after-upload all flow through here.
 func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
-	if cx := s.active(); cx == nil || cx.Degraded {
-		flashStatus(w, http.StatusServiceUnavailable, "Upload unavailable: gallery path is unreadable.")
-		return
-	}
 	cfg := s.cfgSnapshot()
 	maxFileSizeMB := cfg.Gallery.MaxFileSizeMB
 	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
-	// MaxFileSizeMB <= 0 disables the per-file cap (Sync and the watcher
-	// treat it the same way); skip MaxBytesReader entirely so a single
-	// 4 KiB total-body cap doesn't make every upload fail.
 	if maxBytes > 0 {
-		r.Body = http.MaxBytesReader(w, r.Body, maxBytes*10+4096) // allow multiple files
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes*10+4096) // ten files at the cap, plus the other fields
 	}
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeInlineFlash(w, "err", "Upload too large or invalid.")
 		return
 	}
+	// Taken only once the body is in: a slow upload holding it would stall
+	// every request queued behind a gallery switch.
+	s.ctxMu.RLock()
+	defer s.ctxMu.RUnlock()
+	if pageGalleryStale(w, r, s.activeGallery()) {
+		return
+	}
+	if cx := s.active(); cx == nil || cx.Degraded {
+		flashStatus(w, http.StatusServiceUnavailable, "Upload unavailable: gallery path is unreadable.")
+		return
+	}
 
 	tagInput := strings.TrimSpace(r.FormValue("tags"))
 	autotagAfter := r.FormValue("autotag") == "on"
-	// The inline inbox drop zone posts no folder field, so fall back to the
-	// operator's configured destination; an explicit folder still wins.
 	folderInput, naming := gallery.ReceivedNaming(s.activeGallery(),
 		strings.TrimSpace(r.FormValue("folder")),
 		strings.TrimSpace(cfg.Gallery.DefaultUploadFolder),
@@ -125,7 +103,7 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	destDir, destErr := gallery.ResolveSubdir(s.galleryPath(), folderInput)
+	destDir, destErr := s.boundary().ResolveSubdir(folderInput)
 	if destErr != nil {
 		writeInlineFlash(w, "err", destErr.Error())
 		return
@@ -135,7 +113,6 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve tags using the shared parser (same logic as addTagToImage).
 	var tagPairs []catTag
 	if tagInput != "" {
 		tagPairs, _, _ = s.parseTagInput(tagInput)
@@ -152,12 +129,10 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	var tagWarnings []string
 	var refused, tooBig []string
 	added, dupes, oversized := 0, 0, 0
-	unsupported, unsaved, noPreview := 0, 0, 0
+	unsupported, ignored, unsaved, noPreview := 0, 0, 0, 0
 	for _, fh := range files {
-		// Enforce the per-file cap up front; the watcher and API handler do the
-		// same. The MaxBytesReader cap above only bounds the total request body,
-		// so without this a single multi-GB file inside a multipart upload
-		// would still slip through and stall thumbnail generation.
+		// The body limit only bounds the total, so one file can still be
+		// over the cap.
 		if maxBytes > 0 && fh.Size > maxBytes {
 			oversized++
 			tooBig = append(tooBig, fh.Filename)
@@ -171,6 +146,12 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		}
 
 		dstPath := gallery.UniqueDestPath(destDir, fh.Filename)
+		if s.boundary().Check(dstPath) != nil {
+			_ = file.Close()
+			ignored++
+			refused = append(refused, fh.Filename)
+			continue
+		}
 		dst, err := os.Create(dstPath)
 		if err != nil {
 			_ = file.Close()
@@ -200,11 +181,8 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		img, isDup, ingestErr := gallery.Ingest(s.db(), s.galleryPath(), s.thumbnailsPath(), dstPath, models.OriginUpload)
 		if ingestErr != nil {
 			logx.Warnf("upload ingest %q: %v", fh.Filename, ingestErr)
-			// Bytes the ingest will never accept: drop the copy we just
-			// wrote, like the extension check above does, so it doesn't
-			// sit in the gallery folder failing every later sync. A
-			// transient failure keeps the file - the operator's bytes
-			// are not ours to discard over a busy write pool.
+			// Only bytes the ingest can never accept are dropped; a
+			// transient failure keeps the operator's file.
 			if errors.Is(ingestErr, gallery.ErrUnsupportedType) {
 				_ = os.Remove(dstPath)
 				unsupported++
@@ -215,18 +193,13 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if isDup {
-			// The bytes are already in the gallery under another path, so
-			// this copy is dead weight - a re-uploaded 1 GB archive would
-			// otherwise cost another 1 GB with no UI to reclaim it. Drop
-			// the file and the alias ingest just recorded; the API's
-			// multipart path does the same.
 			gallery.DropDuplicateCopy(s.db(), img.ID, dstPath, "upload")
 			dupeIDs = append(dupeIDs, img.ID)
 			dupes++
 			continue
 		}
 
-		if _, err := naming.Apply(r.Context(), s.db(), s.galleryPath(), img.ID, "", ""); err != nil {
+		if _, err := naming.Apply(r.Context(), s.db(), s.boundary(), img.ID, "", ""); err != nil {
 			logx.Warnf("upload: name %d: %v", img.ID, err)
 		}
 
@@ -240,8 +213,8 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 				tagWarnings = append(tagWarnings, ct.name+": "+err.Error())
 			}
 		}
-		// Ingest logs a failed thumbnail and carries on, so the absent file
-		// is the only signal the operator would otherwise never get.
+		// Ingest only logs a failed thumbnail, so the missing file is the
+		// one signal.
 		if _, statErr := os.Stat(gallery.ThumbnailPath(s.thumbnailsPath(), img.ID)); statErr != nil {
 			noPreview++
 		}
@@ -250,8 +223,6 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if added > 0 {
-		// Stamp every row from this POST with one token so the inbox cluster
-		// view groups the whole drop together regardless of the time-gap rule.
 		batch := time.Now().UnixNano()
 		if err := db.Chunked(addedIDs, 500, func(chunk []int64) error {
 			placeholders, args := db.InPlaceholders(chunk)
@@ -265,10 +236,8 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		s.active().InvalidateCaches()
 	}
 
-	// The flash carries links to the duplicate rows, so it is assembled
-	// as HTML; the int counts and ids are safe, and the operator/file
-	// supplied substrings (tag warnings, tagger-selection error) are
-	// escaped before they go in.
+	// Assembled as HTML for the duplicate links: numbers are safe, and
+	// every operator or file supplied string must be escaped.
 	var msg strings.Builder
 	fmt.Fprintf(&msg, "%d added", added)
 	if dupes > 0 {
@@ -290,15 +259,13 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	if oversized > 0 {
 		fmt.Fprintf(&msg, ", %d skipped over %d MB%s", oversized, maxFileSizeMB, namedFiles(tooBig))
 	}
-	failed := unsupported + unsaved
+	failed := unsupported + ignored + unsaved
 	if failed > 0 {
-		fmt.Fprintf(&msg, ", %d error(s): %s", failed, uploadErrorReasons(unsupported, unsaved, refused))
+		fmt.Fprintf(&msg, ", %d error(s): %s", failed, uploadErrorReasons(unsupported, ignored, unsaved, refused))
 	}
 	if len(tagWarnings) > 0 {
 		fmt.Fprintf(&msg, " (%d tag warning(s): %s)", len(tagWarnings), html.EscapeString(strings.Join(tagWarnings, "; ")))
 	}
-	// A drop that lost files is not a clean run, so it never reads as one:
-	// err when nothing landed, warn when only some of it did.
 	kind := "ok"
 	switch {
 	case added == 0 && (failed > 0 || oversized > 0):
@@ -307,7 +274,6 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		kind = "warn"
 	}
 
-	// Optionally kick off auto-tagging on the newly uploaded images.
 	if autotagAfter && len(addedIDs) > 0 && tagger.IsAvailable(cfg) {
 		selected, selErr := tagger.SelectForGallery(cfg, s.activeGallery(), taggerName)
 		if selErr != nil {
@@ -320,18 +286,11 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeInlineFlashHTML(w, kind, msg.String())
-	// Every upload lands in the inbox, so the topbar counter moves with it.
 	_, _ = w.Write([]byte(s.inboxNavOOB(r)))
 }
 
-// maxNamedRefusals is how many rejected files a summary line names before
-// it falls back to the count alone. A handful is what the operator needs to
-// find them again; a whole bad drop would push the flash past the one line
-// it is meant to stay on.
 const maxNamedRefusals = 3
 
-// namedFiles renders the parenthesised file list a refusal line carries,
-// and nothing at all once the list is too long to fit.
 func namedFiles(names []string) string {
 	if len(names) == 0 || len(names) > maxNamedRefusals {
 		return ""
@@ -339,15 +298,24 @@ func namedFiles(names []string) string {
 	return " (" + html.EscapeString(strings.Join(names, ", ")) + ")"
 }
 
-// uploadErrorReasons names why an upload's files failed, and which ones
-// when few enough of them failed to fit.
-func uploadErrorReasons(unsupported, unsaved int, refused []string) string {
+func uploadErrorReasons(unsupported, ignored, unsaved int, refused []string) string {
 	reason := "could not be saved"
-	switch {
-	case unsupported > 0 && unsaved > 0:
-		reason = fmt.Sprintf("%d unsupported file type(s), %d could not be saved", unsupported, unsaved)
-	case unsupported > 0:
-		reason = "unsupported file type"
+	var counted []string
+	for _, r := range []struct {
+		n             int
+		bare, counted string
+	}{
+		{unsupported, "unsupported file type", "%d unsupported file type(s)"},
+		{ignored, "on the ignore list", "%d on the ignore list"},
+		{unsaved, "could not be saved", "%d could not be saved"},
+	} {
+		if r.n > 0 {
+			reason = r.bare
+			counted = append(counted, fmt.Sprintf(r.counted, r.n))
+		}
+	}
+	if len(counted) > 1 {
+		reason = strings.Join(counted, ", ")
 	}
 	return reason + namedFiles(refused)
 }
@@ -373,20 +341,8 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 
 	var ids []int64
 	if scope == "search" {
-		// Mirror batchTag's search-side materialisation: parse q, stream
-		// matching ids off Scope.Stream so the cursor walks the result
-		// set without buffering an extra copy.
-		expr, parseErr := search.Parse(r.FormValue("q"))
-		if parseErr != nil {
-			hxErr(w, r, "Could not parse search: "+parseErr.Error(), parseErr.Error(), http.StatusBadRequest)
-			return
-		}
+		expr := search.Parse(r.FormValue("q"))
 		expr = resolveCeiling(r, s.active()).Apply(expr)
-		// Hard ceiling so a clean-sweep autotag against an unbounded
-		// search doesn't materialise million-id slices plus the
-		// matching per-image frame-extraction state in tagger.RunWithTaggers.
-		// errAutotagOverCap stops the stream cleanly and surfaces a
-		// "narrow your search" flash to the operator.
 		err := search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
 			if len(ids) >= autotagSearchScopeCap {
 				return errAutotagOverCap
@@ -405,7 +361,6 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// scope=selection or empty: read the checked ids from the form.
 		ids = parseIDList(r.Form["ids"])
 	}
 
@@ -418,9 +373,6 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 		hxErr(w, r, "A job is already running.", "job already running", http.StatusConflict)
 		return
 	}
-	// Loading the ONNX model (and initialising CUDA when enabled) can take a
-	// few seconds before the first image completes; surface that up front so
-	// the status bar doesn't look stalled.
 	s.jobs.Update(0, len(ids), "starting (loading model may take a few seconds)…")
 
 	s.spawnAutoTagJob(ids, selected, "batch", "")
@@ -457,18 +409,14 @@ func (s *Server) autotagImage(w http.ResponseWriter, r *http.Request) {
 		hxErr(w, r, "A job is already running.", "job already running", http.StatusConflict)
 		return
 	}
-	// Surface a starting line so the status bar isn't blank while the
-	// model loads. Mirrors the batch-trigger handler's preamble.
 	s.jobs.Update(0, 1, "starting (loading model may take a few seconds)…")
 
 	database := s.db()
 	cx := s.active()
 	baseline := readVmRSS()
 	go func() {
-		// Force CPU inference for one-shot detail-page runs: spinning up the
-		// CUDA session and loading the model onto the GPU dwarfs the tagging
-		// time for a single image, so CPU finishes faster even when the
-		// global provider is GPU.
+		// CPU for a single image: starting a GPU session takes longer
+		// than CPU takes to tag it.
 		ctx := s.jobs.Context()
 		skipped, err := tagger.RunWithTaggers(ctx, database, cfg, []int64{id}, selected, s.jobs, "cpu", cx.MangaCacheDir())
 		cx.InvalidateCaches()

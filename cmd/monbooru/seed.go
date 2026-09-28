@@ -8,18 +8,12 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// inContainer reports whether the shipped image is what is running. The
-// images bake the variable and nothing else sets it, which is what lets a
-// config created anywhere else stop inheriting their volume layout.
+// The images bake MONBOORU_CONTAINER and nothing else sets it.
 func inContainer() bool {
 	return os.Getenv("MONBOORU_CONTAINER") != ""
 }
 
-// hostSeed puts what monbooru creates beside the config file it was handed,
-// the one folder a run outside a container can assume exists. Absolute, so
-// a service unit's working directory cannot move them afterwards, and the
-// gallery is created for the same reason the desktop profile creates one:
-// a named but absent folder boots straight into degraded mode.
+// Absolute, so a service unit's working directory cannot move the paths later.
 func hostSeed(configPath string) func(*config.Config) {
 	dir := filepath.Dir(configPath)
 	if abs, err := filepath.Abs(dir); err == nil {

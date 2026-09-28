@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/api"
 	"github.com/monbooru/monbooru/internal/config"
@@ -34,9 +35,8 @@ const (
 	pairDenied   pairState = "denied"
 )
 
-// pairReq is one in-flight pairing handshake, held in memory until the peer
-// claims its issued token or the request ages out. Nothing is issued until the
-// claim, so an approval the peer never collects mints no token.
+// Nothing is issued until the claim, so an approval the peer never
+// collects mints no token.
 type pairReq struct {
 	ID        string
 	App       string
@@ -49,9 +49,7 @@ type pairReq struct {
 	State     pairState
 	Claimed   bool
 	CreatedAt time.Time
-	// Repair marks an offer from a peer this monbooru is already paired
-	// with, so the approval card can say the existing pairing is replaced.
-	Repair bool
+	Repair    bool
 }
 
 type pairStore struct {
@@ -74,10 +72,9 @@ func (ps *pairStore) sweepLocked() {
 	})
 }
 
-// create records a pending request, capping the number outstanding. A second
-// request from the same app replaces its pending entry rather than stacking:
-// the request endpoint is unauthenticated, so one noisy peer would otherwise
-// fill the cap and starve every other pairing for the TTL.
+// A second request from the same app replaces its pending one: the
+// endpoint is unauthenticated, and one noisy peer would otherwise fill
+// the cap for the TTL.
 func (ps *pairStore) create(req pairReq) (string, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -99,9 +96,8 @@ func (ps *pairStore) create(req pairReq) (string, bool) {
 	return req.ID, true
 }
 
-// dropPending forgets an app's outstanding offer. A removal that also stops
-// the plugin races the offer it makes on its way out, and a card asking to
-// pair with what the operator just removed is noise.
+// A plugin stopped by a removal may offer to pair on its way out; a card
+// for it is noise.
 func (ps *pairStore) dropPending(app string) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -132,7 +128,6 @@ func (ps *pairStore) get(id string) (pairReq, bool) {
 	return pairReq{}, false
 }
 
-// setState moves a pending request to approved or denied (operator action).
 func (ps *pairStore) setState(id string, st pairState) bool {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -144,8 +139,6 @@ func (ps *pairStore) setState(id string, st pairState) bool {
 	return true
 }
 
-// claim transitions an approved request to claimed exactly once, returning the
-// request and true only for the first caller.
 func (ps *pairStore) claim(id string) (pairReq, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -157,7 +150,6 @@ func (ps *pairStore) claim(id string) (pairReq, bool) {
 	return *r, true
 }
 
-// unclaim reverts a claim so a peer can retry after a failed token mint.
 func (ps *pairStore) unclaim(id string) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -172,10 +164,8 @@ func (ps *pairStore) remove(id string) {
 	delete(ps.m, id)
 }
 
-// pairCORS runs the API's origin policy over a pairing response, answering
-// the refusal itself. These routes sit outside the api package's auth wrapper
-// because the operator's approval is the gate, so they would otherwise be the
-// only /api/v1/ addresses a browser cannot read the answer from.
+// The pairing routes sit outside the api auth wrapper, since the operator's
+// approval is the gate, so they apply its CORS policy themselves.
 func (s *Server) pairCORS(w http.ResponseWriter, r *http.Request) bool {
 	if api.SetCORS(w, r, s.cfgSnapshot()) {
 		return true
@@ -184,16 +174,12 @@ func (s *Server) pairCORS(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// pairedWith reports whether a token issued to the given peer already exists.
 func (s *Server) pairedWith(app string) bool {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return s.cfg.FindPairedToken(app) != nil
 }
 
-// pairRequest receives a pairing offer from a peer. It issues nothing; an
-// operator approves it in Settings, after which the peer claims the token via
-// pairStatus.
 func (s *Server) pairRequest(w http.ResponseWriter, r *http.Request) {
 	if !s.pairCORS(w, r) {
 		return
@@ -214,14 +200,11 @@ func (s *Server) pairRequest(w http.ResponseWriter, r *http.Request) {
 		api.WriteJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request", "error": err.Error()})
 		return
 	}
-	// An offer from a peer already paired here is a re-pair, not a conflict:
-	// a plugin whose folder was replaced comes back with no credentials, and
-	// refusing it would leave the operator unpairing by hand before the new
-	// copy could work. It still queues for approval like any other offer, and
-	// the claim replaces the credentials rather than adding a second set.
+	// A re-pair is not a conflict: a replaced plugin comes back with no
+	// credentials. It still queues for approval.
 	repair := s.pairedWith(body.App)
 	id, ok := s.pairs.create(pairReq{
-		App: body.App, URL: body.URL, Source: clientIP(r), Scopes: body.RequestedScopes,
+		App: body.App, URL: body.URL, Source: clientIP(r), Scopes: grantedScopes(body.RequestedScopes),
 		PeerToken: body.PeerToken, Version: body.Version, Buttons: body.Buttons, Repair: repair,
 	})
 	if !ok {
@@ -232,21 +215,16 @@ func (s *Server) pairRequest(w http.ResponseWriter, r *http.Request) {
 	api.WriteJSON(w, http.StatusOK, map[string]string{"request_id": id, "status": "pending"})
 }
 
-// validatePairOffer refuses an offer monbooru could not persist or render.
-// monloader declares no buttons, so it only ever meets the name check.
 func validatePairOffer(app, version string, buttons []config.PluginButton) error {
 	if err := config.ValidatePluginName(app); err != nil {
 		return err
 	}
-	if len(version) > config.MaxPluginVersion {
+	if utf8.RuneCountInString(version) > config.MaxPluginVersion {
 		return fmt.Errorf("version must be at most %d characters", config.MaxPluginVersion)
 	}
 	return config.ValidatePluginButtons(buttons)
 }
 
-// pairStatus reports a request's state. On the first poll after approval it
-// mints the peer's token, stores the reverse credentials, and returns the
-// secret once.
 func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.pairCORS(w, r) {
 		return
@@ -276,9 +254,7 @@ func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
 	api.WriteJSON(w, http.StatusOK, map[string]string{"status": "approved", "token": secret})
 }
 
-// pairTeardown lets a paired peer drop the pairing on this side too, so one
-// "remove pairing" tears down both ends. It removes only locally and never
-// calls back, which would loop.
+// Removes only locally: calling the peer back would loop.
 func (s *Server) pairTeardown(w http.ResponseWriter, r *http.Request) {
 	if !s.pairCORS(w, r) {
 		return
@@ -303,12 +279,8 @@ func (s *Server) pairTeardown(w http.ResponseWriter, r *http.Request) {
 	api.WriteJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
-// peerCallbackURL rewrites the address a peer advertised so its host is the
-// source the pairing request came from, keeping the advertised scheme and
-// port. A peer sends its own base_url, which carries the right port but a host
-// (usually localhost) that means nothing from monbooru's side; the source is
-// where monbooru can actually reach it. Falls back to the advertised value when
-// it can't be parsed or the source is unknown.
+// A peer advertises its own base_url, whose host (usually localhost) means
+// nothing from here; the request's source is where it can be reached.
 func peerCallbackURL(advertised, source string) string {
 	source = strings.TrimSpace(source)
 	u, err := url.Parse(strings.TrimSpace(advertised))
@@ -323,22 +295,54 @@ func peerCallbackURL(advertised, source string) string {
 	return u.String()
 }
 
-// mintPairedToken issues the monbooru token the peer will carry, stores the
-// reverse credentials the peer offered, and returns the new secret once. The
-// address to call the peer back at is the source the request came from, unless
-// an operator override is configured. monloader keeps its own config section;
-// every other peer lands in a [[plugin]] block.
-func (s *Server) mintPairedToken(req pairReq) (string, error) {
-	scopes := filterScopes(req.Scopes)
-	if len(scopes) == 0 {
-		scopes = []string{config.ScopeRead, config.ScopeWrite}
+// Any call carrying a peer's own token names where it is now, so a
+// recreated container's new IP is followed without a re-pair.
+func (s *Server) notePeerAddress(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if secret, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
+			s.repointPeer(secret, clientIP(r))
+		}
+		next(w, r)
 	}
-	tok, secret := config.GenerateToken(req.App+" (paired)", scopes)
+}
+
+func (s *Server) repointPeer(secret, source string) {
+	s.cfgMu.RLock()
+	var app, was string
+	if tok := s.cfg.FindTokenByHash(config.HashToken(secret)); tok != nil {
+		app, was = tok.Paired, tok.PeerURL
+	}
+	s.cfgMu.RUnlock()
+	moved := peerCallbackURL(was, source)
+	if app == "" || moved == was {
+		return
+	}
+	if err := s.withConfig(func(c *config.Config) error {
+		if t := c.FindPairedToken(app); t != nil {
+			t.PeerURL = moved
+		}
+		return nil
+	}); err == nil {
+		logx.Infof("pairing: %s moved to %s", app, moved)
+	}
+}
+
+// The request stores the grant, so the approval card shows what the
+// token will carry.
+func grantedScopes(requested []string) []string {
+	if scopes := filterScopes(requested); len(scopes) > 0 {
+		return scopes
+	}
+	return []string{config.ScopeRead, config.ScopeWrite}
+}
+
+func (s *Server) mintPairedToken(req pairReq) (string, error) {
+	tok, secret := config.GenerateToken(req.App+" (paired)", grantedScopes(req.Scopes))
 	tok.Paired = req.App
 	tok.PeerURL = peerCallbackURL(req.URL, req.Source)
 	if err := s.withConfig(func(c *config.Config) error {
-		// A re-pair replaces the peer's credentials rather than stacking a
-		// second set: the copy that held the old token is gone.
+		// A re-pair replaces the credentials: the copy that held the old
+		// token is gone.
 		c.Auth.Tokens = slices.DeleteFunc(c.Auth.Tokens, func(t config.Token) bool { return t.Paired == req.App })
 		c.Auth.Tokens = append(c.Auth.Tokens, tok)
 		if req.App == monloaderApp {
@@ -369,9 +373,8 @@ func (s *Server) pluginPairApprove(w http.ResponseWriter, r *http.Request) {
 		s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData(r))
 		return
 	}
-	// Probe the url monbooru will actually call (the peer's configured
-	// override, else the address the request came from) and refuse the
-	// pairing if unreachable.
+	// A peer monbooru cannot reach would pair dead, so approval waits
+	// until the url it will call answers.
 	base := cmp.Or(s.peerOverrideURL(req.App), peerCallbackURL(req.URL, req.Source))
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -390,10 +393,6 @@ func (s *Server) pluginPairApprove(w http.ResponseWriter, r *http.Request) {
 	writeFlashOOB(w, "flash-plugins", "", "")
 }
 
-// monloaderLightDisconnect pauses the monloader link from the footer light's
-// kill switch: it suspends every call to monloader without dropping the
-// pairing, so the operator can cut the link and later resume it from the same
-// light with no re-pair.
 func (s *Server) monloaderLightDisconnect(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -407,9 +406,6 @@ func (s *Server) monloaderLightDisconnect(w http.ResponseWriter, r *http.Request
 	s.renderMonloaderLight(w, r, "paused", "")
 }
 
-// monloaderLightReconnect lifts the pause, resuming connectivity with the
-// credentials that stayed on disk. The light renders "checking" and its load
-// poll probes monloader within a second.
 func (s *Server) monloaderLightReconnect(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -421,7 +417,6 @@ func (s *Server) monloaderLightReconnect(w http.ResponseWriter, r *http.Request)
 	s.renderMonloaderLight(w, r, "", "")
 }
 
-// setMonloaderPaused persists the footer light's pause flag.
 func (s *Server) setMonloaderPaused(paused bool) error {
 	return s.withConfig(func(c *config.Config) error {
 		c.Monloader.Paused = paused
@@ -429,7 +424,6 @@ func (s *Server) setMonloaderPaused(paused bool) error {
 	})
 }
 
-// renderMonloaderLight writes the footer light in the given connection state.
 func (s *Server) renderMonloaderLight(w http.ResponseWriter, r *http.Request, conn, version string) {
 	s.renderTemplate(w, "partials/monloader_light.html", map[string]any{
 		"MonloaderConn":    conn,
@@ -439,9 +433,6 @@ func (s *Server) renderMonloaderLight(w http.ResponseWriter, r *http.Request, co
 	})
 }
 
-// teardownMonloaderPairing drops this side of the monloader pairing and
-// notifies the peer, returning the notify error (nil on success). Shared by
-// the settings unpair and the footer light's kill switch.
 func (s *Server) teardownMonloaderPairing(r *http.Request) error {
 	peerURL := s.monloaderAPIBase()
 	s.cfgMu.RLock()
@@ -458,9 +449,8 @@ func (s *Server) teardownMonloaderPairing(r *http.Request) error {
 	return notifyErr
 }
 
-// removePairing tears down this side of a pairing: it drops the pairing token
-// and the credential monbooru uses to authenticate to the peer, but keeps the
-// configured api_url so an operator's URL survives an unpair/re-pair cycle.
+// Keeps the configured api_url so an operator's URL survives an unpair
+// and re-pair.
 func (s *Server) removePairing(app string) error {
 	return s.withConfig(func(c *config.Config) error {
 		c.Auth.Tokens = slices.DeleteFunc(c.Auth.Tokens, func(t config.Token) bool { return t.Paired == app })
@@ -471,11 +461,9 @@ func (s *Server) removePairing(app string) error {
 		if p := c.FindPlugin(app); p != nil {
 			p.PeerToken, p.Version, p.Buttons = "", "", nil
 		}
-		// A block that only ever held the pairing goes with it; one carrying
-		// the operator's own lines stays, since config.Save re-encodes the
-		// whole file from the struct and would otherwise erase them. Enabled
-		// counts: dropping it would leave a dropped plugin running with a row
-		// that offers to enable it, and stopped after the next boot.
+		// A block with the operator's own lines stays, since config.Save
+		// re-encodes the whole file from the struct. Enabled counts: dropping
+		// it would leave a running plugin whose row offers to enable it.
 		c.Plugins = slices.DeleteFunc(c.Plugins, func(p config.PluginConfig) bool {
 			return p.Name == app && p.APIURL == "" && !p.Enabled
 		})

@@ -6,9 +6,6 @@ import (
 	"github.com/monbooru/monbooru/internal/relations"
 )
 
-// relationsResponse mirrors relations.ImageRelations in JSON shape.
-// Pointer fields are nil-friendly so the client can tell the
-// difference between "no parent version" and "parent id 0".
 type relationsResponse struct {
 	DuplicateGroup    *dupGroupJSON `json:"duplicate_group"`
 	AlternateGroup    *altGroupJSON `json:"alternate_group"`
@@ -29,9 +26,8 @@ type altGroupJSON struct {
 	Members []int64 `json:"member_ids"`
 }
 
-// relationsForImage serves GET /api/v1/images/{id}/relations.
 func (h *Handler) relationsForImage(w http.ResponseWriter, r *http.Request) {
-	g, id, ok := h.galleryAndID(w, r)
+	g, id, ok := h.galleryAndExistingID(w, r)
 	if !ok {
 		return
 	}
@@ -67,10 +63,6 @@ func (h *Handler) relationsForImage(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, resp)
 }
 
-// relationsAddBody is the JSON shape POST /api/v1/relations expects.
-// Type, A, and B are required. Direction defaults to "ab" - A is the left
-// side (original / source / newer / parent). Promotion to original is a
-// DELETE-side action (type "promote_original"), not a field here.
 type relationsAddBody struct {
 	Type      string `json:"type"`
 	A         int64  `json:"a"`
@@ -78,7 +70,6 @@ type relationsAddBody struct {
 	Direction string `json:"direction"`
 }
 
-// addRelation serves POST /api/v1/relations.
 func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -90,6 +81,10 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.A == 0 || body.B == 0 {
 		apiError(w, http.StatusBadRequest, "invalid_request", "missing a or b")
+		return
+	}
+	if !imageExists(g, body.A) || !imageExists(g, body.B) {
+		apiError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	}
 	left, right := body.A, body.B
@@ -107,10 +102,8 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 	case "alternate":
 		err = g.RelationsSvc.AddAlternate(left, right)
 	case "version":
-		// left is the parent (older revision), right the child.
 		err = g.RelationsSvc.AddVersionEdge(left, right)
 	case "derivative":
-		// left is a source, right the derivative.
 		err = g.RelationsSvc.AddDerivativeEdge(left, right)
 	case "not_related":
 		err = g.RelationsSvc.AddNotRelated(left, right)
@@ -126,7 +119,6 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-// relationsRemoveBody is the JSON for DELETE /api/v1/relations.
 type relationsRemoveBody struct {
 	Type    string `json:"type"`
 	A       int64  `json:"a"`
@@ -136,7 +128,6 @@ type relationsRemoveBody struct {
 	RootID  int64  `json:"root_id"`
 }
 
-// removeRelation serves DELETE /api/v1/relations.
 func (h *Handler) removeRelation(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -205,9 +196,6 @@ func (h *Handler) removeRelation(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// writeRelationError surfaces relations.Service errors as API errors,
-// using the shared FriendlyErrorFor mapping for typed sentinels and
-// falling back to a generic 500 for anything else.
 func writeRelationError(w http.ResponseWriter, err error) {
 	if fe := relations.FriendlyErrorFor(err); fe != nil {
 		apiError(w, fe.Status, fe.Code, fe.Message)

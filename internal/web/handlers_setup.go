@@ -12,16 +12,10 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// setupData drives setup.html. GalleryPath and LAN are the current state
-// read from the config; Menu and Autostart are the offers a first render
-// makes. All four are echoed back from the form when a submit has to be
-// shown again.
 type setupData struct {
 	BooruName string
 	CSRFToken string
-	// The rest of what partials/head.html reads: the wizard is the first
-	// page a desktop install shows, so it carries the operator's branding
-	// like every other page.
+	// The rest of what partials/head.html reads.
 	Title        string
 	BooruFavicon string
 	Theme        bool
@@ -31,14 +25,9 @@ type setupData struct {
 	Menu         bool
 	Autostart    bool
 	Port         string
-	// Integration drives the offer to add the app to the applications menu
-	// and to start at login, which is the one thing a tarball install lacks.
-	Integration desktopIntegration
+	Integration  desktopIntegration
 }
 
-// setupPending reports whether the first-run wizard still owes the operator
-// a pass. Only the desktop profile has one: a container or a server install
-// was configured by whoever deployed it.
 func (s *Server) setupPending() bool {
 	if !s.desktop {
 		return false
@@ -48,10 +37,6 @@ func (s *Server) setupPending() bool {
 	return !s.cfg.SetupDone
 }
 
-// setupMiddleware sends every page to the wizard until it has been through
-// once. The exemptions are what the wizard itself needs plus the health
-// probe, which the single-instance check and the container healthcheck both
-// depend on answering at all times.
 func (s *Server) setupMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.setupPending() || setupExempt(r.URL.Path) {
@@ -63,9 +48,8 @@ func (s *Server) setupMiddleware(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		// An API client cannot follow a browser redirect to a wizard: a
-		// 303 lands it on an HTML page with a 200, which reads as an
-		// answer. It gets the refusal in the envelope it parses.
+		// An API client would take the wizard's HTML 200 for an answer,
+		// so it gets a JSON refusal.
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -84,9 +68,8 @@ func setupExempt(path string) bool {
 	case "/health", "/setup", "/internal/browse":
 		return true
 	}
-	// The login form and the assets it pulls: with auth on and the wizard
-	// still owed, the session gate sends /setup to /login and this one
-	// would send /login back, leaving neither page reachable.
+	// With auth on, the session gate sends /setup to /login, so gating
+	// the login here would loop.
 	return isStaticPath(path) || isPublicPath(path)
 }
 
@@ -105,11 +88,8 @@ func (s *Server) setupPage(w http.ResponseWriter, r *http.Request) {
 	s.renderSetup(w, r, setupData{
 		GalleryPath: galleryPath,
 		LAN:         !desktop.IsLoopbackAddr(bind),
-		// Both offers are worth making by default: a desktop install that
-		// sits in the launcher and comes back at login is what the profile
-		// is for.
-		Menu:      true,
-		Autostart: true,
+		Menu:        true,
+		Autostart:   true,
 	})
 }
 
@@ -131,10 +111,8 @@ func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, d setupData
 	s.renderTemplate(w, "setup.html", d)
 }
 
-// setupPost is the wizard's only submit. The gallery folder goes first
-// because it is the one input that can fail and every handler assumes an
-// active gallery; the flag is recorded with the address, so a submit that
-// never reaches the end leaves the gate up and the tour re-runnable.
+// The gallery goes first, the one input that can fail; SetupDone is saved
+// with the address, so a submit that fails midway leaves the wizard up.
 func (s *Server) setupPost(w http.ResponseWriter, r *http.Request) {
 	if !s.desktop {
 		http.NotFound(w, r)

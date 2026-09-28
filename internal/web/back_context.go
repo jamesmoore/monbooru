@@ -7,10 +7,6 @@ import (
 	"net/url"
 )
 
-// backContext carries the five back_* navigation params that ferry the
-// gallery query / sort / page across detail, reader, pages-grid, and
-// relations renders. Empty fields are skipped on encode so a URL only
-// grows the params the caller actually passed in.
 type backContext struct {
 	Q     string
 	Sort  string
@@ -19,7 +15,6 @@ type backContext struct {
 	Seed  string
 }
 
-// parseBackContext lifts the five fields off the request URL.
 func parseBackContext(r *http.Request) backContext {
 	q := r.URL.Query()
 	return backContext{
@@ -31,9 +26,6 @@ func parseBackContext(r *http.Request) backContext {
 	}
 }
 
-// values materialises the fields as a url.Values under the given key
-// prefix, dropping empty entries so a missing field doesn't appear in
-// the encoded query.
 func (b backContext) values(prefix string) url.Values {
 	v := url.Values{}
 	for _, f := range []struct{ key, val string }{
@@ -50,13 +42,9 @@ func (b backContext) values(prefix string) url.Values {
 	return v
 }
 
-// URLValues materialises the back-* fields (back_-prefixed keys).
 func (b backContext) URLValues() url.Values { return b.values("back_") }
 
-// QueryString returns the encoded back_* fragment prefixed with sep
-// (use "?" for stand-alone hrefs, "&" for hrefs that already opened a
-// query string). template.URL bypasses html/template's URL-attribute
-// auto-escape so the `&` separators survive interpolation.
+// template.URL so html/template does not escape the & separators.
 func (b backContext) QueryString(sep string) template.URL {
 	v := b.URLValues()
 	if len(v) == 0 {
@@ -65,7 +53,6 @@ func (b backContext) QueryString(sep string) template.URL {
 	return template.URL(sep + v.Encode())
 }
 
-// DetailURL builds /images/{id}?back_q=...&... preserving every set field.
 func (b backContext) DetailURL(id int64) string {
 	base := fmt.Sprintf("/images/%d", id)
 	v := b.URLValues()
@@ -75,9 +62,6 @@ func (b backContext) DetailURL(id int64) string {
 	return base + "?" + v.Encode()
 }
 
-// GalleryURL builds "/" or "/?q=...&sort=...&..." from the back_* fields.
-// The gallery URL drops the `back_` prefix - the receiver is the gallery
-// list, where `q` / `sort` / `order` are the live query.
 func (b backContext) GalleryURL() string {
 	if b == (backContext{}) {
 		return "/"
@@ -85,10 +69,6 @@ func (b backContext) GalleryURL() string {
 	return "/?" + b.values("").Encode()
 }
 
-// ReaderQS returns the two query fragments the reader template needs:
-// a stand-alone `?...` for the detail-page back link, and a `&...`
-// tail for reader-internal page-flip links that already open `?page=N`.
-// Both are empty when no back_* is set and fromPages is false.
 func (b backContext) ReaderQS(fromPages bool) (template.URL, template.URL) {
 	v := b.URLValues()
 	if fromPages {

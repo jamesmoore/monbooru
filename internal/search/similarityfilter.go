@@ -12,15 +12,7 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// buildSimilarFilter handles the two similar: forms:
-//
-//   - `similar:<id>` matches every image sharing at least one of the
-//     seed's tags. Sharing one is already score > 0, so the bare form
-//     skips scoring and rides a plain membership test on
-//     idx_image_tags_tag_image.
-//   - `similar:<id>~<score>` matches images scoring at least <score>.
-//
-// Malformed input collapses to `1=0` like id: does.
+// Sharing one tag already scores above 0, so the bare form skips scoring.
 func (b *whereBuilder) buildSimilarFilter(e FilterExpr) string {
 	seedID, threshold, ok := parseSimilarValue(e.Val)
 	if !ok {
@@ -38,26 +30,20 @@ func (b *whereBuilder) buildSimilarFilter(e FilterExpr) string {
 	if threshold < 0 {
 		return member + ")"
 	}
-	// Tighten the gate to the shared count the threshold implies before
-	// the exact score prices anything: on a large library that is the
-	// difference between scoring a third of the images and scoring the
-	// few that can still reach it.
+	// Only rows sharing enough tags to reach the threshold get scored.
 	if need := seed.MinShared(threshold); need > 1 {
 		member += " GROUP BY it.image_id HAVING count(*) >= ?"
 		b.args = append(b.args, need)
 	}
 	member += ")"
-	// The membership gate runs first, so the score only prices rows that
-	// already share something.
+	// Membership first, so the score only prices rows that share something.
 	scoreExpr, scoreArgs := seed.ScoreExpr("i.id", "its")
 	b.args = append(b.args, scoreArgs...)
 	b.args = append(b.args, threshold)
 	return member + " AND " + scoreExpr + " >= ?"
 }
 
-// parseSimilarValue splits `<id>` and `<id>~<score>`. threshold is -1
-// for the bare form; a `~` with nothing usable after it is malformed
-// rather than a silent fallback to the bare form.
+// threshold is -1 for the bare form.
 func parseSimilarValue(val string) (seedID int64, threshold float64, ok bool) {
 	val = strings.TrimSpace(val)
 	idPart, scorePart := val, ""
@@ -79,19 +65,12 @@ func parseSimilarValue(val string) (seedID int64, threshold float64, ok bool) {
 	return id, s, true
 }
 
-// similarityOrderClause ranks by overlap with the seed. The score is
-// not a column, so it rides a correlated count the same way the
-// collection sort reads its position.
 func similarityOrderClause(seed tags.OverlapSeed, order string) (string, []any) {
 	dir := sqlDir(order, "DESC")
 	sub, args := seed.ScoreExpr("i.id", "it")
 	return "ORDER BY " + sub + " " + dir + ", i.id " + dir, args
 }
 
-// similarityRankSeed resolves the seed the similarity sort ranks
-// against: the leftmost positive similar: term in expr. Returns false
-// when there is none or it has nothing to match on, and the caller
-// keeps the default order.
 func similarityRankSeed(database *db.DB, expr Expr) (tags.OverlapSeed, bool) {
 	if database == nil {
 		return tags.OverlapSeed{}, false
@@ -107,12 +86,8 @@ func similarityRankSeed(database *db.DB, expr Expr) (tags.OverlapSeed, bool) {
 	return seed, true
 }
 
-// SimilaritySeedID returns the seed the query ranks against: the first
-// positive similar: term in reading order. Negated terms are skipped -
-// ranking by a seed the operator asked to exclude is never what they
-// meant. The gallery handler reads it to default the sort to
-// similarity, the way a collection: term defaults it to collection
-// order, and to score the page it is about to render.
+// SimilaritySeedID skips negated terms: ranking by an excluded seed is
+// never meant.
 func SimilaritySeedID(expr Expr) (int64, bool) {
 	switch e := expr.(type) {
 	case AndExpr:
@@ -141,30 +116,14 @@ func HasSimilarTerm(expr Expr) bool {
 	return ok
 }
 
-// similarityMatchIDs runs the ranked id-only SELECT that the cold
-// prev/next and back-page paths read from. The similarity sort has no
-// key column to seek on, so both resolve their answer by position in
-// this list instead of a cursor comparison.
-//
-// The fan seeds the adjacency cache the way Execute's page-1 fan does,
-// so a detail page reached by a direct link - rather than from a
-// gallery that already populated the list - pays the scored pass once
-// instead of on every render. A short read stays out of the cache: a
-// list at the cap is partial against an unknown total.
-//
-// ctx is the render's: no fast counter recognises a similar: shape, so
-// nothing upstream can bail out of an oversized candidate set ahead of
-// this scan, and the deadline is the only bound on it.
+// A list at the cap is partial, so it stays out of the cache. ctx is the
+// only bound on this scan: no fast counter recognises similar:.
 func similarityMatchIDs(ctx context.Context, database *db.DB, q Query) []int64 {
 	seed, ok := similarityRankSeed(database, q.Expr)
 	if !ok {
 		return nil
 	}
-	// The gallery-side fan takes this gate so concurrent misses on one
-	// key don't each run the whole scored pass; this fan rides the same
-	// key for the same reason. A loser renders without prev/next and
-	// the winner leaves the list cached for the next hit. A keyless
-	// render has nothing to share and nothing to seed.
+	// One scored pass per key: a loser renders without prev/next.
 	if q.CacheKey != "" {
 		if !AdjacencyCacheTryAcquireFan(q.CacheKey) {
 			return nil
@@ -182,12 +141,8 @@ func similarityMatchIDs(ctx context.Context, database *db.DB, q Query) []int64 {
 	return ids
 }
 
-// fanSimilarityIDs returns the match set ranked by overlap with the
-// seed. The score's denominator - the candidate's own counted-tag
-// total - comes from the cached tallies rather than the correlated
-// subquery, which re-derives it through both tag joins for every
-// candidate on every render. Falls back to the scored ORDER BY when
-// the tallies are unavailable.
+// Scored in Go off the cached tallies: the SQL score re-derives each
+// candidate's total through both tag joins.
 func fanSimilarityIDs(ctx context.Context, database *db.DB, seed tags.OverlapSeed, order, where string, args []any) []int64 {
 	totals, err := counts.CountedTagTotals(ctx, database, seed.MaxUsage)
 	if err != nil {
@@ -211,9 +166,8 @@ func fanSimilarityIDs(ctx context.Context, database *db.DB, seed tags.OverlapSee
 	}
 	rows := make([]ranked, len(ids))
 	for i, id := range ids {
-		// A candidate with no counted tags scores NULL in SQL, which
-		// sorts below every number: last under DESC, first under ASC,
-		// which is what a negative sentinel reproduces.
+		// SQL scores a candidate with no counted tags NULL, which sorts
+		// below every number; -1 reproduces that.
 		score := -1.0
 		if total := totals.Total(id); total > 0 {
 			score = tags.OverlapScore(int(shared[id]), len(seed.TagIDs), int(total))
@@ -233,8 +187,6 @@ func fanSimilarityIDs(ctx context.Context, database *db.DB, seed tags.OverlapSee
 	return ids
 }
 
-// sharedTagCounts tallies how many of the seed's counted tags each
-// image carries, in one grouped read of idx_image_tags_tag_image.
 func sharedTagCounts(ctx context.Context, database *db.DB, seed tags.OverlapSeed) (map[int64]int32, error) {
 	placeholders, args := db.InPlaceholders(seed.TagIDs)
 	rows, err := database.Read.QueryContext(ctx,

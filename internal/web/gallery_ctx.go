@@ -2,19 +2,35 @@ package web
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/relations"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// requireActive returns the active gallery context, or writes a 503
-// "no gallery" and returns false. Callers must `return` on a false
-// result. Use this for any handler whose work can't proceed without a
-// live DB; sub-service guards (RelationsSvc==nil, bkTree==nil) still
-// belong inline because they check different fields.
+// Image ids are per gallery, so a write from a page rendered for another
+// gallery would act on different images; the page says which one it shows.
+func pageGalleryStale(w http.ResponseWriter, r *http.Request, active string) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead || strings.HasPrefix(r.URL.Path, "/api/") {
+		return false
+	}
+	page := r.Header.Get("X-Monbooru-Gallery")
+	if page == "" && !isMultipart(r) {
+		page = r.FormValue("_gallery")
+	}
+	if page == "" || page == active {
+		return false
+	}
+	w.Header().Set("X-Monbooru-Gallery", active)
+	http.Error(w, fmt.Sprintf("This page shows gallery %s, but %s is now active. Reload the page.", page, active), http.StatusConflict)
+	return true
+}
+
 func (s *Server) requireActive(w http.ResponseWriter) (*galleryCtx, bool) {
 	cx := s.active()
 	if cx == nil || cx.DB == nil {
@@ -24,8 +40,8 @@ func (s *Server) requireActive(w http.ResponseWriter) (*galleryCtx, bool) {
 	return cx, true
 }
 
-// Accessors below resolve to the active gallery's fields. A gallery-read
-// route's RLock keeps the returned pointers stable per request.
+// Each accessor resolves the active gallery anew; only a read route's
+// lock keeps them agreeing.
 
 func (s *Server) db() *db.DB {
 	if cx := s.active(); cx != nil {
@@ -41,18 +57,11 @@ func (s *Server) tagSvc() *tags.Service {
 	return nil
 }
 
-// categoryExists reports whether name matches a row in tag_categories on
-// the active gallery. Callers use it to disambiguate a `prefix:value`
-// token that might be category-qualified or a literal tag containing a
-// colon. Database errors (including nil gallery) count as "no match" so
-// an ambiguous input degrades to literal.
 func (s *Server) categoryExists(name string) bool {
 	_, ok := s.categoryIDByName(name)
 	return ok
 }
 
-// categoryIDByName resolves a category name to its row id, off the
-// package that owns the table.
 func (s *Server) categoryIDByName(name string) (int64, bool) {
 	d := s.db()
 	if d == nil {
@@ -69,6 +78,13 @@ func (s *Server) galleryPath() string {
 	return ""
 }
 
+func (s *Server) boundary() *gallery.Boundary {
+	if cx := s.active(); cx != nil {
+		return cx.Boundary()
+	}
+	return gallery.NewBoundary("", nil, nil)
+}
+
 func (s *Server) relationsSvc() *relations.Service {
 	if cx := s.active(); cx != nil {
 		return cx.RelationsSvc
@@ -76,10 +92,6 @@ func (s *Server) relationsSvc() *relations.Service {
 	return nil
 }
 
-// onImageDeleteCallback wires the active gallery's relations service
-// into the gallery.DeleteImage signature. Returns nil when the
-// service isn't available (e.g. mid-switch), so DeleteImage skips the
-// relations cleanup step rather than crashing.
 func (s *Server) onImageDeleteCallback() func(*sql.Tx, int64) error {
 	svc := s.relationsSvc()
 	if svc == nil {
@@ -88,8 +100,6 @@ func (s *Server) onImageDeleteCallback() func(*sql.Tx, int64) error {
 	return svc.OnImageDeleteTx
 }
 
-// onImagesDeleteCallback is onImageDeleteCallback for the chunked bulk
-// paths, which hand the whole chunk over so each group is decided once.
 func (s *Server) onImagesDeleteCallback() func(*sql.Tx, []int64) error {
 	svc := s.relationsSvc()
 	if svc == nil {
@@ -112,10 +122,6 @@ func (s *Server) dbPath() string {
 	return ""
 }
 
-// galleryCtx is the aggregate, which lives in internal/library. The alias
-// keeps the local spelling every handler already uses.
 type galleryCtx = library.Gallery
 
-// Ceiling is the per-request rating ceiling, which travels with the
-// gallery it filters.
 type Ceiling = library.Ceiling

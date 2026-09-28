@@ -7,7 +7,6 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// extractSDFromJPEG reads A1111 metadata from a JPEG's EXIF UserComment.
 func extractSDFromJPEG(path string) (*models.SDMetadata, error) {
 	x := decodeJPEGEXIF(path)
 	if x == nil {
@@ -16,27 +15,20 @@ func extractSDFromJPEG(path string) (*models.SDMetadata, error) {
 	return sdFromEXIF(x), nil
 }
 
-// sdFromEXIF decodes A1111 parameters from an EXIF UserComment tag,
-// returning nil when the tag is absent or not A1111-shaped.
 func sdFromEXIF(x *exifData) *models.SDMetadata {
 	tag, ok := x.get(userCommentField)
 	if !ok {
 		return nil
 	}
-	raw, ok := tag.stringVal()
+	text, ok := tag.userCommentText()
 	if !ok {
 		return nil
 	}
-	// EXIF UserComment may carry a charset prefix like "ASCII\x00\x00\x00".
-	text := strings.TrimPrefix(raw, "ASCII\x00\x00\x00")
-	text = strings.TrimLeft(text, "\x00")
 	return parseA1111Parameters(text)
 }
 
-// parseA1111Parameters parses A1111's parameter-string format. Returns
-// nil when the blob lacks the "Negative prompt:" / "Steps:" markers
-// that distinguish A1111 from random EXIF UserComment writers (GIMP,
-// Paint Tool SAI, etc.).
+// The "Negative prompt:" and "Steps:" markers tell A1111 text from what
+// other tools write into UserComment.
 func parseA1111Parameters(text string) *models.SDMetadata {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -80,8 +72,6 @@ func parseA1111Parameters(text string) *models.SDMetadata {
 	return sd
 }
 
-// findParamLineIndex returns the byte index of the first line starting
-// with "Steps:" (the A1111 parameter line marker), or -1.
 func findParamLineIndex(text string) int {
 	lines := strings.Split(text, "\n")
 	pos := 0
@@ -90,13 +80,12 @@ func findParamLineIndex(text string) int {
 		if strings.HasPrefix(trimmed, "Steps:") {
 			return pos
 		}
-		pos += len(line) + 1 // +1 for newline
+		pos += len(line) + 1
 	}
 	return -1
 }
 
-// ParseAllSDParams extracts every "Key: Value" pair from an A1111
-// parameter line. Order is preserved; values with braces are kept whole.
+// ParseAllSDParams keeps the line's order, and a braced value stays whole.
 func ParseAllSDParams(paramLine string) []models.SDParam {
 	var result []models.SDParam
 	seen := map[string]bool{}
@@ -109,8 +98,6 @@ func ParseAllSDParams(paramLine string) []models.SDParam {
 	return result
 }
 
-// splitA1111Params splits an A1111 parameter line on commas while
-// respecting nested braces.
 func splitA1111Params(s string) []string {
 	var parts []string
 	depth := 0
@@ -136,8 +123,6 @@ func splitA1111Params(s string) []string {
 	return parts
 }
 
-// eachA1111Param walks the "Key: Value" pairs of an A1111 parameter line
-// in order, invoking fn with the trimmed key and value.
 func eachA1111Param(paramLine string, fn func(key, val string)) {
 	paramLine = strings.ReplaceAll(paramLine, "\n", " ")
 	for _, part := range splitA1111Params(paramLine) {

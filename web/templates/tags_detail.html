@@ -171,6 +171,24 @@
 
   <div class="tag-detail-cols">
     <div>
+      <section class="tag-detail-section" id="tag-note">
+        <h3>Note
+          {{if or .NoteBody .NoteLinks}}
+          <button type="button" id="btn-detail-note" class="btn-link-accent" data-note="{{.NoteBody}}" data-links="{{.NoteLinksText}}" title="Edit the note and links">[edit]</button>
+          {{else}}
+          <button type="button" id="btn-detail-note" class="btn-link-accent" title="Add a note">[+ add note]</button>
+          <button type="button" id="btn-detail-links" class="btn-link-accent" title="Add links">[+ add links]</button>
+          {{end}}
+        </h3>
+        {{if .NoteBody}}<div class="commentary-body">{{.NoteHTML}}</div>{{end}}
+        {{if .NoteLinks}}
+        <ul class="tag-note-links">
+          {{range .NoteLinks}}
+          <li>{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noopener noreferrer" title="{{if .Dead}}dead link: {{end}}{{.URL}}">{{if .Dead}}<s>{{.Label}}</s>{{else}}{{.Label}}{{end}}</a>{{else if .Dead}}<s>{{.Label}}</s>{{else}}{{.Label}}{{end}}{{if .Dead}}<span class="tag-note-dead">dead</span>{{end}}</li>
+          {{end}}
+        </ul>
+        {{end}}
+      </section>
       <section class="tag-detail-section"
                hx-get="/tags/{{.Tag.ID}}/usage" hx-trigger="load" hx-swap="innerHTML">Loading…</section>
     </div>
@@ -241,6 +259,30 @@
   </form>
 </dialog>
 
+{{if not .Tag.IsAlias}}
+<dialog id="tag-note-dialog">
+  <form hx-post="/tags/{{.Tag.ID}}/note"
+        hx-target="#tag-note-error"
+        hx-swap="innerHTML"
+        hx-on::after-request="onExternalEditResponse(event, 'tag-note-dialog')">
+    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+    <p>Note on <strong style="color:{{catColor .Tag.CategoryColor}}">{{.Tag.Name}}</strong></p>
+    <div class="field">
+      <label for="tag-note-body">Note (max 10000 chars)</label>
+      <textarea id="tag-note-body" name="note" rows="6" maxlength="10000"></textarea>
+      {{template "partials/markup_bar.html" (dict "Target" "tag-note-body" "PreviewURL" (printf "/tags/%d/markup/preview" .Tag.ID))}}
+    </div>
+    <div class="field">
+      <label for="tag-note-links">Links</label>
+      <textarea id="tag-note-links" name="links" rows="4"></textarea>
+      <p class="field-hint">One per line. Start a line with - for a dead link.</p>
+    </div>
+    <div id="tag-note-error"></div>
+    {{template "dialog_actions" dict "ID" "tag-note-dialog" "Submit" "Save"}}
+  </form>
+</dialog>
+{{end}}
+
 <script>
 var TAG_ID = {{.Tag.ID}};
 var TAG_NAME = {{.Tag.Name}};
@@ -260,6 +302,21 @@ var TAG_NAME = {{.Tag.Name}};
 })();
 
 (function() {
+  var note = document.getElementById('btn-detail-note');
+  if (!note) return;
+  function open(focusID) {
+    document.getElementById('tag-note-body').value = note.dataset.note || '';
+    document.getElementById('tag-note-links').value = note.dataset.links || '';
+    clearSlots('tag-note-error', 'tag-note-body-preview');
+    document.getElementById('tag-note-dialog').showModal();
+    document.getElementById(focusID).focus();
+  }
+  note.addEventListener('click', function() { open('tag-note-body'); });
+  var links = document.getElementById('btn-detail-links');
+  if (links) links.addEventListener('click', function() { open('tag-note-links'); });
+})();
+
+(function() {
   var btn = document.getElementById('btn-detail-category');
   if (!btn) return;
   btn.addEventListener('click', function() {
@@ -267,8 +324,8 @@ var TAG_NAME = {{.Tag.Name}};
   });
 })();
 
-// A category collision answers 200 with a flash-err carrying the merge
-// offer, so success alone can't drive the header repaint.
+// A collision answers 200 with a flash-err, so success alone does not
+// mean the category moved.
 function onDetailCategoryChanged(event) {
   document.getElementById('detail-category-dialog').close();
   if (!event.detail.successful) return;
@@ -319,18 +376,14 @@ function pullTagPTR(okLabel, question) {
   showConfirm(question, function() { postTagPTRPull(null); }, null, okLabel);
 }
 
-// The look-up dialog's pull: the preview was the confirmation, so the
-// dialog closes and the pull runs under the spelling it showed.
 function pullTagPTRAs(spelling) {
   var d = document.getElementById('ptr-lookup-dialog');
   if (d) d.close();
   postTagPTRPull({as: spelling});
 }
 
-// The same pull the other way round: this tag merges into the repository's
-// spelling first, so the cluster lands on the name the repository uses. The
-// merge moves images and cannot be undone, which the preview does not show,
-// so this direction confirms where the plain pull does not.
+// Confirms, unlike the plain pull: the merge moves images, cannot be
+// undone, and the preview never showed it.
 function pullTagPTRKeeping(spelling) {
   var d = document.getElementById('ptr-lookup-dialog');
   if (d) d.close();
@@ -353,9 +406,6 @@ function updateDetailColor(sel) {
   if (opt && name && opt.dataset.color) name.style.color = opt.dataset.color;
 }
 
-// The implications editor reuses the dialog partial; after an add the
-// body re-fetches so fresh edges render, mirroring the old dialog's
-// behaviour. The remove buttons prune their own <li> in place.
 function reloadImplicationsBody() {
   var body = document.getElementById('implications-editor');
   if (!body) return;

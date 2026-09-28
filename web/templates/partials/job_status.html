@@ -1,26 +1,38 @@
 {{define "partials/job_status.html"}}
+{{$job := .Job}}
 <div id="job-status"
      hx-get="/internal/job/status"
      hx-trigger="every 2s"
      hx-swap="outerHTML"
-     {{if and . .Running}}class="job-running"{{end}}
-     {{if .}}data-job-type="{{.JobType}}" data-processed="{{.Processed}}" data-watcher-notices="{{.WatcherNotices}}"{{end}}
-     {{if and . .FinishedAt}}data-finished-at="{{.FinishedAt.UnixNano}}"{{end}}>
-  {{if and . .Running}}
+     {{if and $job $job.Running}}class="job-running"{{end}}
+     {{if $job}}data-job-type="{{$job.JobType}}" data-processed="{{$job.Processed}}" data-watcher-notices="{{$job.WatcherNotices}}"{{end}}
+     {{if and $job $job.FinishedAt}}data-finished-at="{{$job.FinishedAt.UnixNano}}"{{end}}>
+  {{with $job}}{{if .Running}}
     <span class="job-type">{{.JobType}}</span>
     {{if gt .Total 0}}
       <span class="job-progress">{{.Processed}}/{{.Total}}</span>
     {{end}}
     <span class="job-msg" title="{{.Message}}">{{.Message}}</span>
-    {{if or (eq .JobType "autotag") (eq .JobType "sync") (eq .JobType "delete") (eq .JobType "re-extract") (eq .JobType "rebuild-thumbs") (eq .JobType "move") (eq .JobType "tag") (eq .JobType "prune-thumbs") (eq .JobType "relations") (eq .JobType "hashes") (eq .JobType "fold") (eq .JobType "lookup") (eq .JobType "check")}}
-    <button class="job-dismiss" onclick="cancelJobStatus()" title="{{cancelTitle .JobType}}">×</button>
+    {{with cancelTitle .JobType}}
+    <button class="job-dismiss" onclick="cancelJobStatus()" title="{{.}}">×</button>
     {{end}}
-  {{else if and . .Summary}}
+  {{else if .Summary}}
     <span class="job-done" id="job-done-msg" title="{{.Summary}}">✓ {{.Summary}}</span>
     <button class="job-dismiss" onclick="dismissJobStatus()" title="Dismiss">×</button>
-  {{else if and . .Error}}
+  {{else if .Error}}
     <span class="job-error" id="job-error-msg" title="{{.Error}}">✗ {{.Error}}</span>
     <button class="job-dismiss" onclick="dismissJobStatus()" title="Dismiss">×</button>
+  {{end}}{{end}}
+  {{range .Downloads}}
+    <span class="job-download" title="Downloading {{.Name}}">
+      <span class="job-type">zip</span>
+      {{if .Sent}}
+        <span class="job-progress">{{.Done}}/{{.Files}}</span>
+        <span class="job-msg">{{humanBytes .Sent}} of {{humanBytes .Bytes}}</span>
+      {{else}}
+        <span class="job-msg">preparing {{.Files}} file(s)...</span>
+      {{end}}
+    </span>
   {{end}}
 </div>
 {{end}}

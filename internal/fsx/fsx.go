@@ -1,6 +1,4 @@
-// Package fsx holds the filesystem primitives more than one package needs
-// and none of them owns: it sits below every domain package so a caller as
-// low as internal/config can reach it without inverting the import order.
+// Package fsx holds the filesystem helpers several packages share.
 package fsx
 
 import (
@@ -9,15 +7,8 @@ import (
 	"path/filepath"
 )
 
-// WriteAtomic runs write against a temp file beside path and renames it
-// into place, so a concurrent reader never sees a partial file. The temp
-// is removed on every failure path.
-//
-// The rename is atomic for the directory entry, not for the bytes behind
-// it. A caller that needs the content durable across a crash - not just
-// consistent - calls Sync on the file at the end of write and SyncDir on
-// the containing directory afterwards. Most callers here write derived
-// files that regenerate, and pay neither.
+// WriteAtomic is atomic, not durable: a caller that needs the content to
+// survive a crash calls Sync at the end of write and SyncDir after.
 func WriteAtomic(path, pattern string, write func(*os.File) error) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), pattern)
 	if err != nil {
@@ -40,9 +31,8 @@ func WriteAtomic(path, pattern string, write func(*os.File) error) error {
 	return nil
 }
 
-// SyncDir flushes a directory entry so a rename survives a crash. Best
-// effort: a filesystem that refuses the open or the fsync still has the
-// renamed file, it just has not promised it yet.
+// SyncDir is best effort: a refused open or fsync still leaves the renamed
+// file.
 func SyncDir(dir string) {
 	d, err := os.Open(dir)
 	if err != nil {

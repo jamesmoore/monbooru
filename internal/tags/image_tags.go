@@ -8,31 +8,20 @@ import (
 	"slices"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/models"
 )
-
-// image_tags mutation: the add/remove/prune family, the source-sync
-// merge, implications fan-in, and the rating prunes.
 
 func (s *Service) AddTagToImage(imageID, tagID int64, isAuto bool, confidence *float64) error {
 	_, err := s.AddTagToImageReportingDup(imageID, tagID, isAuto, confidence, "")
 	return err
 }
 
-// AddTagsToImageFromTagger applies a batch of tag IDs to a single image
-// in one write transaction. Per-tag promotion / dup-detection and the
-// rating-prune split (manual overwrites, auto keeps highest) are
-// preserved so the result matches a serial chain of
-// AddTagToImageFromTagger calls, minus the per-tag transaction
-// overhead. Used by gallery_merge.go's import path so a record
-// carrying dozens of tags doesn't pay one tx per row.
 func (s *Service) AddTagsToImageFromTagger(imageID int64, tagIDs []int64, isAuto bool, taggerName string) error {
 	return s.AddTagsToImageFromTaggerConf(imageID, tagIDs, nil, isAuto, taggerName)
 }
 
-// AddTagsToImageFromTaggerConf is AddTagsToImageFromTagger with a per-tag
-// confidence: confs[i] pairs with tagIDs[i], and a nil or missing entry stores
-// NULL. The transfer path uses it so an auto-tag keeps the score it was
-// assigned.
+// AddTagsToImageFromTaggerConf pairs confs[i] with tagIDs[i]; a nil or
+// missing entry stores NULL.
 func (s *Service) AddTagsToImageFromTaggerConf(imageID int64, tagIDs []int64, confs []*float64, isAuto bool, taggerName string) error {
 	if len(tagIDs) == 0 {
 		return nil
@@ -43,9 +32,6 @@ func (s *Service) AddTagsToImageFromTaggerConf(imageID int64, tagIDs []int64, co
 	})
 }
 
-// addTagsTx applies each tag to the image inside tx and reports what
-// each add changed. confs pairs positionally with tagIDs; a nil or
-// short slice stores NULL.
 func addTagsTx(tx *sql.Tx, imageID int64, tagIDs []int64, confs []*float64, isAuto bool, via string, ratingCatID int64) ([]AddResult, error) {
 	results := make([]AddResult, 0, len(tagIDs))
 	for i, tagID := range tagIDs {
@@ -62,8 +48,6 @@ func addTagsTx(tx *sql.Tx, imageID int64, tagIDs []int64, confs []*float64, isAu
 	return results, nil
 }
 
-// addOneTagTx runs one insert-or-promote plus the rating prune the pair
-// always travels with, reporting the flags and any displaced rating names.
 func addOneTagTx(tx *sql.Tx, imageID, tagID int64, isAuto bool, confidence *float64, taggerName string, ratingCatID int64) (added, promoted bool, displaced []string, err error) {
 	added, promoted, err = addTagToImageTxReportingDup(tx, imageID, tagID, isAuto, confidence, taggerName, ratingCatID)
 	if err != nil {
@@ -77,20 +61,12 @@ func addOneTagTx(tx *sql.Tx, imageID, tagID int64, isAuto bool, confidence *floa
 	return added, promoted, displaced, nil
 }
 
-// AddResult bundles the dup-tracking and rating-overwrite signals so
-// callers can surface inline diagnostics without a second query. Added
-// reports a brand-new image_tags row; Promoted reports an existing
-// implied row flipped to user-owned. DisplacedRatings carries the names
-// of rating rows the manual add swept off the image (empty for non-
-// rating adds and for the auto-tagger path).
 type AddResult struct {
 	Added            bool
 	Promoted         bool
 	DisplacedRatings []string
 }
 
-// AddTagToImageReportingDup runs INSERT OR IGNORE inside a write-pool
-// transaction. Returns an AddResult describing what changed.
 func (s *Service) AddTagToImageReportingDup(imageID, tagID int64, isAuto bool, confidence *float64, taggerName string) (AddResult, error) {
 	var res AddResult
 	err := s.inWriteTx(func(tx *sql.Tx) error {
@@ -112,9 +88,7 @@ func addTagToImageTxReportingDup(tx *sql.Tx, imageID, tagID int64, isAuto bool, 
 	if isAuto {
 		isAutoInt = 1
 	}
-	// tagger_name doubles as a generic source identifier: the tagger
-	// subfolder name on auto rows, any caller-supplied string on manual
-	// rows, NULL for UI-driven user adds.
+	// tagger_name is the source label on manual rows too; NULL means a UI add.
 	var tname any
 	if taggerName != "" {
 		tname = taggerName
@@ -130,12 +104,8 @@ func addTagToImageTxReportingDup(tx *sql.Tx, imageID, tagID int64, isAuto bool, 
 	added, _ := res.RowsAffected()
 	var promoted int64
 	if added == 0 {
-		// Row already present. Promote when the new add carries more
-		// authority than the existing row: an implication-side row
-		// becomes user-owned so removing a parent later won't sweep it
-		// out, and an auto-tagger row gets re-stamped as user-owned
-		// when the operator manually re-adds the same tag (manual >
-		// auto). Auto adds never demote a user-owned row.
+		// Promote, never demote: implied < auto < manual, so a promoted
+		// implied row survives its parent's removal.
 		upd, err := tx.Exec(
 			`UPDATE image_tags SET is_implied = 0, is_auto = ?, confidence = ?, tagger_name = ?
 			 WHERE image_id = ? AND tag_id = ?
@@ -152,10 +122,19 @@ func addTagToImageTxReportingDup(tx *sql.Tx, imageID, tagID int64, isAuto bool, 
 		}
 	}
 
-	// A named source re-confirming an existing tag is what the ledger
-	// exists to capture; a bare UI re-add of a tag already present is a
-	// no-op and must not stamp a phantom 'user' source.
-	if added > 0 || promoted > 0 || taggerName != "" {
+	// A bare UI re-add of a present tag must not stamp a phantom 'user'
+	// source, except over a tag only the derivation claims: Remove meta
+	// tags would take a tag the operator typed.
+	reclaimed := false
+	if added == 0 && promoted == 0 && taggerName == "" {
+		if err := tx.QueryRow(
+			`SELECT COALESCE(MIN(source) = ?1 AND MAX(source) = ?1, 0) FROM image_tag_sources WHERE image_id = ?2 AND tag_id = ?3`,
+			models.TagSourceMonbooru, imageID, tagID,
+		).Scan(&reclaimed); err != nil {
+			return false, false, err
+		}
+	}
+	if added > 0 || promoted > 0 || taggerName != "" || reclaimed {
 		if err := RecordTagSourceTx(tx, imageID, tagID, taggerName); err != nil {
 			return false, false, err
 		}
@@ -166,14 +145,11 @@ func addTagToImageTxReportingDup(tx *sql.Tx, imageID, tagID int64, isAuto bool, 
 	}
 
 	if added == 0 {
-		return false, promoted > 0, nil
+		return false, promoted > 0 || reclaimed, nil
 	}
 	return true, false, nil
 }
 
-// TransitiveImpliedTx walks the transitive implied-tag closure of
-// parents inside the transaction the caller already holds open, so a
-// freshly-added edge is visible.
 func TransitiveImpliedTx(tx *sql.Tx, parents []int64) ([]int64, error) {
 	if len(parents) == 0 {
 		return nil, nil
@@ -189,17 +165,6 @@ func TransitiveImpliedTx(tx *sql.Tx, parents []int64) ([]int64, error) {
 	return out, nil
 }
 
-// AddTagsToOneImage adds every tag in tagIDs to imageID inside a single
-// write-pool transaction. Mirrors the per-token behaviour of
-// AddTagToImageReportingDup (insert-or-promote, fan-out implied closure,
-// prune ratings on a manual rating add) and returns one AddResult per
-// input id so callers preserve the existing "added / promoted / dupes /
-// replaced rating" flash. Used by the detail-page paste path so a
-// 50-token paste pays one writer round-trip instead of N. The optional
-// via string is recorded as the tagger_name (origin label) on each new
-// image_tags row; the UI passes "" so manual adds stay anonymous, the
-// REST API passes the caller-supplied source so a scraper can label
-// its writes.
 func (s *Service) AddTagsToOneImage(imageID int64, tagIDs []int64, via string) ([]AddResult, error) {
 	if len(tagIDs) == 0 {
 		return nil, nil
@@ -216,23 +181,15 @@ func (s *Service) AddTagsToOneImage(imageID int64, tagIDs []int64, via string) (
 	return results, nil
 }
 
-// SyncResult reports what SyncSourceTags changed.
 type SyncResult struct {
 	Added        int
 	Retired      int
 	RatingFilled bool
 }
 
-// SyncSourceTags reconciles the tags one source contributed to an image (the
-// image_tags rows with tagger_name = site, is_auto = 0) against the incoming
-// set: incoming tags are added attributed to the site (an existing manual /
-// auto / other-source row keeps its own attribution), a re-confirmed row
-// sheds its stale flag, and, when reconcile is set, tags the source no
-// longer carries are flagged stale rather than removed - the row stays until
-// the operator acts. Reconcile is off when the site holds more than one post
-// on the image - the slice is shared per site, so one post's fetch must not
-// flag its sibling's tags. An incoming rating tag is skipped when the image
-// is already rated, so a merge never displaces an existing rating.
+// A tag the source no longer lists is flagged stale, never removed. Pass
+// reconcile false when the site has several posts on the image: they
+// share one slice.
 func (s *Service) SyncSourceTags(imageID int64, tagIDs []int64, site string, reconcile bool) (SyncResult, error) {
 	if site == "" {
 		return SyncResult{}, errors.New("source label required")
@@ -253,6 +210,7 @@ func (s *Service) SyncSourceTags(imageID int64, tagIDs []int64, site string, rec
 		}
 
 		var res SyncResult
+		var applied []int64
 		for _, tagID := range tagIDs {
 			isRating := false
 			if s.ratingCatID != 0 {
@@ -268,22 +226,28 @@ func (s *Service) SyncSourceTags(imageID int64, tagIDs []int64, site string, rec
 			if isRating && alreadyRated {
 				continue
 			}
-			added, err := addSourceTagTx(tx, imageID, tagID, site, s.ratingCatID)
+			added, err := addSourceTagTx(tx, imageID, tagID, site)
 			if err != nil {
 				return err
 			}
+			applied = append(applied, tagID)
 			if added {
 				res.Added++
 				if isRating {
 					res.RatingFilled = true
-					// A payload carrying more than one rating (a PTR hash with
-					// conflicting ratings) must not stack them: the first wins.
+					// A payload with several ratings (a PTR hash can
+					// carry them) lands only the first.
 					alreadyRated = true
 				}
 			}
 		}
+		// After every insert: a parent fanned out first would leave its listed child implied.
+		for _, tagID := range applied {
+			if err := fanOutImpliedTxImpl(tx, imageID, tagID, s.ratingCatID, 0); err != nil {
+				return err
+			}
+		}
 
-		// A tag the source lists again is current, whatever flagged it before.
 		for _, tagID := range tagIDs {
 			if _, err := tx.Exec(
 				`UPDATE image_tags SET stale = 0
@@ -296,9 +260,7 @@ func (s *Service) SyncSourceTags(imageID int64, tagIDs []int64, site string, rec
 			out = res
 			return nil
 		}
-		// Flag this source's own tags no longer in the incoming set, but never a
-		// rating: an existing rating is protected, so it is neither overwritten
-		// (skipped above) nor flagged here.
+		// Never flag a rating: the image's rating is protected from the source.
 		ratingCat := s.ratingCatID
 		if ratingCat == 0 {
 			ratingCat = -1
@@ -331,12 +293,9 @@ func (s *Service) SyncSourceTags(imageID int64, tagIDs []int64, site string, rec
 	return out, err
 }
 
-// addSourceTagTx records one source-contributed tag insert-only: a tag
-// already on the image - manual, auto, implied, or from another source -
-// keeps its attribution, unlike the promote path a manual re-add takes.
-// That is what keeps the sync's slice-bounded prune from ever deleting a
-// row the source didn't contribute.
-func addSourceTagTx(tx *sql.Tx, imageID, tagID int64, site string, ratingCatID int64) (bool, error) {
+// Insert-only: an existing row keeps its attribution, so the stale
+// flagging never reaches a row this source didn't add.
+func addSourceTagTx(tx *sql.Tx, imageID, tagID int64, site string) (bool, error) {
 	res, err := tx.Exec(
 		`INSERT OR IGNORE INTO image_tags (image_id, tag_id, is_auto, is_implied, confidence, tagger_name) VALUES (?, ?, 0, 0, NULL, ?)`,
 		imageID, tagID, site,
@@ -353,20 +312,10 @@ func addSourceTagTx(tx *sql.Tx, imageID, tagID int64, site string, ratingCatID i
 	if err := RecordTagSourceTx(tx, imageID, tagID, site); err != nil {
 		return false, err
 	}
-	if err := fanOutImpliedTxImpl(tx, imageID, tagID, ratingCatID, 0); err != nil {
-		return false, err
-	}
 	return added > 0, nil
 }
 
-// BatchAddTagsTx applies an add for every (imageID, tagID) pair inside
-// the supplied transaction. Mirrors AddTagToImageReportingDup's per-row
-// logic (insert-or-promote, fan-out implied closure, prune lower
-// ratings on a manual rating add) but without opening N inner
-// transactions. Returns the number of (image, tag) pairs that resulted
-// in a fresh image_tags row, and the number of images whose existing
-// rating the add swept off, so the caller can sum both across chunks -
-// a scope-wide re-rating is otherwise invisible next to the row count.
+// ratingsReplaced counts images whose rating the add replaced.
 func (s *Service) BatchAddTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (added, ratingsReplaced int, err error) {
 	for _, imageID := range imageIDs {
 		replaced := false
@@ -389,42 +338,51 @@ func (s *Service) BatchAddTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (
 	return added, ratingsReplaced, nil
 }
 
-// BatchRemoveTagsTx is the remove twin of BatchAddTagsTx: removes each
-// (imageID, tagID) pair via removeTagFromImageTx so usage_count and the
-// implied closure stay consistent. removed counts the pairs that touched
-// an existing row; implied counts the ones left standing because a parent
-// on the image still implies them. A batch names tags rather than rows,
-// so it reports those instead of failing the whole scope on one.
+// An implied row a parent still justifies is skipped and counted in
+// implied, not an error: a batch names tags, not rows.
 func (s *Service) BatchRemoveTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (removed, implied int, err error) {
 	for _, imageID := range imageIDs {
-		for _, tagID := range tagIDs {
-			before := 0
-			if err := tx.QueryRow(`SELECT COUNT(*) FROM image_tags WHERE image_id = ? AND tag_id = ?`, imageID, tagID).Scan(&before); err != nil {
-				return removed, implied, err
-			}
-			if before == 0 {
-				continue
-			}
-			switch isImplied, err := impliedByParentOnImage(tx, imageID, tagID); {
-			case err != nil:
-				return removed, implied, err
-			case isImplied:
-				implied++
-				continue
-			}
-			if _, err := removeTagFromImageTx(tx, imageID, tagID); err != nil {
-				return removed, implied, err
-			}
-			removed++
+		n, kept, err := removeTagsUnlessImpliedTx(tx, imageID, tagIDs)
+		removed += n
+		implied += len(kept)
+		if err != nil {
+			return removed, implied, err
 		}
 	}
 	return removed, implied, nil
 }
 
-// RemoveTagFromImage drops one operator-named tag from one image. An
-// implied row a parent on the image still justifies is refused with
-// ErrTagImplied: the detail sidebar renders no remove button for those,
-// and the routes behind it owe the same answer.
+// A child named with its parent is only held until the parent goes, so
+// the held rows are checked again once the others are removed.
+func removeTagsUnlessImpliedTx(tx *sql.Tx, imageID int64, tagIDs []int64) (removed int, kept []int64, err error) {
+	pass := func(ids []int64) ([]int64, error) {
+		var held []int64
+		for _, tagID := range ids {
+			switch implied, err := impliedByParentOnImage(tx, imageID, tagID); {
+			case err != nil:
+				return nil, err
+			case implied:
+				held = append(held, tagID)
+				continue
+			}
+			n, err := removeTagFromImageTx(tx, imageID, tagID)
+			if err != nil {
+				return nil, err
+			}
+			if n > 0 {
+				removed++
+			}
+		}
+		return held, nil
+	}
+	held, err := pass(tagIDs)
+	if err != nil || len(held) == 0 {
+		return removed, nil, err
+	}
+	kept, err = pass(held)
+	return removed, kept, err
+}
+
 func (s *Service) RemoveTagFromImage(imageID, tagID int64) error {
 	return s.inWriteTx(func(tx *sql.Tx) error {
 		switch implied, err := impliedByParentOnImage(tx, imageID, tagID); {
@@ -438,8 +396,6 @@ func (s *Service) RemoveTagFromImage(imageID, tagID int64) error {
 	})
 }
 
-// removeTagIDsFromImageTx removes each tag from imageID inside tx and
-// returns how many rows went in total.
 func removeTagIDsFromImageTx(tx *sql.Tx, imageID int64, tagIDs []int64) (int, error) {
 	removed := 0
 	for _, tagID := range tagIDs {
@@ -452,32 +408,20 @@ func removeTagIDsFromImageTx(tx *sql.Tx, imageID int64, tagIDs []int64) (int, er
 	return removed, nil
 }
 
-// RemoveTagsFromOneImage drops every tag in tagIDs from imageID inside
-// a single write-pool transaction, mirroring AddTagsToOneImage's batch
-// shape. Per-id implied-closure cleanup is preserved; the txn rollback
-// covers partial failures so the row's tag state stays consistent.
 func (s *Service) RemoveTagsFromOneImage(imageID int64, tagIDs []int64) error {
 	if len(tagIDs) == 0 {
 		return nil
 	}
 	return s.inWriteTx(func(tx *sql.Tx) error {
-		for _, tagID := range tagIDs {
-			switch implied, err := impliedByParentOnImage(tx, imageID, tagID); {
-			case err != nil:
-				return err
-			case implied:
-				return ErrTagImplied
-			}
+		_, kept, err := removeTagsUnlessImpliedTx(tx, imageID, tagIDs)
+		if err == nil && len(kept) > 0 {
+			return ErrTagImplied
 		}
-		_, err := removeTagIDsFromImageTx(tx, imageID, tagIDs)
 		return err
 	})
 }
 
-// bumpTagUsageTx increments a tag's usage_count for one image, skipping
-// the bump when the image is missing. usage_count tracks visible images
-// only (RecalcDB rebuilds it that way), so counting a missing image would
-// be silently corrected back down by the next RecalcIDs.
+// BumpTagUsageTx skips a missing image: usage_count counts visible images only.
 func BumpTagUsageTx(tx *sql.Tx, tagID, imageID int64) error {
 	_, err := tx.Exec(
 		`UPDATE tags SET usage_count = usage_count + 1,
@@ -488,8 +432,6 @@ func BumpTagUsageTx(tx *sql.Tx, tagID, imageID int64) error {
 	return err
 }
 
-// DropTagUsageTx is the symmetric decrement: a missing image was never
-// counted, so removing its row must not decrement either.
 func DropTagUsageTx(tx *sql.Tx, tagID, imageID int64) error {
 	_, err := tx.Exec(
 		`UPDATE tags SET usage_count = MAX(0, usage_count - 1)
@@ -499,13 +441,7 @@ func DropTagUsageTx(tx *sql.Tx, tagID, imageID int64) error {
 	return err
 }
 
-// removeTagFromImageTx drops one tag from one image and returns how many
-// rows went, the swept implied children included.
 func removeTagFromImageTx(tx *sql.Tx, imageID, tagID int64) (int, error) {
-	// Walk the parent's implication closure before deleting so we know
-	// which implied rows might lose their last justifying parent. The
-	// closure only matters when the row being removed is itself a
-	// parent in the graph; for ordinary tags the SELECT comes back empty.
 	implied, err := TransitiveImpliedTx(tx, []int64{tagID})
 	if err != nil {
 		return 0, err
@@ -531,16 +467,9 @@ func removeTagFromImageTx(tx *sql.Tx, imageID, tagID int64) (int, error) {
 	return removed + n, err
 }
 
-// SweepImpliedClosureTx drops every row in closure that sits on the image
-// as is_implied=1 with nothing left to justify it, and returns how many
-// went. is_implied=0 rows are user-owned and untouched; a row another
-// parent on the image still implies stays. excludeParent is the parent
-// being removed, whose own row is still there while this runs; 0 excludes
-// nothing, which is what the caller whose edge is already deleted passes.
-//
-// A row in the closure can be the only justification for another one, and
-// the closure is walked in an arbitrary order within a level, so it sweeps
-// until a pass drops nothing.
+// SweepImpliedClosureTx repeats until a pass drops nothing: a closure row
+// can be the only justification for another, in any order within a tier.
+// excludeParent never counts as a justifying parent; 0 excludes none.
 func SweepImpliedClosureTx(tx *sql.Tx, imageID int64, closure []int64, excludeParent int64) (int, error) {
 	removed := 0
 	for {
@@ -582,9 +511,7 @@ func SweepImpliedClosureTx(tx *sql.Tx, imageID int64, closure []int64, excludePa
 	}
 }
 
-// removeMatchingTx removes the image's tags selected by andWhere - a
-// predicate on image_tags, ANDed after the image id - through the
-// per-tag closure walk removeTagIDsFromImageTx does.
+// andWhere is raw SQL starting with AND.
 func (s *Service) removeMatchingTx(imageID int64, andWhere string, args ...any) (int, error) {
 	removed := 0
 	err := s.inWriteTx(func(tx *sql.Tx) error {
@@ -600,30 +527,16 @@ func (s *Service) removeMatchingTx(imageID int64, andWhere string, args ...any) 
 	return removed, err
 }
 
-// RemoveUserTagsFromImage drops the operator's manual tags for one image
-// and adjusts usage counts. Manual tags are is_auto = 0, is_implied = 0
-// rows with no tagger_name; a source's tags (is_auto = 0 carrying the
-// site as tagger_name) are left in place - RemoveSourceTagsFromImage
-// handles those. Implied rows carry a NULL tagger_name too but were
-// never added by the operator; the closure cleanup sweeps them when
-// their parent goes.
+// Implied rows have no tagger_name either, but they are not the operator's.
 func (s *Service) RemoveUserTagsFromImage(imageID int64) (int, error) {
 	return s.removeMatchingTx(imageID,
 		`AND is_auto = 0 AND is_implied = 0 AND (tagger_name IS NULL OR tagger_name = '')`)
 }
 
-// RemoveStaleTagsFromImage drops the image's stale rows - tags a source
-// dropped on its last refresh (stale = 1) - adjusting usage counts and the
-// implied closure like the other removers.
 func (s *Service) RemoveStaleTagsFromImage(imageID int64) (int, error) {
 	return s.removeMatchingTx(imageID, `AND stale = 1`)
 }
 
-// RemoveSourceTagsFromImage drops the tags one or more external sources
-// contributed - is_auto = 0 rows whose tagger_name is a listed site - leaving
-// the operator's manual tags and the auto-tagger rows untouched. stale narrows
-// to the source's stale ("1") or current ("0") half, matching how the detail
-// page splits a source into two groups; "" takes both.
 func (s *Service) RemoveSourceTagsFromImage(imageID int64, sources []string, stale string) (int, error) {
 	if len(sources) == 0 {
 		return 0, nil
@@ -639,9 +552,7 @@ func (s *Service) RemoveSourceTagsFromImage(imageID int64, sources []string, sta
 	return s.removeMatchingTx(imageID, where, args...)
 }
 
-// RemoveCategoryTagsFromImage drops the image's own tags in one category.
-// Implied rows are left to the closure walk: they belong to whatever
-// parent justifies them, which may sit in another category.
+// Implied rows go with their parent, which may sit in another category.
 func (s *Service) RemoveCategoryTagsFromImage(imageID int64, category string) (int, error) {
 	return s.removeMatchingTx(imageID,
 		`AND is_implied = 0 AND tag_id IN (
@@ -650,23 +561,12 @@ func (s *Service) RemoveCategoryTagsFromImage(imageID int64, category string) (i
 		   WHERE tc.name = ?)`, category)
 }
 
-// DropSourceFromImageTags withdraws one source's claim on an image's
-// tags. Its ledger rows go; a tag no other source still vouches for
-// leaves the image with them, while one another source also applied
-// stays and merely stops being listed under this source. A non-empty
-// tagIDs narrows the withdrawal to those tags.
-//
-// This is deliberately not RemoveSourceTagsFromImage, which deletes by
-// first-writer attribution: a tag two sources agree on belongs to both,
-// so one of them backing out cannot take it off the image.
-//
-// Returns how many tags the source was recorded against and how many of
-// them left the image.
+// DropSourceFromImageTags withdraws one source's claim: a tag another
+// source also vouches for stays on the image.
 func (s *Service) DropSourceFromImageTags(imageID int64, source string, tagIDs []int64) (covered, removed int, err error) {
 	err = s.inWriteTx(func(tx *sql.Tx) error {
-		// The ledger rows, plus the rows no ledger ever recorded whose own
-		// attribution names this source - the fallback the by-source view
-		// lists them under, so the withdrawal has to reach them too.
+		// Rows with no ledger entry count under their own tagger_name, as
+		// the by-source view lists them.
 		claim := `SELECT tag_id FROM (
 		            SELECT tag_id FROM image_tag_sources
 		             WHERE image_id = ? AND source = ?
@@ -712,9 +612,6 @@ func (s *Service) DropSourceFromImageTags(imageID int64, source string, tagIDs [
 	return covered, removed, err
 }
 
-// RemoveAutoTagsFromImage drops auto-tagged image_tags rows for one
-// image. A non-empty taggerNames restricts the deletion to rows whose
-// tagger_name matches.
 func (s *Service) RemoveAutoTagsFromImage(imageID int64, taggerNames []string) (int, error) {
 	if len(taggerNames) == 0 {
 		return s.removeMatchingTx(imageID, `AND is_auto = 1`)
@@ -723,12 +620,8 @@ func (s *Service) RemoveAutoTagsFromImage(imageID int64, taggerNames []string) (
 	return s.removeMatchingTx(imageID, `AND is_auto = 1 AND tagger_name IN (`+placeholders+`)`, args...)
 }
 
-// PruneOrphanedImplied drops the implied rows on the given images whose last
-// justifying parent is gone, for the bulk paths that delete image_tags rows
-// with one predicate instead of walking each tag's closure. Repeats per chunk
-// because a dropped row can be the only justification for another. Returns
-// the tags whose row count changed and how many rows went; usage_count is
-// left to the caller's RecalcIDs.
+// PruneOrphanedImplied leaves usage_count to the caller: RecalcIDs the
+// returned tags.
 func (s *Service) PruneOrphanedImplied(ctx context.Context, imageIDs []int64) ([]int64, int, error) {
 	seen := map[int64]struct{}{}
 	removed := 0
@@ -737,34 +630,9 @@ func (s *Service) PruneOrphanedImplied(ctx context.Context, imageIDs []int64) ([
 			return ctx.Err()
 		}
 		return s.inWriteTx(func(tx *sql.Tx) error {
-			placeholders, args := db.InPlaceholders(chunk)
-			type orphan struct{ imageID, tagID int64 }
-			for {
-				orphans, err := db.QueryAll(tx, func(rows *sql.Rows) (orphan, error) {
-					var o orphan
-					err := rows.Scan(&o.imageID, &o.tagID)
-					return o, err
-				}, `SELECT it.image_id, it.tag_id FROM image_tags it
-					 WHERE it.is_implied = 1 AND it.image_id IN (`+placeholders+`)
-					   AND NOT EXISTS (SELECT 1 FROM tag_implications ti
-					                   JOIN image_tags p ON p.image_id = it.image_id AND p.tag_id = ti.parent_tag_id
-					                   WHERE ti.implied_tag_id = it.tag_id)`, args...)
-				if err != nil {
-					return err
-				}
-				if len(orphans) == 0 {
-					return nil
-				}
-				for _, o := range orphans {
-					if _, err := tx.Exec(
-						`DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?`, o.imageID, o.tagID,
-					); err != nil {
-						return err
-					}
-					seen[o.tagID] = struct{}{}
-					removed++
-				}
-			}
+			n, err := pruneOrphanedImpliedTx(tx, chunk, seen)
+			removed += n
+			return err
 		})
 	})
 	if err != nil {
@@ -773,13 +641,43 @@ func (s *Service) PruneOrphanedImplied(ctx context.Context, imageIDs []int64) ([
 	return tagIDsFromSet(seen), removed, nil
 }
 
+// Loops because a dropped row can be the only justification for another.
+func pruneOrphanedImpliedTx(tx *sql.Tx, imageIDs []int64, seen map[int64]struct{}) (int, error) {
+	placeholders, args := db.InPlaceholders(imageIDs)
+	type orphan struct{ imageID, tagID int64 }
+	removed := 0
+	for {
+		orphans, err := db.QueryAll(tx, func(rows *sql.Rows) (orphan, error) {
+			var o orphan
+			err := rows.Scan(&o.imageID, &o.tagID)
+			return o, err
+		}, `SELECT it.image_id, it.tag_id FROM image_tags it
+			 WHERE it.is_implied = 1 AND it.image_id IN (`+placeholders+`)
+			   AND NOT EXISTS (SELECT 1 FROM tag_implications ti
+			                   JOIN image_tags p ON p.image_id = it.image_id AND p.tag_id = ti.parent_tag_id
+			                   WHERE ti.implied_tag_id = it.tag_id)`, args...)
+		if err != nil {
+			return removed, err
+		}
+		if len(orphans) == 0 {
+			return removed, nil
+		}
+		for _, o := range orphans {
+			if _, err := tx.Exec(
+				`DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?`, o.imageID, o.tagID,
+			); err != nil {
+				return removed, err
+			}
+			seen[o.tagID] = struct{}{}
+			removed++
+		}
+	}
+}
+
 func (s *Service) RemoveAllTagsFromImage(imageID int64) error {
 	return s.inWriteTx(func(tx *sql.Tx) error { return RemoveAllTagsFromImageTx(tx, imageID) })
 }
 
-// RemoveAllTagsFromImageTx is RemoveAllTagsFromImage on a caller-held
-// transaction, so the image-delete path can commit the tag drop, the
-// relations cleanup and the row delete together.
 func RemoveAllTagsFromImageTx(tx *sql.Tx, imageID int64) error {
 	tagIDs, err := db.QueryIDs(tx, `SELECT tag_id FROM image_tags WHERE image_id = ?`, imageID)
 	if err != nil {
@@ -787,8 +685,6 @@ func RemoveAllTagsFromImageTx(tx *sql.Tx, imageID int64) error {
 	}
 
 	if len(tagIDs) > 0 {
-		// Skip the bulk decrement when the image was missing: its rows
-		// were never counted in usage_count to begin with.
 		var isMissing int
 		if err := tx.QueryRow(`SELECT is_missing FROM images WHERE id = ?`, imageID).Scan(&isMissing); err != nil && err != sql.ErrNoRows {
 			return err
@@ -808,27 +704,14 @@ func RemoveAllTagsFromImageTx(tx *sql.Tx, imageID int64) error {
 	return err
 }
 
-// relatedGeneralTagsCap bounds the general-category portion of the
-// probe set so a source carrying `1girl` doesn't drag every image_tags
-// row for that tag into the candidate GROUP BY. Non-general non-meta
-// categories pass through uncapped because they carry distinguishing
-// signal worth the scan even when common.
+// The related-images probe keeps only this many of the rarest general
+// tags; other categories are distinctive enough to scan uncapped.
 const relatedGeneralTagsCap = 15
 
-// RatingRank returns the position of name in RatingLevels (0-indexed,
-// general < sensitive < questionable < explicit). Returns -1 for any
-// non-canonical name.
 func RatingRank(name string) int { return slices.Index(RatingLevels, name) }
 
-// pruneRatingsAfterAddTx enforces the one-rating-per-image rule after a
-// rating tag is added. The rule splits on origin: a manual add overwrites
-// whatever rating was there so the user's chosen level always wins (even
-// when it ranks below a pre-existing auto-tagger value), returning the
-// names it swept off; an auto-tagger add keeps the highest rank so a
-// single inference emitting `sensitive` and `questionable` resolves the
-// way search does. No-ops when the rating category is unset or tagID is
-// not a rating tag; the PK lookup is cheap and the prune is a no-op on an
-// image carrying 0 or 1 rating tags.
+// A manual add replaces the image's rating even with a lower one; an auto
+// add keeps the highest, as search resolves several.
 func pruneRatingsAfterAddTx(tx *sql.Tx, ratingCatID, imageID, tagID int64, isAuto bool) ([]string, error) {
 	if ratingCatID == 0 {
 		return nil, nil
@@ -848,7 +731,6 @@ type ratingRow struct {
 	name  string
 }
 
-// ratingRowsOnImageTx returns the rating-category rows on imageID.
 func ratingRowsOnImageTx(tx *sql.Tx, ratingCatID, imageID int64) ([]ratingRow, error) {
 	return db.QueryAll(tx, func(rows *sql.Rows) (ratingRow, error) {
 		var r ratingRow
@@ -860,21 +742,8 @@ func ratingRowsOnImageTx(tx *sql.Tx, ratingCatID, imageID int64) ([]ratingRow, e
 		imageID, ratingCatID)
 }
 
-// PruneLowerRatingsTx keeps only the highest-rank rating tag on imageID.
-// When the image carries multiple rating-category rows (general <
-// sensitive < questionable < explicit) the lower-rank rows are removed
-// via removeTagFromImageTx so usage_count adjustment and the implied
-// closure cleanup match the rest of the tag-removal path. Idempotent:
-// after the call the image carries at most one rating tag.
-//
-// Both the manual add path (AddTagToImageReportingDup) and the auto-
-// tagger's storeResults call this so highest-rank-wins is the durable
-// invariant a fresh write upholds. fastCountCeiling and fastCountRating
-// rely on the invariant for their constant-time bounds.
-//
-// ratingCatID is the rating category id; pass 0 to skip (only possible
-// against a pre-bootstrap DB, where the four canonical rating rows
-// don't yet exist).
+// PruneLowerRatingsTx keeps the highest rating; search's rating: fast
+// count assumes one per image.
 func PruneLowerRatingsTx(tx *sql.Tx, ratingCatID, imageID int64) error {
 	if ratingCatID == 0 {
 		return nil
@@ -899,9 +768,6 @@ func PruneLowerRatingsTx(tx *sql.Tx, ratingCatID, imageID int64) error {
 	return nil
 }
 
-// pruneRatingsTx removes every rating row on the image that keep
-// rejects, returning the names it took off. removeTagFromImageTx does
-// the usage-count and implied-closure work per row.
 func pruneRatingsTx(tx *sql.Tx, imageID int64, present []ratingRow, keep func(ratingRow) bool) ([]string, error) {
 	var displaced []string
 	for _, r := range present {
@@ -916,13 +782,6 @@ func pruneRatingsTx(tx *sql.Tx, imageID int64, present []ratingRow, keep func(ra
 	return displaced, nil
 }
 
-// pruneOtherRatingsTx is the manual-add twin of PruneLowerRatingsTx:
-// it keeps only keepTagID and sweeps every other rating row off the
-// image so the user's just-typed rating always wins, even when its
-// rank is below an existing auto-tagger value. Mirrors the prune
-// shape so the usage_count decrements still flow through
-// removeTagFromImageTx. Returns the displaced tag names so the caller
-// can surface "replaced rating:general" in a flash.
 func pruneOtherRatingsTx(tx *sql.Tx, ratingCatID, imageID, keepTagID int64) ([]string, error) {
 	if ratingCatID == 0 {
 		return nil, nil
@@ -940,12 +799,6 @@ func pruneOtherRatingsTx(tx *sql.Tx, ratingCatID, imageID, keepTagID int64) ([]s
 	return displaced, nil
 }
 
-// RatingTagIDsAbove returns the canonical rating tag ids whose level
-// ranks strictly above ceiling (e.g. ceiling="sensitive" returns the ids
-// of "questionable" and "explicit"). An empty or unknown ceiling, or
-// "explicit" (the no-ceiling sentinel), returns nil. The lookup runs a
-// fresh SELECT each call so a tag pruned and re-created at runtime is
-// resolved to its current id.
 func (s *Service) RatingTagIDsAbove(ceiling string) []int64 {
 	if s.ratingCatID == 0 {
 		return nil

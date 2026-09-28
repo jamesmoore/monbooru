@@ -68,9 +68,9 @@
 {{$node := .Node}}
 {{$query := .Query}}
 {{$active := printf "folder:%s" $node.Path}}
-{{$quotedActive := printf `folder:"%s"` $node.Path}}
+{{$quotedActive := printf `folder:"%s"` (qval $node.Path)}}
 {{$onlyActive := printf "folderonly:%s" $node.Path}}
-{{$quotedOnlyActive := printf `folderonly:"%s"` $node.Path}}
+{{$quotedOnlyActive := printf `folderonly:"%s"` (qval $node.Path)}}
 <li class="folder-node-wrap">
   <div class="folder-node-row">
     {{if $node.Children}}

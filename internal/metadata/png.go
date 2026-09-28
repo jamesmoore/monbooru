@@ -14,14 +14,10 @@ import (
 
 var errNotPNG = errors.New("not a PNG file")
 
-// maxChunkBytes bounds any single metadata chunk we'll buffer (PNG tEXt/iTXt,
-// WebP RIFF). A1111 parameter blobs and ComfyUI workflow JSON are kilobytes;
-// the length fields are otherwise attacker-controlled and a forged header
-// could try to allocate up to ~4 GiB.
+// Chunk lengths are attacker-controlled, up to 4 GiB; real parameter and
+// workflow chunks are kilobytes.
 const maxChunkBytes = 16 * 1024 * 1024
 
-// readPNGTextChunks returns every tEXt, zTXt and iTXt chunk from a PNG
-// reader as keyword -> text.
 func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 	sig := make([]byte, 8)
 	if _, err := io.ReadFull(r, sig); err != nil {
@@ -34,7 +30,6 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 	result := map[string]string{}
 
 	for {
-		// 4-byte length, 4-byte type
 		header := make([]byte, 8)
 		if _, err := io.ReadFull(r, header); err != nil {
 			break
@@ -42,8 +37,7 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 		length := binary.BigEndian.Uint32(header[:4])
 		chunkType := string(header[4:8])
 
-		// Skip oversized chunks without materialising them, but still
-		// advance the reader past their body + CRC.
+		// Skipped unbuffered: the body plus its 4-byte CRC.
 		if length > maxChunkBytes {
 			if _, err := io.CopyN(io.Discard, r, int64(length)+4); err != nil {
 				break
@@ -66,7 +60,6 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 
 		switch chunkType {
 		case "tEXt":
-			// keyword\x00text
 			null := strings.IndexByte(string(data), 0)
 			if null < 0 {
 				continue
@@ -102,7 +95,7 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 			if null2 < 0 {
 				continue
 			}
-			rest = rest[null2+1:] // skip language tag
+			rest = rest[null2+1:]
 			null3 := strings.IndexByte(string(rest), 0)
 			if null3 < 0 {
 				continue
@@ -126,9 +119,7 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 	return result, nil
 }
 
-// inflateText decompresses an iTXt payload. Method 0 (zlib) is the only one
-// the PNG spec defines, and a stream that will not inflate is not text: the
-// caller drops the chunk rather than storing the raw bytes as a value.
+// Method 0, zlib, is the only one the PNG spec defines.
 func inflateText(b []byte, method byte) ([]byte, error) {
 	if method != 0 {
 		return nil, errors.New("unknown iTXt compression method")
@@ -141,7 +132,6 @@ func inflateText(b []byte, method byte) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(zr, maxChunkBytes))
 }
 
-// extractFromPNG reads SD and ComfyUI metadata from a PNG file.
 func extractFromPNG(path string) (*models.SDMetadata, *models.ComfyUIMetadata, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -161,8 +151,8 @@ func extractFromPNG(path string) (*models.SDMetadata, *models.ComfyUIMetadata, e
 		sd = parseA1111Parameters(text)
 	}
 
-	// "prompt" is ComfyUI's primary API-format chunk; fall back to
-	// "workflow" (node-graph format) if it doesn't parse.
+	// ComfyUI's API-format "prompt" wins; the node-graph "workflow" is
+	// the fallback.
 	if raw, ok := chunks["prompt"]; ok {
 		comfy = parseComfyPromptChunk(raw)
 	}

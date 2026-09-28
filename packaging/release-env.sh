@@ -1,5 +1,4 @@
-# Shared by the release workflow's build jobs: the version and the ldflags
-# every artifact is stamped with. Sourced, not run.
+# Sourced, not run: the version and ldflags every artifact is stamped with.
 VERSION=$(tr -d '[:space:]' < VERSION.md)
 REPO=$(tr -d '[:space:]' < REPOSITORY.md)
 DOC=$(tr -d '[:space:]' < DOC.md)

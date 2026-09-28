@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/logx"
@@ -19,8 +20,6 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// imageShaType reads one image's sha256 and file type; ok=false when
-// the row is missing.
 func (s *Server) imageShaType(id int64) (sha, fileType string, ok bool) {
 	err := s.db().Read.QueryRow(`SELECT sha256, file_type FROM images WHERE id = ?`, id).Scan(&sha, &fileType)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -29,9 +28,8 @@ func (s *Server) imageShaType(id int64) (sha, fileType string, ok bool) {
 	return sha, fileType, err == nil
 }
 
-// ptrRefuse answers a prologue refusal: the dialogs get the status and the
-// reason, the panels a bare 200 - a panel that cannot render collapses in
-// place rather than reading as breakage.
+// An empty msg is a panel's refusal: a bare 200 collapses it in place
+// rather than reading as breakage.
 func ptrRefuse(w http.ResponseWriter, msg string, code int) {
 	if msg == "" {
 		w.WriteHeader(http.StatusOK)
@@ -40,10 +38,6 @@ func ptrRefuse(w http.ResponseWriter, msg string, code int) {
 	http.Error(w, msg, code)
 }
 
-// ptrTagTarget is the prologue every tag-side PTR handler opens with: the
-// id off the path, the gate, then the tag. refusal is the gate's 409 text;
-// an empty one takes the panels' silent 200 for every refusal. The gate
-// runs ahead of the resolve so a closed one still costs no query.
 func (s *Server) ptrTagTarget(w http.ResponseWriter, r *http.Request, open func() bool, refusal string) (int64, *models.Tag, bool) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
@@ -61,9 +55,8 @@ func (s *Server) ptrTagTarget(w http.ResponseWriter, r *http.Request, open func(
 	return id, tag, true
 }
 
-// ptrImageTarget is the same prologue for the image-side handlers, ending
-// in the row's sha. A cbz bundle has no single file to speak about, so it
-// refuses like a missing row.
+// A cbz bundle has no single file to speak about, so it refuses like a
+// missing row.
 func (s *Server) ptrImageTarget(w http.ResponseWriter, r *http.Request, open func() bool, refusal string) (int64, string, bool) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
@@ -81,8 +74,6 @@ func (s *Server) ptrImageTarget(w http.ResponseWriter, r *http.Request, open fun
 	return id, sha, true
 }
 
-// ptrMissText names the target-resolve refusal for a surface whose gate
-// refusal is refusal: a panel stays silent for both.
 func ptrMissText(refusal string) string {
 	if refusal == "" {
 		return ""
@@ -90,34 +81,20 @@ func ptrMissText(refusal string) string {
 	return "not found"
 }
 
-// The image-page PTR contribution panel: act (tick items, write reasons)
-// then send (the confirm), both inside monbooru. Every surface here
-// gates on the cached contrib flag; a stale flag degrades in place on a
-// 409 from monloader, like the lookup controls.
-
-// contribPreviewToAdd mirrors monloader's preview to_add entry. Color is
-// monbooru's own category color for the row, filled at render time.
 type contribPreviewToAdd struct {
-	Tag    string `json:"tag"`
-	PTR    string `json:"ptr"`
-	Status string `json:"status"`
-	Note   string `json:"note"`
-	// UnknownTag: a new row whose spelling is no tag the repository holds
-	// at all, so a send would create the tag. Older monloaders omit it.
+	Tag        string `json:"tag"`
+	PTR        string `json:"ptr"`
+	Status     string `json:"status"`
+	Note       string `json:"note"`
 	UnknownTag bool   `json:"unknown_tag"`
 	Color      string `json:"-"`
-	// Sent is the spelling a contribution goes up under, which is the tag's
-	// own name unless an alias here answered for it. Filled at render time.
+	// Sent is the spelling the row goes up under; Tag is the one the
+	// operator sees.
 	Sent string `json:"-"`
 }
 
-// PTRDiffers reports whether the PTR spelling differs beyond the
-// mechanical underscore/space mapping, so the dialog only calls out
-// real renames.
 func (t contribPreviewToAdd) PTRDiffers() bool { return strings.ReplaceAll(t.Tag, "_", " ") != t.PTR }
 
-// contribPreviewPTROnly mirrors monloader's ptr_only entry. Color is
-// monbooru's own category color for the row, filled at render time.
 type contribPreviewPTROnly struct {
 	Tag          string `json:"tag"`
 	PTR          string `json:"ptr"`
@@ -125,16 +102,12 @@ type contribPreviewPTROnly struct {
 	Color        string `json:"-"`
 }
 
-// contribPreview is monloader's preview response.
 type contribPreview struct {
 	Provisional bool                    `json:"provisional"`
 	ToAdd       []contribPreviewToAdd   `json:"to_add"`
 	PTROnly     []contribPreviewPTROnly `json:"ptr_only"`
 }
 
-// monloaderPostJSON marshals payload, POSTs it through
-// monloaderContribJSON, and decodes the reply into a T. A free function
-// because methods can't be generic.
 func monloaderPostJSON[T any](s *Server, ctx context.Context, path string, payload map[string]any) (*T, error) {
 	body, _ := json.Marshal(payload)
 	var out T
@@ -144,37 +117,27 @@ func monloaderPostJSON[T any](s *Server, ctx context.Context, path string, paylo
 	return &out, nil
 }
 
-// monloaderContribPreview proxies POST /api/v1/ptr/contrib/preview for
-// one image's sha256, its storage tags, and its implied tags (context
-// only: never offered as adds, but they keep tags the image already
-// shows out of the removal-petition candidates).
 func (s *Server) monloaderContribPreview(ctx context.Context, sha256 string, tags, implied []string) (*contribPreview, error) {
 	return monloaderPostJSON[contribPreview](s, ctx, "/api/v1/ptr/contrib/preview",
 		map[string]any{"sha256": sha256, "tags": tags, "implied": implied})
 }
 
-// contribSendResult is one item's verdict from the send.
 type contribSendResult struct {
 	Kind   string `json:"kind"`
 	Result string `json:"result"`
 	Note   string `json:"note"`
 }
 
-// contribSendResponse is monloader's stage-and-commit answer.
 type contribSendResponse struct {
 	Results []contribSendResult `json:"results"`
 	JobID   int64               `json:"job_id"`
 }
 
-// monloaderContribSend proxies POST /api/v1/ptr/contrib with commit: true.
 func (s *Server) monloaderContribSend(ctx context.Context, origin string, items []map[string]any) (*contribSendResponse, error) {
 	return monloaderPostJSON[contribSendResponse](s, ctx, "/api/v1/ptr/contrib",
 		map[string]any{"commit": true, "origin": origin, "items": items})
 }
 
-// monloaderContribJSON issues one authed request to monloader and
-// decodes a JSON reply, mapping a 409 to errPTRUnavailable so callers
-// collapse the surface in place.
 func (s *Server) monloaderContribJSON(ctx context.Context, method, path string, body []byte, out any) error {
 	resp, err := s.monloader().Do(ctx, method, path, body)
 	if err != nil {
@@ -193,8 +156,6 @@ func (s *Server) monloaderContribJSON(ctx context.Context, method, path string, 
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// tagFormName renders a tag in monbooru form: bare for general,
-// category-qualified otherwise.
 func tagFormName(cat, name string) string {
 	if cat != "general" {
 		return cat + ":" + name
@@ -202,8 +163,6 @@ func tagFormName(cat, name string) string {
 	return name
 }
 
-// contribTagColor returns a category-color resolver for monbooru-form tag
-// names: the prefix's category when it names one, general otherwise.
 func (s *Server) contribTagColor() func(string) string {
 	colors := map[string]string{}
 	if cats, err := s.tagSvc().ListCategories(); err == nil {
@@ -221,15 +180,12 @@ func (s *Server) contribTagColor() func(string) string {
 	}
 }
 
-// contribStorageTags splits an image's tags for the preview: storage
-// tags are eligible adds (non-implied, non-alias, in monbooru form);
-// implied and rating tags ride along as context so the diff knows what
-// the image already shows without offering to add it. Rating tags are
-// never adds (monloader refuses the namespace) but as context they keep
-// the PTR's copy of the rating out of the removal-petition candidates.
-func (s *Server) contribStorageTags(imageTags []models.ImageTag) (storage, implied []string) {
+// Context tags are never offered as adds but keep what the image already
+// shows out of the petition candidates. monloader refuses the rating
+// namespace, and a peer derives the derived-only tags from its own file.
+func (s *Server) contribStorageTags(imageTags []models.ImageTag, sources map[int64][]tags.TagSource) (storage, implied []string) {
 	for _, t := range imageTags {
-		if t.IsImplied || t.Category == "rating" {
+		if t.IsImplied || t.Category == "rating" || derivedOnly(t, sources[t.TagID]) {
 			implied = append(implied, tagFormName(t.Category, t.TagName))
 			continue
 		}
@@ -238,13 +194,25 @@ func (s *Server) contribStorageTags(imageTags []models.ImageTag) (storage, impli
 	return storage, implied
 }
 
-// imageContribPreview fetches the contribution diff for one image's
-// current tags under the surfaces' shared 8 s budget. Runs after the
-// caller's gate and existence checks; the panel and dialog keep their
-// own divergent failure responses.
+func derivedOnly(t models.ImageTag, ledger []tags.TagSource) bool {
+	if len(ledger) == 0 {
+		return t.TaggerName == models.TagSourceMonbooru
+	}
+	for _, src := range ledger {
+		if src.Source != models.TagSourceMonbooru {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) imageContribPreview(rctx context.Context, id int64, sha string) (*contribPreview, error) {
 	_, imageTags, _ := s.tagSvc().GetImageTags(id)
-	storage, implied := s.contribStorageTags(imageTags)
+	ledger, err := s.tagSvc().TagSourcesForImage(id)
+	if err != nil {
+		logx.Warnf("TagSourcesForImage: %v", err)
+	}
+	storage, implied := s.contribStorageTags(imageTags, ledger)
 	byTag, byAlias := s.imageTagAliases(imageTags)
 	ctx, cancel := context.WithTimeout(rctx, 8*time.Second)
 	defer cancel()
@@ -253,8 +221,6 @@ func (s *Server) imageContribPreview(rctx context.Context, id int64, sha string)
 	if err != nil {
 		return nil, err
 	}
-	// Rows come back keyed on the submitted spelling; the surfaces label,
-	// count and attribute them by the tag the operator sees.
 	for i, t := range preview.ToAdd {
 		preview.ToAdd[i].Sent = t.Tag
 		if own, ok := local[t.Tag]; ok {
@@ -265,14 +231,8 @@ func (s *Server) imageContribPreview(rctx context.Context, id int64, sha string)
 	return preview, nil
 }
 
-// ptrSubmitSpellings picks the spelling each storage tag is contributed
-// under: the repository's own when a pull has left an alias here that answers
-// for the tag, so an add lands in the cluster the catalog already agreed with
-// instead of minting the operator's private spelling. Returns the list to
-// submit and, per substituted spelling, the tag it stands for. Only tags that
-// have an alias are asked about, and the graph endpoint refuses outright while
-// the index is still syncing, where the panel keeps rendering: no answer means
-// no substitution, not a failure.
+// The graph endpoint refuses while the index syncs, when the panel still
+// renders: an error means no substitution, not a failure.
 func (s *Server) ptrSubmitSpellings(ctx context.Context, storage []string, byTag map[string][]string) ([]string, map[string]string) {
 	var names []string
 	for _, form := range storage {
@@ -302,8 +262,8 @@ func (s *Server) ptrSubmitSpellings(ctx context.Context, storage []string, byTag
 		if len(byTag[form]) == 0 {
 			continue
 		}
-		// A spelling another tag on the image already occupies would submit
-		// one name twice and pair the wrong row with it.
+		// A spelling another tag on the image already occupies would go
+		// up twice and pair the wrong row with it.
 		if spelling, _, ok := resolvePTRSpelling(graph, form, byTag[form]); ok && !taken[spelling] {
 			sent[i], taken[spelling], local[spelling] = spelling, true, form
 		}
@@ -311,12 +271,8 @@ func (s *Server) ptrSubmitSpellings(ctx context.Context, storage []string, byTag
 	return sent, local
 }
 
-// foldAliasedPTRTags reconciles the two sides of the diff through the alias
-// graph. A PTR pull adopts the repository's spellings as aliases of the
-// operator's tag, and the preview only ever sees the tag's own name, so
-// without this the repository's copy reads as a tag the image lacks and the
-// operator's spelling as one the repository lacks - a petition and an upload
-// for the same tag under two names the catalog calls equal.
+// Without this, a PTR spelling pulled here as an alias shows as a petition
+// and the operator's own spelling as a new upload of the same tag.
 func foldAliasedPTRTags(preview *contribPreview, byAlias map[string]string) {
 	if len(byAlias) == 0 {
 		return
@@ -338,12 +294,7 @@ func foldAliasedPTRTags(preview *contribPreview, byAlias map[string]string) {
 	}
 }
 
-// imageTagAliases reads the alias rows pointing at the image's tags once for
-// the two questions the diff asks of them: which spellings a tag can be
-// contributed under (byTag), and which tag a repository spelling names
-// (byAlias). The pull stores an alias under the same projection monloader
-// answers the diff in, so the two sides compare as strings; a name a
-// pre-widening catalog folded is keyed under both shapes.
+// A name a pre-widening catalog folded is keyed under both shapes.
 func (s *Server) imageTagAliases(imageTags []models.ImageTag) (byTag map[string][]string, byAlias map[string]string) {
 	ids := make([]int64, 0, len(imageTags))
 	for _, t := range imageTags {
@@ -367,12 +318,8 @@ func (s *Server) imageTagAliases(imageTags []models.ImageTag) (byTag map[string]
 	return byTag, out
 }
 
-// ptrUnattributed lists the image's tags the repository also holds but
-// that the local ledger does not record it as having applied. Carrying
-// a tag is not the same as having it from the repository: one a booru
-// supplied leaves the repository absent from the by-source view even
-// though it vouches for the tag too, and a pull is what records that.
-// So these are work to offer even though no tag would be added.
+// A tag the PTR holds that the ledger does not credit to it is still work
+// for a pull, which records the attribution.
 func (s *Server) ptrUnattributed(id int64, preview *contribPreview) []string {
 	known := map[string]bool{}
 	for _, t := range preview.ToAdd {
@@ -402,10 +349,6 @@ func (s *Server) ptrUnattributed(id int64, preview *contribPreview) []string {
 
 func isPTRSource(src tags.TagSource) bool { return strings.EqualFold(src.Source, "ptr") }
 
-// ptrContribPanel renders the image-page panel body: a one-line summary
-// from one preview, or the zero-work / provisional state. Absent when
-// the gate is closed or the row is a cbz bundle, so the caller only
-// mounts it when eligible.
 func (s *Server) ptrContribPanel(w http.ResponseWriter, r *http.Request) {
 	id, sha, ok := s.ptrImageTarget(w, r, s.contribReadOpen, "")
 	if !ok {
@@ -413,7 +356,6 @@ func (s *Server) ptrContribPanel(w http.ResponseWriter, r *http.Request) {
 	}
 	preview, err := s.imageContribPreview(r.Context(), id, sha)
 	if err != nil {
-		// A 409 or a transport hiccup collapses the panel in place.
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -449,20 +391,15 @@ func (s *Server) ptrContribPanel(w http.ResponseWriter, r *http.Request) {
 		"UnattributedCount": len(unattributed),
 		"UnattributedTip":   strings.Join(unattributed, "\n"),
 		"CanContribute":     canContribute,
-		// A pull is worth offering when the repository holds tags this
-		// image lacks, and also when it merely holds tags the ledger has
-		// not credited it for - that is the attribution the pull writes.
-		"CanPull":       s.ptrPullOpen() && (len(petitionTags) > 0 || len(unattributed) > 0),
-		"ContribHint":   contribHint,
-		"Provisional":   preview.Provisional,
-		"FailedUploads": s.mlStatus.Seed().ContribFailed,
-		"Monloader":     s.monloaderWebBase(),
-		"CSRFToken":     s.csrfToken(sessionFromContext(r.Context())),
+		"CanPull":           s.ptrPullOpen() && (len(petitionTags) > 0 || len(unattributed) > 0),
+		"ContribHint":       contribHint,
+		"Provisional":       preview.Provisional,
+		"FailedUploads":     s.mlStatus.Seed().ContribFailed,
+		"Monloader":         s.monloaderWebBase(),
+		"CSRFToken":         s.csrfToken(sessionFromContext(r.Context())),
 	})
 }
 
-// ptrContribDialog renders the contribute dialog, populated from one
-// preview.
 func (s *Server) ptrContribDialog(w http.ResponseWriter, r *http.Request) {
 	id, sha, ok := s.ptrImageTarget(w, r, s.contribGateOpen, "contributions unavailable")
 	if !ok {
@@ -511,8 +448,6 @@ func (s *Server) ptrContribDialog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ptrContribSend handles the dialog confirm: one stage-and-commit call
-// carrying the ticked adds and any petitions with their reason.
 func (s *Server) ptrContribSend(w http.ResponseWriter, r *http.Request) {
 	id, sha, ok := s.ptrImageTarget(w, r, s.contribGateOpen, "contributions unavailable")
 	if !ok {
@@ -522,9 +457,8 @@ func (s *Server) ptrContribSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	// The dialog bakes in the sha it previewed; if the row now resolves to a
-	// different file (a gallery switch under the lock-free route) the ticked
-	// tags belong to another image, so refuse rather than contribute them.
+	// After a gallery switch the id can resolve to another file; the
+	// ticked tags belong to the one previewed.
 	if want := r.FormValue("sha256"); want != "" && want != sha {
 		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{"Err": "this image changed; reopen the dialog"})
 		return
@@ -546,8 +480,6 @@ func (s *Server) ptrContribSend(w http.ResponseWriter, r *http.Request) {
 	s.sendContribItems(w, r, "image "+strconv.FormatInt(id, 10), items)
 }
 
-// sendContribItems is the tail both contribution posts share: refuse an
-// empty selection, send under a bounded context, and swap in the receipt.
 func (s *Server) sendContribItems(w http.ResponseWriter, r *http.Request, scope string, items []map[string]any) {
 	if len(items) == 0 {
 		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{"Err": "nothing selected"})
@@ -563,13 +495,9 @@ func (s *Server) sendContribItems(w http.ResponseWriter, r *http.Request, scope 
 	s.renderContribReceipt(w, items, resp)
 }
 
-// renderContribReceipt swaps the dialog body for the send receipt: the
-// HX-Retarget replaces the whole form so the pick-and-send controls give
-// way to the per-item verdicts and a close.
 func (s *Server) renderContribReceipt(w http.ResponseWriter, items []map[string]any, resp *contribSendResponse) {
-	// The receipt zip relies on monloader answering every item in order;
-	// a mismatched count would pair tags with the wrong verdicts, so it
-	// surfaces as a failure instead of a silently truncated receipt.
+	// Verdicts pair with items by position, so a count mismatch would
+	// mislabel them.
 	if len(resp.Results) != len(items) {
 		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{
 			"Err": fmt.Sprintf("monloader answered %d of %d items; check its contribution history", len(resp.Results), len(items)),
@@ -598,14 +526,11 @@ func (s *Server) renderContribReceipt(w http.ResponseWriter, items []map[string]
 	})
 }
 
-// contribReceiptRow is one named verdict on the send receipt.
 type contribReceiptRow struct {
 	Label string
 	Note  string
 }
 
-// contribReceipt zips the sent items with monloader's per-item results
-// (answered in item order) into named receipt rows.
 func contribReceipt(items []map[string]any, results []contribSendResult) (adds, petitions, refused []contribReceiptRow) {
 	for i := 0; i < min(len(items), len(results)); i++ {
 		kind, _ := items[i]["kind"].(string)
@@ -635,8 +560,6 @@ func contribReceipt(items []map[string]any, results []contribSendResult) (adds, 
 	return adds, petitions, refused
 }
 
-// contribGateOpen reports whether the contribution surfaces may render:
-// paired, PTR enabled, and a usable personal account.
 func (s *Server) contribGateOpen() bool {
 	if !s.pairedWith("monloader") {
 		return false
@@ -645,10 +568,7 @@ func (s *Server) contribGateOpen() bool {
 	return ml.PTR && ml.Contrib
 }
 
-// contribReadOpen reports whether the read-only diff may render: paired and
-// the PTR index enabled. A still-building index answers diffs (marked
-// provisional), so syncing counts; contributing additionally needs a synced
-// index and a personal account (contribGateOpen).
+// A syncing index still answers diffs, marked provisional.
 func (s *Server) contribReadOpen() bool {
 	if !s.pairedWith("monloader") {
 		return false
@@ -657,14 +577,12 @@ func (s *Server) contribReadOpen() bool {
 	return ml.PTR || ml.PTRSyncing
 }
 
-// ptrPullOpen reports whether the PTR pull actions may render: they ride the
-// lookup path, which monloader refuses until the index is caught up.
+// A pull rides the lookup path, which monloader refuses until the index
+// is caught up.
 func (s *Server) ptrPullOpen() bool {
 	return s.mlStatus.Seed().PTR
 }
 
-// contribHint reports whether the panel's Contribute button may act and,
-// when it cannot, why. The diff and Pull stay live either way.
 func (s *Server) contribHint() (bool, string) {
 	ml := s.mlStatus.Seed()
 	switch {
@@ -679,7 +597,6 @@ func (s *Server) contribHint() (bool, string) {
 	}
 }
 
-// pairPreview mirrors monloader's pair-preview response.
 type pairPreview struct {
 	APtr        string `json:"a_ptr"`
 	BPtr        string `json:"b_ptr"`
@@ -688,30 +605,26 @@ type pairPreview struct {
 	Provisional bool   `json:"provisional"`
 }
 
-// monloaderPairPreview proxies the relation pair-preview.
 func (s *Server) monloaderPairPreview(ctx context.Context, kind, a, b string) (*pairPreview, error) {
 	return monloaderPostJSON[pairPreview](s, ctx, "/api/v1/ptr/contrib/pair-preview",
 		map[string]any{"kind": kind, "a": a, "b": b})
 }
 
-// tagPairRow is one relation row in the tag-page contribution surfaces.
-// Sibling pairs carry a=bad (alias), b=good (canonical); parent pairs
-// carry a=child (the carrying tag), b=parent (the implied tag) - the
-// hydrus child/parent flip is owned here.
+// A and B follow hydrus: sibling A=bad (alias), B=good; parent A=child
+// (the carrying tag), B=parent (the implied tag).
 type tagPairRow struct {
-	Kind           string // sibling | parent
-	A, B           string // monbooru form
-	AColor, BColor string // category colors, filled at render time
-	Rel            string // alias of this | implies | implied by
-	Direction      string // suggest | petition | pending | conflict | ineligible
+	Kind           string
+	A, B           string
+	AColor, BColor string
+	Rel            string
+	Direction      string
 	Note           string
 }
 
-// Value encodes a row for the dialog form. Space is the delimiter
-// because it is reserved out of the tag charset, unlike '|'.
+// Space delimits the fields because the tag charset excludes whitespace,
+// unlike '|'.
 func (p tagPairRow) Value() string { return p.Kind + " " + p.A + " " + p.B }
 
-// Label renders the pair for a row: -> reads "resolves to", => "implies".
 func (p tagPairRow) Label() string {
 	if p.Kind == "sibling" {
 		return p.A + " -> " + p.B
@@ -719,33 +632,16 @@ func (p tagPairRow) Label() string {
 	return p.A + " => " + p.B
 }
 
-// tagContribDiff is the tag page's contribution diff: the declared
-// relations with their pair-preview direction, the PTR-side relations
-// monbooru does not declare (removal-petition candidates), and how the
-// PTR knows the tag at all.
 type tagContribDiff struct {
 	Local, PTROnly []tagPairRow
-	// Pullable reports whether a pull would still add a relation, so the
-	// pull control can hide once nothing is left to adopt.
-	Pullable    bool
-	Provisional bool
-	// KnownAs is the alias spelling the PTR answered for when it does not
-	// know the tag's own name; empty when it does, or knows nothing.
-	KnownAs string
-	Unknown bool
-	// Empty is a spelling the PTR holds with no cluster behind it. Distinct
-	// from Unknown, and from a cluster the catalog already declares in full:
-	// here another spelling may still carry the relations.
-	Empty bool
-	// IdealElsewhere is the PTR ideal when it names a separate tag here. The
-	// pull leaves that name alone, so the local answer is a merge.
+	Pullable       bool
+	Provisional    bool
+	KnownAs        string
+	Unknown        bool
+	Empty          bool
 	IdealElsewhere string
 }
 
-// tagContribRows assembles the tag's contribution diff. The PTR is asked
-// about the tag's own name and every alias pointing at it in one call, so
-// a tag the operator spells differently from the repository still finds its
-// graph through the alias.
 func (s *Server) tagContribRows(ctx context.Context, id int64, tag *models.Tag) (*tagContribDiff, error) {
 	tagForm := tagFormName(tag.CategoryName, tag.Name)
 	aliases, err := s.tagSvc().AliasesForTagIDs([]int64{id})
@@ -788,38 +684,35 @@ func (s *Server) tagContribRows(ctx context.Context, id int64, tag *models.Tag) 
 	if ok && known != tagForm {
 		d.KnownAs = known
 	}
+	var toPreview []*tagPairRow
 	for i := range d.Local {
-		// Known only through another spelling: the PTR cannot see the tag's
-		// own name, so pair-preview reads every local relation as new. The
-		// ones the cluster already carries under that spelling are on the
-		// PTR in all but orientation - suggesting them would propose a flip
-		// of the ideal - so they fold as covered without asking.
+		// Known only under another spelling, pair-preview reads every
+		// local relation as new; those the cluster already carries would
+		// propose flipping the ideal, so they fold as covered.
 		if d.KnownAs != "" && s.heldByCluster(d.Local[i], tagForm, known, info) {
 			d.Local[i].Direction = "covered"
 			continue
 		}
-		preview, err := s.monloaderPairPreview(ctx, d.Local[i].Kind, d.Local[i].A, d.Local[i].B)
-		if err != nil {
-			return nil, err
-		}
-		d.Local[i].Direction, d.Local[i].Note = preview.Direction, preview.Note
-		d.Provisional = d.Provisional || preview.Provisional
+		toPreview = append(toPreview, &d.Local[i])
+	}
+	previews, err := s.pairPreviews(ctx, toPreview)
+	if err != nil {
+		return nil, err
+	}
+	for i, row := range toPreview {
+		row.Direction, row.Note = previews[i].Direction, previews[i].Note
+		d.Provisional = d.Provisional || previews[i].Provisional
 	}
 	if !ok {
 		d.Unknown = true
 		return d, nil
 	}
-	// The PTR side: relations of this tag that monbooru does not declare,
-	// limited to the directions a pull can adopt - fan-in aliases and
-	// implications out. Implied-by edges are left out: a pull never writes
-	// the reverse implication onto the parent, so offering them is a dead
-	// action. Only pairs the index actually holds qualify (the preview
-	// answers petition or pending); anything else is graph noise from a
-	// sibling chain and is dropped. The pairs are keyed on the spelling the
-	// PTR answered for, since the index holds them under that name.
 	d.Pullable = s.pullWouldAdd(id, info, known)
 	d.Empty = len(info.Aliases) == 0 && len(info.Implications) == 0 && len(info.ImpliedBy) == 0 &&
 		(info.Ideal == "" || info.Ideal == known)
+	// Only pairs the index holds (petition or pending) qualify; the rest
+	// is sibling-chain noise. Rows are keyed on the spelling the PTR
+	// answered for, the name the index holds them under.
 	var candidates []tagPairRow
 	for _, a := range info.Aliases {
 		if a == "" || a == known || localAlias[s.localForm(a)] {
@@ -827,10 +720,8 @@ func (s *Server) tagContribRows(ctx context.Context, id int64, tag *models.Tag) 
 		}
 		candidates = append(candidates, tagPairRow{Kind: "sibling", A: a, B: known, Rel: "alias of this"})
 	}
-	// A pull inverts the PTR's orientation - the ideal lands here as an
-	// alias of this tag - so an ideal already declared locally is not a
-	// missing relation. One the catalog holds under another tag is not one
-	// either: the pull leaves that name alone and no petition undoes it.
+	// The ideal is never a petition row: a pull adopts it as an alias
+	// here, or leaves it alone when another tag here holds the name.
 	if info.Ideal != "" && info.Ideal != known && !localAlias[s.localForm(info.Ideal)] && s.tagFormExists(info.Ideal) {
 		d.IdealElsewhere = info.Ideal
 	}
@@ -838,40 +729,76 @@ func (s *Server) tagContribRows(ctx context.Context, id int64, tag *models.Tag) 
 		if im == "" || im == known || localImplied[s.localForm(im)] {
 			continue
 		}
-		// The pull skips an endpoint aliased elsewhere here, so the edge has
-		// no local form to disagree with.
+		// The pull skips an endpoint that is an alias here, so the edge
+		// has no local form to disagree with.
 		if isAlias, _, _, _, ok := s.tagRowByForm(im); ok && isAlias {
 			continue
 		}
 		candidates = append(candidates, tagPairRow{Kind: "parent", A: known, B: im, Rel: "implies"})
 	}
-	for _, row := range candidates {
-		// A petition needs a local judgement about the pair; a relation
-		// whose other endpoint the catalog has never seen is not one the
-		// operator can vouch against, so it is not offered at all.
-		other := row.A
+	toPreview = toPreview[:0]
+	for i := range candidates {
+		// A petition needs a local judgement, which an endpoint the
+		// catalog has never seen cannot give.
+		other := candidates[i].A
 		if other == known {
-			other = row.B
+			other = candidates[i].B
 		}
-		if !s.tagFormExists(other) {
+		if s.tagFormExists(other) {
+			toPreview = append(toPreview, &candidates[i])
+		}
+	}
+	previews, err = s.pairPreviews(ctx, toPreview)
+	if err != nil {
+		return nil, err
+	}
+	for i, row := range toPreview {
+		if previews[i].Direction != "petition" && previews[i].Direction != "pending" {
 			continue
 		}
-		preview, err := s.monloaderPairPreview(ctx, row.Kind, row.A, row.B)
-		if err != nil {
-			return nil, err
-		}
-		if preview.Direction != "petition" && preview.Direction != "pending" {
-			continue
-		}
-		row.Direction, row.Note = preview.Direction, preview.Note
-		d.PTROnly = append(d.PTROnly, row)
+		row.Direction, row.Note = previews[i].Direction, previews[i].Note
+		d.PTROnly = append(d.PTROnly, *row)
 	}
 	return d, nil
 }
 
-// localForm normalizes a PTR-side name the way the catalog stores it, so a
-// membership check against local names never misses on a spelling the tag
-// input would fold. A name the charset cannot hold passes through unchanged.
+// Each preview is a monloader round trip and a hub tag has dozens, so a
+// few run at once; the first failure stops the rest.
+func (s *Server) pairPreviews(ctx context.Context, rows []*tagPairRow) ([]*pairPreview, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	out := make([]*pairPreview, len(rows))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	var failed sync.Once
+	var firstErr error
+	for i, row := range rows {
+		if ctx.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			preview, err := s.monloaderPairPreview(ctx, row.Kind, row.A, row.B)
+			if err != nil {
+				failed.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			out[i] = preview
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return out, ctx.Err()
+}
+
 func (s *Server) localForm(name string) string {
 	if form, ok := s.ptrSpellingForm(name); ok {
 		return form
@@ -879,10 +806,6 @@ func (s *Server) localForm(name string) string {
 	return name
 }
 
-// heldByCluster reports whether a local relation of the tag is one the PTR
-// cluster answered for under `known` already carries: the alias that
-// answered, the ideal or a fan-in alias for a sibling row; a declared edge
-// for an implication row.
 func (s *Server) heldByCluster(row tagPairRow, tagForm, known string, info ptrTagInfo) bool {
 	names := func(list []string) bool {
 		return slices.ContainsFunc(list, func(n string) bool { return s.localForm(n) == row.A })
@@ -897,13 +820,8 @@ func (s *Server) heldByCluster(row tagPairRow, tagForm, known string, info ptrTa
 	}
 }
 
-// pullWouldAdd reports whether a PTR pull would still create a relation for the
-// tag: an alias whose name is free (a pull never overwrites an existing tag),
-// the ideal, or an implies / implied-by edge not yet declared against a tag the
-// catalog does not alias elsewhere. Every check goes through the same
-// normalization and row lookups applyPTRTagInfo uses, so the pull control
-// tracks real work - a prediction that compared spellings by string could
-// keep offering a pull that adopts nothing.
+// Uses applyPTRTagInfo's normalization and row lookups: comparing
+// spellings as strings would keep offering a pull that adopts nothing.
 func (s *Server) pullWouldAdd(tagID int64, info ptrTagInfo, tagForm string) bool {
 	aliasFree := func(name string) bool {
 		catID, bare, ok := s.splitCategoryTag(name)
@@ -938,10 +856,6 @@ func (s *Server) pullWouldAdd(tagID int64, info ptrTagInfo, tagForm string) bool
 	return false
 }
 
-// edgeWouldAdd mirrors applyPTRTagInfo's implication branch for one PTR
-// name: representable, and either no row yet (the pull creates it) or a
-// canonical row the edge is not declared against. An alias row is skipped
-// there, so it is not an add here.
 func (s *Server) edgeWouldAdd(tagID int64, name string, implied bool) bool {
 	catID, bare, ok := s.splitCategoryTag(name)
 	if !ok {
@@ -973,8 +887,6 @@ func (s *Server) edgeWouldAdd(tagID int64, name string, implied bool) bool {
 	return err == nil && n == 0
 }
 
-// tagFormExists reports whether a monbooru-form tag names a row that
-// exists in the catalog (alias rows included).
 func (s *Server) tagFormExists(form string) bool {
 	catID, bare, ok := s.splitCategoryTag(form)
 	if !ok {
@@ -984,8 +896,6 @@ func (s *Server) tagFormExists(form string) bool {
 	return err == nil && exists
 }
 
-// contribTag answers the tag row for the contribution surfaces; ok=false
-// when the row is missing or never eligible (alias, rating).
 func (s *Server) contribTag(id int64) (*models.Tag, bool) {
 	tag, err := s.tagSvc().GetTag(id)
 	if err != nil || tag.IsAlias || tag.CategoryName == "rating" {
@@ -994,20 +904,12 @@ func (s *Server) contribTag(id int64) (*models.Tag, bool) {
 	return tag, true
 }
 
-// tagContribPreview fetches the tag's relation diff under the surfaces'
-// shared 8 s budget. Runs after the caller's gate and eligibility
-// checks; the panel and dialog keep their own divergent failure
-// responses.
 func (s *Server) tagContribPreview(rctx context.Context, id int64, tag *models.Tag) (*tagContribDiff, error) {
 	ctx, cancel := context.WithTimeout(rctx, 8*time.Second)
 	defer cancel()
 	return s.tagContribRows(ctx, id, tag)
 }
 
-// tagPtrContribPanel renders the tag-page contribution card body: a
-// one-line summary of what the relation diff offers. Empty when the
-// gate is closed or the tag is not eligible, so the caller only mounts
-// it when eligible.
 func (s *Server) tagPtrContribPanel(w http.ResponseWriter, r *http.Request) {
 	id, tag, ok := s.ptrTagTarget(w, r, s.contribReadOpen, "")
 	if !ok {
@@ -1015,7 +917,6 @@ func (s *Server) tagPtrContribPanel(w http.ResponseWriter, r *http.Request) {
 	}
 	diff, err := s.tagContribPreview(r.Context(), id, tag)
 	if err != nil {
-		// A 409 or a transport hiccup collapses the panel in place.
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1050,8 +951,6 @@ func (s *Server) tagPtrContribPanel(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// tagPtrContribDialog renders the tag contribute dialog, populated from
-// the relation diff.
 func (s *Server) tagPtrContribDialog(w http.ResponseWriter, r *http.Request) {
 	id, tag, ok := s.ptrTagTarget(w, r, s.contribGateOpen, "contributions unavailable")
 	if !ok {
@@ -1076,10 +975,10 @@ func (s *Server) tagPtrContribDialog(w http.ResponseWriter, r *http.Request) {
 		case "pending":
 			pending = append(pending, p)
 		case "petition", "covered":
-			// Declared here and on the PTR (directly, or derived through the
-			// child's parent closure): in sync.
+			// Held on the PTR too, directly or through the child's parent
+			// closure.
 			inSync = append(inSync, p)
-		default: // conflict / ineligible
+		default:
 			ineligible = append(ineligible, p)
 		}
 	}
@@ -1106,9 +1005,6 @@ func (s *Server) tagPtrContribDialog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// tagPtrContribSend handles the tag dialog confirm: one stage-and-commit
-// carrying the ticked relation suggestions and removal petitions with
-// their reasons.
 func (s *Server) tagPtrContribSend(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
@@ -1145,9 +1041,6 @@ func (s *Server) tagPtrContribSend(w http.ResponseWriter, r *http.Request) {
 	s.sendContribItems(w, r, "tag "+strconv.FormatInt(id, 10), items)
 }
 
-// pairSendItem builds the stage item for a pair confirm: the suggest or
-// petition kind matching the resolved direction. a/b are monbooru form;
-// for sibling a=bad, b=good; for parent a=child, b=parent.
 func pairSendItem(kind, direction, a, b, reason string) map[string]any {
 	suggest, petition := "sibling", "sibling_petition"
 	aKey, bKey := "bad", "good"
@@ -1162,27 +1055,23 @@ func pairSendItem(kind, direction, a, b, reason string) map[string]any {
 	case "petition":
 		itemKind = petition
 	default:
-		return nil // pending / conflict / ineligible never send
+		return nil
 	}
 	return map[string]any{"kind": itemKind, aKey: a, bKey: b, "reason": reason}
 }
 
-// ptrLookupRow is one name of a looked-up PTR cluster in the pull preview,
-// with what the pull would do about it.
 type ptrLookupRow struct {
 	Name, Color string
-	Class       string // ptr-row-staged (would add) | ptr-row-ctx (declared) | ptr-row-refused (left alone)
+	Class       string
 	Note        string
 }
 
-// ptrLookupGroup is one hunk of the preview: aliases, implies, implied by.
 type ptrLookupGroup struct {
 	Title, Note string
 	Rows        []ptrLookupRow
 	Adds        int
 }
 
-// ptrNameValid reports whether a PTR-side name can be a tag row here.
 func (s *Server) ptrNameValid(name string) bool {
 	_, bare, ok := s.splitCategoryTag(name)
 	if !ok {
@@ -1192,7 +1081,6 @@ func (s *Server) ptrNameValid(name string) bool {
 	return err == nil
 }
 
-// tagRowByForm answers the catalog row a valid monbooru-form name maps to.
 func (s *Server) tagRowByForm(form string) (isAlias bool, canonicalID int64, canonicalName string, usage int, ok bool) {
 	catID, bare, _ := s.splitCategoryTag(form)
 	norm, _ := tags.ValidateTagName(bare)
@@ -1210,9 +1098,6 @@ func (s *Server) tagRowByForm(form string) (isAlias bool, canonicalID int64, can
 	return alias == 1, canon.Int64, canonName.String, usage, true
 }
 
-// ptrLookupAliasRow classifies one alias-side name of the cluster the way
-// applyPTRTagInfo will treat it: created when the name is free, already
-// declared when it points here, left alone otherwise.
 func (s *Server) ptrLookupAliasRow(tagID int64, name string, color func(string) string) ptrLookupRow {
 	row := ptrLookupRow{Name: name, Color: color(name)}
 	if !s.ptrNameValid(name) {
@@ -1233,10 +1118,6 @@ func (s *Server) ptrLookupAliasRow(tagID int64, name string, color func(string) 
 	return row
 }
 
-// ptrLookupImplRow classifies one implication endpoint: a fresh edge when
-// the tag exists or will be created, declared when the edge is already
-// here, left alone when the name is an alias pointing at another tag (the
-// pull skips those, since the edge would land on a tag the PTR never named).
 func (s *Server) ptrLookupImplRow(name string, declared map[string]bool, color func(string) string) ptrLookupRow {
 	row := ptrLookupRow{Name: name, Color: color(name)}
 	if declared[s.localForm(name)] {
@@ -1259,10 +1140,6 @@ func (s *Server) ptrLookupImplRow(name string, declared map[string]bool, color f
 	return row
 }
 
-// ptrLookupGroups builds the pull preview for a looked-up spelling: the
-// cluster's spellings (the looked-up one, the ideal, the aliases), then
-// both implication directions, each row classified as the pull would treat
-// it.
 func (s *Server) ptrLookupGroups(id int64, tagForm, spelling string, info ptrTagInfo) ([]ptrLookupGroup, error) {
 	implications, err := s.tagSvc().ListImplications(id)
 	if err != nil {
@@ -1306,10 +1183,6 @@ func (s *Server) ptrLookupGroups(id int64, tagForm, spelling string, info ptrTag
 	return groups, nil
 }
 
-// ptrLookupImplGroup fills one implication direction's rows into g. The two
-// directions differ only in which edge set counts as already declared; the
-// looked-up tag and the spelling itself are skipped either way, since an
-// edge to oneself is not one the pull would make.
 func (s *Server) ptrLookupImplGroup(g ptrLookupGroup, names []string, declared map[string]bool, color func(string) string, tagForm, spelling string) ptrLookupGroup {
 	for _, name := range names {
 		if name == "" || name == tagForm || name == spelling {
@@ -1324,10 +1197,6 @@ func (s *Server) ptrLookupImplGroup(g ptrLookupGroup, names []string, declared m
 	return g
 }
 
-// ptrLookupLocalStatus words where the looked-up spelling stands in this
-// catalog, for the preview's header line. aliasable is false for the two
-// standings a merge onto that spelling resolves back to this tag, which is
-// no merge at all.
 func (s *Server) ptrLookupLocalStatus(id int64, tagForm, spelling string) (status string, aliasable bool) {
 	if spelling == tagForm {
 		return "this tag", false
@@ -1345,14 +1214,10 @@ func (s *Server) ptrLookupLocalStatus(id int64, tagForm, spelling string) (statu
 	}
 }
 
-// ptrSearchLimit is how many clusters the look-up dialog lists at once.
 const ptrSearchLimit = 20
 
-// ptrSpellingStems lists the prefixes to try for a tag, longest first: the
-// whole name, then with each trailing "(qualifier)" dropped, then with
-// trailing underscore-separated words dropped. An operator's spelling is
-// usually the repository's with something added, so the longest stem that
-// answers is the closest guess. The category rides along on every stem.
+// Longest first: an operator's spelling is usually the repository's with
+// something added.
 func ptrSpellingStems(form string) []string {
 	cat, name, qualified := strings.Cut(form, ":")
 	if !qualified {
@@ -1383,10 +1248,8 @@ func ptrSpellingStems(form string) []string {
 	return out
 }
 
-// ptrSeedSearch runs the stem backoff and returns the first answer worth
-// showing: a stem whose clusters carry relations, since the tag's own name
-// often sits in the index as an orphan and stopping there would hide the
-// cluster one stem up. Falls back to the longest stem that answered at all.
+// The tag's own name often sits in the index as an orphan, so a stem
+// whose clusters carry relations beats the first stem that answers.
 func (s *Server) ptrSeedSearch(ctx context.Context, tagForm string) (clusters []ptrCluster, stem string, truncated bool, err error) {
 	for _, candidate := range ptrSpellingStems(tagForm) {
 		got, cut, err := s.ptrSpellingSearch(ctx, candidate, "", ptrSearchLimit)
@@ -1408,15 +1271,12 @@ func (s *Server) ptrSeedSearch(ctx context.Context, tagForm string) (clusters []
 	return clusters, stem, truncated, nil
 }
 
-// ptrSearchRow is one cluster as the dialog lists it.
 type ptrSearchRow struct {
 	Spelling string
 	Color    string
 	Note     string
 }
 
-// ptrSearchRows renders the clusters into pickable rows, noting each one's
-// graph size and, when the match came in under another spelling, which.
 func (s *Server) ptrSearchRows(clusters []ptrCluster) []ptrSearchRow {
 	color := s.contribTagColor()
 	rows := make([]ptrSearchRow, 0, len(clusters))
@@ -1444,10 +1304,8 @@ func (s *Server) ptrSearchRows(clusters []ptrCluster) []ptrSearchRow {
 	return rows
 }
 
-// tagPtrLookupSearch answers the dialog's two search shapes from one place: a
-// request carrying no `q` at all is the seed the dialog opens on, rendered
-// into the body with its own header and cancel; one carrying `q` is the
-// typeahead, rendered bare into the dropdown.
+// A request with no q at all is the seed the dialog opens on; an empty q
+// is a typeahead.
 func (s *Server) tagPtrLookupSearch(w http.ResponseWriter, r *http.Request) {
 	id, tag, ok := s.ptrTagTarget(w, r, s.ptrPullOpen, "the Public Tag Repository is unavailable")
 	if !ok {
@@ -1464,8 +1322,8 @@ func (s *Server) tagPtrLookupSearch(w http.ResponseWriter, r *http.Request) {
 		render()
 		return
 	}
-	// The seed walks several stems and a substring pass walks a whole
-	// namespace, so this budget is wider than the panel's single graph call.
+	// Wider than a single graph call: the seed walks several stems and a
+	// substring pass a whole namespace.
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
@@ -1484,8 +1342,6 @@ func (s *Server) tagPtrLookupSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case errors.Is(err, errPTRNoSearch):
-		// An older monloader: the dialog keeps its plain input and says
-		// nothing rather than looking broken.
 		render()
 		return
 	case errors.Is(err, errPTRSearchUnbounded):
@@ -1512,8 +1368,6 @@ func (s *Server) tagPtrLookupSearch(w http.ResponseWriter, r *http.Request) {
 	render()
 }
 
-// tagPtrLookupDialog renders the look-up dialog shell: one spelling input,
-// the result slot the preview fills, and a cancel.
 func (s *Server) tagPtrLookupDialog(w http.ResponseWriter, r *http.Request) {
 	id, tag, ok := s.ptrTagTarget(w, r, s.ptrPullOpen, "the Public Tag Repository is unavailable")
 	if !ok {
@@ -1525,8 +1379,6 @@ func (s *Server) tagPtrLookupDialog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// tagPtrLookupPreview answers the graph for one operator-typed spelling and
-// renders what a pull under it would do to this tag.
 func (s *Server) tagPtrLookupPreview(w http.ResponseWriter, r *http.Request) {
 	id, tag, ok := s.ptrTagTarget(w, r, s.ptrPullOpen, "the Public Tag Repository is unavailable")
 	if !ok {

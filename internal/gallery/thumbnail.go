@@ -3,6 +3,8 @@ package gallery
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -16,7 +18,7 @@ import (
 	"sync"
 
 	"golang.org/x/image/draw"
-	_ "golang.org/x/image/webp"
+	"golang.org/x/image/webp"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/fsx"
@@ -26,44 +28,36 @@ import (
 const thumbMaxDim = 300
 const thumbQuality = 85
 
-// viewMaxPixels is the size past which the detail view stops handing the
-// browser the original file, and ViewMaxDim the longest side of the
-// rendition it hands over instead. Browsers cap a decoded bitmap at 2 GiB,
-// which at four bytes a pixel is 2^29 pixels, and past that they refuse the
-// decode outright - so an image above the cap is undisplayable everywhere
-// with only a 300 px thumbnail between it and the file. The ceiling is a
-// round number well under that measured limit rather than the limit itself,
-// so it survives an engine stricter than Chromium and leaves every real
-// photo and scan on its full-resolution file.
+// Browsers refuse a decoded bitmap past 2 GiB, 2^29 pixels at four bytes; the
+// cap sits well under that for stricter engines and above any real photo.
+// Past it the detail view serves a rendition of at most ViewMaxDim.
 const (
 	viewMaxPixels = 100_000_000
 	ViewMaxDim    = 4000
 )
 
-// viewRenditionPath is where an image's bounded display rendition is cached,
-// beside its thumbnail.
 func viewRenditionPath(dir string, imageID int64) string {
 	return filepath.Join(dir, fmt.Sprintf("%d_view.jpg", imageID))
 }
 
-// NeedsViewRendition reports whether an image's stored geometry is past the
-// ceiling, so the caller serves the rendition rather than the file. Zero
-// dimensions (a header nothing could read) answer false: without a size
-// there is nothing to decide on, and the original is what every other
-// unmeasurable file gets.
 func NeedsViewRendition(width, height int) bool { return int64(width)*int64(height) > viewMaxPixels }
 
-// EnsureViewRendition returns the cached rendition's path, generating it
-// from the original on first use. Lazy because only the rare oversized image
-// needs one at all: producing it at ingest would write a second file per
-// image for a ceiling almost nothing reaches.
-func EnsureViewRendition(srcPath, dstDir string, imageID int64) (string, error) {
+// EnsureViewRendition keeps the image's own size for maxDim 0. It is lazy:
+// only an oversized image, or an AVIF or JPEG XL the browser cannot show,
+// needs one.
+func EnsureViewRendition(srcPath, dstDir string, imageID int64, fileType string, maxDim int) (string, error) {
 	dst := viewRenditionPath(dstDir, imageID)
 	if _, err := os.Stat(dst); err == nil {
 		return dst, nil
 	}
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return "", fmt.Errorf("create rendition dir: %w", err)
+	}
+	if IsFFmpegStill(fileType) {
+		if err := renderStill(srcPath, dst, maxDim); err != nil {
+			return "", err
+		}
+		return dst, nil
 	}
 	f, err := os.Open(srcPath)
 	if err != nil {
@@ -74,23 +68,19 @@ func EnsureViewRendition(srcPath, dstDir string, imageID int64) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("decoding image: %w", err)
 	}
-	if err := writeJPEGAtomic(scaleImage(src, ViewMaxDim), dst, thumbQuality); err != nil {
+	if maxDim > 0 {
+		src = scaleImage(src, maxDim)
+	}
+	if err := writeJPEGAtomic(src, dst, thumbQuality); err != nil {
 		return "", err
 	}
 	return dst, nil
 }
 
-// maxImageBytes caps the destination bitmap the decode path is willing
-// to allocate, so a header claiming 50000x50000 truecolor is refused
-// instead of demanding 10 GiB and OOM-killing the process at ingest or
-// thumbnail regen. Budgeting bytes rather than pixels is what lets a
-// 670-MPx map through at 640 MiB greyscale while a 16-bit header of the
-// same geometry, four times the cost, stays out.
+// A header claiming 50000x50000 truecolor would ask for 10 GiB. Budgeted
+// in bytes, not pixels, since a decoded pixel costs 1 to 8 bytes.
 const maxImageBytes = 3 << 30
 
-// decodedBytesPerPixel is the per-pixel cost of the concrete image type
-// the stdlib decoders return for a header's colour model. Models not
-// listed bill at 4, the truecolor width.
 func decodedBytesPerPixel(m color.Model) int64 {
 	switch m {
 	case color.GrayModel:
@@ -108,65 +98,201 @@ func decodedBytesPerPixel(m color.Model) int64 {
 	return 4
 }
 
-// largeDecodeBytes is the decoded-bitmap size past which the thumbnail
-// path hands the heap back before the next file. Below it, holding the
-// spent copy costs less than forcing the collection would.
+// Below this, keeping a spent bitmap costs less than forcing a collection.
 const largeDecodeBytes = 32 << 20
 
-// decodedBytes is what a decoded bitmap occupies, the same budget
-// decodeBudgetError applies to a header.
 func decodedBytes(img image.Image) int64 {
 	b := img.Bounds()
 	return int64(b.Dx()) * int64(b.Dy()) * decodedBytesPerPixel(img.ColorModel())
 }
 
-// decodeBudgetError refuses a header whose decoded bitmap would not fit
-// maxImageBytes.
-func decodeBudgetError(cfg image.Config) error {
-	// Nothing decodes to less than a byte per pixel, so gating on the
-	// pixel count first also keeps the byte multiply from overflowing.
+// head is the header DecodeConfig read, which a progressive JPEG's
+// coefficient buffers are sized from.
+func decodeBudgetError(cfg image.Config, format string, head []byte) error {
+	// The pixel check also catches a byte count that overflowed.
 	pixels := int64(cfg.Width) * int64(cfg.Height)
-	if pixels > maxImageBytes || pixels*decodedBytesPerPixel(cfg.ColorModel) > maxImageBytes {
+	need := pixels * decodedBytesPerPixel(cfg.ColorModel)
+	if format == "jpeg" {
+		need += progressiveJPEGCoefficientBytes(head)
+	}
+	if pixels > maxImageBytes || need > maxImageBytes {
 		return fmt.Errorf("image %dx%d exceeds the %d GiB decode cap", cfg.Width, cfg.Height, maxImageBytes>>30)
 	}
 	return nil
 }
 
-// DecodeBudgetError reports why the file at path is past the decode
-// budget, or nil when it fits - and when it cannot be read or is not a
-// still image, since a caller explaining a missing thumbnail has nothing
-// to add in those cases. Reads the header only.
-func DecodeBudgetError(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
+// Go's progressive decoder keeps a [64]int32 block per 8x8 of every
+// component, on top of the image: up to 5x what the pixels cost.
+func progressiveJPEGCoefficientBytes(head []byte) int64 {
+	for i := 2; i+4 <= len(head) && head[i] == 0xFF; {
+		marker := head[i+1]
+		if marker == 0xFF {
+			i++
+			continue
+		}
+		size := int(head[i+2])<<8 | int(head[i+3])
+		switch {
+		case marker == 0xC2:
+			seg := head[i+4 : min(i+2+size, len(head))]
+			if len(seg) < 6 {
+				return 0
+			}
+			height, width, n := int(seg[1])<<8|int(seg[2]), int(seg[3])<<8|int(seg[4]), int(seg[5])
+			if len(seg) < 6+3*n {
+				return 0
+			}
+			// As image/jpeg sizes them: MCUs from the first component's
+			// factors, and a lone component read in 8x8 blocks whatever its own.
+			h0, v0, blocks := 1, 1, 1
+			if n > 1 {
+				h0, v0, blocks = int(seg[7]>>4), int(seg[7]&0x0F), 0
+				for c := range n {
+					blocks += int(seg[7+3*c]>>4) * int(seg[7+3*c]&0x0F)
+				}
+			}
+			mcusX := (width + 8*h0 - 1) / (8 * h0)
+			mcusY := (height + 8*v0 - 1) / (8 * v0)
+			return int64(mcusX) * int64(mcusY) * int64(blocks) * 256
+		case marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC:
+			return 0
+		}
+		i += 2 + size
 	}
-	defer func() { _ = f.Close() }()
-	cfg, _, err := image.DecodeConfig(f)
-	if err != nil {
-		return nil
-	}
-	return decodeBudgetError(cfg)
+	return 0
 }
 
-// DecodeImageWithCap is image.Decode gated on maxImageBytes. Runs
-// image.DecodeConfig first to read just the header, refuses any image
-// whose decoded bitmap would exceed the budget, then replays the header
-// bytes alongside the rest of the stream so the full Decode works on
-// non-seekable readers (zip page streams). Mirrors the stdlib signature
-// minus the format-name return.
+// PreviewRefusal explains a missing thumbnail, and is "" when nothing
+// does: an unreadable or corrupt file gets no reason.
+func PreviewRefusal(path, fileType string) string {
+	switch {
+	case fileType == "cbz":
+		return mangaCoverRefusal(path)
+	case IsFFmpegStill(fileType) || IsVideoType(fileType):
+		return ffmpegRefusal()
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	return budgetRefusal(f)
+}
+
+func mangaCoverRefusal(path string) string {
+	m, err := OpenManga(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = m.Close() }()
+	if m.ffmpegPage(0) {
+		return ffmpegRefusal()
+	}
+	rc, err := m.pageReader(0)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = rc.Close() }()
+	return budgetRefusal(rc)
+}
+
+func ffmpegRefusal() string {
+	if !ffmpegAvailable() {
+		return "needs ffmpeg"
+	}
+	return "ffmpeg could not decode it"
+}
+
+func budgetRefusal(r io.Reader) string {
+	var head bytes.Buffer
+	cfg, format, err := image.DecodeConfig(io.TeeReader(r, &head))
+	if err != nil {
+		return ""
+	}
+	if err := decodeBudgetError(cfg, format, head.Bytes()); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// DecodeImageWithCap is image.Decode refusing a bitmap past
+// maxImageBytes; it replays the header bytes, so r need not seek.
 func DecodeImageWithCap(r io.Reader) (image.Image, error) {
 	var buf bytes.Buffer
 	tee := io.TeeReader(r, &buf)
-	cfg, _, err := image.DecodeConfig(tee)
+	cfg, format, err := image.DecodeConfig(tee)
 	if err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
-	if err := decodeBudgetError(cfg); err != nil {
+	if err := decodeBudgetError(cfg, format, buf.Bytes()); err != nil {
 		return nil, err
+	}
+	if format == "webp" && webpAnimated(buf.Bytes()) {
+		return decodeFirstWebPFrame(io.MultiReader(&buf, r), cfg)
 	}
 	img, _, err := image.Decode(io.MultiReader(&buf, r))
 	return img, err
+}
+
+// The animation flag of the VP8X header.
+func webpAnimated(head []byte) bool {
+	return len(head) > 20 && string(head[12:16]) == "VP8X" && head[20]&0x02 != 0
+}
+
+// x/image/webp decodes stills only, and an animated file keeps its
+// bitstreams in ANMF chunks: the first one is rebuilt as a still.
+func decodeFirstWebPFrame(r io.Reader, cfg image.Config) (image.Image, error) {
+	if _, err := io.CopyN(io.Discard, r, 12); err != nil {
+		return nil, err
+	}
+	chunk := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(r, chunk); err != nil {
+			return nil, fmt.Errorf("webp: no animation frame: %w", err)
+		}
+		size := int64(binary.LittleEndian.Uint32(chunk[4:]))
+		if string(chunk[:4]) != "ANMF" {
+			// A payload of odd length is padded to an even one.
+			if _, err := io.CopyN(io.Discard, r, size+size%2); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if size < 16 {
+			return nil, errors.New("webp: short ANMF chunk")
+		}
+		frame := make([]byte, size)
+		if _, err := io.ReadFull(r, frame); err != nil {
+			return nil, err
+		}
+		return decodeANMF(frame, cfg)
+	}
+}
+
+func decodeANMF(frame []byte, cfg image.Config) (image.Image, error) {
+	u24 := func(b []byte) int { return int(b[0]) | int(b[1])<<8 | int(b[2])<<16 }
+	x, y := 2*u24(frame[0:]), 2*u24(frame[3:])
+	w, h := u24(frame[6:])+1, u24(frame[9:])+1
+	data := frame[16:]
+	var still bytes.Buffer
+	still.WriteString("RIFF\x00\x00\x00\x00WEBP")
+	if len(data) >= 4 && string(data[:4]) == "ALPH" {
+		// An alpha chunk is only read behind a VP8X header that names it.
+		still.WriteString("VP8X\x0a\x00\x00\x00\x10\x00\x00\x00")
+		still.Write([]byte{byte(w - 1), byte((w - 1) >> 8), byte((w - 1) >> 16), byte(h - 1), byte((h - 1) >> 8), byte((h - 1) >> 16)})
+	}
+	still.Write(data)
+	b := still.Bytes()
+	binary.LittleEndian.PutUint32(b[4:], uint32(len(b)-8))
+	img, err := webp.Decode(bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	if x == 0 && y == 0 && img.Bounds().Dx() == cfg.Width && img.Bounds().Dy() == cfg.Height {
+		return img, nil
+	}
+	canvas := image.NewNRGBA(image.Rect(0, 0, cfg.Width, cfg.Height))
+	draw.Draw(canvas, image.Rect(x, y, x+w, y+h), img, img.Bounds().Min, draw.Src)
+	return canvas, nil
 }
 
 func ThumbnailPath(dir string, imageID int64) string {
@@ -177,15 +303,22 @@ func hoverPath(dir string, imageID int64) string {
 	return filepath.Join(dir, fmt.Sprintf("%d_hover.webp", imageID))
 }
 
-// Generate writes the static thumbnail (and animated hover for videos
-// and GIFs when ffmpeg is available) for the given file under dstDir.
 func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
+	return generate(srcPath, dstDir, imageID, fileType, false)
+}
+
+// Rebuild writes a manga's page thumbs before it returns: queued, an archive
+// past a full queue keeps its old ones.
+func Rebuild(srcPath, dstDir string, imageID int64, fileType string) error {
+	return generate(srcPath, dstDir, imageID, fileType, true)
+}
+
+func generate(srcPath, dstDir string, imageID int64, fileType string, pagesInline bool) error {
 	if err := os.MkdirAll(dstDir, 0755); err != nil {
 		return fmt.Errorf("creating thumbnail dir: %w", err)
 	}
-	// Both renditions come off the same bytes, so anything that rewrites the
-	// thumbnail - a replace, a re-ingest, a rebuild - leaves the display
-	// rendition showing the picture the file no longer holds.
+	// The display rendition would otherwise keep showing the old bytes
+	// after a replace or rebuild.
 	_ = os.Remove(viewRenditionPath(dstDir, imageID))
 
 	dstPath := ThumbnailPath(dstDir, imageID)
@@ -200,8 +333,11 @@ func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
 		}
 		return nil
 	}
+	if IsFFmpegStill(fileType) {
+		return renderStill(srcPath, dstPath, thumbMaxDim)
+	}
 	if fileType == "cbz" {
-		return generateMangaThumbnails(srcPath, dstDir, imageID)
+		return generateMangaThumbnails(srcPath, dstDir, imageID, pagesInline)
 	}
 	if err := generateImageThumb(srcPath, dstPath); err != nil {
 		return err
@@ -215,54 +351,55 @@ func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
 	return nil
 }
 
-// generateMangaThumbnails writes the cover thumbnail (`<dstDir>/<id>.jpg`)
-// and hands the per-page set (`mangaImageDir/page_NNNN_thumb.jpg`) to a
-// bounded background worker. The cover is the phash input, so it stays on
-// the ingest path; pre-generating every page turns the first /pages render
-// into a static-file serve but takes minutes on a large archive, which
-// would hold the caller's phash write and cache invalidation behind it. A
-// page whose thumbnail is not ready yet falls back to the lazy
-// EnsureMangaPageThumb path on access.
-func generateMangaThumbnails(srcPath, dstDir string, imageID int64) error {
+// The cover is the phash input, so it is written here; the pages can take
+// minutes and go to the background workers unless pagesInline.
+func generateMangaThumbnails(srcPath, dstDir string, imageID int64, pagesInline bool) error {
 	archive, err := OpenManga(srcPath)
 	if err != nil {
 		return fmt.Errorf("open manga thumb: %w", err)
 	}
 	defer func() { _ = archive.Close() }()
 
-	cover, err := archive.coverImage()
-	if err != nil {
-		return fmt.Errorf("decode manga cover: %w", err)
-	}
-	if err := writeJPEGAtomic(scaleImage(cover, thumbMaxDim), ThumbnailPath(dstDir, imageID), thumbQuality); err != nil {
-		return err
+	if archive.ffmpegPage(0) {
+		if err := archive.withPageFile(0, func(page string) error {
+			return renderStill(page, ThumbnailPath(dstDir, imageID), thumbMaxDim)
+		}); err != nil {
+			return fmt.Errorf("render manga cover: %w", err)
+		}
+	} else {
+		cover, err := archive.coverImage()
+		if err != nil {
+			return fmt.Errorf("decode manga cover: %w", err)
+		}
+		if err := writeJPEGAtomic(scaleImage(cover, thumbMaxDim), ThumbnailPath(dstDir, imageID), thumbQuality); err != nil {
+			return err
+		}
 	}
 
 	imageDir := mangaImageDir(dstDir, imageID)
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return fmt.Errorf("create manga thumb dir: %w", err)
 	}
-	queueMangaPageThumbs(srcPath, imageDir)
+	if pagesInline {
+		pregenerateMangaPageThumbs(srcPath, imageDir)
+	} else {
+		queueMangaPageThumbs(srcPath, imageDir)
+	}
 	return nil
 }
 
-// mangaThumbWorkers caps how many archives decode their pages at once.
-// The work is background-only, so it stays well under the core count to
-// leave the foreground request path room on a modest host.
+// Well under the core count: background work must leave a modest host
+// room for requests.
 const mangaThumbWorkers = 2
 
 type mangaThumbJob struct{ srcPath, imageDir string }
 
-// mangaThumbQueue feeds the pregeneration workers. Bounded so a bulk
-// ingest of thousands of archives queues small jobs instead of parking
-// one goroutine per archive; an overflow skips the archive and leaves
-// the lazy EnsureMangaPageThumb path to cover its pages on access.
+// Bounded; an archive that overflows it is skipped, and its pages are
+// thumbnailed lazily on access.
 var mangaThumbQueue = make(chan mangaThumbJob, 256)
 
 var mangaThumbOnce sync.Once
 
-// queueMangaPageThumbs hands the archive to the worker pool, starting
-// the workers on first use. Never blocks the ingest path.
 func queueMangaPageThumbs(srcPath, imageDir string) {
 	mangaThumbOnce.Do(func() {
 		for i := 0; i < mangaThumbWorkers; i++ {
@@ -279,11 +416,7 @@ func queueMangaPageThumbs(srcPath, imageDir string) {
 	}
 }
 
-// pregenerateMangaPageThumbs writes a thumbnail for every page of the
-// archive at srcPath into imageDir. It reopens the archive rather than
-// borrowing the caller's so no file handle is held while it waits in
-// the queue. Every page is best-effort: a failure logs and leaves the
-// lazy path to regenerate it on access.
+// Reopens the archive so no handle is held while the job waits in the queue.
 func pregenerateMangaPageThumbs(srcPath, imageDir string) {
 	archive, err := OpenManga(srcPath)
 	if err != nil {
@@ -293,10 +426,8 @@ func pregenerateMangaPageThumbs(srcPath, imageDir string) {
 	defer func() { _ = archive.Close() }()
 
 	for i := range archive.Pages {
-		// removeMangaCache drops this directory when the image is deleted
-		// or its bytes are replaced. Both can land mid-loop, and grinding
-		// on through a long archive would burn the worker and log a
-		// failure per page for a row that no longer wants them.
+		// The directory goes when the image is deleted or its bytes
+		// change, possibly mid-loop.
 		if _, err := os.Stat(imageDir); err != nil {
 			return
 		}
@@ -308,10 +439,13 @@ func pregenerateMangaPageThumbs(srcPath, imageDir string) {
 	}
 }
 
-// generateOneMangaPageThumb decodes one page directly from the archive
-// (no raw-bytes cache write) and writes the thumbnail. Keeps the
-// per-page footprint to one file on disk - the raw bytes stay lazy.
+// Straight from the archive, so the raw page cache stays lazy.
 func generateOneMangaPageThumb(archive *Manga, idx int, dstPath string) error {
+	if archive.ffmpegPage(idx) {
+		return archive.withPageFile(idx, func(page string) error {
+			return renderStill(page, dstPath, thumbMaxDim)
+		})
+	}
 	rc, err := archive.pageReader(idx)
 	if err != nil {
 		return err
@@ -351,7 +485,6 @@ func generateImageThumb(srcPath, dstPath string) error {
 	return nil
 }
 
-// scaleImage scales src so its longest side is at most maxDim.
 func scaleImage(src image.Image, maxDim int) image.Image {
 	bounds := src.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
@@ -375,7 +508,6 @@ func scaleImage(src image.Image, maxDim int) image.Image {
 	return dst
 }
 
-// writeJPEGAtomic encodes img as JPEG at path via a temp file + rename.
 func writeJPEGAtomic(img image.Image, path string, quality int) error {
 	return fsx.WriteAtomic(path, ".thumb.*", func(f *os.File) error {
 		if err := jpeg.Encode(f, img, &jpeg.Options{Quality: quality}); err != nil {
@@ -385,12 +517,7 @@ func writeJPEGAtomic(img image.Image, path string, quality int) error {
 	})
 }
 
-// regenerateDerived renders the thumbnail and, on success, the phash, and
-// returns the phash it stored so the caller can pass it to whatever holds
-// the in-memory index. Neither failure is fatal: a missing thumbnail is
-// regenerated on demand, and a NULL phash keeps the row out of the
-// relations system until a recompute lands rather than leaving a stale
-// value behind. logCtx names the caller.
+// The caller hands the returned phash to the in-memory index.
 func regenerateDerived(database *db.DB, thumbnailsPath, path string, imageID int64, fileType, logCtx string) *int64 {
 	if err := Generate(path, thumbnailsPath, imageID, fileType); err != nil {
 		logx.Warnf("%s: thumbnail for %q: %v", logCtx, path, err)

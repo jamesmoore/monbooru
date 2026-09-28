@@ -14,50 +14,35 @@ import (
 	"github.com/monbooru/monbooru/internal/fsx"
 )
 
-// MangaPage describes one image entry inside a cbz/zip archive. Path is
-// the entry's full archive path verbatim (used by the zip reader);
-// OriginalName is the leaf basename used to choose the cache extension
-// for the serve / page-bytes path.
 type MangaPage struct {
 	Path         string
 	OriginalName string
 }
 
-// Manga is an opened cbz/zip archive plus its sorted page list. The
-// caller must Close() to release the file handle.
 type Manga struct {
 	Pages  []MangaPage
 	zr     *zip.ReadCloser
 	byPath map[string]*zip.File
 }
 
-// ErrEmptyManga is returned when a zip carries no recognised image
-// entries. Ingest rejects the file rather than creating an empty row.
 var ErrEmptyManga = errors.New("archive contains no recognised image entries")
 
-// pageImageExts is the set of extensions accepted as manga pages.
-// Mirrors the gallery's standalone image support so a cbz of webp or
-// gif files works identically to one of jpeg/png.
 var pageImageExts = map[string]struct{}{
 	".jpg":  {},
 	".jpeg": {},
 	".png":  {},
 	".webp": {},
+	".avif": {},
+	".jxl":  {},
 	".gif":  {},
 }
 
-// pageSkipBasenames are filesystem artefacts a creator's archiver would
-// have folded into the zip but that aren't comic content. Folded out at
-// the page-list build step so they never reach the reader UI.
 var pageSkipBasenames = map[string]struct{}{
 	".ds_store":   {},
 	"thumbs.db":   {},
 	"desktop.ini": {},
 }
 
-// OpenManga opens path as a zip, builds the natural-sorted page list,
-// and returns the open archive. ErrEmptyManga is returned for zips with
-// zero recognised image entries; callers ingest no row in that case.
 func OpenManga(path string) (*Manga, error) {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
@@ -104,8 +89,6 @@ func (m *Manga) Close() error {
 	return m.zr.Close()
 }
 
-// Reader returns the underlying *zip.Reader for callers that want to
-// stream entries directly (e.g. the ComicInfo parser).
 func (m *Manga) Reader() *zip.Reader {
 	if m == nil || m.zr == nil {
 		return nil
@@ -113,8 +96,6 @@ func (m *Manga) Reader() *zip.Reader {
 	return &m.zr.Reader
 }
 
-// pageReader opens an io.ReadCloser for the n-th page (0-based).
-// Callers must Close it.
 func (m *Manga) pageReader(n int) (io.ReadCloser, error) {
 	if n < 0 || n >= len(m.Pages) {
 		return nil, fmt.Errorf("page %d out of range [1,%d]", n+1, len(m.Pages))
@@ -126,9 +107,6 @@ func (m *Manga) pageReader(n int) (io.ReadCloser, error) {
 	return f.Open()
 }
 
-// extractPage writes page n's bytes to dst via a temp file + atomic
-// rename so a concurrent reader never sees a partial file. dst's parent
-// directory must already exist.
 func (m *Manga) extractPage(n int, dst string) error {
 	rc, err := m.pageReader(n)
 	if err != nil {
@@ -143,8 +121,6 @@ func (m *Manga) extractPage(n int, dst string) error {
 	})
 }
 
-// coverImage decodes page 1 (entry 0 of the sorted list) into an
-// image.Image suitable for the gallery thumbnail pipeline.
 func (m *Manga) coverImage() (image.Image, error) {
 	rc, err := m.pageReader(0)
 	if err != nil {
@@ -158,10 +134,18 @@ func (m *Manga) coverImage() (image.Image, error) {
 	return img, nil
 }
 
-// coverDimensions reads page 1's dimensions without decoding the full
-// pixel buffer. Used at ingest to populate images.width/height with the
-// cover's geometry.
 func (m *Manga) coverDimensions() (int, int, error) {
+	if m.ffmpegPage(0) {
+		var w, h int
+		err := m.withPageFile(0, func(page string) error {
+			var ok bool
+			if w, h, ok = ProbeVideoDimensions(page); !ok {
+				return errors.New("ffprobe could not read the cover's size")
+			}
+			return nil
+		})
+		return w, h, err
+	}
 	rc, err := m.pageReader(0)
 	if err != nil {
 		return 0, 0, err
@@ -174,9 +158,24 @@ func (m *Manga) coverDimensions() (int, int, error) {
 	return cfg.Width, cfg.Height, nil
 }
 
-// pageCacheExt returns the extension to use for the n-th cached page
-// file: the archive entry's lowercase extension, with a leading dot.
-// Callers compose the full filename via mangaPagePath.
+func (m *Manga) ffmpegPage(n int) bool {
+	return IsFFmpegStill(ExtFileType(m.Pages[n].OriginalName))
+}
+
+// ffmpeg reads a file, not the zip stream, so the page goes to a temp file.
+func (m *Manga) withPageFile(n int, fn func(page string) error) error {
+	tmp, err := os.CreateTemp("", ".manga-page.*"+m.pageCacheExt(n))
+	if err != nil {
+		return fmt.Errorf("creating temp page file: %w", err)
+	}
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if err := m.extractPage(n, tmp.Name()); err != nil {
+		return err
+	}
+	return fn(tmp.Name())
+}
+
 func (m *Manga) pageCacheExt(n int) string {
 	if n < 0 || n >= len(m.Pages) {
 		return ""
@@ -184,10 +183,7 @@ func (m *Manga) pageCacheExt(n int) string {
 	return strings.ToLower(filepath.Ext(m.Pages[n].OriginalName))
 }
 
-// NaturalLess returns true if a < b under natural ordering: numeric
-// runs compare as integers, non-numeric runs compare byte-by-byte.
-// Handles `1.jpg, 2.jpg, 10.jpg` correctly while preserving the usual
-// lex order on the rest. Inputs are assumed lowercased by the caller.
+// NaturalLess does not fold case; callers lowercase both sides.
 func NaturalLess(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
@@ -195,11 +191,6 @@ func NaturalLess(a, b string) bool {
 		ad := ai >= '0' && ai <= '9'
 		bd := aj >= '0' && aj <= '9'
 		if ad && bd {
-			// Read numeric runs from both sides and compare as integers.
-			// Strip leading zeros so "01" == "1" but break the tie by
-			// choosing the longer (more leading zeros) as smaller -
-			// otherwise "01" and "1" would sort equal and fall through
-			// to a byte tie-break that prefers the digit's ASCII value.
 			as, bs := i, j
 			for i < len(a) && a[i] >= '0' && a[i] <= '9' {
 				i++
@@ -222,11 +213,8 @@ func NaturalLess(a, b string) bool {
 			if cmp := strings.Compare(a[as2:i], b[bs2:j]); cmp != 0 {
 				return cmp < 0
 			}
-			// Equal numeric values: shorter zero-padding sorts first.
-			if as != bs {
-				// fewer leading zeros (longer stripped index gap) sorts first;
-				// equivalent to comparing the original-run lengths.
-				return (i - as) < (j - bs)
+			if i-as != j-bs {
+				return i-as < j-bs
 			}
 			continue
 		}

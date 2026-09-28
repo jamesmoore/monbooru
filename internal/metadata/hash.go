@@ -7,16 +7,12 @@ import (
 	"strings"
 )
 
-// genHashLen is how many hex chars (48 bits) we keep. Small enough to
-// paste into a search bar, large enough for a personal library.
+// 48 bits: short enough to paste into a search bar, enough for a personal
+// library.
 const genHashLen = 12
 
-// computeGenerationHash returns a short hex digest identifying a
-// generation recipe. Seed is intentionally excluded so re-rolls of the
-// same recipe collide. Empty inputs return "" so images without
-// metadata don't all collapse into one bucket.
-//
-// Canonical form: fixed-order "key=value\n" lines.
+// Seed is left out so re-rolls of one recipe share a hash; empty inputs
+// give "" so images without metadata do not all share one.
 func computeGenerationHash(prompt, negPrompt, model, sampler string, steps *int, cfg *float64) string {
 	prompt = strings.TrimSpace(prompt)
 	negPrompt = strings.TrimSpace(negPrompt)
@@ -47,7 +43,7 @@ func computeGenerationHash(prompt, negPrompt, model, sampler string, steps *int,
 	b.WriteByte('\n')
 	b.WriteString("cfg=")
 	if cfg != nil {
-		// Two-decimal rounding absorbs float noise (7 vs 7.0 vs 7.00).
+		// Two decimals absorb float noise.
 		fmt.Fprintf(&b, "%.2f", *cfg)
 	}
 	b.WriteByte('\n')

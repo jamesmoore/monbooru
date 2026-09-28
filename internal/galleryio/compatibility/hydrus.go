@@ -20,9 +20,6 @@ func init() {
 	})
 }
 
-// detectHydrus: a Hydrus export carries supported media files plus at
-// least one `<file>.txt` sidecar (the operator opted into the
-// "all known tags" sidecar at export time).
 func detectHydrus(entries []NormalizedEntry) bool {
 	hasImage, hasSidecar := false, false
 	for _, e := range entries {
@@ -39,11 +36,6 @@ func detectHydrus(entries []NormalizedEntry) bool {
 	return false
 }
 
-// translateHydrus pairs each media file with its `<file>.txt` sidecar
-// (when present) and emits the manifest + extraction map. The relative
-// path keeps the original filename so the file extracts under the same
-// name; sha256 is filled in only when the basename minus its extension
-// is a 64-hex-char hydrus-style hash.
 func translateHydrus(entries []NormalizedEntry) (Result, error) {
 	images := map[string]*zip.File{}
 	sidecars := map[string]*zip.File{}
@@ -53,9 +45,7 @@ func translateHydrus(entries []NormalizedEntry) (Result, error) {
 			continue
 		}
 		if strings.HasSuffix(strings.ToLower(e.Rel), ".txt") {
-			// The check above already proved the suffix, whatever its
-			// case; TrimSuffix per spelling missed foo.png.Txt, which
-			// then failed HasMediaExt and dropped that image's tags.
+			// Sliced by length: TrimSuffix would miss a .Txt suffix.
 			imgRel := e.Rel[:len(e.Rel)-len(".txt")]
 			if HasMediaExt(imgRel) {
 				sidecars[imgRel] = e.File
@@ -87,17 +77,6 @@ func translateHydrus(entries []NormalizedEntry) (Result, error) {
 	return out, nil
 }
 
-// readHydrusSidecar parses one tag per line; blank lines and `#`-prefixed
-// comments are ignored. Tokens already in `category:tag` form pass
-// through so the apply path's category resolver routes them; each is
-// normalized to monbooru's tag-name charset first (hydrus stores spaces).
-// A few Hydrus namespaces are rewritten to their Monbooru counterparts
-// since they share the same semantic; without the rewrite they would
-// land as literal `<prefix>:name` tags in `general`:
-//
-//	creator: → artist:
-//	series:  → copyright:
-//	studio:  → copyright:
 func readHydrusSidecar(f *zip.File) ([]string, error) {
 	rc, err := f.Open()
 	if err != nil {

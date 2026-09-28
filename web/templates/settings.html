@@ -1,16 +1,15 @@
 {{define "maintenance_row"}}
         <tr>
-          <td><strong{{if .Accent}} class="{{.Accent}}"{{end}}>{{.Title}}</strong> <span class="field-hint">- {{.Desc}}</span></td>
+          <td><strong{{if .Accent}} class="{{.Accent}}"{{end}}>{{.Title}}</strong>{{if .Mark}}<span class="status-badge status-faint">{{.Mark}}</span>{{end}} <span class="field-hint">- {{.Desc}}</span></td>
           <td>
-            <form hx-post="{{.URL}}" hx-target="{{or .Target "#flash-maintenance"}}" hx-swap="innerHTML"
+            <form hx-post="{{.URL}}" hx-target="#flash-maintenance" hx-swap="innerHTML"
                   {{if .JobKick}}hx-on::after-request="if(event.detail.successful){document.getElementById('job-status').setAttribute('hx-trigger','load');htmx.trigger('#job-status','load')}"
                   {{end}}{{if .Confirm}}hx-confirm="{{.Confirm}}"
                   {{if .ConfirmDanger}}data-confirm-danger="{{.ConfirmDanger}}"
                   {{end}}data-confirm-ok="{{.ConfirmOK}}"
                   {{end}}style="display:inline">
               <input type="hidden" name="_csrf" value="{{.CSRF}}">
-              {{range $k, $v := .Fields}}<input type="hidden" name="{{$k}}" value="{{$v}}">
-              {{end}}<button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm{{if .Accent}} {{.Accent}}{{end}}"{{if .Disabled}} disabled title="{{.DisabledReason}}"{{end}}>{{.Verb}}</button>
+              <button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm{{if .Accent}} {{.Accent}}{{end}}"{{if .Disabled}} disabled title="{{.DisabledReason}}"{{end}}>{{.Verb}}</button>
             </form>
           </td>
         </tr>
@@ -47,7 +46,10 @@
   {{if .DesktopProfile}}
   {{$dk := .Desktop}}
   <section id="desktop" class="settings-section">
-    <h3>Desktop</h3>
+    <div class="settings-section-header">
+      <h3>Desktop</h3>
+      <p class="field-hint">Folders, launch options and the tray icon.</p>
+    </div>
     <div id="flash-desktop"></div>
     <form id="desktop-switches" hx-post="/settings/desktop" hx-target="#flash-desktop" hx-swap="innerHTML">
       <input type="hidden" name="_csrf" value="{{$csrf}}">
@@ -103,14 +105,25 @@
   {{end}}
 
   <section id="general" class="settings-section">
-    <h3>General</h3>
+    <div class="settings-section-header">
+      <h3>General</h3>
+      <p class="field-hint">File handling, display options and meta tags.</p>
+    </div>
     <div id="flash-general"></div>
     <form hx-post="/settings/general" hx-target="#flash-general" hx-swap="innerHTML">
       <input type="hidden" name="_csrf" value="{{$csrf}}">
       <div class="settings-cols">
         <div class="settings-sub">
           <h4>Files</h4>
-          {{template "partials/range_field.html" dict "Name" "max_file_size_mb" "Label" "Max file size (MB)" "Min" 1 "Max" 5120 "Step" 1 "Value" $cfg.Gallery.MaxFileSizeMB "Ticks" (list 512 1024 2048 3072 4096 5120) "Hint" "Files larger than this are skipped on upload and during sync."}}
+          {{$sizeHint := "Files larger than this are skipped on upload and during sync."}}{{if eq $cfg.Gallery.MaxFileSizeMB 0}}{{$sizeHint = "0 means no cap: no file is skipped for its size."}}{{end}}
+          {{template "partials/range_field.html" dict "Name" "max_file_size_mb" "Label" "Max file size (MB)" "Min" 1 "Max" 5120 "Step" 1 "Value" $cfg.Gallery.MaxFileSizeMB "Ticks" (list 512 1024 2048 3072 4096 5120) "Hint" $sizeHint}}
+          <div class="field">
+            <div class="field-title">
+              <label>Ignored files and folders</label>
+              <button type="button" class="btn-link-accent" id="ignore-edit" onclick="openIgnoreDialog()">[edit]</button>
+            </div>
+            {{template "partials/ignore_list.html" (dict "Ignore" $cfg.Gallery.Ignore)}}
+          </div>
           <div class="field">
             <label>Where received files go</label>
             <div class="dest-row">
@@ -151,14 +164,26 @@
             <span class="field-hint">Takes effect after a restart.</span>
           </div>
         </div>
-        <div class="settings-sub">
-          <h4>UI</h4>
-          {{template "partials/range_field.html" dict "Name" "page_size" "Label" "Default page size" "Min" 1 "Max" 100 "Step" 1 "Value" $cfg.UI.PageSize "Ticks" (list 20 40 60 80 100)}}
-          <div class="field">
-            <label>Thumbnails</label>
-            <div class="radio-row">
-              <label><input type="radio" name="thumbnail_fit" value="square" {{if ne $cfg.UI.ThumbnailFit "natural"}}checked{{end}}> Square (cropped)</label>
-              <label><input type="radio" name="thumbnail_fit" value="natural" {{if eq $cfg.UI.ThumbnailFit "natural"}}checked{{end}}> Real aspect ratio</label>
+        <div class="settings-col">
+          <div class="settings-sub">
+            <h4>UI</h4>
+            {{template "partials/range_field.html" dict "Name" "page_size" "Label" "Default page size" "Min" 1 "Max" 100 "Step" 1 "Value" $cfg.UI.PageSize "Ticks" (list 20 40 60 80 100)}}
+            <div class="field">
+              <label>Thumbnails</label>
+              <div class="radio-row">
+                <label><input type="radio" name="thumbnail_fit" value="square" {{if ne $cfg.UI.ThumbnailFit "natural"}}checked{{end}}> Square (cropped)</label>
+                <label><input type="radio" name="thumbnail_fit" value="natural" {{if eq $cfg.UI.ThumbnailFit "natural"}}checked{{end}}> Real aspect ratio</label>
+              </div>
+            </div>
+          </div>
+          <div class="settings-sub">
+            <h4>Meta tags</h4>
+            <div class="field">
+              <label>
+                <input type="checkbox" name="auto_meta_tags" {{if $cfg.Gallery.AutoMetaTags}}checked{{end}}>
+                Automatically generate meta tags from the file
+              </label>
+              <span class="field-hint">Generate some meta tags automatically: highres, lowres, animated, greyscale...</span>
             </div>
           </div>
         </div>
@@ -167,8 +192,51 @@
     </form>
   </section>
 
+  <dialog id="ignore-dialog">
+    <form id="ignore-form" hx-post="/settings/general/ignore" hx-target="#flash-ignore" hx-swap="innerHTML"
+          hx-on::after-request="onIgnoreSaved()">
+      <input type="hidden" name="_csrf" value="{{$csrf}}">
+      <p><strong>Ignored files and folders</strong></p>
+      <textarea name="ignore" id="ignore" rows="12" spellcheck="false" aria-label="Ignored files and folders"></textarea>
+      <ul class="ignore-rules">
+        <li>One name or path per line.</li>
+        <li>A name is left out wherever it appears.</li>
+        <li>A path with / counts from each gallery's root.</li>
+        <li>* and ? are wildcards; case does not matter.</li>
+        <li>A sync applies it at once, the watcher after a restart.</li>
+      </ul>
+      <div id="flash-ignore"></div>
+      {{template "dialog_actions" dict "ID" "ignore-dialog" "Submit" "Save"}}
+    </form>
+  </dialog>
+  <script>
+  function openIgnoreDialog() {
+    var field = document.getElementById('ignore');
+    var lines = Array.prototype.map.call(document.querySelectorAll('#ignore-list code'),
+      function(c) { return c.textContent; });
+    field.value = lines.join('\n');
+    field.rows = Math.min(Math.max(lines.length + 1, 6), 20);
+    clearSlots('flash-ignore');
+    document.getElementById('ignore-dialog').showModal();
+    field.focus();
+    field.setSelectionRange(0, 0);
+    field.scrollTop = 0;
+  }
+  function onIgnoreSaved() {
+    var flash = document.getElementById('flash-ignore');
+    if (flash && flash.querySelector('.flash-ok')) {
+      document.getElementById('flash-general').innerHTML = flash.innerHTML;
+      flash.innerHTML = '';
+      document.getElementById('ignore-dialog').close();
+    }
+  }
+  </script>
+
   <section id="galleries" class="settings-section">
-    <h3>Galleries</h3>
+    <div class="settings-section-header">
+      <h3>Galleries</h3>
+      <p class="field-hint">Add, switch, export or import your galleries.</p>
+    </div>
     <div id="flash-galleries"></div>
     <div class="table-scroll">
     <table class="gallery-table">
@@ -183,7 +251,7 @@
         {{range $galleries}}
         <tr>
           <td><strong>{{.Name}}</strong></td>
-          <td class="gallery-path-cell"><code>{{.GalleryPath}}</code></td>
+          <td class="gallery-path-cell"><code>{{.GalleryPath}}</code>{{range .LeavesOut}}<span class="gallery-leaves">leaves out {{.}}</span>{{end}}</td>
           <td class="gallery-status-cell">
             {{if eq .Name $active}}<span class="status-badge status-ok">active</span>{{end}}
             {{if eq .Name $cfg.DefaultGallery}}<span class="status-badge status-ok">default</span>{{end}}
@@ -223,7 +291,7 @@
           </td>
           <td>
             {{if and (ne .Name $active) (ne .Name $cfg.DefaultGallery) (gt (len $galleries) 1)}}
-            <button class="btn-sm btn-danger btn-gallery-delete" data-name="{{.Name}}">Delete</button>
+            <button class="btn-sm btn-danger btn-gallery-delete" data-name="{{.Name}}" data-keeps="{{range $i, $k := .LeavesOut}}{{if $i}}, {{end}}{{$k}}{{end}}">Delete</button>
             {{else}}
             <span class="status-dim" title="{{if le (len $galleries) 1}}The last gallery cannot be deleted{{else if eq .Name $active}}Switch to another gallery first{{else}}Set another gallery as the default first{{end}}">-</span>
             {{end}}
@@ -291,19 +359,12 @@
     }
     document.getElementById('gallery-add-import-toggle')
       .addEventListener('change', syncImportToggle);
-    // Disables the submit button and swaps its label while the Add request
-    // is in flight. Without this the user gets no feedback between click
-    // and the post-success reload, and can re-submit.
     function setAddGalleryBusy(form, busy) {
       var submit = form.querySelector('button[type=submit]');
       if (!submit) return;
       submit.disabled = busy;
       submit.textContent = busy ? 'Adding…' : 'Add';
     }
-    // Mirrors the import dialog: on success, relay the flash from the
-    // in-dialog target out to #flash-galleries so it survives the close,
-    // then close + reload. The stash carries it across that reload - it
-    // is where the operator learns the new gallery is now the active one.
     function onAddGalleryResponse(form) {
       setAddGalleryBusy(form, false);
       var flash = document.getElementById('flash-gallery-add');
@@ -336,12 +397,14 @@
   </dialog>
 
   <dialog id="gallery-delete-dialog">
-    <form id="gallery-delete-form" hx-post="" hx-target="#flash-gallery-delete" hx-swap="innerHTML">
+    <form id="gallery-delete-form" hx-post="" hx-target="#flash-gallery-delete" hx-swap="innerHTML"
+          hx-on::after-request="onDeleteGalleryResponse()">
       <input type="hidden" name="_csrf" value="{{$csrf}}">
       <p>Delete gallery <strong id="gallery-delete-src"></strong>?</p>
       <p class="confirm-dialog-danger">The database and thumbnails will be erased.</p>
       <div class="field">
-        <label><input type="checkbox" name="remove_folder"> Also delete the gallery folder (source images)</label>
+        <label><input type="checkbox" name="remove_folder"> Also delete the gallery folder and everything in it</label>
+        <span class="field-hint" id="gallery-delete-keeps"></span>
       </div>
       <div class="field">
         <label>Type the gallery name to confirm</label>
@@ -423,6 +486,10 @@
       form.setAttribute('hx-post', '/settings/galleries/' + name + '/delete');
       if (window.htmx) window.htmx.process(form);
       document.getElementById('gallery-delete-src').textContent = name;
+      var keeps = this.dataset.keeps;
+      document.getElementById('gallery-delete-keeps').textContent = keeps
+        ? 'Kept: the folders it leaves out, ' + keeps + ', and anything the ignore list names.'
+        : 'Anything the ignore list names is kept.';
       clearSlots('flash-gallery-delete');
       form.querySelector('input[name="remove_folder"]').checked = false;
       form.querySelector('input[name="confirm_name"]').value = '';
@@ -453,9 +520,6 @@
       clearSlots('flash-gallery-import');
       form.reset();
       setImportBusy(form, false);
-      // Active and default galleries reject Replace server-side; disable the
-      // radio up front and stay on the default Merge so the user can't pick
-      // a mode that will error, and a hint explains why.
       var replaceRadio = form.querySelector('input[name="mode"][value="replace"]');
       var mergeRadio = form.querySelector('input[name="mode"][value="merge"]');
       var replaceLabel = replaceRadio.parentElement;
@@ -467,10 +531,6 @@
     });
   });
 
-  // Toggle the confirm-name row, destructive warning, and submit button
-  // styling to match the selected mode. Replace keeps the type-to-confirm
-  // gate and the red button; merge drops both so the user isn't forced to
-  // type the name for a non-destructive action.
   function syncImportModeFields() {
     var form = document.getElementById('gallery-import-form');
     if (!form) return;
@@ -496,9 +556,6 @@
     radio.addEventListener('change', syncImportModeFields);
   });
 
-  // Toggles the in-flight state of the import form: swaps the submit label,
-  // disables the file + confirm inputs, and shows the wait hint. Called on
-  // both the before-request and after-request HTMX events.
   function setImportBusy(form, busy) {
     var submit = form.querySelector('button[type=submit]');
     submit.disabled = busy;
@@ -508,18 +565,8 @@
     document.getElementById('gallery-import-wait').hidden = !busy;
   }
 
-  // Runs after the import POST settles. Unwinds the busy state and, when
-  // the server replied with a flash-ok body (written to the in-dialog
-  // #flash-gallery-import by the hx-target), closes the modal. Error
-  // responses keep the flash inside the dialog so the user can read it and
-  // fix the confirm-name or file input.
-  //
-  // A successful import flips the server-side active gallery, so the page
-  // has to repaint to show the new badge in the galleries table and the
-  // footer switcher. The summary is the whole point of the message on a
-  // merge - "0 image(s) added, 0 tagged, 431 not in this gallery" is often
-  // the honest answer - so it is handed to the next load rather than shown
-  // for a moment and repainted away.
+  // A successful import switches the active gallery, so the page reloads
+  // and the summary rides the stash.
   function onImportResponse(form) {
     setImportBusy(form, false);
     var flash = document.getElementById('flash-gallery-import');
@@ -531,8 +578,18 @@
     }
   }
 
-  // The stash carries a timestamp so a summary the reload never consumed
-  // does not pop on a settings visit an hour later.
+  // Only a delete that kept folders answers with a flash; a plain one
+  // answers with a refresh.
+  function onDeleteGalleryResponse() {
+    var flash = document.getElementById('flash-gallery-delete');
+    if (flash && flash.querySelector('.flash-ok')) {
+      stashImportFlash(flash.innerHTML);
+      flash.innerHTML = '';
+      document.getElementById('gallery-delete-dialog').close();
+      window.location.reload();
+    }
+  }
+
   function stashImportFlash(html) {
     try {
       sessionStorage.setItem('monbooru_import_flash', JSON.stringify({h: html, t: Date.now()}));
@@ -553,7 +610,10 @@
   </script>
 
   <section id="plugins" class="settings-section">
-    <h3>Plugins</h3>
+    <div class="settings-section-header">
+      <h3>Plugins</h3>
+      <p class="field-hint">Plugins and themes.</p>
+    </div>
     <div id="flash-plugins"></div>
     <div class="settings-sub">
       <h4>Pairing requests</h4>
@@ -580,6 +640,7 @@
   <section id="tagger" class="settings-section">
     <div class="settings-section-header">
       <h3>Auto-Tagger</h3>
+      <p class="field-hint">Settings for the local tagging models.</p>
       {{template "partials/tagger_mode_badge.html" (dict "Provider" $cfg.Tagger.ExecutionProvider)}}
     </div>
     <div id="flash-tagger"></div>
@@ -748,7 +809,10 @@
   </section>
 
   <section id="relations" class="settings-section">
-    <h3>Relations</h3>
+    <div class="settings-section-header">
+      <h3>Relations</h3>
+      <p class="field-hint">Settings for duplicate and similar image detection.</p>
+    </div>
     <div id="flash-relations-settings"></div>
     <form hx-post="/settings/relations" hx-target="#flash-relations-settings" hx-swap="innerHTML">
       <input type="hidden" name="_csrf" value="{{$csrf}}">
@@ -784,10 +848,13 @@
   </section>
 
   <section id="auth" class="settings-section">
-    <h3>Authentication</h3>
+    <div class="settings-section-header">
+      <h3>Authentication</h3>
+      <p class="field-hint">UI password and API tokens.</p>
+    </div>
     <div id="flash-auth"></div>
     <div class="settings-cols">
-      {{template "partials/auth_password_section.html" (dict "AuthEnabled" $cfg.Auth.EnablePassword "CSRFToken" $csrf)}}
+      {{template "partials/auth_password_section.html" (dict "AuthEnabled" $cfg.Auth.EnablePassword "HasPassword" (ne $cfg.Auth.PasswordHash "") "CSRFToken" $csrf)}}
       <div class="settings-sub">
         <h4>API Tokens</h4>
         <p class="field-hint">Bearer tokens for the REST API. The secret is shown once, at creation.</p>
@@ -802,54 +869,107 @@
   </section>
 
   <section id="maintenance" class="settings-section">
-    <h3>Maintenance</h3>
+    <div class="settings-section-header">
+      <h3>Maintenance</h3>
+      <p class="field-hint">Cleanup and rebuild tasks for the current gallery.</p>
+    </div>
     <div id="flash-maintenance"></div>
-    <div class="table-scroll">
-    <table class="maintenance-table">
-      <tbody>
-        <tr>
-          <td><strong>Missing images</strong> <span class="field-hint">- remove DB entries whose files are gone (<a href="/?q=missing:true">view</a>)</span></td>
-          <td>
-            <form hx-post="/settings/maintenance/prune-missing" hx-target="#flash-maintenance" hx-swap="innerHTML"
-                  hx-confirm="Prune every image marked missing from the database?"
-                  data-confirm-danger="Tags on those images are removed too. Re-mounting the gallery volume before pruning restores the files."
-                  data-confirm-ok="Prune"
-                  style="display:inline">
-              <input type="hidden" name="_csrf" value="{{$csrf}}">
-              <button type="submit" class="btn-danger btn-sm">Prune</button>
-            </form>
-          </td>
-        </tr>
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Orphaned thumbnails" "Desc" "remove thumbnail files with no matching image" "URL" "/settings/maintenance/prune-orphaned-thumbnails" "Verb" "Remove" "Confirm" "Remove every thumbnail file with no matching image?" "ConfirmOK" "Remove"}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Empty folders" "Desc" "list the folders under the gallery root holding nothing, then remove the ones you pick" "URL" "/settings/maintenance/empty-folders" "Verb" "Scan" "Target" "#flash-empty-folders"}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Rebuild thumbnails" "Desc" "regenerate thumbnail files for every image" "URL" "/settings/maintenance/rebuild-thumbnails" "Verb" "Rebuild" "JobKick" true "Confirm" "Rebuild thumbnails for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Rebuild"}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Compute hashes" "Desc" "backfill the perceptual hash and md5 of every image missing one; search -phash: or -md5: to see which" "URL" "/settings/maintenance/compute-hashes" "Verb" "Compute" "JobKick" true "Confirm" "Compute the missing perceptual hashes and md5 digests?" "ConfirmDanger" "The md5 pass reads every file in the gallery from disk. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Compute"}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Rebuild pair queue" "Desc" "wipe potential relation pairs and rescan from scratch" "URL" "/relations/find-pairs" "Verb" "Rebuild" "Danger" true "JobKick" true "Confirm" "Wipe the existing pair queue and rescan from scratch?" "ConfirmDanger" "Skipped pairs and any queue work in progress are dropped." "ConfirmOK" "Rebuild" "Fields" (dict "replace" "true" "confirm" "REBUILD")}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Tag counts" "Desc" "recompute usage counts" "URL" "/settings/maintenance/recalc-tags" "Verb" "Recalculate"}}
-        <tr>
-          <td><strong>Category conflicts</strong> <span class="field-hint">- list tags whose name occupies more than one category</span></td>
-          <td>
-            <form hx-post="/settings/maintenance/tag-conflicts" hx-target="#flash-maintenance" hx-swap="innerHTML" style="display:inline">
-              <input type="hidden" name="_csrf" value="{{$csrf}}">
-              <button type="submit" class="btn-sm">List</button>
-            </form>
-          </td>
-        </tr>
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Find folded duplicates" "Desc" "pair pre-widening folded tags with their corrected spelling, then review and merge on the Tags page (Folded dup. filter)" "URL" "/settings/maintenance/find-folded-duplicates" "Verb" "Scan" "JobKick" true}}
+    <div class="settings-cols">
+      <div class="settings-col">
+        <div class="settings-sub">
+          <h4>Disk</h4>
+          <div class="table-scroll">
+          <table class="maintenance-table">
+            <tbody>
+              <tr>
+                <td><strong>Missing images</strong> <span class="field-hint">- remove DB entries whose files are gone (<a href="/?q=missing:true">view</a>)</span></td>
+                <td>
+                  <form hx-post="/settings/maintenance/prune-missing" hx-target="#flash-maintenance" hx-swap="innerHTML"
+                        hx-confirm="Prune the images marked missing whose file is gone from disk?"
+                        data-confirm-danger="Tags on those images are removed too. An image whose file is still on disk is kept. Re-mounting the gallery volume before pruning restores the files."
+                        data-confirm-ok="Prune"
+                        style="display:inline">
+                    <input type="hidden" name="_csrf" value="{{$csrf}}">
+                    <button type="submit" class="btn-danger btn-sm">Prune</button>
+                  </form>
+                </td>
+              </tr>
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Orphaned thumbnails" "Desc" "remove thumbnail files with no matching image" "URL" "/settings/maintenance/prune-orphaned-thumbnails" "Verb" "Remove" "Confirm" "Remove every thumbnail file with no matching image?" "ConfirmOK" "Remove"}}
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Empty folders" "Desc" "list the folders under the gallery root holding nothing, then remove the ones you pick" "URL" "/settings/maintenance/empty-folders" "Verb" "Scan" "Mark" "report"}}
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Rebuild thumbnails" "Desc" "regenerate thumbnail files for every image" "URL" "/settings/maintenance/rebuild-thumbnails" "Verb" "Rebuild" "Mark" "long job" "JobKick" true "Confirm" "Rebuild thumbnails for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Rebuild"}}
+            </tbody>
+          </table>
+          </div>
+        </div>
+
+        <div class="settings-sub">
+          <h4>Tags</h4>
+          <div class="table-scroll">
+          <table class="maintenance-table">
+            <tbody>
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Tag counts" "Desc" "recompute usage counts" "URL" "/settings/maintenance/recalc-tags" "Verb" "Recalculate"}}
+              <tr>
+                <td><strong>Category conflicts</strong><span class="status-badge status-faint">report</span> <span class="field-hint">- list tags whose name occupies more than one category</span></td>
+                <td>
+                  <form hx-post="/settings/maintenance/tag-conflicts" hx-target="#flash-maintenance" hx-swap="innerHTML" style="display:inline">
+                    <input type="hidden" name="_csrf" value="{{$csrf}}">
+                    <button type="submit" class="btn-sm">List</button>
+                  </form>
+                </td>
+              </tr>
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Find folded duplicates" "Desc" "pair pre-widening folded tags with their corrected spelling, then review and merge on the Tags page (Folded dup. filter)" "URL" "/settings/maintenance/find-folded-duplicates" "Verb" "Scan" "Mark" "report" "JobKick" true}}
+            </tbody>
+          </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-col">
+        <div class="settings-sub">
+          <h4>Derived data</h4>
+          <div class="table-scroll">
+          <table class="maintenance-table">
+            <tbody>
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Compute hashes" "Desc" "backfill the perceptual hash and md5 of every image missing one; search -phash: or -md5: to see which" "URL" "/settings/maintenance/compute-hashes" "Verb" "Compute" "Mark" "long job" "JobKick" true "Confirm" "Compute the missing perceptual hashes and md5 digests?" "ConfirmDanger" "The md5 pass reads every file in the gallery from disk. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Compute"}}
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Meta tags" "Desc" "derive the meta tags every image's own properties imply; new files get them as they arrive" "URL" "/settings/maintenance/meta-tags" "Verb" "Generate" "Mark" "long job" "JobKick" true "Confirm" "Derive meta tags for every image in this gallery?" "ConfirmDanger" "Reads a thumbnail per image. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Generate"}}
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Remove meta tags" "Desc" "withdraw every tag monbooru derived; one another source also applied stays under that source" "URL" "/settings/maintenance/meta-tags/remove" "Verb" "Remove" "Mark" "long job" "Danger" true "JobKick" true "Confirm" "Remove every meta tag monbooru derived?" "ConfirmDanger" "Tags you added by hand, and tags a source also vouches for, are kept." "ConfirmOK" "Remove"}}
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Index ComfyUI workflows" "Desc" "rebuild the node and input index the comfyui: search seeks; new files are indexed as they arrive" "URL" "/settings/maintenance/index-workflows" "Verb" "Index" "Mark" "long job" "JobKick" true "Confirm" "Rebuild the ComfyUI workflow index?" "ConfirmDanger" "Re-reads every stored workflow. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Index"}}
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Re-extract metadata" "Desc" "re-parse metadata for every image" "URL" "/settings/maintenance/re-extract-metadata" "Verb" "Re-extract" "Mark" "long job" "Confirm" "Re-parse metadata for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Re-extract"}}
+            </tbody>
+          </table>
+          </div>
+        </div>
+
         {{if .MonloaderPaired}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Look up unsourced images" "Accent" "monloader-accent" "Desc" "run the scheduled lookup now on the images that are due" "URL" "/settings/maintenance/lookup-due" "Verb" "Look up" "JobKick" true "Confirm" "Look up the images that are due now?" "ConfirmDanger" "Online lookups count against monloader's daily budget." "ConfirmOK" "Look up" "Disabled" (not .MonloaderUsable) "DisabledReason" (monloaderOffReason .MonloaderConn)}}
+        <div class="settings-sub">
+          <h4>Sources</h4>
+          <div class="table-scroll">
+          <table class="maintenance-table">
+            <tbody>
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Look up unsourced images" "Accent" "monloader-accent" "Desc" "run the scheduled lookup now on the images that are due" "URL" "/settings/maintenance/lookup-due" "Verb" "Look up" "JobKick" true "Confirm" "Look up the images that are due now?" "ConfirmDanger" "Online lookups count against monloader's daily budget." "ConfirmOK" "Look up" "Disabled" (not .MonloaderUsable) "DisabledReason" (monloaderOffReason .MonloaderConn)}}
+            </tbody>
+          </table>
+          </div>
+        </div>
         {{end}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Re-extract metadata" "Desc" "re-parse metadata for every image" "URL" "/settings/maintenance/re-extract-metadata" "Verb" "Re-extract" "Confirm" "Re-parse metadata for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Re-extract"}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Vacuum database" "Desc" "compact the SQLite file after mass deletions" "URL" "/settings/maintenance/vacuum-db" "Verb" "Vacuum" "Confirm" "Compact the SQLite database now?" "ConfirmDanger" "Holds a database lock for the duration of the VACUUM; other jobs and queries will wait." "ConfirmOK" "Vacuum"}}
-        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Free memory" "Desc" "shrink SQLite caches, return the Go heap, and release the auto-tagger from RAM/VRAM." "URL" "/settings/maintenance/free-memory" "Verb" "Free"}}
-      </tbody>
-    </table>
+
+        <div class="settings-sub">
+          <h4>Database</h4>
+          <div class="table-scroll">
+          <table class="maintenance-table">
+            <tbody>
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Vacuum database" "Desc" "compact the SQLite file after mass deletions" "URL" "/settings/maintenance/vacuum-db" "Verb" "Vacuum" "Mark" "long job" "Confirm" "Compact the SQLite database now?" "ConfirmDanger" "Holds a database lock for the duration of the VACUUM; other jobs and queries will wait." "ConfirmOK" "Vacuum"}}
+              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Free memory" "Desc" "shrink SQLite caches, return the Go heap, and release the auto-tagger from RAM/VRAM" "URL" "/settings/maintenance/free-memory" "Verb" "Free"}}
+            </tbody>
+          </table>
+          </div>
+        </div>
+      </div>
     </div>
     <div id="flash-empty-folders"></div>
 
   <script>
-  // The empty-folder list is swapped in after load, so it binds through
-  // document-level listeners.
+  // Delegated: the empty-folder list is swapped in after load.
   function emptyFolderBoxes() {
     return Array.prototype.slice.call(document.querySelectorAll('.empty-folders-list input[name="folder"]'));
   }
@@ -864,8 +984,7 @@
   document.addEventListener('change', function(e) {
     var box = e.target;
     if (!box.closest || box.name !== 'folder' || !box.closest('.empty-folders-list')) return;
-    // A folder whose child survives is not going anywhere, and one that goes
-    // takes its subtree with it.
+    // A kept child keeps its parent, and a removed folder takes its subtree.
     emptyFolderBoxes().forEach(function(other) {
       if (other === box) return;
       if (!box.checked && box.value.indexOf(other.value + '/') === 0) other.checked = false;
@@ -887,9 +1006,11 @@
   {{$sched := $cfg.Schedule}}
   {{$schedSt := .ScheduleStatus}}
   <section id="schedule" class="settings-section">
-    <h3>Schedule</h3>
+    <div class="settings-section-header">
+      <h3>Schedule</h3>
+      <p class="field-hint">Runs the selected actions once per day, one gallery after another.</p>
+    </div>
     <div id="flash-schedule"></div>
-    <p class="field-hint">Runs the selected maintenance actions once per day at the configured time, on every configured gallery in sequence. Skipped silently if another job is already running at fire time.</p>
     {{template "partials/schedule_status.html" (dict "Status" $schedSt)}}
     {{if $schedSt.LookupInfo}}
     <p class="field-hint">
@@ -898,20 +1019,6 @@
     {{end}}
     <form hx-post="/settings/schedule" hx-target="#flash-schedule" hx-swap="innerHTML">
       <input type="hidden" name="_csrf" value="{{$csrf}}">
-      <div class="field">
-        <label>Time of day (24h, HH:MM) <input type="text" name="time" value="{{$sched.Time}}"
-               pattern="^([01]\d|2[0-3]):[0-5]\d$" placeholder="HH:MM" maxlength="5"
-               class="schedule-time-input" required></label>
-      </div>
-      <div class="field">
-        <label>When it runs</label>
-        {{$mode := $sched.EffectiveMode}}
-        <div class="radio-grid">
-          {{range .ScheduleModes}}
-          <label><input type="radio" name="mode" value="{{.Name}}"{{if eq $mode .Name}} checked{{end}}> {{.Label}}</label>
-          {{end}}
-        </div>
-      </div>
       <div class="schedule-grid">
         <div class="field">
           <label><input type="checkbox" name="sync_gallery"{{if $sched.SyncGallery}} checked{{end}}> Sync gallery</label>
@@ -927,10 +1034,48 @@
         </div>
         {{if .MonloaderPaired}}
         <div class="field">
+          <input type="hidden" name="lookup_switches" value="1">
           <label class="monloader-accent{{if not .MonloaderUsable}} label-off{{end}}"{{if not .MonloaderUsable}} title="{{monloaderOffReason .MonloaderConn}}"{{else if .MonloaderPTRSyncing}} title="monloader's PTR index is still syncing"{{else if not .MonloaderPTR}} title="the PTR index is off on monloader"{{end}}><input type="checkbox" name="lookup_ptr"{{if $sched.LookupPTR}} checked{{end}}> Look up unsourced images in the Public Tag Repository</label>
         </div>
         <div class="field">
           <label class="monloader-accent{{if not .MonloaderUsable}} label-off{{end}}"{{if not .MonloaderUsable}} title="{{monloaderOffReason .MonloaderConn}}"{{end}}><input type="checkbox" name="lookup_booru"{{if $sched.LookupBooru}} checked{{end}}> Look up unsourced images on online boorus</label>
+        </div>
+        {{end}}
+      </div>
+      {{$scope := .ScheduleScope}}
+      <div class="settings-cols">
+        <div class="field">
+          <label>Run time</label>
+          <label class="schedule-time">Time of day (24h, HH:MM) <input type="text" name="time" value="{{$sched.Time}}"
+                 pattern="^([01]\d|2[0-3]):[0-5]\d$" placeholder="HH:MM" maxlength="5"
+                 class="schedule-time-input" required></label>
+          {{$mode := $sched.EffectiveMode}}
+          <div class="radio-grid{{if $scope.Show}} schedule-modes{{end}}">
+            {{range .ScheduleModes}}
+            <label><input type="radio" name="mode" value="{{.Name}}"{{if eq $mode .Name}} checked{{end}}> {{.Label}}</label>
+            {{end}}
+          </div>
+        </div>
+        {{if $scope.Show}}
+        <div class="field">
+          <label>Galleries</label>
+          <div class="table-scroll">
+            <table class="schedule-scope-table">
+              <thead><tr><th></th>
+                {{range $scope.Columns}}<th scope="col" class="{{.Accent}}{{if not .On}} scope-off{{end}}" data-scope-col="{{.Action}}" title="{{.Title}}">{{.Label}}<input type="hidden" name="scope_action" value="{{.Action}}"></th>{{end}}
+              </tr></thead>
+              <tbody>
+                <tr class="schedule-scope-every"><th scope="row">All galleries</th>
+                  {{range $scope.Columns}}<td data-scope-col="{{.Action}}"{{if not .On}} class="scope-off"{{end}}><input type="checkbox" name="every_{{.Action}}" value="on" data-scope-every="{{.Action}}" aria-label="{{.Title}}: all galleries"{{if .Every}} checked{{end}}></td>{{end}}
+                </tr>
+                {{range $g := $scope.Galleries}}
+                <tr><th scope="row">{{$g}}</th>
+                  {{range $scope.Columns}}{{$idle := index .Idle $g}}<td data-scope-col="{{.Action}}" class="{{if not .On}}scope-off{{end}}{{if $idle}} scope-idle{{end}}"{{if $idle}} title="no enabled auto-tagger runs on this gallery"{{end}}><input type="checkbox" name="on_{{.Action}}" value="{{$g}}" aria-label="{{.Title}}: {{$g}}"{{if .Every}} checked disabled{{else if index .Picked $g}} checked{{end}}></td>{{end}}
+                </tr>
+                {{end}}
+              </tbody>
+            </table>
+          </div>
         </div>
         {{end}}
       </div>
@@ -940,11 +1085,34 @@
         <button type="submit">Save</button>
       </div>
     </form>
+  <script>
+  // A switched-off column only dims: a disabled box submits nothing, and
+  // the save would read it as unticked.
+  document.addEventListener('change', function(e) {
+    var box = e.target;
+    var form = box.closest && box.closest('#schedule form');
+    if (!form) return;
+    var every = box.dataset.scopeEvery;
+    if (every) {
+      form.querySelectorAll('input[name="on_' + every + '"]').forEach(function(b) {
+        b.disabled = box.checked;
+        if (box.checked) b.checked = true;
+      });
+      return;
+    }
+    form.querySelectorAll('[data-scope-col="' + box.name + '"]').forEach(function(c) {
+      c.classList.toggle('scope-off', !box.checked);
+    });
+  });
+  </script>
   </section>
 
   {{$stats := .Stats}}
   <section id="stats" class="settings-section">
-    <h3>Stats</h3>
+    <div class="settings-section-header">
+      <h3>Stats</h3>
+      <p class="field-hint">Memory, database and disk usage.</p>
+    </div>
     <div class="stats-cols">
     <div class="settings-sub">
       <h4>Process memory</h4>

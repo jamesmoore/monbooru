@@ -1,7 +1,5 @@
 #!/bin/sh
-# packaging/fetch-tools.sh
-#
-# Downloads the bundled tools for one target into tools/
+# Downloads the bundled tools for one target into tools/.
 set -eu
 
 ort_arch=""

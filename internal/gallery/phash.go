@@ -12,26 +12,14 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 )
 
-// phashSize is the input-matrix side length (32x32 greyscale) and
-// phashBlock is the top-left DCT block side (8x8) that the bit-pack
-// reads. Both are the standard pHash settings.
+// The standard pHash settings: a 32x32 greyscale input and an 8x8 DCT block.
 const (
 	phashSize  = 32
 	phashBlock = 8
 )
 
-// computePhashFromThumb opens the static thumbnail JPEG at thumbPath
-// and returns its canonicalised 64-bit perceptual hash as a signed
-// int64 (SQLite's INTEGER affinity). Returns a non-nil error when the
-// file is missing or undecodable; the caller leaves images.phash NULL
-// in that case.
-//
-// The thumbnail is the uniform input across every visual file_type:
-// jpeg / png / webp / gif use their static thumbnail directly, mp4 /
-// webm use the 10%-of-duration frame the existing pipeline writes,
-// and cbz uses the cover thumbnail. Hashing the thumbnail (not the
-// original) keeps the hashed pixels identical to what the operator
-// sees on the gallery grid.
+// The thumbnail, not the original: one input for every file type, and the
+// pixels the grid shows.
 func computePhashFromThumb(thumbPath string) (int64, error) {
 	f, err := os.Open(thumbPath)
 	if err != nil {
@@ -45,13 +33,8 @@ func computePhashFromThumb(thumbPath string) (int64, error) {
 	return int64(computePhash(img)), nil
 }
 
-// computePhash converts img into a 32x32 greyscale matrix via box-
-// average downsample, runs a 2D DCT-II, takes the top-left 8x8 block,
-// and emits one bit per non-DC coefficient (1 when the coefficient is
-// at least the median of the 63 non-DC values, else 0). Bit 0 maps to
-// the DC slot and is forced to 0 so the encoding is canonical. The
-// returned value is min(h(img), h(mirror(img))) so a horizontally-
-// flipped copy lands at the same value.
+// The smaller of the image's and its mirror's hash, so a flipped copy
+// hashes the same.
 func computePhash(img image.Image) uint64 {
 	mat := greyResize32(img)
 	h := dctHashMatrix(mat)
@@ -67,10 +50,6 @@ func computePhash(img image.Image) uint64 {
 	return h
 }
 
-// greyResize32 reads img into a 32x32 greyscale matrix using a box
-// average over each destination cell's source area. Rec. 601 luma
-// coefficients on 8-bit-per-channel samples; the source can be any
-// stdlib-decodable image.
 func greyResize32(img image.Image) [phashSize][phashSize]float64 {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -105,11 +84,6 @@ func greyResize32(img image.Image) [phashSize][phashSize]float64 {
 	return out
 }
 
-// dctHashMatrix runs the 2D DCT-II on a 32x32 input matrix, keeps the
-// top-left 8x8 block, and emits the 64-bit pHash. The DCT scaling
-// factors are omitted: each coefficient is compared against the median
-// of the other 63 in the same block, so any positive uniform scale on
-// the row or column pass cancels out.
 func dctHashMatrix(in [phashSize][phashSize]float64) uint64 {
 	var rowDCT [phashSize][phashBlock]float64
 	for j := 0; j < phashSize; j++ {
@@ -157,8 +131,6 @@ func dctHashMatrix(in [phashSize][phashSize]float64) uint64 {
 	return h
 }
 
-// dctCosTable memoises cos((2n+1)*k*pi/(2*N)) for N = phashSize, since
-// row and column passes both reuse the same 32*8 = 256 entries.
 var dctCosTable [phashSize][phashBlock]float64
 
 func init() {
@@ -169,31 +141,15 @@ func init() {
 	}
 }
 
-// PhashSink is handed a phash the moment it is stored, so whoever holds
-// the in-memory near-duplicate index can keep it in step without this
-// package importing the one that owns it. A nil sink is a no-op, which is
-// every build and every test that runs no relations index.
-type PhashSink func(imageID, phash int64)
+// A nil phash reports one cleared, so an index drops the old bytes' entry.
+type PhashSink func(imageID int64, phash *int64)
 
-// Stored forwards a phash a regeneration produced. A nil sink, or nothing
-// stored, forwards nothing.
 func (s PhashSink) Stored(imageID int64, phash *int64) {
-	if s == nil || phash == nil {
-		return
+	if s != nil {
+		s(imageID, phash)
 	}
-	s(imageID, *phash)
 }
 
-// RecomputeAndStorePhash recomputes the phash from the image's static
-// thumbnail, writes it back, and returns what it stored so a caller
-// holding the in-memory index can keep it in step. The ingest path
-// calls this after thumbnail generation; the re-extract maintenance
-// loop calls it once per image alongside its other recompute steps.
-// When the thumbnail is unreadable - missing because Generate failed,
-// or undecodable because the disk image is corrupt - the row's phash
-// stays at its previous value (or NULL on first compute). The
-// relations system then ignores the row until the operator rebuilds
-// thumbnails and re-runs the compute.
 func RecomputeAndStorePhash(ctx context.Context, database *db.DB, imageID int64, thumbnailsPath string) (int64, error) {
 	thumb := ThumbnailPath(thumbnailsPath, imageID)
 	h, err := computePhashFromThumb(thumb)

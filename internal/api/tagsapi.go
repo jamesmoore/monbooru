@@ -18,7 +18,32 @@ type tagResponse struct {
 	LastUsedAt string `json:"last_used_at,omitempty"`
 }
 
-// listTags handles GET /api/v1/tags.
+type tagDetailResponse struct {
+	tagResponse
+	Note  string   `json:"note"`
+	Links []string `json:"links"`
+}
+
+func (h *Handler) getTag(w http.ResponseWriter, r *http.Request) {
+	g, id, ok := h.galleryAndID(w, r)
+	if !ok {
+		return
+	}
+	t, err := g.TagSvc.GetTag(id)
+	if err != nil {
+		writeTagError(w, err)
+		return
+	}
+	note, err := g.TagSvc.TagNote(id)
+	if serverError(w, err) {
+		return
+	}
+	if note.Links == nil {
+		note.Links = []string{}
+	}
+	WriteJSON(w, http.StatusOK, tagDetailResponse{tagResponse: toTagResponse(t), Note: note.Body, Links: note.Links})
+}
+
 func (h *Handler) listTags(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -39,11 +64,7 @@ func (h *Handler) listTags(w http.ResponseWriter, r *http.Request) {
 		Limit:     limit,
 		Origin:    q.Get("origin"),
 		Type:      q.Get("type"),
-		// Tri-state with the /tags page: empty / anything but "0" → Show
-		// (default so freshly-declared tags surface without a flag flip);
-		// "0" → Hide. The UI also exposes "only" but the API has no use
-		// for that triage view, so any non-"0" string folds into Show.
-		ShowZero: q.Get("show_zero") != "0",
+		ShowZero:  q.Get("show_zero") != "0",
 	}
 
 	if catName != "" {

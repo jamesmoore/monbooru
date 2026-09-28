@@ -1,8 +1,10 @@
 package web
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,22 +13,24 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
+	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/galleryio"
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// errJobRunning is what every gallery mutation answers while the job lane
-// is busy. The lane is held for the mutation rather than merely checked
-// before it: a batch handler holds ctxMu read-locked while it claims the
-// lane and spawns, so a check taken ahead of the write lock can read a
-// free lane and publish the swap under a job that started behind it.
+// Mutations hold the lane, not just check it: batch routes claim it under the
+// ctxMu read lock, so a job can start between a check and the write lock.
 var errJobRunning = errors.New("a job is running; try again when it finishes")
 
-// switchGallery changes the runtime-active gallery. The change is ephemeral:
-// the persisted default_gallery in monbooru.toml is only touched by
-// setDefault. Every gallery runs its own watcher for the whole process
-// lifetime, so the swap does not stop/start watchers or trigger a sync.
+func exportRunning(cx *galleryCtx) error {
+	if cx.Exporting() {
+		return fmt.Errorf("gallery %q is being exported; try again when the export finishes", cx.Name)
+	}
+	return nil
+}
+
 func (s *Server) switchGallery(name string) error {
 	if err := s.jobs.BeginSchedule(); err != nil {
 		return errJobRunning
@@ -52,8 +56,6 @@ func (s *Server) switchGallery(name string) error {
 	return nil
 }
 
-// setDefault persists cfg.DefaultGallery so the given gallery loads on
-// startup. Doesn't change the runtime-active gallery.
 func (s *Server) setDefault(name string) error {
 	s.ctxMu.Lock()
 	if _, ok := s.galleryState().contexts[name]; !ok {
@@ -78,8 +80,67 @@ func (s *Server) setDefault(name string) error {
 	return nil
 }
 
-// addGallery opens a new gallery and appends it to the config. DB and
-// thumbnails directories are created under paths.data_path/<name>/.
+func (s *Server) rebuildBoundaries() {
+	s.boundsMu.Lock()
+	defer s.boundsMu.Unlock()
+	s.cfgMu.RLock()
+	ignore := slices.Clone(s.cfg.Gallery.Ignore)
+	s.cfgMu.RUnlock()
+	drawn := s.drawBoundaries(ignore)
+	for name, cx := range s.galleryState().contexts {
+		if b, ok := drawn[name]; ok {
+			cx.Bounds.Store(b)
+		}
+	}
+}
+
+// Takes ignore rather than reading the config so a new list can be
+// checked before it is stored.
+func (s *Server) drawBoundaries(ignore []string) map[string]*gallery.Boundary {
+	s.cfgMu.RLock()
+	galleries := slices.Clone(s.cfg.Galleries)
+	own := []gallery.Fence{
+		{Path: s.cfg.Paths.DataPath, Kind: gallery.FenceData},
+		{Path: s.cfg.Paths.ModelPath, Kind: gallery.FenceModels},
+	}
+	s.cfgMu.RUnlock()
+	own = append(own,
+		gallery.Fence{Path: s.themesDir(), Kind: gallery.FenceThemes},
+		gallery.Fence{Path: s.pluginsDir(), Kind: gallery.FencePlugins})
+	// A gallery mounted under data_path is not fenced off by it, but what
+	// monbooru writes there still has to stay out of that gallery.
+	for _, g := range galleries {
+		own = append(own,
+			gallery.Fence{Path: g.DBPath, Kind: gallery.FenceData},
+			gallery.Fence{Path: g.DBPath + "-wal", Kind: gallery.FenceData},
+			gallery.Fence{Path: g.DBPath + "-shm", Kind: gallery.FenceData},
+			gallery.Fence{Path: g.ThumbnailsPath, Kind: gallery.FenceData},
+			gallery.Fence{Path: gallery.MangaCacheDir(g.ThumbnailsPath), Kind: gallery.FenceData})
+	}
+	drawn := map[string]*gallery.Boundary{}
+	for name, cx := range s.galleryState().contexts {
+		fences := slices.Clone(own)
+		for _, g := range galleries {
+			if g.Name != name {
+				fences = append(fences, gallery.Fence{Path: g.GalleryPath, Owner: g.Name, Kind: gallery.FenceGallery})
+			}
+		}
+		drawn[name] = gallery.NewBoundary(cx.GalleryPath, fences, ignore)
+	}
+	return drawn
+}
+
+// Nothing watched dir while it was fenced off. The caller holds the job
+// lane rather than ctxMu: a restart walks the whole tree.
+func (s *Server) restartEnclosing(dir string) {
+	watch, maxMB := s.watcherSettings()
+	for _, cx := range s.galleryState().contexts {
+		if gallery.Encloses(cx.GalleryPath, dir) {
+			cx.RestartWatcher(watch, maxMB, s.ingestNaming(cx.Name), s.jobs)
+		}
+	}
+}
+
 func (s *Server) addGallery(name, galleryPath string) error {
 	name = strings.TrimSpace(name)
 	galleryPath = strings.TrimSpace(galleryPath)
@@ -89,10 +150,8 @@ func (s *Server) addGallery(name, galleryPath string) error {
 	if galleryPath == "" {
 		return fmt.Errorf("gallery path must not be empty")
 	}
-	// Reject non-existent or unreadable paths at add time. Existing configs
-	// that point at a temporarily-unreadable path still load (degraded mode);
-	// this gate only applies to the explicit Add mutation so the user doesn't
-	// walk away with a gallery that can never sync or watch.
+	// Only an add refuses an unreadable folder; a configured one still
+	// loads, degraded.
 	if _, err := os.ReadDir(galleryPath); err != nil {
 		return fmt.Errorf("gallery path %q is not readable: %w", galleryPath, err)
 	}
@@ -106,6 +165,18 @@ func (s *Server) addGallery(name, galleryPath string) error {
 	if _, ok := next.contexts[name]; ok {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("gallery %q already exists", name)
+	}
+	if other := s.galleryOnFolder(galleryPath, ""); other != "" {
+		s.ctxMu.Unlock()
+		return fmt.Errorf("%s is already the folder of gallery %s", galleryPath, other)
+	}
+	if err := s.inOwnFolder(galleryPath, name); err != nil {
+		s.ctxMu.Unlock()
+		return err
+	}
+	if dir, what := s.dataFolderHolds(name); what != "" {
+		s.ctxMu.Unlock()
+		return fmt.Errorf("a gallery named %s would keep its data in %s, which holds %s", name, dir, what)
 	}
 	dbPath, thumbnailsPath := s.derivePaths(name)
 	if _, err := os.Stat(dbPath); err == nil {
@@ -128,6 +199,7 @@ func (s *Server) addGallery(name, galleryPath string) error {
 	s.cfgMu.Lock()
 	s.cfg.Galleries = append(s.cfg.Galleries, g)
 	s.cfgMu.Unlock()
+	s.rebuildBoundaries()
 	watch, maxMB := s.watcherSettings()
 	cx.StartBackground(watch, maxMB, s.ingestNaming(cx.Name), s.jobs)
 	s.ctxMu.Unlock()
@@ -139,12 +211,9 @@ func (s *Server) addGallery(name, galleryPath string) error {
 	return nil
 }
 
-// removeGallery drops a gallery and deletes its DB + thumbnails on disk.
-// When removeFolder is true, the gallery's source folder is also removed
-// (best-effort). Refuses to remove the active, default, or last gallery.
-func (s *Server) removeGallery(name string, removeFolder bool) error {
+func (s *Server) removeGallery(name string, removeFolder bool) (kept []string, err error) {
 	if err := s.jobs.BeginSchedule(); err != nil {
-		return errJobRunning
+		return nil, errJobRunning
 	}
 	defer s.jobs.EndSchedule()
 	s.ctxMu.Lock()
@@ -152,59 +221,86 @@ func (s *Server) removeGallery(name string, removeFolder bool) error {
 	cx, ok := next.contexts[name]
 	if !ok {
 		s.ctxMu.Unlock()
-		return fmt.Errorf("unknown gallery %q", name)
+		return nil, fmt.Errorf("unknown gallery %q", name)
 	}
 	if name == next.active {
 		s.ctxMu.Unlock()
-		return fmt.Errorf("cannot remove the active gallery; switch to another first")
+		return nil, fmt.Errorf("cannot remove the active gallery; switch to another first")
 	}
 	if name == s.defaultGallery() {
 		s.ctxMu.Unlock()
-		return fmt.Errorf("cannot remove the default gallery; set another as default first")
+		return nil, fmt.Errorf("cannot remove the default gallery; set another as default first")
 	}
 	if len(next.contexts) <= 1 {
 		s.ctxMu.Unlock()
-		return fmt.Errorf("cannot remove the last gallery")
+		return nil, fmt.Errorf("cannot remove the last gallery")
+	}
+	if err := exportRunning(cx); err != nil {
+		s.ctxMu.Unlock()
+		return nil, err
 	}
 
 	galleryPath := cx.GalleryPath
-	dataDir := filepath.Dir(cx.DBPath) // /<data_path>/<name>
+	bound := cx.Boundary()
+	dataDir := filepath.Dir(cx.DBPath)
+	owned := []string{cx.DBPath, cx.DBPath + "-wal", cx.DBPath + "-shm", cx.ThumbnailsPath, cx.MangaCacheDir()}
 	cx.Close()
 	delete(next.contexts, name)
 	s.galState.Store(next)
 	s.cfgMu.Lock()
 	s.cfg.Galleries = slices.DeleteFunc(s.cfg.Galleries, func(g config.Gallery) bool { return g.Name == name })
+	s.cfg.DropGalleryRefs(name)
 	s.cfgMu.Unlock()
+	s.rebuildBoundaries()
 	s.ctxMu.Unlock()
 
-	if err := os.RemoveAll(dataDir); err != nil {
-		logx.Warnf("remove gallery data dir %q: %v", dataDir, err)
+	// Only what monbooru wrote: a gallery folder can sit in this directory.
+	for _, p := range owned {
+		if err := os.RemoveAll(p); err != nil {
+			logx.Warnf("remove gallery data %q: %v", p, err)
+		}
 	}
 	if removeFolder {
-		// Refuse to follow a symlink: the target sitting behind the
-		// gallery_path config field could point anywhere, and os.RemoveAll
-		// would happily wipe whatever directory the link resolves to.
-		// On a LAN single-operator setup this guard is "foot-shot
-		// prevention" rather than a security boundary, but the
-		// destructive blast radius warrants it.
+		// Not through a symlink: the link could resolve to any directory.
 		if info, err := os.Lstat(galleryPath); err != nil {
 			logx.Warnf("remove gallery folder %q: stat: %v", galleryPath, err)
 		} else if info.Mode()&os.ModeSymlink != 0 {
 			logx.Warnf("remove gallery folder %q: refusing to follow symlink", galleryPath)
-		} else if err := os.RemoveAll(galleryPath); err != nil {
+		} else if kept, err = gallery.RemoveOwned(bound); err != nil {
+			logx.Warnf("remove gallery folder %q: %v", galleryPath, err)
+		} else if len(kept) > 0 {
+			// Other galleries' folders go first: what the ignore list
+			// kept can be a sidecar per image.
+			fenced := map[string]bool{}
+			for _, e := range bound.Fenced() {
+				fenced[e.Rel] = true
+			}
+			var first, rest []string
+			for _, k := range kept {
+				if fenced[k] {
+					first = append(first, k)
+				} else {
+					rest = append(rest, k)
+				}
+			}
+			kept = append(first, rest...)
+			logx.Infof("remove gallery folder %q: kept %s", galleryPath, listFirst(kept, keptShown))
+		} else if err := os.Remove(galleryPath); err != nil {
 			logx.Warnf("remove gallery folder %q: %v", galleryPath, err)
 		}
 	}
+	if err := os.Remove(dataDir); err != nil && !os.IsNotExist(err) {
+		logx.Infof("gallery data dir %q kept: %v", dataDir, err)
+	}
+	s.restartEnclosing(galleryPath)
 
 	if err := s.saveConfig(); err != nil {
-		return fmt.Errorf("persist gallery removal: %w", err)
+		return kept, fmt.Errorf("persist gallery removal: %w", err)
 	}
 	logx.Infof("gallery: removed %q (folder removed=%t)", name, removeFolder)
-	return nil
+	return kept, nil
 }
 
-// renameGallery moves the in-memory key and rewrites the TOML. The data
-// directory is also renamed so the derived paths stay consistent.
 func (s *Server) renameGallery(oldName, newName string) error {
 	oldName = strings.TrimSpace(oldName)
 	newName = strings.TrimSpace(newName)
@@ -229,17 +325,22 @@ func (s *Server) renameGallery(oldName, newName string) error {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("gallery %q already exists", newName)
 	}
+	if dir, what := s.dataFolderHolds(oldName); what != "" {
+		s.ctxMu.Unlock()
+		return fmt.Errorf("%s holds %s, which a rename would move; move it out first", dir, what)
+	}
 	newDB, newThumbs := s.derivePaths(newName)
 	newDir := filepath.Dir(newDB)
 	if _, err := os.Stat(newDir); err == nil {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("data dir %q already exists", newDir)
 	}
+	if err := exportRunning(cx); err != nil {
+		s.ctxMu.Unlock()
+		return err
+	}
 	cx.Close()
 	oldDir := filepath.Dir(cx.DBPath)
-	// restoreOld puts the gallery back the way it was found, background
-	// goroutines included: the close above already happened, so a refused
-	// rename would otherwise leave the map holding closed handles.
 	restoreOld := func() {
 		reopened, err := library.Open(config.Gallery{
 			Name: oldName, GalleryPath: cx.GalleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath,
@@ -250,6 +351,7 @@ func (s *Server) renameGallery(oldName, newName string) error {
 		}
 		next.contexts[oldName] = reopened
 		s.galState.Store(next)
+		s.rebuildBoundaries()
 		watch, maxMB := s.watcherSettings()
 		reopened.StartBackground(watch, maxMB, s.ingestNaming(oldName), s.jobs)
 	}
@@ -263,54 +365,82 @@ func (s *Server) renameGallery(oldName, newName string) error {
 	} else {
 		moved = true
 	}
+	moveBack := func() {
+		if !moved {
+			return
+		}
+		if err := os.Rename(newDir, oldDir); err != nil {
+			logx.Errorf("gallery %q: could not put the data dir back at %q: %v", oldName, oldDir, err)
+		}
+	}
 	newCx, err := library.Open(config.Gallery{
 		Name: newName, GalleryPath: cx.GalleryPath, DBPath: newDB, ThumbnailsPath: newThumbs,
 	})
 	if err != nil {
-		// The directory already moved, so the old context's paths point at
-		// somewhere that is no longer there; put it back before reopening.
-		if moved {
-			if renameErr := os.Rename(newDir, oldDir); renameErr != nil {
-				logx.Errorf("gallery %q: could not put the data dir back at %q: %v", oldName, oldDir, renameErr)
-			}
-		}
+		moveBack()
 		restoreOld()
 		s.ctxMu.Unlock()
 		return err
 	}
-	delete(next.contexts, oldName)
-	next.contexts[newName] = newCx
+	// Saved before the new name goes live: a restart on a config that still
+	// names the old gallery would open it empty and orphan the moved data.
 	s.cfgMu.Lock()
-	for i := range s.cfg.Galleries {
-		if s.cfg.Galleries[i].Name == oldName {
-			s.cfg.Galleries[i].Name = newName
-			s.cfg.Galleries[i].DBPath = newDB
-			s.cfg.Galleries[i].ThumbnailsPath = newThumbs
-			break
-		}
-	}
-	if s.cfg.DefaultGallery == oldName {
-		s.cfg.DefaultGallery = newName
+	undoCfg := renameGalleryInConfig(s.cfg, oldName, newName, newDB, newThumbs)
+	err = config.Save(s.cfg, s.configPath)
+	if err != nil {
+		undoCfg()
 	}
 	s.cfgMu.Unlock()
+	if err != nil {
+		newCx.Close()
+		moveBack()
+		restoreOld()
+		s.ctxMu.Unlock()
+		return fmt.Errorf("persist gallery rename: %w", err)
+	}
+	delete(next.contexts, oldName)
+	next.contexts[newName] = newCx
 	if next.active == oldName {
 		next.active = newName
 	}
 	s.galState.Store(next)
+	s.rebuildBoundaries()
 	watch, maxMB := s.watcherSettings()
 	newCx.StartBackground(watch, maxMB, s.ingestNaming(newCx.Name), s.jobs)
 	s.ctxMu.Unlock()
 
-	if err := s.saveConfig(); err != nil {
-		return fmt.Errorf("persist gallery rename: %w", err)
-	}
 	logx.Infof("gallery: renamed %q to %q", oldName, newName)
 	return nil
 }
 
-// repointGallery moves a gallery's source folder without touching its data.
-// The db and thumbnails stay where they are, so the whole operation is a
-// reopen: the context caches the path and the watcher holds it open.
+func renameGalleryInConfig(cfg *config.Config, oldName, newName, newDB, newThumbs string) func() {
+	galleries, def, schedule := slices.Clone(cfg.Galleries), cfg.DefaultGallery, cfg.Schedule.Galleries
+	taggerLists := make([][]string, len(cfg.Tagger.Taggers))
+	for i := range cfg.Tagger.Taggers {
+		taggerLists[i] = cfg.Tagger.Taggers[i].Galleries
+	}
+	for i := range cfg.Galleries {
+		if cfg.Galleries[i].Name == oldName {
+			cfg.Galleries[i].Name = newName
+			cfg.Galleries[i].DBPath = newDB
+			cfg.Galleries[i].ThumbnailsPath = newThumbs
+			break
+		}
+	}
+	if cfg.DefaultGallery == oldName {
+		cfg.DefaultGallery = newName
+	}
+	cfg.RenameGalleryRefs(oldName, newName)
+	return func() {
+		cfg.Galleries, cfg.DefaultGallery, cfg.Schedule.Galleries = galleries, def, schedule
+		for i := range cfg.Tagger.Taggers {
+			cfg.Tagger.Taggers[i].Galleries = taggerLists[i]
+		}
+	}
+}
+
+// A reopen, not an edit in place: the context caches the path and the
+// watcher holds it open.
 func (s *Server) repointGallery(name, galleryPath string) error {
 	galleryPath = filepath.Clean(strings.TrimSpace(galleryPath))
 	if galleryPath == "" || !filepath.IsAbs(galleryPath) {
@@ -334,9 +464,20 @@ func (s *Server) repointGallery(name, galleryPath string) error {
 		s.ctxMu.Unlock()
 		return nil
 	}
-	// Opened before the old one closes: a reopen that fails after the close
-	// would leave the map holding closed handles, and the wizard's only
-	// submit is what calls this.
+	if other := s.galleryOnFolder(galleryPath, name); other != "" {
+		s.ctxMu.Unlock()
+		return fmt.Errorf("%s is already the folder of gallery %s", galleryPath, other)
+	}
+	if err := s.inOwnFolder(galleryPath); err != nil {
+		s.ctxMu.Unlock()
+		return err
+	}
+	if err := exportRunning(cx); err != nil {
+		s.ctxMu.Unlock()
+		return err
+	}
+	// Opened before the old one closes, so a failed open leaves the
+	// gallery as it was.
 	newCx, err := library.Open(config.Gallery{
 		Name: name, GalleryPath: galleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath,
 	})
@@ -344,6 +485,7 @@ func (s *Server) repointGallery(name, galleryPath string) error {
 		s.ctxMu.Unlock()
 		return err
 	}
+	oldPath := cx.GalleryPath
 	cx.Close()
 	next.contexts[name] = newCx
 	s.galState.Store(next)
@@ -352,9 +494,11 @@ func (s *Server) repointGallery(name, galleryPath string) error {
 		g.GalleryPath = galleryPath
 	}
 	s.cfgMu.Unlock()
+	s.rebuildBoundaries()
 	watch, maxMB := s.watcherSettings()
 	newCx.StartBackground(watch, maxMB, s.ingestNaming(name), s.jobs)
 	s.ctxMu.Unlock()
+	s.restartEnclosing(oldPath)
 
 	if err := s.saveConfig(); err != nil {
 		return fmt.Errorf("persist gallery path: %w", err)
@@ -363,44 +507,37 @@ func (s *Server) repointGallery(name, galleryPath string) error {
 	return nil
 }
 
-// galleryList returns a name-sorted copy for the Settings table.
 func (s *Server) galleryList() []config.Gallery {
 	out := s.galleries()
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// galleryRow pairs a gallery with cheap per-gallery counts surfaced in the
-// Settings → Galleries table. Counts read from the gallery's own DB so
-// inactive galleries report their own state rather than the active one.
 type galleryRow struct {
 	config.Gallery
-	Images int
-	Tags   int
+	Images    int
+	Tags      int
+	LeavesOut []string
 }
 
-// galleryRowsWithSnapshot returns the same name-sorted list as
-// galleryList plus per-row counts, with the active gallery's row pinned
-// to the supplied baseData snapshot. Counts come from the per-gallery
-// atomic caches so the warm steady state is two atomic loads per row;
-// cold rows pay one query each, then stay warm until InvalidateCaches
-// drops them. Errors degrade to zero so a transient failure on one
-// gallery never blanks the whole table. Without the snapshot pin, a cache
-// invalidation racing between the footer's read (in s.base) and the
-// per-row read here can land the two surfaces on different counts for
-// the same gallery; the operator sees a footer "47 img" next to a
-// table cell "46 img" and can't tell which is right.
+// The active row takes the caller's counts, which the footer shows: a
+// second cache read could straddle an invalidation and disagree.
 func (s *Server) galleryRowsWithSnapshot(activeName string, activeImages, activeTags int) []galleryRow {
 	galleries := s.galleryList()
 	out := make([]galleryRow, len(galleries))
 	for i, g := range galleries {
 		out[i].Gallery = g
+		cx := s.get(g.Name)
+		if cx != nil {
+			for _, e := range cx.Boundary().Fenced() {
+				out[i].LeavesOut = append(out[i].LeavesOut, e.Rel+" ("+e.OwnerName()+")")
+			}
+		}
 		if g.Name == activeName {
 			out[i].Images = activeImages
 			out[i].Tags = activeTags
 			continue
 		}
-		cx := s.get(g.Name)
 		if cx == nil || cx.DB == nil {
 			continue
 		}
@@ -414,9 +551,6 @@ func (s *Server) galleryRowsWithSnapshot(activeName string, activeImages, active
 	return out
 }
 
-// gallerySwitchHandler handles POST /internal/gallery/switch. Errors render
-// as an inline flash inside the topbar dialog; success sends the browser
-// home.
 func (s *Server) gallerySwitchHandler(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -427,10 +561,8 @@ func (s *Server) gallerySwitchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isHTMXRequest(r) {
-		// Every current URL belongs to the old gallery's namespace - image
-		// and tag ids resolve to unrelated rows (or 404) in the new one, and
-		// search queries surface unrelated results. Send the browser home
-		// instead of refreshing in place.
+		// Home, not a refresh: the ids in the current URL mean other rows
+		// in the new gallery.
 		w.Header().Set("HX-Redirect", "/")
 		w.WriteHeader(http.StatusOK)
 		return
@@ -438,69 +570,193 @@ func (s *Server) gallerySwitchHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// settingsGallery*Post handlers write a flash on error and fire HX-Refresh on
-// success. The refresh reloads the whole page, so a success-path flash would
-// never render; the page itself is the confirmation.
-//
-// The Add form accepts an optional file upload; when present the new gallery
-// is created first and then importGallery is called against it, so the user
-// can spin up a populated gallery in one step. importGallery refuses the
-// active and default gallery as targets, but a freshly-added one is neither,
-// so the import is always permitted. On import failure the gallery stays in
-// place (empty) - the user can retry from its row or delete it.
 func (s *Server) settingsGalleriesPost(w http.ResponseWriter, r *http.Request) {
-	// The form ships as multipart/form-data so the optional `import_file`
-	// field rides along; cap the body to match the standalone import flow.
 	const maxImport = 16 << 30
 	r.Body = http.MaxBytesReader(w, r.Body, maxImport)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	mr, err := r.MultipartReader()
+	if err != nil {
 		writeInlineFlash(w, "err", "bad form data: "+err.Error())
 		return
 	}
-	name := strings.TrimSpace(r.FormValue("name"))
-	path := strings.TrimSpace(r.FormValue("gallery_path"))
-	if err := s.addGallery(name, path); err != nil {
+	fields, filePart, err := readFieldsToFile(mr)
+	if err != nil {
+		writeInlineFlash(w, "err", "bad form data: "+err.Error())
+		return
+	}
+	if filePart != nil {
+		defer func() { _ = filePart.Close() }()
+	}
+	name := fields["name"]
+	if err := s.addGallery(name, fields["gallery_path"]); err != nil {
 		writeInlineFlash(w, "err", err.Error())
 		return
 	}
 
-	// Optional import. The file field is named to match the standalone
-	// import dialog (`import_file` here vs `file` there) so the form layout
-	// stays clear at-a-glance: name / path / optional import_file.
-	file, fh, err := r.FormFile("import_file")
-	if err == http.ErrMissingFile {
-		// No import - switch to the new gallery so creating a gallery
-		// behaves like importing into one (which already calls switchGallery).
+	nesting := s.nestingNote(name)
+	var file *bufio.Reader
+	if filePart != nil {
+		file = bufio.NewReader(filePart)
+		if _, err := file.Peek(1); err == io.EOF {
+			file = nil
+		}
+	}
+	if file == nil {
 		if switchErr := s.switchGallery(name); switchErr != nil {
 			logx.Infof("gallery %q: post-add switch skipped: %v", name, switchErr)
 		}
-		writeInlineFlash(w, "ok", "Gallery "+name+" added and now active.")
+		writeInlineFlash(w, "ok", "Gallery "+name+" added and now active."+nesting)
 		return
 	}
-	if err != nil {
-		writeInlineFlash(w, "err", "Gallery created. Import failed reading upload: "+err.Error())
-		return
-	}
-	defer func() { _ = file.Close() }()
-	if fh.Size == 0 {
-		if switchErr := s.switchGallery(name); switchErr != nil {
-			logx.Infof("gallery %q: post-add switch skipped: %v", name, switchErr)
-		}
-		writeInlineFlash(w, "ok", "Gallery "+name+" added and now active.")
-		return
-	}
-	format := galleryio.FormatFromExt(fh.Filename)
+	format := galleryio.FormatFromExt(filePart.FileName())
 	if format == "" {
 		writeInlineFlash(w, "err", "Gallery created. Import failed: file must be .db, .json, or .zip.")
 		return
 	}
-	// importGallery itself calls switchGallery on success, so the gallery
-	// becomes active without an extra step here.
-	if err := s.importGallery(name, format, file); err != nil {
+	leftOut, err := s.importGallery(name, format, file)
+	if err != nil {
 		writeInlineFlash(w, "err", "Gallery created. Import failed: "+err.Error())
 		return
 	}
-	writeInlineFlash(w, "ok", "Gallery "+name+" added and imported.")
+	writeInlineFlash(w, "ok", "Gallery "+name+" added and imported."+nesting+leftOutNote(leftOut))
+}
+
+const keptShown = 5
+
+func listFirst(names []string, n int) string {
+	if len(names) <= n {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s (and %d more)", strings.Join(names[:n], ", "), len(names)-n)
+}
+
+func (s *Server) galleryOnFolder(folder, skip string) string {
+	for _, g := range s.galleries() {
+		if g.Name != skip && gallery.SameFolder(g.GalleryPath, folder) {
+			return g.Name
+		}
+	}
+	return ""
+}
+
+type ownFolder struct{ path, what string }
+
+func (s *Server) monbooruFolders() []ownFolder {
+	s.cfgMu.RLock()
+	model := s.cfg.Paths.ModelPath
+	s.cfgMu.RUnlock()
+	return []ownFolder{
+		{model, "monbooru's model folder"},
+		{s.themesDir(), "monbooru's theme folder"},
+		{s.pluginsDir(), "monbooru's plugin folder"},
+	}
+}
+
+func holds(outer, inner string) bool {
+	return outer != "" && inner != "" && (gallery.SameFolder(outer, inner) || gallery.Encloses(outer, inner))
+}
+
+// A gallery folder inside a folder monbooru writes to loses its files to
+// that folder's cleanup, or moves with it on a rename. names are galleries
+// not configured yet, whose data folders count too.
+func (s *Server) inOwnFolder(galleryPath string, names ...string) error {
+	s.cfgMu.RLock()
+	dataPath := s.cfg.Paths.DataPath
+	folders := make([]ownFolder, 0, len(s.cfg.Galleries)+len(names))
+	for _, g := range s.cfg.Galleries {
+		folders = append(folders, ownFolder{filepath.Dir(g.DBPath), "the data folder of gallery " + g.Name})
+	}
+	for _, name := range names {
+		db, _ := s.cfg.DerivePaths(name)
+		folders = append(folders, ownFolder{filepath.Dir(db), "the data folder of gallery " + name})
+	}
+	s.cfgMu.RUnlock()
+	if gallery.SameFolder(galleryPath, dataPath) {
+		return fmt.Errorf("%s is monbooru's data folder; pick a folder outside it", galleryPath)
+	}
+	for _, f := range append(folders, s.monbooruFolders()...) {
+		if holds(f.path, galleryPath) {
+			return fmt.Errorf("%s is inside %s; pick a folder outside it", galleryPath, f.what)
+		}
+	}
+	return nil
+}
+
+func (s *Server) dataFolderHolds(name string) (dir, what string) {
+	db, _ := s.derivePaths(name)
+	dir = filepath.Dir(db)
+	held := s.monbooruFolders()
+	for _, g := range s.galleries() {
+		held = append(held, ownFolder{g.GalleryPath, "the folder of gallery " + g.Name})
+	}
+	for _, h := range held {
+		if holds(dir, h.path) {
+			return dir, h.what
+		}
+	}
+	return dir, ""
+}
+
+func (s *Server) nestingNote(name string) string {
+	cx := s.get(name)
+	if cx == nil {
+		return ""
+	}
+	var around *galleryCtx
+	var inside []config.Gallery
+	for _, g := range s.galleryList() {
+		other := s.get(g.Name)
+		if g.Name == name || other == nil {
+			continue
+		}
+		switch {
+		case gallery.Encloses(g.GalleryPath, cx.GalleryPath):
+			if around == nil || gallery.Encloses(around.GalleryPath, g.GalleryPath) {
+				around = other
+			}
+		case gallery.Encloses(cx.GalleryPath, g.GalleryPath):
+			inside = append(inside, g)
+		}
+	}
+	var outermost []string
+	for _, g := range inside {
+		if !slices.ContainsFunc(inside, func(o config.Gallery) bool { return gallery.Encloses(o.GalleryPath, g.GalleryPath) }) {
+			outermost = append(outermost, g.Name)
+		}
+	}
+	note := ""
+	if around != nil {
+		note += fmt.Sprintf(" It sits inside gallery %s, which leaves this folder to it from now on", around.Name)
+		if n := imagesUnder(around, name); n > 0 {
+			note += fmt.Sprintf(": %s's next sync marks the %d image(s) it holds there missing", around.Name, n)
+		}
+		note += "."
+	}
+	switch len(outermost) {
+	case 0:
+	case 1:
+		note += fmt.Sprintf(" It leaves out the folder of gallery %s.", outermost[0])
+	default:
+		note += fmt.Sprintf(" It leaves out the folders of galleries %s.", strings.Join(outermost, ", "))
+	}
+	return note
+}
+
+func imagesUnder(cx *galleryCtx, inner string) int {
+	for _, e := range cx.Boundary().Fenced() {
+		if e.Kind != gallery.FenceGallery || e.Owner != inner {
+			continue
+		}
+		var n int
+		if err := cx.DB.Read.QueryRow(
+			`SELECT COUNT(*) FROM images WHERE is_missing = 0
+			   AND (folder_path = ? COLLATE NOCASE OR folder_path LIKE ? ESCAPE '\' COLLATE NOCASE)`,
+			e.Rel, db.EscapeLike(e.Rel)+"/%",
+		).Scan(&n); err != nil {
+			logx.Warnf("gallery %q: count images under %q: %v", cx.Name, e.Rel, err)
+		}
+		return n
+	}
+	return 0
 }
 
 func (s *Server) settingsGalleryRenamePost(w http.ResponseWriter, r *http.Request) {
@@ -508,10 +764,17 @@ func (s *Server) settingsGalleryRenamePost(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	oldName := r.PathValue("name")
-	newName := r.FormValue("new_name")
+	newName := strings.TrimSpace(r.FormValue("new_name"))
 	if err := s.renameGallery(oldName, newName); err != nil {
 		writeInlineFlash(w, "err", err.Error())
 		return
+	}
+	if oldName != newName {
+		if err := s.monloaderGalleryRenamed(r.Context(), oldName, newName); err != nil {
+			logx.Warnf("gallery: telling monloader about the rename of %q: %v", oldName, err)
+			writeInlineFlash(w, "warn", fmt.Sprintf("Renamed %s to %s. monloader could not be told, so its default gallery and site targets still name %s.", oldName, newName, oldName))
+			return
+		}
 	}
 	w.Header().Set("HX-Refresh", "true")
 }
@@ -527,8 +790,13 @@ func (s *Server) settingsGalleryDeletePost(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	removeFolder := r.FormValue("remove_folder") == "on"
-	if err := s.removeGallery(name, removeFolder); err != nil {
+	kept, err := s.removeGallery(name, removeFolder)
+	if err != nil {
 		writeInlineFlash(w, "err", err.Error())
+		return
+	}
+	if len(kept) > 0 {
+		writeInlineFlash(w, "ok", fmt.Sprintf("Deleted %s. Kept what it leaves out: %s.", name, listFirst(kept, keptShown)))
 		return
 	}
 	w.Header().Set("HX-Refresh", "true")

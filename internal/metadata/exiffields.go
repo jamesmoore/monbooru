@@ -1,13 +1,9 @@
 package metadata
 
-// EXIF tag-id to field-name tables, transcribed from the EXIF 2.2
-// specification. The mapping is reproduced from rwcarlsen/goexif
-// (BSD-2-Clause, Copyright (c) 2012 Robert Carlsen & Contributors), whose
-// tables this file replaces; a name change here changes what the detail
-// page's metadata panel prints.
+// EXIF 2.2 tag names, reproduced from rwcarlsen/goexif (BSD-2-Clause,
+// Copyright (c) 2012 Robert Carlsen & Contributors). A name change here
+// changes what the metadata panel prints.
 
-// exifTagNames maps IFD0 and Exif sub-IFD tag ids to their
-// EXIF 2.2 field names.
 var exifTagNames = map[uint16]string{
 	0x0100: "ImageWidth",
 	0x0101: "ImageLength",
@@ -97,7 +93,6 @@ var exifTagNames = map[uint16]string{
 	0xA434: "LensModel",
 }
 
-// gpsTagNames maps GPS sub-IFD tag ids to their field names.
 var gpsTagNames = map[uint16]string{
 	0x0000: "GPSVersionID",
 	0x0001: "GPSLatitudeRef",
@@ -132,14 +127,10 @@ var gpsTagNames = map[uint16]string{
 	0x001E: "GPSDifferential",
 }
 
-// interopTagNames maps Interoperability sub-IFD tag ids to their
-// field names.
 var interopTagNames = map[uint16]string{
 	0x0001: "InteroperabilityIndex",
 }
 
-// thumbTagNames maps the two IFD1 thumbnail-pointer tag ids to their
-// field names.
 var thumbTagNames = map[uint16]string{
 	0x0201: "ThumbJPEGInterchangeFormat",
 	0x0202: "ThumbJPEGInterchangeFormatLength",

@@ -18,23 +18,16 @@ import (
 	internalweb "github.com/monbooru/monbooru/internal/web"
 )
 
-// appName is the identity the desktop profile builds its directory names,
-// its log filename and its single-instance answer from.
 const appName = "monbooru"
 
-// defaultDesktop is stamped at link time by the desktop artifacts, so
-// double-clicking one lands in the profile rather than on the container
-// defaults. -desktop=false still turns it off.
+// Stamped "true" at link time (-X) by the desktop artifacts.
 var defaultDesktop string
 
-// probeTimeout bounds the single-instance question. It is a loopback
-// request to a process that either answers immediately or is not there.
+// A loopback request to a process that answers at once or is not there.
 const probeTimeout = 500 * time.Millisecond
 
-// desktopSeed adjusts the defaults a config file that does not exist yet is
-// written with: OS-native paths in place of the container mounts. A portable
-// install takes its paths from the config package instead, which states the
-// whole beside-the-program layout in one place and keeps it relative.
+// A portable install keeps the config package's relative paths: OS-native
+// ones would pin the folder to the machine it was first run on.
 func desktopSeed(l desktop.Layout) func(*config.Config) {
 	return func(cfg *config.Config) {
 		if !l.Portable {
@@ -42,19 +35,14 @@ func desktopSeed(l desktop.Layout) func(*config.Config) {
 			cfg.Paths.ModelPath = filepath.Join(l.DataDir, "models")
 			cfg.Galleries[0].GalleryPath = seedGalleryDir(l)
 		}
-		// A desktop sleeps through 01:00 more often than not, so a fresh
-		// config gets the mode that notices and runs the missed pass.
 		cfg.Schedule.Mode = config.ScheduleAtTimeCatchup
-		// The log file is the only thing a desktop bug report can carry, and
-		// nothing writes at the warn default while the app is healthy.
+		// A desktop bug report carries only the log, which warn leaves empty.
 		cfg.Log.Level = "info"
 	}
 }
 
-// portableGallery creates the folder a portable install watches, for the
-// same reason seedGalleryDir does: an absent one boots into degraded mode.
-// Only the folder the archive itself promises - a config pointing at
-// another disk that is not mounted is honestly degraded, not ours to fill in.
+// Only the folder the archive promises: a gallery on a disk that is not
+// mounted must stay degraded.
 func portableGallery(l desktop.Layout, cfg *config.Config) {
 	g := cfg.FindGallery(cfg.DefaultGallery)
 	if g == nil {
@@ -69,10 +57,7 @@ func portableGallery(l desktop.Layout, cfg *config.Config) {
 	}
 }
 
-// seedGalleryDir picks and creates the folder a fresh install watches.
-// It is created rather than only named: validate() requires a gallery and
-// an unreadable path boots straight into degraded mode, so a seeded-but-
-// absent folder would greet a first-time user with a banner.
+// Created, not only named: a missing gallery folder boots into degraded mode.
 func seedGalleryDir(l desktop.Layout) string {
 	base := desktop.PicturesDir()
 	if base == "" {
@@ -88,16 +73,8 @@ func seedGalleryDir(l desktop.Layout) string {
 	return dir
 }
 
-// claimPort answers a second launch before anything tries to bind. It
-// returns proceed=false when this process should stop, and a diagnostic
-// when the port belongs to something that is not monbooru. The caller
-// decides what a failure costs: at startup nothing is open yet, while the
-// shutdown path has a database and watchers to release first.
-//
-// A 2xx carrying our own name means the operator clicked the menu entry
-// twice: show them the instance they already have. Anything else on the
-// port is reported by name, because "address already in use" does not tell
-// them what to do. No answer at all is the only case where binding is safe.
+// claimPort returns a diagnostic rather than exiting: the shutdown path
+// still owes the database and watchers a close.
 func claimPort(addr string, openBrowser bool) (string, bool) {
 	local := desktop.LoopbackAddr(addr)
 	inst, found := desktop.Probe(local, probeTimeout)
@@ -105,8 +82,7 @@ func claimPort(addr string, openBrowser bool) (string, bool) {
 		return "", true
 	}
 	if inst.App == appName {
-		// stdout, not the log: a -no-browser launch from a terminal is the
-		// one shape of this that has nothing else to show the operator.
+		// stdout: a -no-browser launch from a terminal shows nothing else.
 		fmt.Printf("%s is already running on http://%s\n", appName, local)
 		if openBrowser {
 			if err := desktop.OpenBrowser("http://" + local); err != nil {
@@ -122,11 +98,7 @@ func claimPort(addr string, openBrowser bool) (string, bool) {
 	return fmt.Sprintf("%s is already serving %s; free the port or set server.bind_address to another one", other, local), false
 }
 
-// relaunch starts a fresh process carrying this one's arguments, for the
-// Restart control. It runs after the shutdown has released the port and the
-// database, so the new process probes an empty port and binds it.
-// -no-browser is added because the page that asked for the restart is
-// already open and reloads itself; a second tab would be noise.
+// -no-browser is added: the page that asked for the restart reloads itself.
 func relaunch() {
 	exe := desktop.Program()
 	if exe == "" {
@@ -142,18 +114,13 @@ func relaunch() {
 		logx.Errorf("restart: %v", err)
 		return
 	}
-	// Nothing here waits on it: this process is on its way out.
 	_ = cmd.Process.Release()
 }
 
-// dialogOnFatal is set by the desktop profile: a shortcut launch on Windows
-// has no console, so a startup failure has to reach a message box or it
-// reaches nobody.
+// A shortcut launch on Windows has no console, so a startup failure must
+// reach a message box.
 var dialogOnFatal bool
 
-// reportFatal puts a startup failure through the log sink - which the
-// desktop profile has already pointed at a file - and, on a shortcut
-// launch with no console, into a message box.
 func reportFatal(msg string) {
 	logx.Errorf("FATAL %s", msg)
 	if dialogOnFatal {
@@ -161,16 +128,12 @@ func reportFatal(msg string) {
 	}
 }
 
-// fatalf reports a startup failure and exits non-zero. Only for failures
-// early enough that no defer is owed anything.
+// Only for failures early enough that no defer is owed anything.
 func fatalf(format string, a ...any) {
 	reportFatal(fmt.Sprintf(format, a...))
 	os.Exit(1)
 }
 
-// explicitFlag returns value only when the operator actually passed the
-// flag, so the desktop profile can tell "-config was given" from the flag
-// set's own default without changing what -help prints.
 func explicitFlag(name, value string) string {
 	passed := ""
 	flag.Visit(func(f *flag.Flag) {
@@ -181,8 +144,6 @@ func explicitFlag(name, value string) string {
 	return passed
 }
 
-// versionLine is what -version prints: the version, plus the build stamp
-// in parentheses when the artifact carries one.
 func versionLine() string {
 	line := appName + " " + internalweb.Version
 	if label := internalweb.BuildLabel(); label != "" {
@@ -191,10 +152,6 @@ func versionLine() string {
 	return line
 }
 
-// openWhenServing waits for the listener to answer before opening a
-// browser, so a first run that pays a cold start does not land the user on
-// a connection-refused page. Gives up quietly: a browser that never opened
-// is a smaller problem than one that opened on an error.
 func openWhenServing(addr string) {
 	local := desktop.LoopbackAddr(addr)
 	deadline := time.Now().Add(30 * time.Second)
@@ -210,9 +167,6 @@ func openWhenServing(addr string) {
 	logx.Warnf("the server did not answer in time; open http://%s yourself", local)
 }
 
-// runTray serves the optional tray. It is never the only route to anything
-// - Open, start-at-login and Quit are all in Settings - so a platform or a
-// build without one is a log line, not a failure.
 func runTray(ctx context.Context, srv *internalweb.Server, bindAddr string) {
 	local := desktop.LoopbackAddr(bindAddr)
 	hook := srv.DesktopHook()
@@ -232,8 +186,7 @@ func runTray(ctx context.Context, srv *internalweb.Server, bindAddr string) {
 	}
 }
 
-// trayIconPath is the .ico the Windows artifacts ship beside the binary.
-// Elsewhere the icon comes from the desktop theme by name.
+// Windows only: elsewhere the tray names its icon from the desktop theme.
 func trayIconPath() string {
 	if runtime.GOOS != "windows" {
 		return ""

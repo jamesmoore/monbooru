@@ -1,4 +1,3 @@
-# Stage 1: build the binary.
 FROM golang:1.26.7-trixie AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -10,7 +9,6 @@ RUN . ./packaging/release-env.sh && \
     -ldflags="-s -w $LDFLAGS -X '$MOD.Package=docker'" \
     -o /monbooru ./cmd/monbooru
 
-# Stage 2: fetch runtime assets.
 FROM debian:trixie-slim AS assets
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl tar xz-utils \
@@ -45,10 +43,10 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -f /tmp/ort.tgz
 
 # ffmpeg + ffprobe: the project's trimmed fully-static builds.
-ARG FFMPEG_BUILD=v8.1.2-mb2
-ARG FFMPEG_NAME=ffmpeg-8.1.2-mb2
-ARG FFMPEG_SHA256_LINUX64=256131407bd62df7ff2d870073d9f7cc14e6cc0123cebd3616497805bc45f168
-ARG FFMPEG_SHA256_LINUXARM64=f77a5808571b6716bf66f5d25fbb01078e6e2930defdaa5606617f0e4c7b1644
+ARG FFMPEG_BUILD=v8.1.2-mb4
+ARG FFMPEG_NAME=ffmpeg-8.1.2-mb4
+ARG FFMPEG_SHA256_LINUX64=66f8f4627e1cc9ad26caa9fcd9799e88db84711ef03c1565c923694804c11000
+ARG FFMPEG_SHA256_LINUXARM64=937a346aa931764d5bde26d70b51ec1f8720360777ff93d1cde66006a7a2241f
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) FF_ARCH="linux64";    FF_SHA="${FFMPEG_SHA256_LINUX64}" ;; \
@@ -62,7 +60,6 @@ RUN ARCH=$(dpkg --print-architecture) && \
     cp /tmp/ff/bin/ffmpeg /tmp/ff/bin/ffprobe /opt/ffmpeg/ && \
     cp /tmp/ff/licenses/* /opt/licenses/ffmpeg/
 
-# Stage 3: runtime.
 FROM gcr.io/distroless/cc-debian13:nonroot
 
 COPY --from=assets /idsrc/passwd /etc/passwd

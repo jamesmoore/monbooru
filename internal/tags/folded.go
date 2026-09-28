@@ -10,35 +10,24 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 )
 
-// Folded-duplicate detection pairs a pre-widening folded tag with the richer
-// spelling that superseded it, so the operator can merge the old into the new.
-
 var (
-	// legacyDisallowedChars is the pre-widening tag charset (lowercase ASCII
-	// plus a little punctuation). LegacyFold projects a stored name back to the
-	// spelling that charset would have produced, so a tag folded before the
-	// widening is recognised against its richer counterpart. Kept in lockstep
-	// with monloader's mapping.LegacyFoldTag.
+	// Runs outside the tag charset used before it was widened; names
+	// stored then were folded into it. Kept in step with monloader's
+	// mapping.LegacyFoldTag.
 	legacyDisallowedChars = regexp.MustCompile(`[^a-z0-9_()!@#$.~+:?<>=^-]+`)
 	underscoreRuns        = regexp.MustCompile(`_+`)
 )
 
-// LegacyFold returns the pre-widening projection of a tag name: runs outside
-// the old charset collapse to `_`, underscore runs merge, ends trim. It is
-// idempotent on a name already in the old form.
+// LegacyFold returns the spelling the old charset would have stored for name.
 func LegacyFold(name string) string {
 	name = legacyDisallowedChars.ReplaceAllString(name, "_")
 	name = underscoreRuns.ReplaceAllString(name, "_")
 	return strings.Trim(name, "_")
 }
 
-// ScanFoldedDuplicates recomputes folded_tag_pairs and returns the number of
-// distinct folded originals found. For each non-alias tag B carrying a
-// character the old charset had no room for, if a non-alias tag A named
-// LegacyFold(B) exists in the same category, it records A (the old fold) -> B
-// (the corrected spelling). When more than one B folds onto the same A, all of
-// A's rows are flagged ambiguous so the merge leaves them for manual
-// resolution.
+// ScanFoldedDuplicates pairs each tag A with a richer B in the same
+// category that folds onto it; an A with several such B is ambiguous and
+// left to the operator.
 func (s *Service) ScanFoldedDuplicates() (int, error) {
 	type tagRow struct {
 		id   int64
@@ -67,11 +56,10 @@ func (s *Service) ScanFoldedDuplicates() (int, error) {
 	for _, b := range all {
 		fold := LegacyFold(b.name)
 		if fold == "" || fold == b.name {
-			continue // b is already in the folded form (a candidate A, not a B)
+			continue
 		}
-		// LegacyFold also collapses underscore runs, so a scrape artifact like
-		// girls__frontline differs from its fold without having gained
-		// anything; pairing it would retire the clean spelling.
+		// Differing only by collapsed underscores (girls__frontline) is
+		// no widening; pairing it would retire the clean spelling.
 		if !legacyDisallowedChars.MatchString(b.name) {
 			continue
 		}
@@ -107,19 +95,14 @@ func (s *Service) ScanFoldedDuplicates() (int, error) {
 	return len(countByOld), nil
 }
 
-// FoldedDuplicatesCount returns the number of folded originals recorded by the
-// last scan, for the /tags Folded-duplicates badge and the Maintenance
-// diagnostic.
 func (s *Service) FoldedDuplicatesCount() (int, error) {
 	var n int
 	err := s.db.Read.QueryRow(`SELECT COUNT(DISTINCT old_id) FROM folded_tag_pairs`).Scan(&n)
 	return n, err
 }
 
-// FoldedMergeResult reports what MergeFolded did. Refused carries the
-// distinct MergeTags errors behind the skipped count - a pair that no
-// longer holds contributes to Skipped and nothing else, so a caller can
-// tell "nothing left to do" from "every merge was refused".
+// Refused holds the distinct merge errors; a pair that no longer holds
+// only counts in Skipped.
 type FoldedMergeResult struct {
 	Merged    int
 	Skipped   int
@@ -127,8 +110,6 @@ type FoldedMergeResult struct {
 	Cancelled bool
 }
 
-// addRefusal records err unless an identical message is already held, so
-// one repeated refusal doesn't grow a slice the length of the scope.
 func (r *FoldedMergeResult) addRefusal(err error) {
 	if slices.ContainsFunc(r.Refused, func(seen error) bool { return seen.Error() == err.Error() }) {
 		return
@@ -136,10 +117,6 @@ func (r *FoldedMergeResult) addRefusal(err error) {
 	r.Refused = append(r.Refused, err)
 }
 
-// MergeFolded merges each given folded original into its corrected spelling,
-// resolving the target from folded_tag_pairs and skipping ambiguous ones or any
-// whose pair no longer holds. ctx aborts between merges, leaving the ones
-// already committed in place.
 func (s *Service) MergeFolded(ctx context.Context, oldIDs []int64) (FoldedMergeResult, error) {
 	var res FoldedMergeResult
 	for _, oldID := range oldIDs {
@@ -163,8 +140,6 @@ func (s *Service) MergeFolded(ctx context.Context, oldIDs []int64) (FoldedMergeR
 			res.addRefusal(e)
 			continue
 		}
-		// The old spelling is now a zero-usage alias; drop its pair so the
-		// folded view reflects the merge before the next scan.
 		_, _ = s.db.Write.Exec(`DELETE FROM folded_tag_pairs WHERE old_id = ?`, oldID)
 		res.Merged++
 	}

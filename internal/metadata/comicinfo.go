@@ -9,15 +9,10 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// ComicInfoMaxRawXML caps the raw XML body persisted on
-// manga_metadata.raw_xml. Anything larger is truncated and the row
-// surfaces a "(truncated)" affordance in the metadata panel.
 const ComicInfoMaxRawXML = 64 * 1024
 
-// comicInfoXML is the on-disk schema, name-for-name with the
-// ComicRack / Anansi standard. Pages are intentionally absent: the
-// authoritative page count lives on images.page_count, derived from
-// the archive's image entries.
+// No Pages element: images.page_count, counted from the archive, is the
+// authority.
 type comicInfoXML struct {
 	XMLName         xml.Name `xml:"ComicInfo"`
 	Title           string   `xml:"Title,omitempty"`
@@ -49,30 +44,20 @@ type comicInfoXML struct {
 	PageCount       *int     `xml:"PageCount,omitempty"`
 }
 
-// MarshalComicInfo renders the ComicInfo.xml document for a generated
-// archive: the collection label as Title and the page count. The inverse
-// of ParseComicInfo's read path, sharing its schema. No XML declaration
-// is emitted, matching how most archivers write the file.
+// MarshalComicInfo writes no XML declaration, as most archivers do.
 func MarshalComicInfo(title string, pageCount int) ([]byte, error) {
 	doc := comicInfoXML{Title: title, PageCount: &pageCount}
 	return xml.MarshalIndent(doc, "", "  ")
 }
 
-// ParseComicInfo locates ComicInfo.xml at the archive root
-// (case-insensitive root match), parses it, and returns a populated
-// MangaMetadata. Returns (nil, nil) when no ComicInfo file exists or
-// when the file is at a non-root path. Returns (nil, err) only on a
-// genuine read error; XML parse failures are logged at debug by the
-// caller and surface as nil so the manga itself still ingests.
 func ParseComicInfo(zr *zip.Reader) (*models.MangaMetadata, error) {
 	if zr == nil {
 		return nil, nil
 	}
 	var entry *zip.File
 	for _, f := range zr.File {
-		// ComicInfo lives at the archive root by spec; reject any
-		// nested path so a stray comicinfo.xml inside a chapter folder
-		// isn't picked up.
+		// The spec puts it at the root; a comicinfo.xml inside a chapter
+		// folder is not it.
 		if strings.ContainsRune(f.Name, '/') {
 			continue
 		}
@@ -98,9 +83,7 @@ func ParseComicInfo(zr *zip.Reader) (*models.MangaMetadata, error) {
 		body = body[:ComicInfoMaxRawXML]
 	}
 	var doc comicInfoXML
-	// Malformed XML still earns a row so the truncated raw_xml is
-	// preserved for the operator to inspect; populated fields stay
-	// zero-valued.
+	// Malformed XML still earns a row, so the raw XML stays inspectable.
 	_ = xml.Unmarshal(body, &doc)
 	return &models.MangaMetadata{
 		Title:           strings.TrimSpace(doc.Title),

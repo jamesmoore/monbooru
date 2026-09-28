@@ -17,22 +17,18 @@ type contextKey int
 
 const sessionContextKey contextKey = 1
 
-// Session holds session data for a logged-in user.
 type Session struct {
 	ID        string
 	ExpiresAt time.Time
 }
 
-// SessionStore is an in-memory session store.
 type SessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]Session
 }
 
-// NewSessionStore creates an empty session store.
 func NewSessionStore() *SessionStore { return &SessionStore{sessions: map[string]Session{}} }
 
-// NewSession creates a new session and returns its ID.
 func (s *SessionStore) NewSession(lifetimeDays int) (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -50,7 +46,6 @@ func (s *SessionStore) NewSession(lifetimeDays int) (string, error) {
 	return id, nil
 }
 
-// GetSession returns the session for the given ID, or false if invalid/expired.
 func (s *SessionStore) GetSession(id string) (Session, bool) {
 	s.mu.RLock()
 	sess, ok := s.sessions[id]
@@ -62,21 +57,24 @@ func (s *SessionStore) GetSession(id string) (Session, bool) {
 	return sess, true
 }
 
-// DeleteSession removes a session.
 func (s *SessionStore) DeleteSession(id string) {
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
 }
 
-// Clear removes all sessions (e.g. when password auth is disabled).
 func (s *SessionStore) Clear() {
 	s.mu.Lock()
 	s.sessions = map[string]Session{}
 	s.mu.Unlock()
 }
 
-// SweepExpired removes all expired sessions.
+func (s *SessionStore) ClearExcept(keep string) {
+	s.mu.Lock()
+	maps.DeleteFunc(s.sessions, func(id string, _ Session) bool { return id != keep })
+	s.mu.Unlock()
+}
+
 func (s *SessionStore) SweepExpired() {
 	now := time.Now()
 	s.mu.Lock()
@@ -86,7 +84,6 @@ func (s *SessionStore) SweepExpired() {
 	s.mu.Unlock()
 }
 
-// sessionFromRequest returns the session ID from the cookie, or "".
 func sessionFromRequest(r *http.Request) string {
 	c, err := r.Cookie("monbooru_session")
 	if err != nil {
@@ -95,25 +92,20 @@ func sessionFromRequest(r *http.Request) string {
 	return c.Value
 }
 
-// sessionFromContext returns the session attached to the request context, or "".
 func sessionFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(sessionContextKey).(string)
 	return v
 }
 
-// sessionMiddleware validates the session cookie and redirects to /login if absent.
-// When authEnabled is false, it passes through with a synthetic session ID.
 func (s *Server) sessionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// API routes bypass session middleware (they use bearer token auth)
+		// The API checks its own bearer tokens.
 		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Public paths inject "anon" session so CSRF works on the login form.
-		// The manifest joins them because browsers fetch it with credentials
-		// omitted: gated, it resolves to the login page and fails to parse.
+		// An "anon" session, so the CSRF check has one to validate.
 		if isPublicPath(r.URL.Path) || isStaticPath(r.URL.Path) {
 			ctx := context.WithValue(r.Context(), sessionContextKey, "anon")
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -121,7 +113,6 @@ func (s *Server) sessionMiddleware(next http.Handler) http.Handler {
 		}
 
 		if !s.authEnabled() {
-			// No auth - inject synthetic session so CSRF validation still works.
 			ctx := context.WithValue(r.Context(), sessionContextKey, "anon")
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
@@ -130,12 +121,17 @@ func (s *Server) sessionMiddleware(next http.Handler) http.Handler {
 		sessID := sessionFromRequest(r)
 		_, ok := s.sessions.GetSession(sessID)
 		if !ok {
+			// No HX-Redirect: a poll would take the page, and whatever was
+			// typed on it, to the login.
 			if isHTMXRequest(r) {
-				w.Header().Set("HX-Redirect", "/login")
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			target := "/login"
+			if r.Method == http.MethodGet && r.URL.Path != "/" {
+				target += "?next=" + url.QueryEscape(r.URL.RequestURI())
+			}
+			http.Redirect(w, r, target, http.StatusSeeOther)
 			return
 		}
 
@@ -144,13 +140,9 @@ func (s *Server) sessionMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isPublicPath lists the routes a browser reaches before it holds a
-// session. The theme's files are on it because the login page and the
-// first-run wizard render them too, and gated they resolve to the login
-// HTML - a stylesheet that never applies and a favicon that never draws.
-// The health probe is on it for the same reason the setup gate exempts
-// it: the single-instance check and the container healthcheck both read
-// its body, and a login redirect reads to them as a foreign process.
+// The login page and the wizard load the theme files, browsers fetch the
+// manifest without credentials, and the single-instance check and the
+// container healthcheck read /health's body.
 func isPublicPath(path string) bool {
 	switch path {
 	case "/login", "/health", "/manifest.json", "/theme.css", "/theme.logo", "/theme.favicon":
@@ -163,38 +155,36 @@ func isStaticPath(path string) bool { return len(path) >= 8 && path[:8] == "/sta
 
 func isHTMXRequest(r *http.Request) bool { return r.Header.Get("HX-Request") == "true" }
 
-// clientIP returns the best-effort remote IP for rate-limiting and audit
-// logging. When monbooru runs behind a reverse proxy (Caddy, Traefik, nginx
-// - the README shows Caddy) every request's RemoteAddr is the proxy itself,
-// which would collapse every LAN client into a single rate-limit bucket.
-// Prefer the first entry of X-Forwarded-For when the immediate peer is a
-// loopback address (the typical reverse-proxy setup); otherwise fall back
-// to RemoteAddr so a direct public deploy is not trivially spoofable.
+// X-Forwarded-For is trusted only from a loopback peer, a same-host
+// proxy, and only the entry that proxy appended: the ones before it are
+// whatever the client sent.
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first := xff
-			if idx := strings.Index(xff, ","); idx >= 0 {
-				first = xff[:idx]
-			}
-			if first = strings.TrimSpace(first); first != "" {
-				return first
+		if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
+			xff := vals[len(vals)-1]
+			if last := strings.TrimSpace(xff[strings.LastIndex(xff, ",")+1:]); last != "" {
+				return last
 			}
 		}
 	}
 	return host
 }
 
-// sameOriginReferer returns the Referer when it points at the same Host as
-// r, falling back to "/". Used by handlers that 303-redirect on form submit
-// so a Referer pointing at a different origin can never bounce the user
-// off-site. Schemes other than http(s) (or empty for relative refs) are
-// rejected so a `javascript:` or `data:` Referer can't round-trip into a
-// Location header.
+// Browsers read "//host", a backslash, and a path whose tab or newline they
+// strip into "//", as another host.
+func localPath(p string) bool {
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || strings.Contains(p, `\`) {
+		return false
+	}
+	return !strings.ContainsFunc(p, func(c rune) bool { return c < 0x20 || c == 0x7f })
+}
+
+// sameOriginReferer keeps a form's 303 from following a forged Referer
+// off-site or into a javascript: URL.
 func sameOriginReferer(r *http.Request) string {
 	ref := r.Referer()
 	if ref == "" {
@@ -213,7 +203,6 @@ func sameOriginReferer(r *http.Request) string {
 	return ref
 }
 
-// loginRateLimiter tracks failed login attempts per IP with exponential backoff.
 type loginRateLimiter struct {
 	mu       sync.Mutex
 	failures map[string]loginAttempt
@@ -228,7 +217,6 @@ func newLoginRateLimiter() *loginRateLimiter {
 	return &loginRateLimiter{failures: map[string]loginAttempt{}}
 }
 
-// check returns true if the IP is allowed to attempt a login, false if rate-limited.
 func (l *loginRateLimiter) check(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -236,9 +224,8 @@ func (l *loginRateLimiter) check(ip string) bool {
 	if !ok {
 		return true
 	}
-	// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s capped at 30s.
-	// Clamp the shift to >= 0 so a future caller seeding count=0 (or any
-	// negative) never trips Go's runtime panic on a negative shift amount.
+	// 1s doubling to a 30s cap; the shift is clamped at 0 because a
+	// negative shift panics.
 	shift := min(max(a.count-1, 0), 5)
 	delay := time.Duration(1<<shift) * time.Second
 	if delay > 30*time.Second {
@@ -247,7 +234,6 @@ func (l *loginRateLimiter) check(ip string) bool {
 	return time.Since(a.lastFail) >= delay
 }
 
-// recordFailure increments the failure count for an IP.
 func (l *loginRateLimiter) recordFailure(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -257,14 +243,12 @@ func (l *loginRateLimiter) recordFailure(ip string) {
 	l.failures[ip] = a
 }
 
-// recordSuccess resets the failure count for an IP.
 func (l *loginRateLimiter) recordSuccess(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.failures, ip)
 }
 
-// sweep removes entries older than 5 minutes (called from session sweep).
 func (l *loginRateLimiter) sweep() {
 	cutoff := time.Now().Add(-5 * time.Minute)
 	l.mu.Lock()

@@ -1,6 +1,7 @@
 {{define "partials/empty_folders.html"}}
+<div id="flash-empty-folders" hx-swap-oob="true">
 <form class="empty-folders" hx-post="/settings/maintenance/empty-folders/remove"
-      hx-target="#flash-empty-folders" hx-swap="innerHTML"
+      hx-target="#flash-maintenance" hx-swap="innerHTML"
       hx-confirm="Remove the folders left checked?"
       data-confirm-ok="Remove">
   <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
@@ -26,4 +27,5 @@
     <button type="submit" class="btn-danger btn-sm">Remove</button>
   </div>
 </form>
+</div>
 {{end}}

@@ -8,15 +8,10 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// MD5BackfillProgress reports the walk's position to the caller-side job
-// manager. Keeps the helper testable without internal/jobs.
 type MD5BackfillProgress func(processed, total int, message string)
 
-// ComputeAndStoreMD5 hashes the image's canonical file and writes the
-// digest back, returning what it stored. The lazy detail-page fill and
-// the backfill job both land here, and so does any lookup that finds the
-// column empty: the digest a booru is queried with has to come from the
-// local bytes, never from what a source claims.
+// ComputeAndStoreMD5 hashes the local bytes: the digest a booru is
+// queried with must never come from what a source claims.
 func ComputeAndStoreMD5(ctx context.Context, database *db.DB, imageID int64) (string, error) {
 	var canonPath string
 	if err := database.Read.QueryRowContext(ctx,
@@ -36,14 +31,8 @@ func ComputeAndStoreMD5(ctx context.Context, database *db.DB, imageID int64) (st
 	return sum, nil
 }
 
-// BackfillMD5s computes images.md5 for every non-missing row that still
-// has none. Reads the candidate ids up front so the read cursor isn't
-// held open for what is the longest job monbooru runs: unlike the phash
-// walk, which reads small cached thumbnails, this one reads every
-// original byte in the gallery.
-//
-// Honours ctx cancellation between rows. Re-running once every row is
-// hashed is an empty walk.
+// BackfillMD5s reads the ids up front rather than hold a read cursor open
+// through a walk over every original byte.
 func BackfillMD5s(ctx context.Context, database *db.DB, progress MD5BackfillProgress) (processed, updated int, err error) {
 	ids, err := db.QueryIDs(database.Read,
 		`SELECT id FROM images WHERE md5 = '' AND is_missing = 0 ORDER BY id`)
@@ -51,23 +40,12 @@ func BackfillMD5s(ctx context.Context, database *db.DB, progress MD5BackfillProg
 		return 0, 0, err
 	}
 
-	// A file that vanished or turned unreadable between the id scan and
-	// the read leaves the row empty for the next run.
 	return BackfillWalk(ctx, ids, progress, "md5", "MD5…", func(id int64) error {
 		_, err := ComputeAndStoreMD5(ctx, database, id)
 		return err
 	})
 }
 
-// BackfillWalk is the row loop the backfill jobs share: per-row
-// cancellation, a progress call before each row and one at the end, and a
-// per-row failure that logs and moves on rather than ending the run. The
-// contract rather than the line count is why it lives in one place - the
-// settings page reads these counts and the job bar reads the progress, so
-// the two jobs must not drift on either.
-//
-// label names the job in the debug line; doneMsg is what the closing
-// progress call carries.
 func BackfillWalk(
 	ctx context.Context,
 	ids []int64,

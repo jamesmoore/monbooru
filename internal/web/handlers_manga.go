@@ -12,48 +12,36 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// readerData drives reader.html. PageCount is the authoritative count;
-// Page is the 1-based current page (server-clamped). BackQS / BackKVQS
-// are pre-rendered query-string fragments for the reader's links: the
-// first carries `?back_*=...&from=pages` (used on the Back-to-detail
-// link), the second carries `&back_*=...&from=pages` (used on
-// prev/next links that already have a `?page=` prefix). Both are
-// template.URL so html/template treats the `&` separators as already
-// encoded and emits them verbatim into the URL attribute.
 type readerData struct {
 	baseData
 	Image       models.Image
 	Filename    string
 	Page        int
 	PageCount   int
-	NextPage    int          // 0 when on the last page; drives the prefetch link
-	BackQS      template.URL // "?back_q=...&..." or ""; safe to append to a path with no query
-	BackKVQS    template.URL // "&back_q=...&..." or ""; safe to append after `?page=N`
-	BackToPages bool         // true when the reader was opened from /images/{id}/pages; flips the back-link target to that page
+	NextPage    int
+	BackQS      template.URL
+	BackKVQS    template.URL
+	BackToPages bool
 }
 
-// pagesGridData drives pages.html.
 type pagesGridData struct {
 	baseData
 	Image        models.Image
 	Filename     string
 	PageCount    int
-	LastReadPage int        // resume bookmark, 0 when unstarted or finished
-	TagSidebar   tagSidebar // the per-image sidebar tag listing, same shape detail.html renders
-	BackQuery    string     // raw back_q used by the sidebar-browse render
+	LastReadPage int
+	TagSidebar   tagSidebar
+	BackQuery    string
 	BackQS       template.URL
 	BackKVQS     template.URL
 }
 
-// resumePage returns the reader bookmark clamped to the row's current
-// page count, or 0 when there is nothing to resume. A re-ingested
-// archive can shrink, so a stored value is never trusted; landing on the
-// first or last page means unstarted or finished either way.
+// The stored page is re-checked: a re-ingested archive can shrink, and
+// the first or last page means unstarted or finished.
 func resumePage(img *models.Image) int {
 	if img.LastReadPage == nil || img.PageCount == nil {
 		return 0
@@ -65,8 +53,7 @@ func resumePage(img *models.Image) int {
 	return page
 }
 
-// loadMangaImage parses {id}, loads the image, and 404s unless it is a
-// readable cbz. Returns ok=false (the 404 is already written) otherwise.
+// On false the 404 is already written.
 func (s *Server) loadMangaImage(w http.ResponseWriter, r *http.Request) (*models.Image, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -81,19 +68,13 @@ func (s *Server) loadMangaImage(w http.ResponseWriter, r *http.Request) (*models
 	return img, true
 }
 
-// readerHandler serves /images/{id}/read?page=N and renders the reader
-// template. A bare URL opens on the resume bookmark; an explicit page
-// is clamped to [1, page_count] and clears the bookmark at page 1.
 func (s *Server) readerHandler(w http.ResponseWriter, r *http.Request) {
 	img, ok := s.loadMangaImage(w, r)
 	if !ok {
 		return
 	}
 	pageCount := *img.PageCount
-	// No `page` at all means "open the book", so land on the bookmark
-	// rather than page 1 - rendering page 1 is what clears it, and a
-	// browser bookmark of the bare URL would wipe the resume position
-	// every visit. An explicit `?page=1` still clears, as documented.
+	// A bare URL resumes; page 1 would clear the bookmark on every visit.
 	page := 1
 	if resume := resumePage(img); resume > 0 {
 		page = resume
@@ -111,10 +92,7 @@ func (s *Server) readerHandler(w http.ResponseWriter, r *http.Request) {
 	if page > pageCount {
 		page = pageCount
 	}
-	// URL coherence with the gallery's pagination clamp: when the raw
-	// `?page=N` disagrees with the clamped page (out of range, leading
-	// zero, etc.), 303 to the clamped value so a bookmark of the bogus
-	// URL doesn't keep replaying it.
+	// Redirect before recording, so only canonical URLs move the bookmark.
 	if rawPage != "" && rawPage != strconv.Itoa(page) {
 		q := r.URL.Query()
 		q.Set("page", strconv.Itoa(page))
@@ -144,12 +122,7 @@ func (s *Server) readerHandler(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "reader.html", data)
 }
 
-// recordReaderPosition moves the resume bookmark to the page just
-// rendered. Page 1 is the default entry point and the last page means
-// the book is finished, so both clear it. Writing from a GET is fine
-// here: the reader prefetches page bytes, not the render, so this only
-// runs on real navigation, and the clamp redirect fires first so only
-// canonical URLs reach it.
+// A write on GET is safe: prefetch fetches page bytes, never this render.
 func (s *Server) recordReaderPosition(img *models.Image, page, pageCount int) {
 	next := 0
 	if page > 1 && page < pageCount {
@@ -173,17 +146,13 @@ func (s *Server) recordReaderPosition(img *models.Image, page, pageCount int) {
 	}
 }
 
-// pagesGridHandler serves /images/{id}/pages. Renders a thumbnail grid
-// of every page; clicking a cell opens the reader at that page.
 func (s *Server) pagesGridHandler(w http.ResponseWriter, r *http.Request) {
 	img, ok := s.loadMangaImage(w, r)
 	if !ok {
 		return
 	}
 	back := parseBackContext(r)
-	// Pages grid never opens the reader as a from=pages context for
-	// itself; the back link from the grid lands on the detail page,
-	// not back on the grid.
+	// false: the grid's back link goes to the detail page, not to itself.
 	backQS, backKVQS := back.ReaderQS(false)
 	_, imageTags, _ := s.tagSvc().GetImageTags(img.ID)
 	base := s.base(r, "gallery", filepath.Base(img.CanonicalPath)+" - Pages - "+s.booruName())
@@ -201,10 +170,7 @@ func (s *Server) pagesGridHandler(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "pages.html", data)
 }
 
-// extractMangaPage saves the n-th page of a cbz as its own image row in
-// the active gallery, linked back to the archive by a derivative edge.
-// Extracting the same page twice lands on the row already holding those
-// bytes, so the reader's button needs no "already extracted" state.
+// Idempotent: a second extract lands on the row already holding the bytes.
 func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 	img, ok := s.loadMangaImage(w, r)
 	if !ok {
@@ -225,7 +191,7 @@ func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeDir, naming := s.receivedNaming(cx.Name)
-	destDir, err := gallery.ResolveSubdir(cx.GalleryPath, writeDir)
+	destDir, err := cx.Boundary().ResolveSubdir(writeDir)
 	if err != nil {
 		fail("resolve folder", err)
 		return
@@ -235,16 +201,13 @@ func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stem := strings.TrimSuffix(filepath.Base(img.CanonicalPath), filepath.Ext(img.CanonicalPath))
-	// Copy rather than move: the cache file belongs to the manga reclaim
-	// goroutine, which is free to unlink it at any point. The helper
-	// extracts, ingests and links the page exactly as this button did.
 	pageID, filed, err := s.extractMangaPageToGallery(cx, img, n, destDir, stem+"_p")
 	if err != nil {
 		fail("extract", err)
 		return
 	}
 	if filed {
-		if _, err := naming.Apply(r.Context(), cx.DB, cx.GalleryPath, pageID, "", ""); err != nil {
+		if _, err := naming.Apply(r.Context(), cx.DB, cx.Boundary(), pageID, "", ""); err != nil {
 			logx.Warnf("extract page %d of image %d: file: %v", n, img.ID, err)
 		}
 	}
@@ -252,9 +215,6 @@ func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/images/%d", pageID), http.StatusSeeOther)
 }
 
-// loadMangaMeta reads the manga_metadata row for an image, or nil when
-// absent. Errors other than ErrNoRows are logged at debug since the
-// detail page degrades cleanly when the row is missing.
 func loadMangaMeta(ctx context.Context, database *db.DB, imageID int64) *models.MangaMetadata {
 	var m models.MangaMetadata
 	var title, series, number, volume, summary, notes sql.NullString

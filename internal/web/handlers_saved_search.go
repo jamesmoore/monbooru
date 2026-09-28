@@ -33,16 +33,10 @@ func (s *Server) createSavedSearch(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "Name and query required.", http.StatusBadRequest)
 		return
 	}
-	// Capture sort + order + seed so a `random` save reopens at the same
-	// shuffle and explicit non-default sorts survive the round trip. Empty
-	// values mean "use the gallery handler's defaults" on reopen.
 	sortStr := strings.TrimSpace(r.FormValue("sort"))
 	orderStr := strings.TrimSpace(r.FormValue("order"))
 	seedStr := strings.TrimSpace(r.FormValue("seed"))
-	// Plain INSERT so the UNIQUE(name) constraint surfaces as an error
-	// instead of clobbering the existing entry. The user can delete the
-	// previous saved search from the sidebar and resubmit; same idiom
-	// the category and tag-name uniqueness checks use elsewhere.
+	// Plain INSERT: a name clash must error, not overwrite the saved search.
 	if _, err := s.db().Write.Exec(
 		`INSERT INTO saved_searches (name, query, sort, sort_order, seed) VALUES (?, ?, ?, ?, ?)`,
 		name, query, sortStr, orderStr, seedStr,

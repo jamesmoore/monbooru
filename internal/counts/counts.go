@@ -1,14 +1,4 @@
-// Package counts owns the whole-library tallies more than one caller
-// divides by, and caches them per gallery. They live here rather than in
-// internal/db because "visible" and "untagged" are domain predicates, not
-// driver concerns - and rather than in internal/tags or internal/search
-// because both of those read them and neither owns "the number of images
-// in the library".
-//
-// The per-pool state hangs off a registry keyed by *db.DB, the shape
-// relations.DefaultRegistry already uses. Entries are created on first
-// read, so a caller never has to register one; Release drops a gallery's
-// entry when its context closes.
+// Package counts caches whole-library tallies per gallery.
 package counts
 
 import (
@@ -20,35 +10,20 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/models"
 )
 
-// cache is one gallery's tallies.
 type cache struct {
-	db *db.DB
-	// untaggedVisible / autoUntaggedVisible cache the count subtrahends
-	// behind tagged:true / autotagged:true partition reads. The
-	// underlying NOT EXISTS walk over image_tags is multi-second on a
-	// million-row library; Invalidate drops both on every image_tags
-	// membership write.
+	db                  *db.DB
 	untaggedVisible     atomic.Pointer[int]
 	autoUntaggedVisible atomic.Pointer[int]
-	// visibleCount caches the non-missing image total. Cheap on its own
-	// - an index scan of idx_images_missing - but it is the divisor
-	// behind every tag-similarity weight, so the tag-pairs pass would
-	// otherwise re-run it once per image in the library.
-	visibleCount atomic.Pointer[int]
-	// countedTags caches the per-image counted-tag totals the overlap
-	// score divides by. Dropped alongside the counts above.
-	countedTags atomic.Pointer[CountedTags]
-	// The remaining whole-library tallies the sidebar, the toolbar and the
-	// footer render on every page. Cheap individually, but each is a scan
-	// the render would otherwise repeat per request.
+	// Cheap, but the tag-pairs pass divides by it once per image.
+	visibleCount     atomic.Pointer[int]
+	countedTags      atomic.Pointer[CountedTags]
 	inboxCount       atomic.Pointer[int]
 	tagCount         atomic.Pointer[int]
 	collectionsCount atomic.Pointer[int]
-	// phashMissing has its own invalidator: a phash write changes it
-	// without touching image membership.
-	phashMissing atomic.Pointer[int]
+	phashMissing     atomic.Pointer[int]
 }
 
 var (
@@ -67,18 +42,12 @@ func forDB(database *db.DB) *cache {
 	return c
 }
 
-// Release drops a gallery's tallies. Called when its context is
-// destroyed (gallery removal, server shutdown), beside the BK-tree's own
-// unregister; missing it leaks one small struct, not correctness.
 func Release(database *db.DB) {
 	mu.Lock()
 	delete(caches, database)
 	mu.Unlock()
 }
 
-// cachedCount returns the cached value or runs sql once. Errors return
-// (0, false) so the fastCount* callers can fall back to the slow path
-// without per-call error handling.
 func (c *cache) cachedCount(slot *atomic.Pointer[int], sql string) (int, bool) {
 	if p := slot.Load(); p != nil {
 		return *p, true
@@ -91,29 +60,22 @@ func (c *cache) cachedCount(slot *atomic.Pointer[int], sql string) (int, bool) {
 	return n, true
 }
 
-// UntaggedVisibleCount returns the cached count of visible images that
-// carry no image_tags row, or queries it on demand. fastCountTagged
-// subtracts this from the visible total to derive an exact tagged:true
-// partition without re-walking image_tags on every search.
+// UntaggedVisibleCount must leave out the derived meta rows exactly as
+// the tagged: filter does, or the header count disagrees with the grid.
 func UntaggedVisibleCount(database *db.DB) (int, bool) {
 	c := forDB(database)
 	return c.cachedCount(&c.untaggedVisible,
 		`SELECT COUNT(*) FROM images i
 		 WHERE is_missing = 0
-		   AND NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id)`)
+		   AND NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id
+		                    AND it.tagger_name IS NOT '`+models.TagSourceMonbooru+`')`)
 }
 
-// VisibleCount returns the cached count of non-missing images, or
-// queries it on demand.
 func VisibleCount(database *db.DB) (int, bool) {
 	c := forDB(database)
 	return c.cachedCount(&c.visibleCount, `SELECT COUNT(*) FROM images WHERE is_missing = 0`)
 }
 
-// AutoUntaggedVisibleCount is UntaggedVisibleCount restricted to
-// image_tags rows carrying is_auto = 1 - the subtrahend behind
-// autotagged:true. There is no covering (image_id, is_auto) index, so
-// the NOT-EXISTS walk is heavier than the bare-untagged one above.
 func AutoUntaggedVisibleCount(database *db.DB) (int, bool) {
 	c := forDB(database)
 	return c.cachedCount(&c.autoUntaggedVisible,
@@ -125,62 +87,41 @@ func AutoUntaggedVisibleCount(database *db.DB) (int, bool) {
 		       )`)
 }
 
-// InboxCount returns the cached count of visible images sitting in the
-// inbox. Surfaced in the gallery toolbar's inbox toggle so the operator
-// sees the triage backlog at a glance; reads off idx_images_inbox_visible.
 func InboxCount(database *db.DB) (int, bool) {
 	c := forDB(database)
 	return c.cachedCount(&c.inboxCount, `SELECT COUNT(*) FROM images WHERE is_missing = 0 AND is_inbox = 1`)
 }
 
-// TagCount returns the cached count of non-alias tags. Surfaced in the
-// Settings galleries table and the layout footer, so uncached it runs once
-// per render per gallery.
 func TagCount(database *db.DB) (int, bool) {
 	c := forDB(database)
 	return c.cachedCount(&c.tagCount, `SELECT COUNT(*) FROM tags WHERE is_alias = 0`)
 }
 
-// CollectionsCount returns the cached count of distinct collection labels
-// across non-missing images, surfaced in the layout footer. Reads the
-// trigger-maintained per-label counts, so the re-pay after a drop is one
-// row per label.
 func CollectionsCount(database *db.DB) (int, bool) {
 	c := forDB(database)
 	return c.cachedCount(&c.collectionsCount, `SELECT COUNT(*) FROM collection_counts WHERE visible_count > 0`)
 }
 
-// PhashMissing returns the cached count of visible rows carrying no phash.
-// The relations hub renders it on every hit and the partial index excludes
-// NULLs, so the underlying SELECT walks every visible row.
 func PhashMissing(database *db.DB) (int, bool) {
 	c := forDB(database)
 	return c.cachedCount(&c.phashMissing, `SELECT COUNT(*) FROM images WHERE phash IS NULL AND is_missing = 0`)
 }
 
-// InvalidatePhashMissing drops only the phash tally. Call after a write
-// that changes the NULL/non-NULL count without touching membership:
-// single-image recompute, the backfill, rebuild-thumbnails completion.
+// InvalidatePhashMissing is for phash writes that leave image membership
+// alone; anything else calls Invalidate.
 func InvalidatePhashMissing(database *db.DB) {
 	forDB(database).phashMissing.Store(nil)
 }
 
-// CountedTags holds every image's counted-tag total - its non-meta
-// tags at or under maxUsage - in image-id order. Parallel slices
-// rather than a map: the tally is read once per candidate during a
-// similarity ranking and a million-image library costs 12 MB here
-// against four times that in map buckets.
+// CountedTags keeps parallel id-sorted slices rather than a map: a million
+// images cost 12 MB here against about four times that in map buckets.
 type CountedTags struct {
 	maxUsage int64
 	ids      []int64
 	totals   []int32
-	// used stamps the last read so the reclaim loop can drop tallies
-	// nothing is ranking against.
-	used atomic.Int64
+	used     atomic.Int64
 }
 
-// Total returns id's counted-tag total; images carrying none are
-// absent from the walk and answer 0.
 func (c *CountedTags) Total(id int64) int32 {
 	if i, ok := slices.BinarySearch(c.ids, id); ok {
 		return c.totals[i]
@@ -188,12 +129,6 @@ func (c *CountedTags) Total(id int64) int32 {
 	return 0
 }
 
-// CountedTagTotals returns the tallies the tag-overlap score divides
-// by, walking image_tags once on first use. Deriving them per query
-// instead means scanning every candidate's tag rows through both tag
-// joins, which is seconds on a large library; here the ranking pays a
-// lookup per candidate. Rebuilt when maxUsage moves with the visible
-// count, and dropped by Invalidate.
 func CountedTagTotals(ctx context.Context, database *db.DB, maxUsage int64) (*CountedTags, error) {
 	c := forDB(database)
 	if t := c.countedTags.Load(); t != nil && t.maxUsage == maxUsage {
@@ -229,10 +164,6 @@ func CountedTagTotals(ctx context.Context, database *db.DB, maxUsage int64) (*Co
 	return totals, nil
 }
 
-// ReleaseIdleCountedTags drops the tallies when nothing has read them
-// for at least `after`, returning whether it did. The next reader walks
-// image_tags again; the point is that an idle gallery shouldn't hold an
-// index only a similarity browse needs.
 func ReleaseIdleCountedTags(database *db.DB, after time.Duration) bool {
 	c := forDB(database)
 	t := c.countedTags.Load()
@@ -242,11 +173,7 @@ func ReleaseIdleCountedTags(database *db.DB, after time.Duration) bool {
 	return c.countedTags.CompareAndSwap(t, nil)
 }
 
-// Invalidate drops every cached tally for one gallery. Call after a
-// write that changes image_tags membership (tag add/remove, batch tag,
-// implication propagation, autotag ingest, image delete) so the next
-// reader recomputes the slow subtrahends from current state. Cheap to
-// call - just a few atomic stores - so over-invalidating costs nothing.
+// Invalidate must follow every write that changes image_tags membership.
 func Invalidate(database *db.DB) {
 	c := forDB(database)
 	c.untaggedVisible.Store(nil)

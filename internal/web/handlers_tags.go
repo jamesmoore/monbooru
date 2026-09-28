@@ -2,6 +2,7 @@ package web
 
 import (
 	"cmp"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -16,14 +17,11 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// tagsPageData embeds baseData so the layout template sees its fields as
-// struct members (matching galleryData / detailData) and the tags template
-// can reach its own state via direct field access.
 type tagsPageData struct {
 	baseData
 	Tags         []models.Tag
 	Categories   []models.TagCategory
-	Implications map[int64][]models.Implication // direct implications keyed by parent tag id
+	Implications map[int64][]models.Implication
 	Total        int
 	Page         int
 	TotalPages   int
@@ -33,44 +31,25 @@ type tagsPageData struct {
 	Order        string
 	Origin       string
 	Type         string
-	// CreatedAfter is the raw query value ("24h" / "7d" / "30d" or an ISO
-	// timestamp from a sweep-review link) so the sidebar chips highlight
-	// on the spelling the URL carries.
-	CreatedAfter string
-	// Conflicts narrows to names living in more than one category;
-	// ConflictsTotal is the badge count on the sidebar toggle.
-	Conflicts      bool
-	ConflictsTotal int
-	// Stale narrows to tags with source-dropped usage ("has" / "full");
-	// StaleTotal and FullyStaleTotal are the two sidebar badge counts.
+	// Raw, not the resolved cutoff, so the sidebar chips can match it.
+	CreatedAfter    string
+	Conflicts       bool
+	ConflictsTotal  int
 	Stale           string
 	StaleTotal      int
 	FullyStaleTotal int
-	// Folded narrows to the folded originals from the last scan; FoldedTotal
-	// is the sidebar badge count.
-	Folded       bool
-	FoldedTotal  int
-	OriginCounts []tags.OriginCount
-	// UsedBy narrows to tags a source has applied; UsedByLabels is the
-	// sidebar's label set and UsedBySources the per-row column, keyed by
-	// tag id.
-	UsedBy        string
-	UsedByLabels  []string
-	UsedBySources map[int64][]string
-	// OriginKinds classifies each origin and used-by label on the page for
-	// chip coloring: "user", "auto", "ptr", or "site".
-	OriginKinds map[string]string
-	ShowZero    bool
-	ZeroOnly    bool
-	// BackQS is the resolved listing state each See-detail link carries
-	// as its `back` value, so the detail page can navigate relative to
-	// this search.
-	BackQS string
+	Folded          bool
+	FoldedTotal     int
+	OriginCounts    []tags.OriginCount
+	UsedBy          string
+	UsedByLabels    []string
+	UsedBySources   map[int64][]string
+	OriginKinds     map[string]string
+	ShowZero        bool
+	ZeroOnly        bool
+	BackQS          string
 }
 
-// originKinds buckets the given origin labels for the template's chip
-// classes. Anything that is not the operator, the PTR, or a known
-// auto-tagger attribution reads as a site / import label.
 func (s *Server) originKinds(labels []string) map[string]string {
 	kinds := make(map[string]string, len(labels))
 	var unknown []string
@@ -103,9 +82,6 @@ func (s *Server) originKinds(labels []string) map[string]string {
 	return kinds
 }
 
-// createdAfterCutoff resolves the created_after query value: the quick
-// range tokens the sidebar emits become a UTC cutoff, anything else
-// (the ISO timestamp a sweep-review link carries) passes through.
 func createdAfterCutoff(raw string) string {
 	now := time.Now().UTC()
 	switch raw {
@@ -121,10 +97,6 @@ func createdAfterCutoff(raw string) string {
 	return raw
 }
 
-// tagsSidebarCounts are the sidebar's badge counts and label sets. Every
-// one of them aggregates over the whole catalog regardless of which page
-// the listing is showing, so together they set the floor for a /tags
-// render.
 type tagsSidebarCounts struct {
 	Conflicts  int
 	Stale      int
@@ -135,9 +107,7 @@ type tagsSidebarCounts struct {
 	Err        error
 }
 
-// tagsSidebarLoad runs the badge queries side by side, the way the
-// gallery sidebar loads its own aggregates: run in sequence their scans
-// add up to more than the listing they decorate.
+// In parallel: in sequence the scans cost more than the listing they decorate.
 func (s *Server) tagsSidebarLoad(typeFilter string) tagsSidebarCounts {
 	var c tagsSidebarCounts
 	var mu sync.Mutex
@@ -165,17 +135,10 @@ func (s *Server) tagsSidebarLoad(typeFilter string) tagsSidebarCounts {
 }
 
 func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
-	// The tags page reflects rapidly-changing state (category re-assignment,
-	// merges). Opt out of browser caching so a reload after a mutation never
-	// serves a stale render.
 	w.Header().Set("Cache-Control", "no-store")
 	q := r.URL.Query()
 	catIDStr := q.Get("cat")
 	prefix := q.Get("q")
-	// `?q=character:` (a category prefix with no tag-name suffix) is a
-	// dead end against tags.name (no tag name may contain a colon). Mirror
-	// the autocomplete's branch and route to the category-only filter so
-	// the user's intent surfaces instead of "No tags found".
 	if catIDStr == "" && prefix != "" && strings.HasSuffix(prefix, ":") && strings.Count(prefix, ":") == 1 {
 		catName := strings.TrimSuffix(prefix, ":")
 		if catName != "" && s.categoryExists(catName) {
@@ -201,10 +164,6 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 	cats, _ := s.tagSvc().ListCategories()
 	totalPages := (total + 99) / 100
 
-	// Clamp past-the-end pages to the last valid one and re-run, mirroring
-	// the gallery handler. Without this the header reads `Tags <total>`
-	// while the body says "No tags found" when a stale ?page=N URL
-	// survives a tag prune.
 	if total > 0 && p.Page > totalPages {
 		p.Page = totalPages
 		tagList, total, err = s.tagSvc().ListTags(s.tagListingFilter(p))
@@ -283,9 +242,6 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "tags.html", data)
 }
 
-// tagListingParams are the /tags query values after the page's
-// defaulting rules. The detail page re-resolves its back context
-// through the same struct so prev/next walk the exact listing order.
 type tagListingParams struct {
 	CatID, Prefix, Sort, Order, Origin, Type, CreatedAfter, ZeroParam, Stale, UsedBy string
 	HasType, Conflicts, ShowZero, ZeroOnly, Folded                                   bool
@@ -313,8 +269,6 @@ func tagListingParamsFrom(q url.Values) tagListingParams {
 	p.Folded = q.Get("folded") == "1"
 	p.Sort = cmp.Or(p.Sort, "usage")
 	if p.Order != "asc" && p.Order != "desc" {
-		// Default to the natural reading direction per sort: most-used /
-		// newest / most recently applied first, alphabetical A→Z for name.
 		switch p.Sort {
 		case "usage", "created", "last_used":
 			p.Order = "desc"
@@ -322,16 +276,11 @@ func tagListingParamsFrom(q url.Values) tagListingParams {
 			p.Order = "asc"
 		}
 	}
-	// Plain tags by default; alias rows surface via the explicit sidebar
-	// filter (whose links always carry a type=, so "All" stays reachable).
-	// The legacy origin=alias spelling opts out - it selects alias rows by
-	// structure and would otherwise always come back empty.
+	// An absent type means plain tags; an empty type= is All.
+	// origin=alias selects alias rows, which type=tag would hide.
 	if !p.HasType && p.Origin != "alias" {
 		p.Type = "tag"
 	}
-	// show_zero is tri-state: empty/"1" → Show (default so freshly-declared
-	// tags surface without a filter flip); "0" → Hide; "only" → only zero-
-	// usage rows (triage view).
 	p.ZeroOnly = p.ZeroParam == "only"
 	p.ShowZero = p.ZeroOnly || p.ZeroParam != "0"
 	if n, err := strconv.Atoi(q.Get("page")); err == nil && n > 0 {
@@ -349,10 +298,6 @@ func (s *Server) tagListingFilter(p tagListingParams) tags.TagFilter {
 	return f
 }
 
-// backQS encodes the resolved listing state as the `back` value the
-// detail links carry. Keys whose absence differs from an empty value
-// (type's all-vs-default split) are always written; the rest only when
-// set, so the string stays short on the default view.
 func (p tagListingParams) backQS() string {
 	v := url.Values{}
 	if p.Prefix != "" {
@@ -407,8 +352,6 @@ func (s *Server) buildTagFilter(catIDStr, prefix, sortStr, orderStr, originStr, 
 		ZeroOnly:     zeroOnly,
 	}
 	if catIDStr != "" {
-		// The sidebar buttons emit the id; a hand-edited URL is likelier
-		// to carry the name, which every other /tags filter takes.
 		if id, err := strconv.ParseInt(catIDStr, 10, 64); err == nil {
 			f.CategoryID = &id
 		} else if id, ok := s.categoryIDByName(catIDStr); ok {
@@ -418,73 +361,94 @@ func (s *Server) buildTagFilter(catIDStr, prefix, sortStr, orderStr, originStr, 
 	return f
 }
 
-// resolveCanonicalTagInput resolves a "name", "category:name", or id
-// input to a tag id. With create set, a missing name is minted via
-// GetOrCreateTag - the implications dialog's parseTagInput →
-// GetOrCreateTag flow, so users can declare an alias or edge to a
-// still-pending name; without it the input must name an existing tag.
-// A numeric input always requires the id to exist (a typo'd id
-// shouldn't silently mint a fresh tag).
+// "#<id>" is a tag id and anything else a name: normalised, an alias
+// followed to its canonical, a bare one taken only when it names a single
+// tag across the categories.
 func (s *Server) resolveCanonicalTagInput(input string, create bool) (int64, string) {
 	input = strings.TrimSpace(input)
 	if input == "" {
 		return 0, "Tag name is required."
 	}
-	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
+	if digits, ok := strings.CutPrefix(input, "#"); ok {
 		var exists int
-		if err := s.db().Read.QueryRow(`SELECT COUNT(*) FROM tags WHERE id = ?`, id).Scan(&exists); err != nil || exists == 0 {
+		id, err := strconv.ParseInt(digits, 10, 64)
+		if err == nil {
+			err = s.db().Read.QueryRow(`SELECT COUNT(*) FROM tags WHERE id = ?`, id).Scan(&exists)
+		}
+		if err != nil || exists == 0 {
 			return 0, "Tag not found: " + input
 		}
 		return id, ""
 	}
+	catName, bare := "", input
 	if idx := strings.Index(input, ":"); idx > 0 && s.categoryExists(input[:idx]) {
-		catName := input[:idx]
-		tagName := strings.TrimSpace(input[idx+1:])
-		if tagName == "" {
+		catName, bare = input[:idx], strings.TrimSpace(input[idx+1:])
+		if bare == "" {
 			return 0, "Tag name is required after the category prefix."
 		}
-		catID, ok, err := tags.CategoryIDByName(s.db(), catName)
+	}
+	name, err := tags.ValidateTagName(strings.Trim(bare, `"`))
+	if err != nil {
+		return 0, err.Error()
+	}
+	var catID int64
+	if catName != "" {
+		id, ok, err := tags.CategoryIDByName(s.db(), catName)
 		if !ok || err != nil {
 			return 0, "Category not found: " + catName
 		}
-		if !create {
-			var id int64
-			if err := s.db().Read.QueryRow(
-				`SELECT id FROM tags WHERE name = ? AND category_id = ?`, tagName, catID,
-			).Scan(&id); err != nil {
-				return 0, "Tag not found: " + input
-			}
-			return id, ""
-		}
-		tag, err := s.tagSvc().GetOrCreateTag(tagName, catID)
-		if err != nil {
-			return 0, err.Error()
-		}
-		return tag.ID, ""
+		catID = id
 	}
-	ids, err := db.QueryIDs(s.db().Read, `SELECT id FROM tags WHERE name = ?`, input)
+	type choice struct {
+		id    int64
+		label string
+	}
+	choices, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (choice, error) {
+		var c choice
+		err := rows.Scan(&c.id, &c.label)
+		return c, err
+	}, `SELECT DISTINCT ct.id, c.name || ':' || ct.name
+	    FROM tags t
+	    JOIN tags ct ON ct.id = COALESCE(t.canonical_tag_id, t.id)
+	    JOIN tag_categories c ON c.id = ct.category_id
+	    WHERE t.name = ? AND (? = 0 OR t.category_id = ?)
+	    ORDER BY c.name`, name, catID, catID)
 	if err != nil {
 		return 0, "Tag lookup failed: " + err.Error()
 	}
-	switch len(ids) {
+	switch len(choices) {
 	case 1:
-		return ids[0], ""
+		return choices[0].id, ""
 	case 0:
 		if !create {
 			return 0, "Tag not found: " + input
 		}
-		cx := s.active()
-		if cx == nil || cx.GeneralCategoryID == 0 {
-			return 0, "Could not resolve the general category."
+		if catID == 0 {
+			cx := s.active()
+			if cx == nil || cx.GeneralCategoryID == 0 {
+				return 0, "Could not resolve the general category."
+			}
+			catID = cx.GeneralCategoryID
 		}
-		tag, err := s.tagSvc().GetOrCreateTag(input, cx.GeneralCategoryID)
+		tag, err := s.tagSvc().GetOrCreateTag(name, catID)
 		if err != nil {
 			return 0, err.Error()
 		}
 		return tag.ID, ""
-	default:
-		return 0, "Tag name " + input + " exists in multiple categories; use category:name or the tag ID"
 	}
+	labels := make([]string, len(choices))
+	for i, c := range choices {
+		labels[i] = c.label
+	}
+	return 0, "Tag name " + name + " exists in more than one category; use " + strings.Join(labels, " or ")
+}
+
+func (s *Server) qualifiedTagName(id int64) string {
+	t, err := s.tagSvc().GetTag(id)
+	if err != nil {
+		return "#" + strconv.FormatInt(id, 10)
+	}
+	return t.CategoryName + ":" + t.Name
 }
 
 func (s *Server) createTagPost(w http.ResponseWriter, r *http.Request) {
@@ -532,12 +496,9 @@ func (s *Server) createAliasPost(w http.ResponseWriter, r *http.Request) {
 	}
 	s.active().InvalidateCaches()
 
-	hxDone(w, r, "Alias "+name+" created.", "/tags?type=alias&q="+url.QueryEscape(name), "/tags?type=alias")
+	hxDone(w, r, "Alias "+name+" created, resolving to "+s.qualifiedTagName(canonID)+".", "/tags?type=alias&q="+url.QueryEscape(name), "/tags?type=alias")
 }
 
-// addTagAliasPost is the tag detail page's inline alias editor: each
-// token in `name` becomes an alias pointing at {id}. Failures flash in
-// place; success refreshes the page so the new rows render.
 func (s *Server) addTagAliasPost(w http.ResponseWriter, r *http.Request) {
 	id, ok := idAndForm(w, r)
 	if !ok {
@@ -584,9 +545,6 @@ func (s *Server) addTagAliasPost(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// removeTagAliasesDelete deletes every alias in one origin subgroup of the
-// detail page's "Aliases pointing here" list. Alias rows carry no images, so
-// the deletes run inline.
 func (s *Server) removeTagAliasesDelete(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
@@ -632,9 +590,7 @@ func (s *Server) deleteTagHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.active().InvalidateCaches()
-	// A deleted alias row changes its canonical's relation diff; the tag
-	// detail PTR panel re-fetches on this. An alias delete also confirms
-	// with a flash, matching the implication remove.
+	// tag-relations-changed makes the tag page's PTR panel refetch its diff.
 	if tag != nil && tag.IsAlias {
 		setFlashHeader(w, "Alias removed.", "ok", map[string]any{"tag-relations-changed": ""})
 	} else {
@@ -643,11 +599,6 @@ func (s *Server) deleteTagHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// deleteTagsSearchPost deletes every tag in scope - the checkbox
-// selection when ids are posted, else everything matching the posted
-// /tags filter. Mirrors the gallery's /internal/delete-search: resolve
-// the id set up front, kick off a background "tag" job, return 202
-// Accepted so the client surfaces progress via the job status bar.
 func (s *Server) deleteTagsSearchPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -655,9 +606,6 @@ func (s *Server) deleteTagsSearchPost(w http.ResponseWriter, r *http.Request) {
 	s.startTagScopeRun(w, r, s.runDeleteTagsByIDs)
 }
 
-// runDeleteTagsByIDs deletes the supplied tag ids one by one, reporting
-// progress through the job manager and honouring cancellation.
-// DeleteTag handles cascade and usage-count cleanup per row.
 func (s *Server) runDeleteTagsByIDs(ids []int64) {
 	deleted, skipped, reasons, cancelled := s.runTagScopeLoop(ids, "deleting tags…", 50, func(id int64) (bool, error) {
 		if err := s.tagSvc().DeleteTag(id); err != nil {
@@ -691,11 +639,8 @@ func (s *Server) renameTagPost(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// A tag rename moves it to a new literal-name match in the search
-	// resolver, so a cached `?q=oldname` snapshot must drop too.
+	// Cached id lists for ?q=oldname would outlive the rename.
 	s.active().InvalidateCaches()
-	// Refresh the current URL instead of redirecting to /tags so the
-	// user's active filter - q, sort, origin, page - survives the
-	// rename and the renamed row stays in scope.
+	// HX-Refresh, not a redirect: the listing keeps its filters.
 	hxDone(w, r, "Renamed to "+newName+".", "", "/tags")
 }

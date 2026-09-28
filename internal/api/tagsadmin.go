@@ -11,9 +11,8 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// toTagResponse projects a fully-joined models.Tag (the shape GetTag /
-// CreateAlias return, with category name + colour populated) into the
-// API's TagRow.
+// t must carry its category name and color, which GetTag fills and
+// GetOrCreateTag does not.
 func toTagResponse(t *models.Tag) tagResponse {
 	resp := tagResponse{
 		ID:         t.ID,
@@ -30,24 +29,18 @@ func toTagResponse(t *models.Tag) tagResponse {
 	return resp
 }
 
-// resolveCategoryID maps a category name to its id; an empty name
-// resolves to the built-in general category. The bool reports whether
-// the name named a real category.
 func resolveCategoryID(g Gallery, name string) (int64, bool, error) {
 	name = strings.TrimSpace(name)
 	name = cmp.Or(name, "general")
 	return tags.CategoryIDByName(g.DB, name)
 }
 
-// sentinelStatus maps one service sentinel to its API status/code pair.
 type sentinelStatus struct {
 	err    error
 	status int
 	code   string
 }
 
-// writeSentinelError walks the table and writes the first errors.Is match,
-// reporting whether one hit; the caller keeps its bespoke fallback.
 func writeSentinelError(w http.ResponseWriter, err error, table []sentinelStatus) bool {
 	for _, e := range table {
 		if errors.Is(err, e.err) {
@@ -58,12 +51,8 @@ func writeSentinelError(w http.ResponseWriter, err error, table []sentinelStatus
 	return false
 }
 
-// writeTagError maps tags-service errors to API status codes. Typed
-// sentinels resolve precisely; the remaining plain-text errors the
-// rename / alias / merge paths return are matched by phrase (the
-// service has no sentinel for them) so a collision reads as 409, a
-// missing target as 404, and a self-reference as 400 instead of a bare
-// 500.
+// The rename, alias and merge errors the service has no sentinel for
+// match by phrase.
 func writeTagError(w http.ResponseWriter, err error) {
 	if writeSentinelError(w, err, []sentinelStatus{
 		{tags.ErrTagNotFound, http.StatusNotFound, "not_found"},
@@ -90,9 +79,6 @@ func writeTagError(w http.ResponseWriter, err error) {
 	}
 }
 
-// createTag handles POST /api/v1/tags. Get-or-create against (name,
-// category); category defaults to general. Returns the tag either way -
-// a name already present in the category resolves to the existing row.
 func (h *Handler) createTag(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -130,9 +116,6 @@ func (h *Handler) createTag(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusCreated, toTagResponse(full))
 }
 
-// patchTag handles PATCH /api/v1/tags/{id}: rename and/or move to
-// another category. Both edits target the same row; rename is applied
-// first. At least one of name / category is required.
 func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
@@ -149,14 +132,9 @@ func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "name or category is required")
 		return
 	}
-	if body.Name != nil {
-		if err := g.TagSvc.RenameTag(id, *body.Name); err != nil {
-			writeTagError(w, err)
-			return
-		}
-	}
+	var catID int64
 	if body.Category != nil {
-		catID, found, cerr := resolveCategoryID(g, *body.Category)
+		cid, found, cerr := resolveCategoryID(g, *body.Category)
 		if serverError(w, cerr) {
 			return
 		}
@@ -164,6 +142,15 @@ func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusBadRequest, "invalid_request", "unknown category: "+*body.Category)
 			return
 		}
+		catID = cid
+	}
+	if body.Name != nil {
+		if err := g.TagSvc.RenameTag(id, *body.Name); err != nil {
+			writeTagError(w, err)
+			return
+		}
+	}
+	if body.Category != nil {
 		if err := g.TagSvc.ChangeTagCategory(id, catID); err != nil {
 			writeTagError(w, err)
 			return
@@ -178,9 +165,6 @@ func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, toTagResponse(full))
 }
 
-// deleteTag handles DELETE /api/v1/tags/{id}. Rating-category rows are
-// usage-stripped rather than removed (the catalog row stays), matching
-// the web behaviour; the response is 204 either way.
 func (h *Handler) deleteTag(w http.ResponseWriter, r *http.Request) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
@@ -194,9 +178,6 @@ func (h *Handler) deleteTag(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// createAlias handles POST /api/v1/tags/aliases: declare that name (in
-// category, default general) resolves to canonical_id. Returns the
-// alias row.
 func (h *Handler) createAlias(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -235,9 +216,6 @@ func (h *Handler) createAlias(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusCreated, toTagResponse(alias))
 }
 
-// mergeTags handles POST /api/v1/tags/merge: make alias_id an alias of
-// canonical_id, moving its image_tags onto the canonical. Returns the
-// canonical tag.
 func (h *Handler) mergeTags(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -274,8 +252,6 @@ type implicationJSON struct {
 	ImpliedCategory string `json:"implied_category"`
 }
 
-// listImplications handles GET /api/v1/tags/{id}/implications: the
-// direct edges declared from this parent.
 func (h *Handler) listImplications(w http.ResponseWriter, r *http.Request) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
@@ -301,13 +277,6 @@ func (h *Handler) listImplications(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, out)
 }
 
-// addImplication handles POST /api/v1/tags/{id}/implications. Body
-// carries an existing tag id as implied_id; both sides must be
-// canonical (non-alias) tags and the edge must not close a cycle.
-// Declaring the edge is synchronous and immediately governs future tag
-// adds; the historical fan-out across images already carrying the
-// parent (the web's background propagation job, scoped to the active
-// gallery) is not run from the API.
 func (h *Handler) addImplication(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -336,13 +305,9 @@ func (h *Handler) addImplication(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		return
 	}
-	// Edge already declared - idempotent no-op.
 	w.WriteHeader(http.StatusOK)
 }
 
-// removeImplication handles DELETE /api/v1/tags/{id}/implications/{impliedID}.
-// Drops the edge only; the image-side sweep of rows implied solely by
-// this edge is the web's background job and is not run from the API.
 func (h *Handler) removeImplication(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {

@@ -8,8 +8,6 @@ import (
 	"os"
 )
 
-// decodeJPEGEXIF reads a JPEG's EXIF block and decodes it. Returns nil
-// when the file carries no EXIF or the block does not decode.
 func decodeJPEGEXIF(path string) *exifData {
 	f, err := os.Open(path)
 	if err != nil {
@@ -27,9 +25,7 @@ func decodeJPEGEXIF(path string) *exifData {
 	return x
 }
 
-// jpegEXIF returns the TIFF payload of a JPEG's APP1 EXIF segment, or
-// nil when the file carries none. Segment lengths are uint16, so the
-// buffered read is bounded by the format itself.
+// Segment lengths are uint16, so each read is bounded by the format itself.
 func jpegEXIF(r io.Reader) []byte {
 	br := bufio.NewReader(r)
 	head := make([]byte, 2)
@@ -41,10 +37,8 @@ func jpegEXIF(r io.Reader) []byte {
 		if err != nil {
 			return nil
 		}
-		// SOS opens the entropy-coded data and EOI ends the file; EXIF
-		// always sits in an APP segment ahead of both. The standalone
-		// markers carry no length word, so skipping them keeps the
-		// segment walk aligned.
+		// EXIF sits in an APP segment before SOS (0xDA) and EOI (0xD9). TEM,
+		// SOI and RSTn carry no length word, so they are skipped alone.
 		switch {
 		case marker == 0xDA || marker == 0xD9:
 			return nil
@@ -69,9 +63,8 @@ func jpegEXIF(r io.Reader) []byte {
 	}
 }
 
-// nextJPEGMarker advances to the next marker byte, tolerating the 0xFF
-// fill bytes a segment may be padded with and the 0xFF00 stuffing that
-// stands for a literal 0xFF.
+// Tolerates 0xFF fill bytes and the 0xFF00 stuffing that stands for a
+// literal 0xFF.
 func nextJPEGMarker(br *bufio.Reader) (byte, error) {
 	for {
 		b, err := br.ReadByte()

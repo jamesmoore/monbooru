@@ -1,10 +1,6 @@
-// Package desktop resolves the per-OS locations and the one-time startup
-// behaviour the -desktop profile needs. It knows nothing about the app it
-// serves beyond the name it is handed, so both halves of the pair can use
-// the same shape without sharing a config.
-//
-// Copied into monloader, this package and internal/fsx/exedir.go with it,
-// and kept in step by hand; a fix here belongs there too.
+// Package desktop is the per-OS side of the -desktop profile. monloader
+// carries a copy, with internal/fsx/exedir.go, kept in step by hand: a fix
+// here belongs there too.
 package desktop
 
 import (
@@ -18,9 +14,6 @@ import (
 	"github.com/monbooru/monbooru/internal/fsx"
 )
 
-// Layout is where one app keeps its files under the desktop profile.
-// Portable records that the config came from beside the executable, which
-// also moves the data directory there.
 type Layout struct {
 	ConfigPath string
 	ConfigDir  string
@@ -29,12 +22,6 @@ type Layout struct {
 	Portable   bool
 }
 
-// Resolve builds the layout for app ("monbooru"). explicitConfig is the
-// -config value when the operator passed one and always wins, so the
-// container entrypoint and the healthcheck are unaffected by the profile.
-// Otherwise a config already sitting beside the executable is used in
-// place (portable mode: a folder on a stick that carries its own data),
-// and failing that the OS config directory, whose file Load then seeds.
 func Resolve(app, explicitConfig string) (Layout, error) {
 	data, err := dataHome(app)
 	if err != nil {
@@ -45,9 +32,8 @@ func Resolve(app, explicitConfig string) (Layout, error) {
 	case explicitConfig != "":
 		l.ConfigPath = explicitConfig
 	default:
-		// A file test, never a write attempt, so an executable in a
-		// read-only location does not try to seed one there. Skipped in a
-		// sandbox, whose directories are already private to the install.
+		// A file test, never a write attempt, so a read-only install
+		// folder is not seeded.
 		if !Sandboxed() {
 			if dir := InstallDir(); dir != "" {
 				if p := filepath.Join(dir, app+".toml"); fsx.IsFile(p) {
@@ -69,9 +55,8 @@ func Resolve(app, explicitConfig string) (Layout, error) {
 	return l, nil
 }
 
-// dataHome is the OS data directory for app. There is no stdlib
-// equivalent of os.UserConfigDir for it, so each platform is spelled out;
-// macOS does not separate the two, so its data lives under the config dir.
+// macOS does not separate data from config, so its data lives under the
+// config dir.
 func dataHome(app string) (string, error) {
 	switch runtime.GOOS {
 	case "windows":
@@ -94,9 +79,8 @@ func dataHome(app string) (string, error) {
 	return filepath.Join(dir, app, "data"), nil
 }
 
-// Program is the path that starts this install again. Inside an AppImage
-// the executable lives in a mount that is gone once the process exits, so
-// the file the user actually has is the AppImage itself.
+// Program is the AppImage itself when run from one: the executable's mount
+// is gone once it exits.
 func Program() string {
 	if p := os.Getenv("APPIMAGE"); p != "" {
 		return p
@@ -111,9 +95,8 @@ func Program() string {
 	return exe
 }
 
-// InstallDir is the folder portable mode reads its config from: the one
-// holding the AppImage, or the executable's own. Bundled tools stay behind
-// fsx.ExeDir, which has to keep pointing inside the mount.
+// InstallDir is not for bundled tools: fsx.ExeDir has to keep pointing
+// inside the AppImage mount.
 func InstallDir() string {
 	p := Program()
 	if p == "" {
@@ -122,8 +105,6 @@ func InstallDir() string {
 	return filepath.Dir(p)
 }
 
-// Sandboxed reports whether the process runs inside a Flatpak sandbox,
-// which redirects the XDG directories and makes portable mode meaningless.
 func Sandboxed() bool {
 	if os.Getenv("FLATPAK_ID") != "" {
 		return true
@@ -131,8 +112,6 @@ func Sandboxed() bool {
 	return fsx.IsFile("/.flatpak-info")
 }
 
-// PicturesDir is where a fresh install proposes to look for images.
-// Empty when nothing resolves, so the caller can fall back.
 func PicturesDir() string {
 	if runtime.GOOS == "windows" {
 		if home := os.Getenv("USERPROFILE"); home != "" {
@@ -150,9 +129,6 @@ func PicturesDir() string {
 	return filepath.Join(home, "Pictures")
 }
 
-// xdgUserDir reads one entry out of ~/.config/user-dirs.dirs, the file
-// xdg-user-dirs writes and every desktop honours for a localised or
-// relocated Pictures folder. Absent or unparseable reads as unset.
 func xdgUserDir(key, home string) string {
 	cfgDir, err := os.UserConfigDir()
 	if err != nil {
@@ -175,8 +151,8 @@ func xdgUserDir(key, home string) string {
 		if val == "" {
 			continue
 		}
-		// xdg-user-dirs writes the home directory itself for a folder the
-		// user disabled; taking it would point the seed at the whole home.
+		// xdg-user-dirs writes $HOME itself for a disabled folder; that
+		// must not become the gallery.
 		if val = filepath.Clean(val); val != home {
 			return val
 		}

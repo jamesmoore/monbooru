@@ -11,9 +11,6 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// Manifest is the launch declaration a dropped plugin folder carries in its
-// plugin.toml. The folder name is the plugin name; the manifest only says
-// how to run what is inside it.
 type Manifest struct {
 	Command        string   `toml:"command"`
 	Args           []string `toml:"args"`
@@ -21,8 +18,6 @@ type Manifest struct {
 	ArgsWindows    []string `toml:"args_windows"`
 }
 
-// launchFor picks the per-OS launch line: the windows overrides on Windows
-// when present, the plain keys everywhere else.
 func (m Manifest) launchFor(goos string) (string, []string) {
 	if goos == "windows" && m.CommandWindows != "" {
 		if m.ArgsWindows != nil {
@@ -33,11 +28,7 @@ func (m Manifest) launchFor(goos string) (string, []string) {
 	return m.Command, m.Args
 }
 
-// Discover scans dir for subfolders carrying a plugin.toml and returns the
-// launch line each declares. Nothing runs on discovery; the scan only feeds
-// the settings rows and the boot-start pass, which both gate on the
-// operator's choice. skip refuses a folder name the caller reserves, and
-// reports why for the log.
+// Discovery runs nothing: starting a plugin is the operator's choice.
 func Discover(dir string, skip func(name string) (string, bool)) []Launch {
 	if dir == "" {
 		return nil
@@ -81,8 +72,6 @@ func Discover(dir string, skip func(name string) (string, bool)) []Launch {
 	return out
 }
 
-// resolveCommand anchors a folder-relative launch line to its folder. A bare
-// name stays a PATH lookup; an absolute path is used as written.
 func resolveCommand(dir, command string) string {
 	if filepath.IsAbs(command) || !strings.ContainsAny(command, `/\`) {
 		return command

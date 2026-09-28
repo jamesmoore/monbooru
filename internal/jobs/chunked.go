@@ -5,11 +5,7 @@ import (
 	"fmt"
 )
 
-// Chunked runs op on consecutive chunks of ids, honoring ctx cancellation
-// between chunks and emitting Update progress with the noun template
-// ("deleting", "applying implication", ...). The returned processed count
-// is the number of ids reached when the loop exits (cancelled or
-// completed). cancelled is true when ctx tripped before the slice ran out.
+// Chunked checks ctx only between chunks, and a cancel is not an error.
 func Chunked(ctx context.Context, mgr *Manager, ids []int64, chunkSize int, noun string,
 	op func(chunk []int64) error,
 ) (processed int, cancelled bool, err error) {

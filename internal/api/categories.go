@@ -24,10 +24,8 @@ func toCategoryResponse(c models.TagCategory) categoryResponse {
 	return categoryResponse{ID: c.ID, Name: c.Name, Color: c.Color, IsBuiltin: c.IsBuiltin}
 }
 
-// writeCategoryError maps category-service errors to status codes. It
-// differs from writeTagError on ErrCategoryNotFound: editing a missing
-// category id is a 404 here, whereas referencing an unknown category
-// for a tag op is a 400.
+// ErrCategoryNotFound is a 404 here but a 400 for a tag op, where the
+// category is only referenced.
 func writeCategoryError(w http.ResponseWriter, err error) {
 	if writeSentinelError(w, err, []sentinelStatus{
 		{tags.ErrCategoryNotFound, http.StatusNotFound, "not_found"},
@@ -51,7 +49,6 @@ func writeCategoryError(w http.ResponseWriter, err error) {
 	apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
 }
 
-// getCategory reads one category row for the post-mutation response.
 func getCategory(g Gallery, id int64) (models.TagCategory, error) {
 	var c models.TagCategory
 	var isBuiltin int
@@ -65,7 +62,6 @@ func getCategory(g Gallery, id int64) (models.TagCategory, error) {
 	return c, err
 }
 
-// listCategories handles GET /api/v1/categories.
 func (h *Handler) listCategories(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -82,8 +78,6 @@ func (h *Handler) listCategories(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, out)
 }
 
-// createCategory handles POST /api/v1/categories. color defaults to the
-// neutral grey the web form uses when blank.
 func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
@@ -106,10 +100,8 @@ func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusCreated, toCategoryResponse(*cat))
 }
 
-// patchCategory handles PATCH /api/v1/categories/{id}: rename and/or
-// recolor. The colour format is validated before any write so a bad
-// colour can't leave a half-applied rename behind. Built-in categories
-// accept a recolor but refuse a rename.
+// The color is checked before the rename so a bad one can't leave a
+// half-applied edit.
 func (h *Handler) patchCategory(w http.ResponseWriter, r *http.Request) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
@@ -135,6 +127,7 @@ func (h *Handler) patchCategory(w http.ResponseWriter, r *http.Request) {
 			writeCategoryError(w, err)
 			return
 		}
+		g.invalidate()
 	}
 	if body.Color != nil {
 		if err := g.TagSvc.UpdateCategoryColor(id, strings.TrimSpace(*body.Color)); err != nil {
@@ -150,10 +143,6 @@ func (h *Handler) patchCategory(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, toCategoryResponse(cat))
 }
 
-// deleteCategory handles DELETE /api/v1/categories/{id}. action is
-// "move" (default; reparent the category's tags to target_id, or
-// general when target_id is omitted) or "delete_all" (drop the tags
-// too). Built-in categories cannot be deleted.
 func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
@@ -163,8 +152,7 @@ func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
 		Action   string `json:"action"`
 		TargetID int64  `json:"target_id"`
 	}
-	// An empty body is valid: it means the default move-to-general, so
-	// EOF is not an error - only malformed JSON is.
+	// An empty body is the default move to general.
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 		return
