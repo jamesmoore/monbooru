@@ -41,7 +41,7 @@
           <button type="button" class="btn-link-accent btn-copy-tags-preview"
                   data-group-id="{{.GroupID}}">[copy tags]</button>
           {{end}}
-          <form hx-post="/relations/duplicates/marked/delete-one" hx-swap="none"
+          <form hx-post="/relations/duplicates/marked/delete-one" hx-target="#flash-walker-marked" hx-swap="innerHTML"
                 hx-confirm="Delete image {{.DuplicateID}} from the gallery?"
                 data-confirm-danger="Its file is removed from disk. This cannot be undone."
                 data-confirm-ok="Delete" style="display:inline">

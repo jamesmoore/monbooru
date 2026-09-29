@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"net/http"
 	"slices"
 	"sort"
@@ -18,14 +19,8 @@ import (
 	"github.com/monbooru/monbooru/internal/relations"
 )
 
-// maxPhashDistance is the documented upper bound on the Find-pairs
-// Hamming distance.
 const maxPhashDistance = 12
 
-// findPairsDistance returns the operator-configured Find-pairs default
-// Hamming distance (saturating into the documented 0..maxPhashDistance
-// range). Reads through cfgMu so a Settings -> Relations save is
-// honoured on the next page render without a restart.
 func (s *Server) findPairsDistance() int {
 	s.cfgMu.Lock()
 	d := s.cfg.Relations.DefaultDistance
@@ -39,18 +34,12 @@ func (s *Server) findPairsDistance() int {
 	return d
 }
 
-// tagPairsEnabled reports whether the tag-similarity detector is on,
-// read through cfgMu like findPairsDistance so a settings save lands on
-// the next render.
 func (s *Server) tagPairsEnabled() bool {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 	return s.cfg.Relations.TagPairs
 }
 
-// applyRelationsConfig mirrors the operator's [relations] block onto
-// the relations package's runtime atomics. Called at boot and after
-// every settings edit so a TOML save propagates without restart.
 func applyRelationsConfig(rc config.RelationsConfig) {
 	d := rc.DefaultDistance
 	if d < 0 || d > maxPhashDistance {
@@ -60,11 +49,7 @@ func applyRelationsConfig(rc config.RelationsConfig) {
 	relations.IncrementalProbeEnabled.Store(rc.IncrementalOnIngest)
 }
 
-// settingsRelationsPost reads the form, persists to TOML, then
-// re-applies the atomics. IncrementalOnIngest stays true (the
-// on-ingest probe is always on). The tag-pairs switch is the
-// exception: it is opt-in by design, so off is a state the operator
-// keeps until they say otherwise.
+// The on-ingest probe has no switch: a save always turns it on.
 func (s *Server) settingsRelationsPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -80,8 +65,6 @@ func (s *Server) settingsRelationsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	threshold := config.DefaultTagPairThreshold
-	// The form speaks percent, matching the ~N% the session cards show;
-	// the config keeps the 0..1 fraction the scoring paths use.
 	if raw := r.FormValue("tag_pair_threshold"); raw != "" {
 		v, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
@@ -117,11 +100,8 @@ func (s *Server) settingsRelationsPost(w http.ResponseWriter, r *http.Request) {
 		d, order, tagPairs, threshold*100, pruned)
 }
 
-// pruneRelationQueues reconciles every gallery's pair queue with the
-// detector settings just saved. The [relations] block is app-wide while
-// each gallery owns its queue, so a queue left unpruned would keep
-// offering pairs the new settings reject until the operator switched to
-// it. Returns the number of rows dropped.
+// Every gallery, not only the active one: the settings are app-wide but
+// each gallery keeps its own queue.
 func (s *Server) pruneRelationQueues(ctx context.Context, rc config.RelationsConfig) int {
 	ctxs := s.allContexts()
 	opts := relations.FindPairsOptions{
@@ -144,20 +124,10 @@ func (s *Server) pruneRelationQueues(ctx context.Context, rc config.RelationsCon
 	return total
 }
 
-// relationsCounts is the cheap rollup the Relations page header
-// renders. Each query rides a covering index; the whole page header
-// builds in well under a millisecond on a 1M-image library. The
-// version / derivative counters are "chains" / "trees" rather than
-// "edges" so the number matches the card list /relations/browse
-// renders: the same `AnyTainted` whole-group filter that drops a card
-// also drops a chain / tree from the counter.
 type relationsCounts struct {
-	PhashMissing int
-	QueueOpen    int
-	QueueSkipped int
-	// QueueBySource splits the open queue by which detector filed each
-	// pair. Nil when one detector produced every row - the total
-	// already says everything there is to say.
+	PhashMissing    int
+	QueueOpen       int
+	QueueSkipped    int
 	QueueBySource   []queueSourceCount
 	DupGroups       int
 	AltGroups       int
@@ -166,14 +136,11 @@ type relationsCounts struct {
 	NotRelatedPairs int
 }
 
-// queueSourceCount is one bucket of the hub's by-detector breakdown.
 type queueSourceCount struct {
 	Label string
 	Count int
 }
 
-// queueSourceLabels names each stored source in operator language, in
-// the order the hub lists them.
 var queueSourceLabels = []struct{ source, label string }{
 	{relations.SourcePhash, "image similarity"},
 	{relations.SourceTags, "rare tag similarity"},
@@ -181,12 +148,6 @@ var queueSourceLabels = []struct{ source, label string }{
 	{relations.SourceReview, "reopened"},
 }
 
-// queueCounts runs the grouped scan behind the hub's three queue
-// numbers and returns the open / skipped totals plus the open rows'
-// non-empty by-detector buckets in label order. A single bucket means
-// one detector filed everything, and the breakdown would just restate
-// the total, so the split is nil. Errors degrade to zeroes - the page
-// still renders the rest.
 func queueCounts(cx *galleryCtx, ceiling *Ceiling) (open, skipped int, bySource []queueSourceCount) {
 	var rank *int
 	if r, active := ceiling.RankCeiling(); active {
@@ -209,41 +170,17 @@ func queueCounts(cx *galleryCtx, ceiling *Ceiling) (open, skipped int, bySource 
 	return open, skipped, bySource
 }
 
-// browseCard is one row of the unified /relations/browse page. Group
-// kinds (dup, alt) lift n members in a thumb strip; the version kind
-// lifts a chain of N images and the derivative kind lifts a tree of
-// N images, each rooted at the chain / tree's earliest ancestor; the
-// not_related kind rides a two-image pair plus a comparison table.
-// The template branches on .Kind.
 type browseCard struct {
-	Kind     string  // "duplicate" | "alternate" | "version" | "derivative" | "not_related"
-	GroupID  int64   // group id for group kinds; 0 for chain / tree / pair rows
-	Members  []int64 // group members in id order; for version chains root-to-leaf order; for derivative trees BFS order; for not_related [a, b]
-	Original int64   // dup-group original; 0 for the other kinds
-	// CreatedAt is the group / chain / tree / pair declaration date,
-	// formatted as "2006-01-02 15:04:05" to match the detail page. For
-	// chains and trees this is the newest edge's created_at so the
-	// card's "declared" time tracks the last extension.
-	CreatedAt string
-	// MemberIngestedAt is keyed by Members[i] and carries the same
-	// formatted ingest date the detail page shows for each image. The
-	// template renders it next to the image id.
+	Kind             string
+	GroupID          int64
+	Members          []int64
+	Original         int64
+	CreatedAt        string
 	MemberIngestedAt map[int64]string
-	// Generations groups Members by depth for the version (chain) kind
-	// so the template paints a left-to-right row of thumbs with one
-	// image per generation. Empty for kinds without a chain structure.
-	Generations [][]int64
-	// Graph lays the derivative component out for drawing. Empty for
-	// kinds without one.
-	Graph *derivGraph
-	// Roots names the sourceless images the graph descends from,
-	// ascending. Several when the component holds an image made from
-	// more than one source. Empty for kinds without a tree.
-	Roots []int64
+	Graph            *derivGraph
+	Roots            []int64
 }
 
-// relationsPage serves /relations: header counters and the per-section
-// CTAs. Per-group cards live on /relations/browse.
 func (s *Server) relationsPage(w http.ResponseWriter, r *http.Request) {
 	cx, ok := s.requireActive(w)
 	if !ok {
@@ -264,9 +201,6 @@ type relationsPageData struct {
 	ActiveGallery string
 }
 
-// browseGroupsRedirect 301s the v1.8 /relations/browse-groups URL to
-// the unified /relations/browse page. Keeps bookmarks alive without
-// dragging the old route into the handler set.
 func (s *Server) browseGroupsRedirect(w http.ResponseWriter, r *http.Request) {
 	target := "/relations/browse?kind=duplicate"
 	switch r.URL.Query().Get("kind") {
@@ -282,18 +216,8 @@ func (s *Server) browseGroupsRedirect(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, target, http.StatusMovedPermanently)
 }
 
-// loadRelationsCounts runs the seven small count queries the header
-// renders. Errors during the rollup degrade to a zero count on that
-// row - the page still renders the rest. Every counter is ceiling-
-// aware so the hub's numbers match what the operator can see and act
-// on under their current cookie: group counters drop a group when
-// any member is hidden, edge / pair counters drop a row when either
-// side is hidden, PhashMissing skips hidden rows. This keeps the
-// /relations hub consistent with /relations/browse, whose cards apply
-// the same filters.
-// skipKind names a relation kind whose count the caller will supply from
-// its own card walk, so the counter can skip an in-Go walk of the same
-// edge table. Empty counts everything.
+// The skipKind count (version or derivative) is left at zero for the
+// caller to fill from its own card walk.
 func loadRelationsCounts(cx *galleryCtx, ceiling *Ceiling, skipKind string) relationsCounts {
 	var c relationsCounts
 	get := func(q string, dst *int, args ...any) {
@@ -304,9 +228,6 @@ func loadRelationsCounts(cx *galleryCtx, ceiling *Ceiling, skipKind string) rela
 	if n, err := cx.PhashMissingUnder(ceiling); err == nil {
 		c.PhashMissing = n
 	}
-	// One grouped scan yields the open and skipped totals plus the
-	// by-detector split. The numbers match what a session will actually
-	// walk, because it is the same scan the session's own counts use.
 	c.QueueOpen, c.QueueSkipped, c.QueueBySource = queueCounts(cx, ceiling)
 	if where, args := ceiling.WhereGroupClean("dup_group_members", "dup_groups.id"); where != "" {
 		get(`SELECT COUNT(*) FROM dup_groups WHERE `+where, &c.DupGroups, args...)
@@ -340,22 +261,9 @@ func loadRelationsCounts(cx *galleryCtx, ceiling *Ceiling, skipKind string) rela
 	return c
 }
 
-// loadBrowseCardsByKind collects up to `limit` cards of one relation
-// kind in newest-first order. Group kinds (duplicate, alternate) lift
-// the full member list per row; edge kinds (version, derivative) and
-// the symmetric pair kind (not_related) emit a two-member slice in
-// canonical order. Cards whose members fall above the operator's
-// rating ceiling are filtered out via ceiling - an inactive ceiling
-// disables the filter. The returned kindTotal is the post-ceiling
-// count of chains / trees for version / derivative kinds (regardless
-// of limit) so the caller can drive the matching hub counter without
-// re-walking the edges; 0 for kinds the count helpers can query
-// directly from SQL.
+// The int is the version or derivative total past the ceiling and before
+// the limit; 0 for the other kinds.
 func loadBrowseCardsByKind(cx *galleryCtx, kind, sort string, limit, offset int, ceiling *Ceiling) ([]browseCard, int, error) {
-	// groupCardsWhere wraps Ceiling.WhereGroupClean for the two
-	// group-card scans: the underlying SQL is "AND <not-exists>" when
-	// the predicate is non-empty, plain `1=1` filler otherwise so the
-	// LIMIT placeholder ordering stays stable.
 	groupCardsWhere := func(membersTable, groupCol string) (string, []any) {
 		w, a := ceiling.WhereGroupClean(membersTable, groupCol)
 		if w == "" {
@@ -393,10 +301,7 @@ func loadBrowseCardsByKind(cx *galleryCtx, kind, sort string, limit, offset int,
 			return nil, 0, err
 		}
 	case "version":
-		// loadVersionChainCards always returns the full sorted set
-		// and its post-ceiling total. The annotate-then-sort order
-		// matters when sort=newest_member - that pass reads each
-		// member's ingested_at, populated by annotateBrowseCardIngestedAt.
+		// Annotated before the sort: newest_member reads the ingest dates.
 		chains, total, cErr := loadVersionChainCards(cx, 0, ceiling)
 		if cErr != nil {
 			return nil, 0, cErr
@@ -444,19 +349,11 @@ func loadBrowseCardsByKind(cx *galleryCtx, kind, sort string, limit, offset int,
 		return nil, 0, nil
 	}
 	if err := annotateBrowseCardIngestedAt(cx, cards); err != nil {
-		// Log but keep rendering: dates are nice-to-have, the rest of
-		// the card carries the operator's primary signal.
 		logx.Warnf("browse cards ingest-dates %s: %v", kind, err)
 	}
 	return cards, walkedTotal, nil
 }
 
-// dupSortClause maps the per-kind whitelist value to a static
-// ORDER BY tail. The sort value is already resolved through
-// resolveBrowseSort so it's safe to splice directly.
-// browseGroupKinds describes the two group-card kinds, which differ only in
-// their tables, their sort vocabulary and whether the group names an original.
-// The alternate select pads a zero so both scan the same three columns.
 var browseGroupKinds = map[string]struct {
 	groupTable   string
 	membersTable string
@@ -504,7 +401,6 @@ func sortVersionCards(cards []browseCard, sortKey string) {
 			return newest(cards[i]) > newest(cards[j])
 		})
 	}
-	// "recent" is the loader's default order; nothing to do.
 }
 
 func sortDerivativeCards(cards []browseCard, sortKey string) {
@@ -526,10 +422,6 @@ func sliceWindow(cards []browseCard, offset, limit int) []browseCard {
 	return cards[offset:end]
 }
 
-// annotateBrowseCardIngestedAt populates the per-card MemberIngestedAt
-// map with each member's images.ingested_at, formatted the same way
-// the detail page formats its dates. One bulk SELECT keeps the load
-// O(1) regardless of card / member count.
 func annotateBrowseCardIngestedAt(cx *galleryCtx, cards []browseCard) error {
 	if len(cards) == 0 {
 		return nil
@@ -576,10 +468,6 @@ func annotateBrowseCardIngestedAt(cx *galleryCtx, cards []browseCard) error {
 	return nil
 }
 
-// humanISOTime turns an ISO-8601 timestamp stored as TEXT in SQLite
-// ("2026-05-17T08:00:00Z") into the matter-of-fact "2026-05-17 08:00:00"
-// the rest of the app uses. Returns the input unchanged on a parse
-// failure so a freshly added column never blanks a card body.
 func humanISOTime(s string) string {
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
@@ -588,10 +476,6 @@ func humanISOTime(s string) string {
 	return t.In(time.Local).Format("2006-01-02 15:04:05")
 }
 
-// humanISODate is humanISOTime's date-only sibling: the table-cell
-// formatter on the comparison view drops the time so the cell stays
-// short. Falls back to the substring split on a parse failure so the
-// stored timestamp still renders something sensible.
 func humanISODate(s string) string {
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
@@ -603,17 +487,12 @@ func humanISODate(s string) string {
 	return t.In(time.Local).Format("2006-01-02")
 }
 
-// sortedRootsDesc returns the keys of rootSet sorted by id descending,
-// so the newest root sorts first.
 func sortedRootsDesc(rootSet map[int64]bool) []int64 {
 	roots := slices.Sorted(maps.Keys(rootSet))
 	slices.Reverse(roots)
 	return roots
 }
 
-// finalizeCards orders cards by CreatedAt descending (newest first) and
-// trims to limit when positive, returning the trimmed slice and the
-// pre-trim total.
 func finalizeCards(cards []browseCard, limit int) ([]browseCard, int) {
 	total := len(cards)
 	sort.SliceStable(cards, func(i, j int) bool {
@@ -625,17 +504,8 @@ func finalizeCards(cards []browseCard, limit int) ([]browseCard, int) {
 	return cards, total
 }
 
-// loadVersionChainCards reads every version_edge into memory, walks
-// each chain from its root (a parent with no incoming edge) down to
-// its leaf, and emits one card per chain. The flat Members slice is
-// root-to-leaf so per-member ingest dates key into it; Generations is
-// the same image ids regrouped one-per-depth so the template can
-// render each generation as a row separated by a down-arrow. Chains
-// whose member set carries any tag above the ceiling are dropped
-// whole so a ceiling-hidden image never surfaces a sibling. The
-// returned total counts every surviving chain regardless of limit so
-// the caller can drive the matching counter without re-walking the
-// edges.
+// A chain with any member above the ceiling is dropped whole, so a hidden
+// image's relations never show.
 func loadVersionChainCards(cx *galleryCtx, limit int, ceiling *Ceiling) ([]browseCard, int, error) {
 	rows, err := cx.DB.Read.Query(`SELECT child_image_id, parent_image_id, created_at FROM version_edges`)
 	if err != nil {
@@ -646,8 +516,8 @@ func loadVersionChainCards(cx *galleryCtx, limit int, ceiling *Ceiling) ([]brows
 		parent    int64
 		createdAt string
 	}
-	edges := map[int64]edgeMeta{} // child -> {parent, createdAt}
-	childOf := map[int64]int64{}  // parent -> child (UNIQUE per schema)
+	edges := map[int64]edgeMeta{}
+	childOf := map[int64]int64{} // parent -> child (UNIQUE per schema)
 	for rows.Next() {
 		var c, p int64
 		var ts string
@@ -670,7 +540,6 @@ func loadVersionChainCards(cx *galleryCtx, limit int, ceiling *Ceiling) ([]brows
 	cards := make([]browseCard, 0, len(roots))
 	for _, root := range roots {
 		members := []int64{root}
-		generations := [][]int64{{root}}
 		latestTS := ""
 		cur := root
 		for {
@@ -679,7 +548,6 @@ func loadVersionChainCards(cx *galleryCtx, limit int, ceiling *Ceiling) ([]brows
 				break
 			}
 			members = append(members, next)
-			generations = append(generations, []int64{next})
 			if em, ok := edges[next]; ok && em.createdAt > latestTS {
 				latestTS = em.createdAt
 			}
@@ -689,39 +557,26 @@ func loadVersionChainCards(cx *galleryCtx, limit int, ceiling *Ceiling) ([]brows
 			continue
 		}
 		cards = append(cards, browseCard{
-			Kind:        "version",
-			Members:     members,
-			Generations: generations,
-			CreatedAt:   humanISOTime(latestTS),
+			Kind:      "version",
+			Members:   members,
+			CreatedAt: humanISOTime(latestTS),
 		})
 	}
-	// Order by the newest edge in each chain so freshly declared chains
-	// land at the top.
 	cards, total := finalizeCards(cards, limit)
 	return cards, total, nil
 }
 
-// loadDerivativeTreeCards is the derivative-edge analogue of
-// loadVersionChainCards. One card per connected component: an image
-// made from several sources joins their trees, so a component can have
-// several roots. Each root gets a depth-first walk (root first, then
-// each subtree before its next sibling) so the template can indent
-// each row by its depth and the branching is visible at a glance; a
-// node reached again through a second source emits a Repeat row rather
-// than a second copy of its subtree. Members keeps the DFS order of
-// first visits so per-member metadata maps key against it. Returns the
-// total card count (every surviving component, regardless of limit) so
-// the caller can drive the matching counter without re-walking the
-// edges.
+// One card per component, which has several roots when an image was made
+// from several sources.
 func loadDerivativeTreeCards(cx *galleryCtx, limit int, ceiling *Ceiling) ([]browseCard, int, error) {
 	rows, err := cx.DB.Read.Query(`SELECT derivative_image_id, source_image_id, created_at FROM derivative_edges`)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer func() { _ = rows.Close() }()
-	derivativesOf := map[int64][]int64{} // source -> derivatives (sorted by id ASC)
-	sourcesOf := map[int64][]int64{}     // derivative -> sources
-	derivCreated := map[int64]string{}   // derivative -> newest incoming edge's created_at
+	derivativesOf := map[int64][]int64{}
+	sourcesOf := map[int64][]int64{}
+	derivCreated := map[int64]string{}
 	for rows.Next() {
 		var d, src int64
 		var ts string
@@ -780,22 +635,14 @@ func loadDerivativeTreeCards(cx *galleryCtx, limit int, ceiling *Ceiling) ([]bro
 	return cards, total, nil
 }
 
-// The horizontal geometry the derivative graph is drawn on. Coordinates are
-// per-mille of the graph's own width rather than pixels, so the drawing
-// follows whatever width the card gives it: the CSS splits every row into
-// the same number of equal columns and the wires land on their centres at
-// any size. Row height is deliberately not among them - the wires live in
-// bands of their own between the rows, so a cell can be as tall as its
-// actions need.
+// X coordinates are per-mille of the graph's width, not pixels, so the
+// wires follow the CSS columns at any card width.
 const (
 	derivSpanX = 1000
-	// derivBandH matches .deriv-band's height; the wires are drawn in it.
+	// Must match .deriv-band's height in main.css.
 	derivBandH = 44
 )
 
-// derivNode is one image in the drawn graph: where it sits, and which
-// images it was made from - the template hangs one action per incoming
-// edge off the node that receives it.
 type derivNode struct {
 	ID      int64
 	Row     int
@@ -803,39 +650,19 @@ type derivNode struct {
 	Sources []int64
 }
 
-// derivSeg is one edge's crossing of one band, from an x on the band's top
-// edge to an x on its bottom edge. An edge spanning several rows is drawn
-// as one segment per band it crosses, so the line stays continuous without
-// the layout knowing how tall any row rendered. From / To name the edge the
-// segment belongs to, which is what pairs a wire with the action that would
-// cut it.
 type derivSeg struct {
 	X1, X2   int
 	From, To int64
 }
 
-// derivGraph is a whole derivative component laid out for drawing: rows of
-// cells with a band of wires between each pair, so an image made from three
-// sources is three lines converging on it rather than one branch and two
-// back-references.
 type derivGraph struct {
 	Rows  [][]derivNode
 	Bands [][]derivSeg
-	// Cols is the widest row, which the CSS divides the graph into so a
-	// node's column is the same fraction of the width the wires assume.
-	Cols int
-	// Width and BandH are the wires' own coordinate space, carried here so
-	// it is not spelled again in the templates.
+	Cols  int
 	Width int
 	BandH int
 }
 
-// layOutDerivatives assigns every member a row and a column and cuts the
-// edges into per-band segments. A node's row is one past the deepest of its
-// sources (longest-path layering), which is what puts every edge on a
-// downward line: the graph is acyclic and capped at MaxVersionChainDepth,
-// so the walk settles. Columns are id order within a row, so a render is
-// stable.
 func layOutDerivatives(members []int64, sourcesOf map[int64][]int64) *derivGraph {
 	if len(members) == 0 {
 		return nil
@@ -844,8 +671,7 @@ func layOutDerivatives(members []int64, sourcesOf map[int64][]int64) *derivGraph
 	for _, id := range members {
 		row[id] = 0
 	}
-	// Repeat until nothing moves: a node's row depends on its sources',
-	// and members are not in dependency order.
+	// Repeated until nothing moves: members are not in dependency order.
 	for pass := 0; pass <= relations.MaxVersionChainDepth; pass++ {
 		moved := false
 		for _, id := range members {
@@ -876,11 +702,8 @@ func layOutDerivatives(members []int64, sourcesOf map[int64][]int64) *derivGraph
 	g := &derivGraph{Rows: make([][]derivNode, depth+1), Bands: make([][]derivSeg, depth), BandH: derivBandH}
 	col := make(map[int64]int, len(members))
 	widest := 0
-	// Rows are ordered top down, so every source already has its column
-	// when the row below it is placed: a node sits over the average of the
-	// images it was made from, which is what keeps the lines from crossing
-	// each other on the way down. Ties and sourceless rows fall back to id
-	// order, so a render is stable.
+	// Top down, so every source already has its column when parentMean
+	// reads it.
 	for r := 0; r <= depth; r++ {
 		ids := byRow[r]
 		slices.Sort(ids)
@@ -900,10 +723,8 @@ func layOutDerivatives(members []int64, sourcesOf map[int64][]int64) *derivGraph
 	}
 	g.Cols, g.Width = widest, derivSpanX
 
-	// The centre of a node's column, in per-mille of the graph. A shorter
-	// row is centred under the widest one, the way the CSS centres it, so a
-	// fan-in reads as one shape; the half-column that centring can leave
-	// over is why the numerator counts half-columns.
+	// Counted in half-columns: a shorter row is centred under the widest,
+	// as the CSS does, which can leave half a column over.
 	centreX := func(id int64) int {
 		halves := widest - len(g.Rows[row[id]]) + 2*col[id] + 1
 		return halves * derivSpanX / (2 * widest)
@@ -928,8 +749,6 @@ func layOutDerivatives(members []int64, sourcesOf map[int64][]int64) *derivGraph
 	return g
 }
 
-// parentMean is the average column of the images a node was made from, the
-// position it would sit at with nothing else in the way.
 func parentMean(id int64, sourcesOf map[int64][]int64, col map[int64]int) float64 {
 	sum, n := 0, 0
 	for _, src := range sourcesOf[id] {
@@ -944,8 +763,6 @@ func parentMean(id int64, sourcesOf map[int64][]int64, col map[int64]int) float6
 	return float64(sum) / float64(n)
 }
 
-// componentMembers lists every image reachable from the component's roots,
-// ascending, which is the set a card counts and the ceiling filters.
 func componentMembers(roots []int64, derivativesOf, sourcesOf map[int64][]int64) []int64 {
 	seen := map[int64]bool{}
 	var queue []int64
@@ -967,10 +784,6 @@ func componentMembers(roots []int64, derivativesOf, sourcesOf map[int64][]int64)
 	return queue
 }
 
-// componentRoots returns every sourceless image joined to start by
-// derivative edges in either direction, ascending, so the walk that
-// renders the component draws a multi-source node under its
-// lowest-numbered source.
 func componentRoots(start int64, derivativesOf, sourcesOf map[int64][]int64) []int64 {
 	seen := map[int64]bool{start: true}
 	queue := []int64{start}
@@ -991,15 +804,10 @@ func componentRoots(start int64, derivativesOf, sourcesOf map[int64][]int64) []i
 	return roots
 }
 
-// scanGroupMembers returns every image_id belonging to the named
-// group in id order. Reused across dup_group_members and
-// alt_group_members.
 func scanGroupMembers(cx *galleryCtx, table string, groupID int64) ([]int64, error) {
 	return db.QueryIDs(cx.DB.Read, `SELECT image_id FROM `+table+` WHERE group_id = ? ORDER BY image_id`, groupID)
 }
 
-// validBrowseKinds is the closed vocabulary the /relations/browse page
-// accepts as the ?kind= query parameter.
 var validBrowseKinds = map[string]bool{
 	"duplicate":   true,
 	"alternate":   true,
@@ -1008,10 +816,7 @@ var validBrowseKinds = map[string]bool{
 	"not_related": true,
 }
 
-// browseSortsByKind whitelists the ?sort= values each kind tab accepts.
-// The first entry in every slice is the default; anything off the list
-// silently collapses to that default so a typo never executes against
-// an interpolated SQL fragment.
+// The first entry is each kind's default.
 var browseSortsByKind = map[string][]string{
 	"duplicate":   {"recent", "size", "original_added"},
 	"alternate":   {"recent", "size"},
@@ -1033,16 +838,8 @@ func resolveBrowseSort(kind, requested string) string {
 	return allowed[0]
 }
 
-// browseRelationsPageSize caps each /relations/browse page; matches
-// /tags's 100-row cap shape but tuned smaller because each card lifts
-// a thumb strip whose vertical footprint is far denser.
 const browseRelationsPageSize = 60
 
-// browseRelationsPage renders /relations/browse with one tab per
-// relation kind. The card layout adapts per kind: group cards lift a
-// thumb strip plus dissolve / merge controls; edge cards render two
-// thumbs with a directional arrow plus reverse / unlink; not-related
-// rows render two thumbs plus unlink.
 func (s *Server) browseRelationsPage(w http.ResponseWriter, r *http.Request) {
 	cx, ok := s.requireActive(w)
 	if !ok {
@@ -1062,14 +859,12 @@ func (s *Server) browseRelationsPage(w http.ResponseWriter, r *http.Request) {
 	if page < 1 {
 		page = 1
 	}
+	// Past this the offset wraps negative and slices out of range.
+	page = min(page, math.MaxInt/browseRelationsPageSize)
 	sort := resolveBrowseSort(kind, r.URL.Query().Get("sort"))
 	ceiling := resolveCeiling(r, cx)
-	// The version and derivative loaders walk their whole edge table in
-	// Go and hand back its post-ceiling total, so the counter skips the
-	// active kind and takes the number from the card walk instead of
-	// repeating it. That means the cards load before the page clamp; an
-	// out-of-range page only pays a second slice on the htmx path, since
-	// a full request redirects out of here first.
+	// A version or derivative count comes from the card walk, so the cards
+	// load before the page clamp and an out-of-range htmx page loads twice.
 	counts := loadRelationsCounts(cx, ceiling, kind)
 	offset := (page - 1) * browseRelationsPageSize
 	cards, walkedTotal, err := loadBrowseCardsByKind(cx, kind, sort, browseRelationsPageSize, offset, ceiling)
@@ -1092,8 +887,6 @@ func (s *Server) browseRelationsPage(w http.ResponseWriter, r *http.Request) {
 	if page > totalPages {
 		page = totalPages
 	}
-	// Sync the address bar when an out-of-range ?page= was clamped, mirroring
-	// the gallery; otherwise a bookmarked deep page sticks in the URL.
 	if requested != 0 && requested != page {
 		clampedQ := r.URL.Query()
 		clampedQ.Set("page", strconv.Itoa(page))
@@ -1126,7 +919,6 @@ func (s *Server) browseRelationsPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// kindTotal returns the per-kind count from a relationsCounts bundle.
 func kindTotal(c relationsCounts, kind string) int {
 	switch kind {
 	case "duplicate":

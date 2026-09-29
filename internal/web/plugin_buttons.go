@@ -10,10 +10,6 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 )
 
-// pluginButtonView is one rendered button. Href is the substituted target of
-// an open-mode link; Index locates a relay button in its peer's block. Off
-// marks a button whose peer is paired but paused or unreachable: it renders
-// inert rather than vanishing, so a pause reads as a pause.
 type pluginButtonView struct {
 	Label string
 	Mode  string
@@ -23,26 +19,19 @@ type pluginButtonView struct {
 	Why   string
 }
 
-// pluginGroup is one peer's buttons in a slot, under its name.
 type pluginGroup struct {
 	Peer    string
 	Buttons []pluginButtonView
 }
 
-// pluginSlotView is what a mount point renders: the peer groups plus the
-// image a relay click there acts on (0 on the gallery, where the scope is the
-// live selection instead).
+// ImageID is 0 on the gallery, where a relay acts on the live selection.
 type pluginSlotView struct {
 	ImageID int64
 	Groups  []pluginGroup
 }
 
-// Any reports whether the surface has something to render. A slot with no
-// buttons is absent entirely, like the monloader-gated surfaces.
 func (v pluginSlotView) Any() bool { return len(v.Groups) > 0 }
 
-// AnyOpen reports whether any button here opens a page, so a surface of
-// relay buttons carries no pop-in it would never show.
 func (v pluginSlotView) AnyOpen() bool {
 	for _, g := range v.Groups {
 		if slices.ContainsFunc(g.Buttons, func(b pluginButtonView) bool { return b.Mode == config.ModeOpen }) {
@@ -52,20 +41,14 @@ func (v pluginSlotView) AnyOpen() bool {
 	return false
 }
 
-// pluginSlot collects the buttons every paired peer declared for a slot,
-// grouped by peer in name order and declaration order within a peer. A peer
-// that is paused or unreachable still contributes its group, inert; one with
-// no address to reach contributes nothing, since there is no pairing to
-// resume. fileType is the medium the surface holds, empty where it holds
-// several (the gallery).
 func (s *Server) pluginSlot(r *http.Request, slot string, imageID int64, fileType string) pluginSlotView {
 	peers := s.plugins()
 	slices.SortFunc(peers, func(a, b config.PluginConfig) int { return strings.Compare(a.Name, b.Name) })
 	back, gallery := s.pageURL(r), s.activeGallery()
 	view := pluginSlotView{ImageID: imageID}
 	for _, p := range peers {
-		// pluginAddress rather than pluginBase: the latter reports a paused
-		// peer as unreachable, which is the state that should render inert.
+		// pluginAddress, not pluginBase: a paused peer renders inert
+		// rather than vanishing, so a pause reads as a pause.
 		if s.pluginAddress(p) == "" {
 			continue
 		}
@@ -83,9 +66,8 @@ func (s *Server) pluginSlot(r *http.Request, slot string, imageID int64, fileTyp
 				v.Why = p.Name + " is " + pluginOffState(p)
 			}
 			if b.Mode == config.ModeOpen {
-				// A peer's own pages ride monbooru's mount, not the address
-				// it pairs on: that one answers from the server, not from
-				// the browser (pluginMount).
+				// Through monbooru's mount, not the paired address: that
+				// one is reachable from the server, not the browser.
 				v.Href = substitutePluginVars(pluginMountBase(p.Name)+b.Path, imageID, gallery, back)
 			}
 			g.Buttons = append(g.Buttons, v)
@@ -97,8 +79,6 @@ func (s *Server) pluginSlot(r *http.Request, slot string, imageID int64, fileTyp
 	return view
 }
 
-// substitutePluginVars fills an open-mode target's variables, escaped so a
-// gallery name or a back url with reserved characters survives the trip.
 func substitutePluginVars(target string, imageID int64, gallery, backURL string) string {
 	return strings.NewReplacer(
 		"{image_id}", url.QueryEscape(strconv.FormatInt(imageID, 10)),
@@ -107,10 +87,8 @@ func substitutePluginVars(target string, imageID int64, gallery, backURL string)
 	).Replace(target)
 }
 
-// pageURL is the absolute address of the page being rendered, for {back_url}.
-// The host is the one the browser actually reached monbooru on, since
-// server.base_url defaults to localhost and would send a LAN browser nowhere;
-// only the scheme comes from the configured base.
+// The host is the one the browser reached: base_url defaults to
+// localhost, which sends a LAN browser nowhere.
 func (s *Server) pageURL(r *http.Request) string {
 	scheme := "http"
 	s.cfgMu.RLock()

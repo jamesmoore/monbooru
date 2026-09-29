@@ -2,7 +2,9 @@ package gallery
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,11 +24,8 @@ var (
 	ffprobePath string
 )
 
-// resolveTools finds ffmpeg and ffprobe once, as absolute paths. A copy
-// shipped beside the executable wins over one on PATH: that rung is the
-// whole reason a downloaded bundle works, where nothing sets anything up
-// before the process starts. Inside a container or a sandbox the tools are
-// on PATH anyway, so it is harmless there rather than load bearing.
+// A copy beside the executable wins over PATH: a downloaded bundle has
+// nothing else to find.
 func resolveTools() {
 	toolsOnce.Do(func() {
 		ffmpegPath = resolveTool("ffmpeg")
@@ -50,9 +49,8 @@ func resolveTool(name string) string {
 	return ""
 }
 
-// runnable rejects a file that is there but cannot be executed - a tarball
-// unpacked without the mode bits - so it does not shadow a working copy on
-// PATH.
+// A copy without exec bits, unpacked from a tarball that dropped the
+// modes, must not shadow a working one on PATH.
 func runnable(path string) bool {
 	fi, err := os.Stat(path)
 	if err != nil || fi.IsDir() {
@@ -61,14 +59,10 @@ func runnable(path string) bool {
 	return runtime.GOOS == "windows" || fi.Mode()&0o111 != 0
 }
 
-// ffmpegTimeout caps any single ffmpeg/ffprobe run. The per-file size cap
-// bounds bytes, not decode time, so a truncated or pathological-but-small
-// media file could otherwise wedge the ingest/thumbnail goroutine (and its
-// held write transaction) until killed by hand.
+// The size cap bounds bytes, not decode time: a small pathological file
+// could otherwise wedge an ingest until killed by hand.
 const ffmpegTimeout = 60 * time.Second
 
-// runFFmpeg executes ffmpeg/ffprobe under ffmpegTimeout. A timeout surfaces
-// as a normal command error, which every caller already turns into a skip.
 func runFFmpeg(combinedOutput bool, name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ffmpegTimeout)
 	defer cancel()
@@ -80,24 +74,22 @@ func runFFmpeg(combinedOutput bool, name string, args ...string) ([]byte, error)
 	return cmd.Output()
 }
 
-// ffmpegAvailable reports whether an ffmpeg was resolved (cached).
 func ffmpegAvailable() bool {
 	resolveTools()
 	return ffmpegPath != ""
 }
 
-// ffprobeAvailable is the same for the probe half. The two are shipped
-// together but nothing guarantees both are present.
+// FFmpegAvailable exists for other packages' tests.
+func FFmpegAvailable() bool { return ffmpegAvailable() }
+
+// Shipped with ffmpeg, but nothing guarantees both are present.
 func ffprobeAvailable() bool {
 	resolveTools()
 	return ffprobePath != ""
 }
 
-// runFFmpegToFile runs one ffmpeg encode into a temp file next to dstPath
-// and renames it over on success. args receives the temp path and returns
-// the full argument list; every caller ends its list with `--` + the temp
-// path so a name beginning with `-` stays a positional output. label names
-// the step in the error.
+// args must end with "--" and the temp path, so a name starting with "-"
+// stays an output.
 func runFFmpegToFile(dstPath, tmpPattern, label string, args func(tmp string) []string) error {
 	if !ffmpegAvailable() {
 		return fmt.Errorf("ffmpeg not available")
@@ -112,20 +104,23 @@ func runFFmpegToFile(dstPath, tmpPattern, label string, args func(tmp string) []
 	if out, err := runFFmpeg(true, ffmpegPath, args(tmpName)...); err != nil {
 		return fmt.Errorf("ffmpeg %s: %w\n%s", label, err, string(out))
 	}
+	if wroteNothing(tmpName) {
+		return fmt.Errorf("ffmpeg %s wrote nothing", label)
+	}
 	return os.Rename(tmpName, dstPath)
 }
 
-// NormalizeImage re-encodes srcPath in place to a baseline JPEG via
-// ffmpeg. Some CDN image resizers emit JPEGs with a luma/chroma
-// subsampling ratio Go's image/jpeg refuses ("unsupported JPEG
-// feature"); ffmpeg decodes them, and the re-encode lands a file the
-// stdlib decode path - dimension probe, thumbnail, phash - can read.
-// The caller passes only a freshly uploaded file it owns, so no
-// operator file on disk is rewritten. Returns an error when ffmpeg is
-// absent or the re-encode fails, leaving the original in place.
+// A seek past a video track's last frame exits 0 having written nothing.
+func wroteNothing(path string) bool {
+	fi, err := os.Stat(path)
+	return err != nil || fi.Size() == 0
+}
+
+// NormalizeImage rewrites srcPath in place, so it is only for a file the
+// caller owns. It rescues JPEGs whose subsampling Go's image/jpeg
+// refuses, as some CDN resizers emit.
 func NormalizeImage(srcPath string) error {
-	// `-update 1` writes a single still image rather than a numbered
-	// sequence.
+	// -update 1: one still image, not a numbered sequence.
 	return runFFmpegToFile(srcPath, ".normalize.*.jpg", "normalize", func(tmp string) []string {
 		return []string{
 			"-y",
@@ -139,10 +134,40 @@ func NormalizeImage(srcPath string) error {
 	})
 }
 
-// tenPercentOffset is the -ss value both video renditions seek to, as
-// ffmpeg wants it. One place so the thumbnail and the hover preview agree
-// by construction rather than by having been written the same way twice; a
-// duration ffprobe would not give seeks to the start.
+// ffmpeg picks the encoder from the extension, so the temp file takes
+// dstPath's.
+func renderStill(srcPath, dstPath string, maxDim int) error {
+	return runFFmpegToFile(dstPath, ".still.*"+filepath.Ext(dstPath), "still", func(tmp string) []string {
+		// The first decode error ends the run: on a truncated JPEG XL, ffmpeg's
+		// libjxl decoder repeats its error forever instead of stopping.
+		args := []string{"-y", "-xerror", "-i", srcPath, "-update", "1", "-frames:v", "1"}
+		if maxDim > 0 {
+			args = append(args, "-vf", fmt.Sprintf(
+				"scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease", maxDim, maxDim))
+		}
+		if filepath.Ext(dstPath) == ".webp" {
+			return append(args, "-c:v", "libwebp", "-lossless", "1", "--", tmp)
+		}
+		return append(args, "-q:v", "2", "--", tmp)
+	})
+}
+
+// RenderStillFrame renders an AVIF or JPEG XL to a lossless WebP in dir
+// for a Go decode, which keeps a JPEG XL's alpha (the shipped ffmpeg has
+// no PNG encoder); the caller removes it.
+func RenderStillFrame(srcPath, dir string) (string, error) {
+	tmp, err := os.CreateTemp(dir, ".still-frame.*.webp")
+	if err != nil {
+		return "", fmt.Errorf("creating temp frame file: %w", err)
+	}
+	_ = tmp.Close()
+	if err := renderStill(srcPath, tmp.Name(), ViewMaxDim); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	return tmp.Name(), nil
+}
+
 func tenPercentOffset(srcPath string) string {
 	duration, err := probeDuration(srcPath)
 	if err != nil || duration <= 0 {
@@ -151,44 +176,52 @@ func tenPercentOffset(srcPath string) string {
 	return strconv.FormatFloat(duration*0.10, 'f', 3, 64)
 }
 
-// generateVideoThumb extracts a frame at ~10% of the video's duration.
+// The video track can end before 10% of the container's length, so a
+// render that fails there is tried again from the start.
+func fromTenPercent(srcPath string, render func(offset string) error) error {
+	offset := tenPercentOffset(srcPath)
+	err := render(offset)
+	if err != nil && offset != "0.000" {
+		err = render("0")
+	}
+	return err
+}
+
 func generateVideoThumb(srcPath, dstPath string) error {
-	offsetStr := tenPercentOffset(srcPath)
-	return runFFmpegToFile(dstPath, ".vthumb.*.jpg", "thumbnail", func(tmp string) []string {
-		return []string{
-			"-y",
-			"-ss", offsetStr,
-			"-i", srcPath,
-			"-frames:v", "1",
-			"-vf", fmt.Sprintf("scale=%d:-1", thumbMaxDim),
-			"-q:v", "2",
-			"--",
-			tmp,
-		}
+	return fromTenPercent(srcPath, func(offset string) error {
+		return runFFmpegToFile(dstPath, ".vthumb.*.jpg", "thumbnail", func(tmp string) []string {
+			return []string{
+				"-y",
+				"-ss", offset,
+				"-i", srcPath,
+				"-frames:v", "1",
+				"-vf", fmt.Sprintf("scale=%d:-1", thumbMaxDim),
+				"-q:v", "2",
+				"--",
+				tmp,
+			}
+		})
 	})
 }
 
-// generateVideoHover writes a ~4-second animated WebP hover preview.
 func generateVideoHover(srcPath, dstPath string) error {
-	offsetStr := tenPercentOffset(srcPath)
-	return runFFmpegToFile(dstPath, ".vhover.*.webp", "hover", func(tmp string) []string {
-		return []string{
-			"-y",
-			"-ss", offsetStr,
-			"-t", "4",
-			"-i", srcPath,
-			"-vf", fmt.Sprintf("scale=%d:-1", thumbMaxDim),
-			"-an",        // no audio
-			"-loop", "0", // infinite loop
-			"--",
-			tmp,
-		}
+	return fromTenPercent(srcPath, func(offset string) error {
+		return runFFmpegToFile(dstPath, ".vhover.*.webp", "hover", func(tmp string) []string {
+			return []string{
+				"-y",
+				"-ss", offset,
+				"-t", "4",
+				"-i", srcPath,
+				"-vf", fmt.Sprintf("scale=%d:-1", thumbMaxDim),
+				"-an",
+				"-loop", "0", // infinite loop
+				"--",
+				tmp,
+			}
+		})
 	})
 }
 
-// generateGIFHover converts an animated GIF into a scaled WebP preview.
-// Silently skipped without ffmpeg; the static first-frame thumbnail
-// stays in place.
 func generateGIFHover(srcPath, dstPath string) error {
 	return runFFmpegToFile(dstPath, ".ghover.*.webp", "gif hover", func(tmp string) []string {
 		return []string{
@@ -202,9 +235,8 @@ func generateGIFHover(srcPath, dstPath string) error {
 	})
 }
 
-// ExtractVideoFrames writes one JPEG per relative offset (0.0..1.0) from
-// the video into tmpDir. Frames whose extraction fails are skipped, so a
-// shorter-than-requested return slice means partial success.
+// ExtractVideoFrames takes offsets as fractions of the duration and skips
+// a frame that fails, so a short result is a partial success.
 func ExtractVideoFrames(srcPath, tmpDir string, positions []float64) ([]string, error) {
 	if !ffmpegAvailable() {
 		return nil, fmt.Errorf("ffmpeg not available")
@@ -230,7 +262,7 @@ func ExtractVideoFrames(srcPath, tmpDir string, positions []float64) ([]string, 
 			"--",
 			tmp.Name(),
 		}
-		if _, err := runFFmpeg(true, ffmpegPath, args...); err != nil {
+		if _, err := runFFmpeg(true, ffmpegPath, args...); err != nil || wroteNothing(tmp.Name()) {
 			_ = os.Remove(tmp.Name())
 			continue
 		}
@@ -239,13 +271,9 @@ func ExtractVideoFrames(srcPath, tmpDir string, positions []float64) ([]string, 
 	return out, nil
 }
 
-// probeDuration returns the video's duration in seconds via ffprobe.
 func probeDuration(srcPath string) (float64, error) {
-	// The thumbnail path reaches this before anything has resolved the
-	// tools, and an unresolved ffprobe would report no duration at all.
+	// The thumbnail path can get here before the tools are resolved.
 	resolveTools()
-	// `--` terminates option parsing so a filename beginning with `-`
-	// is treated as positional rather than a flag.
 	out, err := runFFmpeg(false, ffprobePath,
 		"-v", "quiet",
 		"-print_format", "csv=p=0",
@@ -260,11 +288,6 @@ func probeDuration(srcPath string) (float64, error) {
 	return strconv.ParseFloat(s, 64)
 }
 
-// ProbeDurationSeconds is the public-package wrapper around the
-// internal duration probe. Callers in the ingest and re-extract paths
-// use it to populate images.duration_seconds for video rows. Returns
-// (0, false) when ffmpeg is unavailable or probing fails; callers
-// leave the column NULL in that case.
 func ProbeDurationSeconds(srcPath string) (float64, bool) {
 	if !ffprobeAvailable() {
 		return 0, false
@@ -276,10 +299,8 @@ func ProbeDurationSeconds(srcPath string) (float64, bool) {
 	return d, true
 }
 
-// ProbeVideoDimensions returns the first video stream's width and
-// height via ffprobe. Mirrors ProbeDurationSeconds: (0, 0, false) when
-// ffmpeg is unavailable or the probe fails so callers leave width and
-// height NULL in that case.
+// The display size: the thumbnail and the player apply a phone video's
+// rotation, so a quarter turn swaps the coded width and height.
 func ProbeVideoDimensions(srcPath string) (int, int, bool) {
 	if !ffprobeAvailable() {
 		return 0, 0, false
@@ -287,25 +308,61 @@ func ProbeVideoDimensions(srcPath string) (int, int, bool) {
 	out, err := runFFmpeg(false, ffprobePath,
 		"-v", "quiet",
 		"-select_streams", "v:0",
-		"-show_entries", "stream=width,height",
-		"-print_format", "csv=p=0:s=x",
+		"-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate",
+		"-print_format", "json",
 		"--",
 		srcPath,
 	)
 	if err != nil {
 		return 0, 0, false
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(out)), "x", 2)
-	if len(parts) != 2 {
+	var probe struct {
+		Streams []struct {
+			Width    int `json:"width"`
+			Height   int `json:"height"`
+			SideData []struct {
+				Rotation float64 `json:"rotation"`
+			} `json:"side_data_list"`
+			Tags struct {
+				Rotate string `json:"rotate"`
+			} `json:"tags"`
+		} `json:"streams"`
+	}
+	if json.Unmarshal(out, &probe) != nil || len(probe.Streams) == 0 {
 		return 0, 0, false
 	}
-	w, err := strconv.Atoi(parts[0])
-	if err != nil || w <= 0 {
+	st := probe.Streams[0]
+	if st.Width <= 0 || st.Height <= 0 {
 		return 0, 0, false
 	}
-	h, err := strconv.Atoi(parts[1])
-	if err != nil || h <= 0 {
-		return 0, 0, false
+	rotation, _ := strconv.ParseFloat(st.Tags.Rotate, 64)
+	for _, sd := range st.SideData {
+		if sd.Rotation != 0 {
+			rotation = sd.Rotation
+		}
 	}
-	return w, h, true
+	if int(math.Abs(rotation))%180 == 90 {
+		return st.Height, st.Width, true
+	}
+	return st.Width, st.Height, true
+}
+
+// ProbeVideoHasAudio is false also when ffprobe is missing or fails, so
+// false must not be read as silent.
+func ProbeVideoHasAudio(srcPath string) bool {
+	if !ffprobeAvailable() {
+		return false
+	}
+	out, err := runFFmpeg(false, ffprobePath,
+		"-v", "quiet",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_type",
+		"-print_format", "csv=p=0",
+		"--",
+		srcPath,
+	)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "audio"
 }

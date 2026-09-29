@@ -11,19 +11,12 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// MaxImplicationDepth bounds transitive closure walks. Real-world booru
-// implication graphs sit well under ten levels; the cap is a runtime
-// belt-and-braces guard so a future cycle that slipped past the
-// create-time check can't spin forever.
+// MaxImplicationDepth sits well past real booru graphs, which stay under
+// ten levels.
 const MaxImplicationDepth = 16
 
-// ErrImplicationCycle is returned when AddImplication would create a
-// path from ImpliedID back to ParentID through the existing graph.
 var ErrImplicationCycle = errors.New("implication would form a cycle")
 
-// scanImplications collects the rows of an implication SELECT. The
-// implied-side display columns are only present on the parent-side
-// listing; withImpliedCols says whether to expect them.
 func scanImplications(rows *sql.Rows, withImpliedCols bool) ([]models.Implication, error) {
 	var out []models.Implication
 	for rows.Next() {
@@ -48,8 +41,6 @@ func scanImplications(rows *sql.Rows, withImpliedCols bool) ([]models.Implicatio
 	return out, rows.Err()
 }
 
-// ListImplications returns every direct implication whose parent is
-// parentID, with display fields joined for the /tags dialog.
 func (s *Service) ListImplications(parentID int64) ([]models.Implication, error) {
 	return s.implicationsQuery(
 		`SELECT ti.parent_tag_id, ti.implied_tag_id,
@@ -65,9 +56,6 @@ func (s *Service) ListImplications(parentID int64) ([]models.Implication, error)
 		 ORDER BY i.name`, parentID, true)
 }
 
-// implicationsQuery runs one edge listing and owns its cursor. full says
-// whether the row set carries the implied side's display fields too,
-// which is the only thing the two listings differ in beyond their SQL.
 func (s *Service) implicationsQuery(query string, arg int64, full bool) ([]models.Implication, error) {
 	rows, err := s.db.Read.Query(query, arg)
 	if err != nil {
@@ -77,8 +65,6 @@ func (s *Service) implicationsQuery(query string, arg int64, full bool) ([]model
 	return scanImplications(rows, full)
 }
 
-// ImpliedBy returns the direct edges whose implied side is tagID, with
-// parent display fields joined for the detail page's reverse view.
 func (s *Service) ImpliedBy(tagID int64) ([]models.Implication, error) {
 	return s.implicationsQuery(
 		`SELECT ti.parent_tag_id, ti.implied_tag_id,
@@ -91,10 +77,6 @@ func (s *Service) ImpliedBy(tagID int64) ([]models.Implication, error) {
 		 ORDER BY p.name`, tagID, false)
 }
 
-// SyncImplicationStaleness mirrors SyncAliasStaleness for a parent's
-// origin-attributed implication edges, keyed by implied tag id: edges
-// absent from fresh are flagged stale, edges listed again are cleared.
-// Returns how many edges were newly flagged.
 func (s *Service) SyncImplicationStaleness(parentID int64, origin string, fresh map[int64]bool) (int, error) {
 	flagged := 0
 	err := s.inWriteTx(func(tx *sql.Tx) error {
@@ -134,10 +116,6 @@ func setImplicationsStaleTx(tx *sql.Tx, parentID int64, impliedIDs []int64, stal
 		`parent_tag_id = `+strconv.FormatInt(parentID, 10)+` AND `, impliedIDs, stale)
 }
 
-// ImplicationsForParents returns the direct implications keyed by
-// parent id, with display fields joined for the /tags listing. One
-// query per call regardless of input size (chunked at the SQLite
-// parameter cap).
 func (s *Service) ImplicationsForParents(parentIDs []int64) (map[int64][]models.Implication, error) {
 	out := make(map[int64][]models.Implication, len(parentIDs))
 	if len(parentIDs) == 0 {
@@ -175,19 +153,13 @@ func (s *Service) ImplicationsForParents(parentIDs []int64) (map[int64][]models.
 	return out, nil
 }
 
-// AddImplication declares parent -> implied. Refuses self-implication,
-// alias rows on either side (alias resolution is name-only and would
-// silently bypass the link), and any edge that would close a cycle
-// through the existing graph. Rating tags are allowed on either side
-// because the implication graph doesn't mutate the rating vocabulary -
-// the tag row itself is still immutable. The returned bool reports
-// whether the row was new; false means the edge already existed.
+// AddImplication reports false for an edge that already existed. Aliases
+// are refused on either side: an edge keyed on an alias would never fire.
 func (s *Service) AddImplication(parentID, impliedID int64) (bool, error) {
 	return s.AddImplicationFrom(parentID, impliedID, "user")
 }
 
-// AddImplicationFrom is AddImplication with an explicit creation origin,
-// stamped only when the edge is actually inserted.
+// AddImplicationFrom stamps origin only on a new edge.
 func (s *Service) AddImplicationFrom(parentID, impliedID int64, origin string) (bool, error) {
 	if parentID == impliedID {
 		return false, fmt.Errorf("cannot imply a tag from itself")
@@ -207,8 +179,6 @@ func (s *Service) AddImplicationFrom(parentID, impliedID int64, origin string) (
 			}
 		}
 
-		// Cycle check: walk the existing graph from impliedID; if we reach
-		// parentID, the new edge closes a loop.
 		if reaches, err := implicationReachesTx(tx, impliedID, parentID); err != nil {
 			return err
 		} else if reaches {
@@ -232,11 +202,8 @@ func (s *Service) AddImplicationFrom(parentID, impliedID int64, origin string) (
 	return created, nil
 }
 
-// RemoveImplication deletes the parent -> implied edge. Image-side
-// cleanup (removing implied rows that were only there because of this
-// edge) is the caller's responsibility - it lives in the propagation
-// job rather than the synchronous DELETE so the user's click returns
-// fast on libraries with millions of image_tags.
+// RemoveImplication leaves the rows the edge implied in place; sweeping
+// them is the caller's job, kept off this path so the click stays fast.
 func (s *Service) RemoveImplication(parentID, impliedID int64) error {
 	res, err := s.db.Write.Exec(
 		`DELETE FROM tag_implications WHERE parent_tag_id = ? AND implied_tag_id = ?`,
@@ -251,9 +218,7 @@ func (s *Service) RemoveImplication(parentID, impliedID int64) error {
 	return nil
 }
 
-// bfsImpliedTx walks the implied closure of start breadth-first, bounded
-// by MaxImplicationDepth, invoking visit once per newly-discovered tag id
-// (start ids never fire); visit returning false stops the walk early.
+// Start ids are never visited, even when a cycle leads back to them.
 func bfsImpliedTx(tx *sql.Tx, start []int64, visit func(int64) bool) error {
 	seen := make(map[int64]struct{}, len(start))
 	for _, p := range start {
@@ -262,8 +227,7 @@ func bfsImpliedTx(tx *sql.Tx, start []int64, visit func(int64) bool) error {
 	frontier := append([]int64(nil), start...)
 	for depth := 0; depth < MaxImplicationDepth && len(frontier) > 0; depth++ {
 		placeholders, args := db.InPlaceholders(frontier)
-		// Read the whole level before visiting any of it: visit is the
-		// caller's own code and must not run with a cursor held open.
+		// The whole level is read first: visit must not run with a cursor open.
 		ids, err := db.QueryIDs(tx,
 			`SELECT DISTINCT implied_tag_id FROM tag_implications WHERE parent_tag_id IN (`+placeholders+`)`,
 			args...)
@@ -286,10 +250,6 @@ func bfsImpliedTx(tx *sql.Tx, start []int64, visit func(int64) bool) error {
 	return nil
 }
 
-// implicationReachesTx returns whether a directed path from start
-// reaches target through tag_implications. Used for cycle detection
-// inside AddImplication's transaction; callers never pass
-// start == target (AddImplication rejects self-implication first).
 func implicationReachesTx(tx *sql.Tx, start, target int64) (bool, error) {
 	reached := false
 	err := bfsImpliedTx(tx, []int64{start}, func(id int64) bool {
@@ -302,14 +262,8 @@ func implicationReachesTx(tx *sql.Tx, start, target int64) (bool, error) {
 	return reached, err
 }
 
-// ApplyImpliedFanoutTx fans out implications on an open transaction so
-// callers outside the tags package (the auto-tagger insert path and
-// the propagation job) get the same is_implied=1 rows the tags-service
-// write path produces. The is_auto value is the parent's; implied rows
-// inherit it so the detail-page source grouping keeps tracking origin.
-// ratingCatID, if non-zero, gates a PruneLowerRatingsTx pass after the
-// fan-out so an implication whose implied side is a rating tag doesn't
-// leave the image with multiple rating rows.
+// Implied rows take the parent's is_auto so the detail page groups them
+// by source.
 func ApplyImpliedFanoutTx(tx *sql.Tx, imageID, parentID, ratingCatID int64, isAuto bool) error {
 	isAutoInt := 0
 	if isAuto {
@@ -318,9 +272,6 @@ func ApplyImpliedFanoutTx(tx *sql.Tx, imageID, parentID, ratingCatID int64, isAu
 	return fanOutImpliedTxImpl(tx, imageID, parentID, ratingCatID, isAutoInt)
 }
 
-// fanOutImpliedTxImpl is the package-internal twin shared between the
-// service's addTagToImageTxReportingDup and the public ApplyImpliedFanoutTx
-// entrypoint. Kept private so the fan-out logic lives in one place.
 func fanOutImpliedTxImpl(tx *sql.Tx, imageID, parentID, ratingCatID int64, isAutoInt int) error {
 	implied, err := TransitiveImpliedTx(tx, []int64{parentID})
 	if err != nil {
@@ -329,11 +280,6 @@ func fanOutImpliedTxImpl(tx *sql.Tx, imageID, parentID, ratingCatID int64, isAut
 	return applyImpliedClosureTx(tx, imageID, implied, ratingCatID, isAutoInt)
 }
 
-// applyImpliedClosureTx is fanOutImpliedTxImpl with the closure walk
-// hoisted to the caller. MergeTags uses it to avoid recomputing the
-// canonical's invariant implied closure once per newly-carrying image
-// in the post-move loop; pure addTagToImage* callers go through
-// fanOutImpliedTxImpl which resolves the closure for them.
 func applyImpliedClosureTx(tx *sql.Tx, imageID int64, implied []int64, ratingCatID int64, isAutoInt int) error {
 	insertedRating := false
 	for _, id := range implied {
@@ -351,9 +297,6 @@ func applyImpliedClosureTx(tx *sql.Tx, imageID int64, implied []int64, ratingCat
 		if err := BumpTagUsageTx(tx, id, imageID); err != nil {
 			return err
 		}
-		// If this newly-inserted implied tag is a rating, mark for the
-		// post-fanout prune so the image keeps the highest-wins
-		// invariant the executor's fast counts depend on.
 		if ratingCatID != 0 && !insertedRating {
 			var catID int64
 			if err := tx.QueryRow(`SELECT category_id FROM tags WHERE id = ?`, id).Scan(&catID); err == nil && catID == ratingCatID {
@@ -369,11 +312,8 @@ func applyImpliedClosureTx(tx *sql.Tx, imageID int64, implied []int64, ratingCat
 	return nil
 }
 
-// impliedByParentOnImage reports whether the (imageID, tagID) row is an
-// implication fan-out that a parent still on the image justifies. Removing
-// such a row directly breaks the operator's own declaration - the image
-// keeps the parent, loses the child, and drops out of searches for a tag
-// its own tags imply - so the operator-facing removal paths refuse it.
+// Removing an implied row its parent still justifies breaks the operator's
+// own declaration: the image drops out of searches for a tag its tags imply.
 func impliedByParentOnImage(tx *sql.Tx, imageID, tagID int64) (bool, error) {
 	var isImplied int
 	switch err := tx.QueryRow(
@@ -387,19 +327,56 @@ func impliedByParentOnImage(tx *sql.Tx, imageID, tagID int64) (bool, error) {
 	if isImplied != 1 {
 		return false, nil
 	}
-	// An orphan - is_implied = 1 with no parent left on the image - stays
-	// removable: refusing it would trap a row nothing justifies.
-	parents, err := implicationParentsOnImageExcluding(tx, imageID, tagID, 0)
+	rows, err := db.QueryAll(tx, func(rows *sql.Rows) (models.ImageTag, error) {
+		t := models.ImageTag{ImageID: imageID}
+		err := rows.Scan(&t.TagID, &t.IsImplied)
+		return t, err
+	}, `SELECT tag_id, is_implied FROM image_tags WHERE image_id = ?`, imageID)
 	if err != nil {
 		return false, err
 	}
-	return len(parents) > 0, nil
+	type edge struct{ parent, child int64 }
+	edges, err := db.QueryAll(tx, func(rows *sql.Rows) (edge, error) {
+		var e edge
+		err := rows.Scan(&e.parent, &e.child)
+		return e, err
+	}, `SELECT ti.parent_tag_id, ti.implied_tag_id FROM tag_implications ti
+		 JOIN image_tags p ON p.image_id = ?1 AND p.tag_id = ti.parent_tag_id
+		 JOIN image_tags c ON c.image_id = ?1 AND c.tag_id = ti.implied_tag_id AND c.is_implied = 1`, imageID)
+	if err != nil {
+		return false, err
+	}
+	implied := make(map[int64][]int64, len(edges))
+	for _, e := range edges {
+		implied[e.parent] = append(implied[e.parent], e.child)
+	}
+	// An orphan stays removable: refusing it would trap a row nothing
+	// justifies.
+	return JustifiedImplied(rows, implied)[tagID], nil
 }
 
-// implicationParentsOnImageExcluding returns the tag ids on the image
-// that still imply impliedID, optionally excluding one parent (the one
-// being removed). Used by the propagation cleanup job and by
-// removeTagFromImageTx to decide whether an implied row should stay.
+// JustifiedImplied lists the implied rows reached from the image's own rows
+// through implied (parent -> implied tags on the image); the rest are orphans.
+func JustifiedImplied(imageTags []models.ImageTag, implied map[int64][]int64) map[int64]bool {
+	justified := map[int64]bool{}
+	var walk func(parent int64)
+	walk = func(parent int64) {
+		for _, child := range implied[parent] {
+			if justified[child] {
+				continue
+			}
+			justified[child] = true
+			walk(child)
+		}
+	}
+	for _, t := range imageTags {
+		if !t.IsImplied {
+			walk(t.TagID)
+		}
+	}
+	return justified
+}
+
 func implicationParentsOnImageExcluding(tx *sql.Tx, imageID, impliedID, excludeParent int64) ([]int64, error) {
 	return db.QueryAll(tx, func(rows *sql.Rows) (int64, error) {
 		var id int64

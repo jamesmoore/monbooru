@@ -35,7 +35,7 @@
   <form id="batch-delete-form">
     <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <span class="batch-bar-spacer"></span>
-    <button type="button" onclick="openTagSelectedDialog()">Add tags manually</button>
+    <button type="button" onclick="openTagSelectedDialog()">Add tags</button>
     <button type="button" onclick="openStripSelectedDialog()">Remove tags</button>
     {{if .TaggersPresent}}<button type="button" class="btn-autotag"{{if not .EnabledTaggers}} disabled title="{{.TaggerReason}}"{{end}} onclick="openBatchAutotagDialog('selection')">Auto-tag</button>{{end}}
     {{if .MonloaderPaired}}<button type="button" class="monloader-accent"{{if not .MonloaderUsable}} disabled title="{{monloaderOffReason .MonloaderConn}}"{{end}} onclick="openBatchLookupDialog('selection')">Find tags</button>{{end}}
@@ -44,8 +44,9 @@
     <button type="button" onclick="openBatchFavoriteDialog('selection')">Favorite</button>
     <button type="button" onclick="openBatchCollectionDialog('selection')">Set collection</button>
     <span class="batch-bar-sep" aria-hidden="true"></span>
+    <button type="button" id="batch-download" onclick="openBatchDownloadDialog('selection')">Download</button>
     {{if gt (len .Galleries) 1}}<button type="button" id="batch-transfer" onclick="openBatchTransferDialog('selection')">Transfer</button>{{end}}
-    <button type="button" onclick="openBatchPlaceDialog('selection')">Rename / move</button>
+    <button type="button" onclick="openBatchPlaceDialog('selection')">Rename</button>
     <button type="button" class="btn-danger" onclick="batchDeleteSelected()">Delete</button>
   </form>
 </div>
@@ -233,6 +234,24 @@
   </form>
 </dialog>
 
+<dialog id="batch-download-dialog">
+  <p>Download {{template "batch_count" "batch-download"}} as a zip:</p>
+  <p class="field-hint" id="batch-download-summary"></p>
+  <form id="batch-download-form" method="post" action="/internal/batch-download" target="batch-download-frame"
+        onsubmit="event.preventDefault(); confirmBatchDownload();">
+    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+    <input type="hidden" name="_gallery" value="{{.ActiveGallery}}">
+    <input type="hidden" id="batch-download-scope">
+    <span id="batch-download-scope-fields" hidden></span>
+    <div class="field">
+      <label><input type="checkbox" name="tags" value="1" id="batch-download-tags"> Include tags (tags.json)</label>
+    </div>
+    <div id="batch-download-flash"></div>
+    {{template "dialog_actions" dict "ID" "batch-download-dialog" "Submit" "Download"}}
+  </form>
+</dialog>
+<iframe name="batch-download-frame" id="batch-download-frame" hidden></iframe>
+
 <dialog id="batch-inbox-dialog">
   <input type="hidden" id="batch-inbox-scope">
   <p>
@@ -315,13 +334,6 @@
 
 
 <script>
-// The batch plumbing this page leans on - scopeCount, searchScopeParts,
-// selectionScopeIds, runBatchOp, plus the shared openBatchDialog /
-// confirmBatchSimple skeletons - lives in main.js so other pages can
-// share it. Each dialog below only names its id prefix, endpoint, and
-// per-dialog extras.
-// _batchLookupCounts holds the scope split the server answered for the open
-// dialog, so the live summary can price each operation without guessing.
 var _batchLookupCounts = {total: 0, sourced: 0, unsourced: 0};
 
 function openBatchLookupDialog(scope) {
@@ -349,8 +361,6 @@ function batchLookupMode() {
   return checked ? checked.value : 'refresh';
 }
 
-// updateBatchLookupSummary prices the picked operation against the scope and
-// kills the submit button at zero, so an empty combination cannot be posted.
 function updateBatchLookupSummary() {
   var c = _batchLookupCounts;
   var mode = batchLookupMode();
@@ -378,14 +388,13 @@ function updateBatchLookupSummary() {
     if (backends.length === 0) n = 0;
     text = n + ' image(s) will be looked up' + (backends.length ? ': ' + backends.join(', ') : '') + '.';
   } else {
-    n = unsourced ? c.unsourced : c.total;
+    n = c.unsourced;
     text = 'Applies to the ' + n + ' image(s) with no source.';
   }
   summary.textContent = text;
   submit.disabled = n === 0;
 }
 
-// confirmBatchLookup posts the picked operation across the scope.
 function confirmBatchLookup() {
   var mode = batchLookupMode();
   var params = ['mode=' + encodeURIComponent(mode)];
@@ -401,7 +410,6 @@ function confirmBatchLookup() {
 }
 
 function openBatchDeleteDialog(scope) {
-  // requireMatches: don't open the delete confirm over an empty search.
   openBatchDialog('batch-delete', scope, {requireMatches: true});
 }
 
@@ -423,9 +431,8 @@ function confirmBatchDelete() {
               consumesScope: true});
 }
 
-// The folder opens on {folder} rather than blank: a batch spans folders, so
-// only a token can say "leave each file where it is", and a blank field
-// already means the gallery root everywhere else.
+// {folder}, not blank: a blank folder means the gallery root, and a batch
+// spans folders.
 function openBatchPlaceDialog(scope) {
   openBatchDialog('batch-place', scope, {
     clearIds: ['batch-place-folder', 'batch-place-name', 'batch-place-suggest', 'batch-place-preview'],
@@ -447,10 +454,6 @@ function confirmBatchPlace() {
     'Rename / move failed.');
 }
 
-// The preview above the button samples the scope; this walks all of it and
-// writes nothing, so a template that names hundreds of files the same is
-// caught before the run numbers them apart. The dialog stays open on the
-// template being checked, and the job's answer is mirrored into it.
 function checkBatchPlaceCollisions() {
   var scope = document.getElementById('batch-place-scope').value;
   var flash = document.getElementById('batch-place-flash');
@@ -487,9 +490,86 @@ function confirmBatchTransfer() {
   confirmBatchSimple('batch-transfer', '/internal/batch-transfer', params, 'Transfer failed.');
 }
 
-// Open the Remove-tags dialog. beforeShow re-syncs the mode rows before the
-// dialog opens so showModal's initial focus doesn't land on a field left
-// disabled by the previous open's mode.
+var _batchDownloadFiles = 0;
+
+function openBatchDownloadDialog(scope) {
+  openBatchDialog('batch-download', scope, {
+    requireMatches: true,
+    beforeShow: function() {
+      document.getElementById('batch-download-tags').checked = false;
+      countBatchDownload();
+    }
+  });
+}
+
+// A selection also sends its listing's q, which names the zip.
+function batchDownloadScope() {
+  var scope = document.getElementById('batch-download-scope').value;
+  var parts = ['scope=' + encodeURIComponent(scope)];
+  if (scope === 'search') return parts.concat(searchScopeParts());
+  return parts.concat(selectionScopeIds() || [],
+    ['q=' + encodeURIComponent(new URLSearchParams(location.search).get('q') || '')]);
+}
+
+function countBatchDownload() {
+  var submit = document.querySelector('#batch-download-form button[type=submit]');
+  var summary = document.getElementById('batch-download-summary');
+  submit.disabled = true;
+  summary.textContent = 'Counting...';
+  postForm('/internal/batch-download/count', new URLSearchParams(batchDownloadScope().join('&')), {
+    onErr: function(body) {
+      summary.textContent = '';
+      document.getElementById('batch-download-flash').innerHTML = body;
+    },
+    onOK: function(res) {
+      res.json().then(function(c) {
+        _batchDownloadFiles = c.files;
+        var text = c.files
+          ? c.files + ' file(s), about ' + c.size + '.'
+          : 'Nothing to download: every file in the scope is missing on disk.';
+        if (c.files && c.missing) text += ' ' + c.missing + (c.missing === 1 ? ' is' : ' are') + ' missing on disk and left out.';
+        summary.textContent = text;
+        submit.disabled = !c.files;
+      });
+    }
+  });
+}
+
+// A real form post into the hidden frame, so the zip streams as a
+// download and the page stays.
+function confirmBatchDownload() {
+  var fields = document.getElementById('batch-download-scope-fields');
+  fields.textContent = '';
+  new URLSearchParams(batchDownloadScope().join('&')).forEach(function(value, key) {
+    var input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = key;
+    input.value = value;
+    fields.appendChild(input);
+  });
+  document.getElementById('batch-download-form').submit();
+  document.getElementById('batch-download-dialog').close();
+  showActionFlash('Packing ' + _batchDownloadFiles + ' file(s) into a zip. Your browser saves it as it arrives.', 'ok');
+}
+
+// Only a refusal loads into the frame; a zip downloads without navigating it.
+(function () {
+  var frame = document.getElementById('batch-download-frame');
+  if (!frame) return;
+  frame.addEventListener('load', function() {
+    var doc = frame.contentDocument;
+    if (!doc || !doc.body) return;
+    if (frame.contentWindow.location.pathname === '/login') {
+      window.location.reload();
+      return;
+    }
+    var text = (doc.body.textContent || '').trim();
+    if (text) showActionFlash(escapeHTML(text), 'err');
+  });
+})();
+
+// beforeShow re-syncs the rows so showModal's initial focus does not
+// follow the last open's mode.
 function openStripSelectedDialog() { openStripDialog('selection'); }
 function openStripDialog(scope) {
   openBatchDialog('batch-strip', scope, {
@@ -500,14 +580,8 @@ function openStripDialog(scope) {
   });
 }
 
-// Show only the input row that matches the currently-selected mode. The
-// "specific" radio reveals the tag-name input; "auto-specific" reveals the
-// tagger picker. The bulk modes (user / auto / all) reveal nothing.
-//
-// Inactive rows stay in flow with .row-inactive (visibility:hidden) so the
-// dialog dimensions and the radio positions don't shift when the user flips
-// modes. Inputs/selects inside an inactive row are disabled so tab focus
-// skips them while invisible.
+// Rows hide by visibility so the dialog keeps its size; disabling keeps
+// tab focus off the hidden fields.
 function updateBatchStripRow() {
   var picked = (document.querySelector('#batch-strip-form input[name="mode"]:checked') || {}).value;
   toggleStripModeRow('batch-strip-specific-row', picked !== 'specific');
@@ -540,11 +614,8 @@ function confirmBatchStrip() {
   var flash = document.getElementById('batch-strip-flash');
   if (flash) flash.innerHTML = '';
 
-  // mode=specific dispatches through the existing batch-tag handler with
-  // op=remove; the bulk modes go through batch-strip with the matching
-  // predicate. mode=auto-specific / source-specific are UI shorthands for
-  // mode=auto / mode=source plus a name filter; the server only knows the
-  // bare mode, so unwrap before sending.
+  // The server knows only the bare auto and source modes; the -specific
+  // forms add a name filter.
   var url, params;
   if (mode === 'specific') {
     var tags = (document.getElementById('batch-strip-input').value || '').trim();
@@ -599,8 +670,6 @@ function confirmBatchAutotag() {
     ['tagger_name=' + encodeURIComponent(tagger)], 'Auto-tag failed.');
 }
 
-// Open the Add-tags dialog on the checked thumbnails; ids are read from
-// .thumb-checkbox:checked at submit.
 function openTagSelectedDialog() { openTagDialog('selection'); }
 function openTagDialog(scope) {
   openBatchDialog('batch-tag', scope, {
@@ -631,9 +700,6 @@ function confirmBatchTag() {
 function toggleFavFilter() {
   var si = document.getElementById('search-input');
   if (!si) return;
-  // Strip any existing fav:true token from the query, then re-add at the
-  // front when toggling on. Lets the toggle compose with arbitrary other
-  // tags ('fav:true 1girl' / '1girl fav:true' / 'fav:true').
   var tokens = si.value.split(/\s+/).filter(function(t) { return t && t.toLowerCase() !== 'fav:true'; });
   var hadFav = tokens.length !== si.value.split(/\s+/).filter(Boolean).length;
   if (hadFav) {
@@ -693,7 +759,6 @@ function applyRandomSort() {
   window.location.href = '/?q=' + encodeURIComponent(q) + '&sort=random&seed=' + seed;
 }
 
-// Close save-search dialog after success and reload so sidebar updates
 document.addEventListener('htmx:afterSettle', function(e) {
   var el = e.detail.elt;
   if (!el || el.id !== 'save-search-result') return;

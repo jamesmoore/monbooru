@@ -9,12 +9,13 @@
     {{range .AppliedBy}}
     <tr>
       <td>
-        {{if .Label}}
+        {{if .Implied}}<span class="origin-user">implied</span>
+        {{else if .Label}}
         {{$kind := index $kinds .Label}}
         <span class="origin-chip origin-{{$kind}}">{{.Label}}</span>
         {{else}}<span class="origin-user">user</span>{{end}}
       </td>
-      <td class="field-hint">{{if .IsAuto}}auto{{else if .Label}}source{{else}}manual{{end}}</td>
+      <td class="field-hint">{{if .Implied}}implication{{else if .IsAuto}}auto{{else if .Label}}source{{else}}manual{{end}}</td>
       <td>{{.Count}}</td>
     </tr>
     {{end}}

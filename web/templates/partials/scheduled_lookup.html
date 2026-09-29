@@ -4,7 +4,7 @@
 {{$id := $l.ImageID}}
 <div id="scheduled-lookup" class="scheduled-lookup">
   {{range $l.Backends}}
-  {{$off := ""}}{{if not .ScheduleOn}}{{$off = " lookup-line-off"}}{{end}}
+  {{$off := ""}}{{if or (not .ScheduleOn) .GalleryOff}}{{$off = " lookup-line-off"}}{{end}}
   <span class="lookup-backend{{$off}}">{{.Label}}</span>
   <span class="lookup-switch{{$off}}">
     {{if .Enabled}}<span class="tag-mode-current">[on]</span>

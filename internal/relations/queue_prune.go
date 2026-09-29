@@ -7,15 +7,9 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 )
 
-// PruneQueue drops the queue rows the current detector settings would
-// no longer nominate: phash rows past the distance cap, tag rows under
-// the score threshold, every tag row when the pass is off. A pair both
-// detectors filed keeps its place under whichever one still backs it,
-// demoted to that detector alone. Requeued pairs stay: the operator
-// asked to see those, not a detector.
-//
-// Only tightening a setting strands rows; loosening one leaves pairs
-// missing instead, which the next find-pairs run fills.
+// PruneQueue drops the rows the current settings would not nominate,
+// demoting a both-detector pair to the detector still backing it. Review
+// pairs stay: the operator asked for those.
 func PruneQueue(ctx context.Context, database *db.DB, opts FindPairsOptions) (int, error) {
 	threshold := opts.TagPairThreshold
 	if !opts.TagPairs {
@@ -44,8 +38,6 @@ func PruneQueue(ctx context.Context, database *db.DB, opts FindPairsOptions) (in
 		if err := del(`source = ? AND COALESCE(score, 0) < ?`, SourceTags, threshold); err != nil {
 			return err
 		}
-		// Between the two deletes on purpose: the demotion re-keys rows
-		// the distance delete would otherwise take with it.
 		if err := demoteOverDistanceTx(ctx, tx, opts.Distance); err != nil {
 			return err
 		}
@@ -57,10 +49,8 @@ func PruneQueue(ctx context.Context, database *db.DB, opts FindPairsOptions) (in
 	return removed, nil
 }
 
-// demoteOverDistanceTx turns every both-detector row whose pixel
-// distance now exceeds the cap into a tag-only row, re-keying it into
-// the tag band so the queue order stays consistent. Runs per row
-// because the band mapping lives in TagPairDistance.
+// Re-keys into the tag band so the queue order holds; per row because the
+// mapping is TagPairDistance.
 func demoteOverDistanceTx(ctx context.Context, tx *sql.Tx, distance int) error {
 	type demotion struct {
 		a, b  int64

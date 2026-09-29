@@ -3,12 +3,15 @@ package web
 import (
 	"errors"
 	"fmt"
+	"html/template"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -16,24 +19,23 @@ import (
 
 type tagDetailData struct {
 	baseData
-	Tag        *models.Tag
-	Categories []models.TagCategory
-	IsRating   bool
-	// Canonical is the resolve target on alias rows; nil otherwise.
-	Canonical *models.Tag
-	// Aliases are the rows pointing at this tag (fan-in).
+	Tag              *models.Tag
+	Categories       []models.TagCategory
+	IsRating         bool
+	Canonical        *models.Tag
 	Aliases          []models.Tag
 	Implications     []models.Implication
 	ImpliedBy        []models.Implication
 	RecentImageIDs   []int64
+	NoteBody         string
+	NoteHTML         template.HTML
+	NoteLinksText    string
+	NoteLinks        []tagLinkView
 	OriginKinds      map[string]string
 	MonloaderContrib bool
-	// BackURL points the crumb at the listing view the visitor came
-	// from; PrevURL/NextURL step through that view's tag order. All
-	// empty on a direct visit with no `back` context.
-	BackURL string
-	PrevURL string
-	NextURL string
+	BackURL          string
+	PrevURL          string
+	NextURL          string
 }
 
 func (s *Server) tagDetailHandler(w http.ResponseWriter, r *http.Request) {
@@ -101,11 +103,17 @@ func (s *Server) tagDetailHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Newest carriers by image id: ids are allocation-ordered, so the
-		// id ordering streams straight off idx_image_tags_tag_image where a
-		// created_at order would temp-sort a popular tag's whole row set.
-		// CROSS JOIN pins image_tags as the outer table; otherwise the
-		// planner drives from images on is_missing and temp-sorts anyway.
+		note, err := s.tagSvc().TagNote(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data.NoteBody = note.Body
+		data.NoteHTML = s.renderMarkup(note.Body)
+		data.NoteLinksText = strings.Join(note.Links, "\n")
+		data.NoteLinks = buildTagLinkViews(note.Links)
+		// Newest by image id: that order streams off the index where created_at
+		// would temp-sort. CROSS JOIN keeps images from driving the plan.
 		recentQ := `SELECT it.image_id FROM image_tags it INDEXED BY idx_image_tags_tag_image
 			 CROSS JOIN images i ON i.id = it.image_id
 			 WHERE it.tag_id = ? AND i.is_missing = 0`
@@ -133,16 +141,76 @@ func (s *Server) tagDetailHandler(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "tags_detail.html", data)
 }
 
-// relationGroupFilter reads the origin subgroup a detail-page [×] button
-// names: the exact provenance label (empty selects the unrecorded-source
-// group) and whether it is that label's stale half.
+func (s *Server) setTagNote(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt64(w, r, "id")
+	if !ok {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		externalErr(w, r, "bad form", http.StatusBadRequest)
+		return
+	}
+	body := strings.TrimSpace(r.FormValue("note"))
+	if utf8.RuneCountInString(body) > tags.MaxTagNoteLen {
+		externalErr(w, r, fmt.Sprintf("note too long (max %d chars)", tags.MaxTagNoteLen), http.StatusBadRequest)
+		return
+	}
+	links, err := tags.ParseTagLinks(r.FormValue("links"))
+	if err != nil {
+		externalErr(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	switch err := s.tagSvc().SetTagNote(id, body, links); {
+	case errors.Is(err, tags.ErrTagNotFound):
+		externalErr(w, r, "tag not found", http.StatusNotFound)
+	case errors.Is(err, tags.ErrAliasNote):
+		externalErr(w, r, err.Error(), http.StatusBadRequest)
+	case err != nil:
+		externalErr(w, r, err.Error(), http.StatusInternalServerError)
+	default:
+		hxDone(w, r, "Note updated.", "", fmt.Sprintf("/tags/%d", id))
+	}
+}
+
+type tagLinkView struct {
+	URL   string
+	Label string
+	Dead  bool
+}
+
+func buildTagLinkViews(links []string) []tagLinkView {
+	out := make([]tagLinkView, 0, len(links))
+	for _, l := range links {
+		text := strings.TrimPrefix(l, "-")
+		v := tagLinkView{Label: text, Dead: text != l}
+		if gallery.ValidExternalURL(text) {
+			v.URL = text
+			v.Label = linkLabel(text)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// Host and path: two links to one site differ only past the host.
+func linkLabel(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	label := strings.TrimPrefix(u.Host, "www.") + u.Path
+	if u.RawQuery != "" {
+		label += "?" + u.RawQuery
+	}
+	return strings.TrimSuffix(label, "/")
+}
+
+// An empty origin is the unrecorded-source group, not a wildcard.
 func relationGroupFilter(r *http.Request) (origin string, stale bool) {
 	q := r.URL.Query()
 	return q.Get("origin"), q.Get("stale") == "1"
 }
 
-// usageBar is one row of the detail page's usage histogram, with the
-// bar pre-rendered server-side as block characters (no chart library).
 type usageBar struct {
 	Month string
 	Count int
@@ -151,19 +219,12 @@ type usageBar struct {
 
 const usageBarMaxWidth = 24
 
-// tagUsagePanelHandler renders the detail page's applied-by table and
-// usage histogram as one lazy fragment. Both views aggregate every
-// image_tags row the tag carries - seconds on a monster tag - so they
-// load after first paint and share a single pass (UsageBreakdown)
-// instead of blocking the page render.
+// Lazy, one pass: aggregating a big tag's image_tags rows takes seconds.
 func (s *Server) tagUsagePanelHandler(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
 		return
 	}
-	// Fetched as a fragment by the tag detail page; a non-htmx caller
-	// (refresh, bookmark, shared link) gets the detail page rather than
-	// a chrome-less fragment.
 	if !isHTMXRequest(r) {
 		http.Redirect(w, r, fmt.Sprintf("/tags/%d", id), http.StatusSeeOther)
 		return
@@ -173,8 +234,7 @@ func (s *Server) tagUsagePanelHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Keep the panel bounded on very old tags: the last 24 months tell
-	// the "is this vocabulary alive" story the graph exists for.
+	// 24 months is enough to show whether the tag is still alive.
 	if len(months) > 24 {
 		months = months[len(months)-24:]
 	}

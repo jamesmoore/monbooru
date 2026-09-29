@@ -19,12 +19,7 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// taggerRow is the per-template render shape for one row of the
-// Auto-Tagger settings table. It unifies installed taggers and catalog
-// ghosts so the template iterates a single list. Supported rows (i.e.
-// in the catalog) carry precomputed host + docker install snippets so
-// the Instructions cell can open a per-row dialog without the template
-// touching shell quoting.
+// Install snippets are built in Go so the template never does shell quoting.
 type taggerRow struct {
 	Name                string
 	Description         string
@@ -39,19 +34,12 @@ type taggerRow struct {
 	Gated               bool
 	HostCommand         string
 	DockerCommand       string
-	// Files and TargetDir drive the desktop profile's click-through form of
-	// the install dialog: the browser downloads each file, which is what
-	// keeps the no-outbound-request promise true by construction rather
-	// than by argument. The shell snippets above answer the container.
+	// The browser fetches these itself, which keeps the server's
+	// no-outbound-request promise.
 	Files     []tagger.CatalogFile
 	TargetDir string
 }
 
-// installedTaggerRow fills the fields every installed tagger shares; the
-// caller layers the catalog-only fields on supported rows. Differs
-// drives the row's Reset button: true when any operator-tunable state
-// (thresholds, caps, disabled categories, gallery scope, dispatch
-// overlay) departs from the catalog-seeded stock.
 func (s *Server) installedTaggerRow(t tagger.TaggerStatus, totalGalleries int, modelPath string) taggerRow {
 	ruleCount := tagger.OverlayRuleCount(modelPath, t.Name)
 	return taggerRow{
@@ -66,10 +54,6 @@ func (s *Server) installedTaggerRow(t tagger.TaggerStatus, totalGalleries int, m
 	}
 }
 
-// taggerConfigSummary is the inline summary next to the row's single
-// Configure button: the threshold summary, a gallery restriction when
-// one applies, and the custom dispatch-rule count when the overlay
-// exists.
 func taggerConfigSummary(inst config.TaggerInstance, totalGalleries, ruleCount int) string {
 	out := taggerThresholdSummary(inst.ConfidenceThreshold, inst.CategoryThresholds, inst.DisabledCategories)
 	if inst.Galleries != nil && len(inst.Galleries) != totalGalleries {
@@ -88,10 +72,6 @@ func taggerConfigSummary(inst config.TaggerInstance, totalGalleries, ruleCount i
 	return out
 }
 
-// taggerDiffersFromStock reports whether the instance departs from what
-// SeedTaggerInstance would produce for a fresh row: any threshold / cap
-// / disabled-category override off the catalog seed, a gallery
-// restriction, or a dispatch overlay on disk.
 func taggerDiffersFromStock(inst config.TaggerInstance, modelPath string, ruleCount int) bool {
 	seed := tagger.SeedTaggerInstance(inst.Name, inst.Enabled, catalogEntryByName(modelPath, inst.Name))
 	if inst.ConfidenceThreshold != seed.ConfidenceThreshold {
@@ -113,33 +93,18 @@ func taggerDiffersFromStock(inst config.TaggerInstance, modelPath string, ruleCo
 	return inst.Galleries != nil || ruleCount > 0
 }
 
-// thresholdRow is the per-category render shape for the per-tagger
-// Configure dialog. Override is the live category_thresholds value; an
-// empty Override falls back to the global threshold and the input
-// renders a placeholder instead of a value. MaxTags is the live
-// per_category_top_k value formatted as a string ("" = use default,
-// "0" = uncapped). Disabled mirrors disabled_categories membership; a
-// disabled category emits nothing regardless of its threshold.
-// DefaultThreshold / DefaultMaxTags are the catalog-seeded values for
-// this category (empty when the catalog seeds none); the per-row Reset
-// restores the inputs to these so it lands on the same state the
-// dialog-level "Reset to defaults" would, instead of blanking the cell.
 type thresholdRow struct {
 	Category         string
-	Override         string // "" when no override; formatted "%.2f" otherwise
-	MaxTags          string // "" when no override; integer string otherwise
-	MaxDefault       int    // default cap surfaced as the input placeholder
-	Color            string // tag_categories.color, surfaced as a 1px dot
-	Disabled         bool   // category is muted (in disabled_categories)
-	ViaRules         bool   // reached only through dispatch rules, not the model
-	DefaultThreshold string // catalog default threshold; "" = no catalog override
-	DefaultMaxTags   string // catalog default top-K; "" = no catalog override
+	Override         string
+	MaxTags          string
+	MaxDefault       int
+	Color            string
+	Disabled         bool
+	ViaRules         bool // reached only through dispatch rules, not the model
+	DefaultThreshold string
+	DefaultMaxTags   string
 }
 
-// taggerGalleryRow is the per-gallery render shape for the per-tagger
-// Galleries dialog: one entry per configured gallery, with Checked =
-// true when the tagger's Galleries list contains this name (or is
-// empty/missing, meaning "every gallery").
 type taggerGalleryRow struct {
 	Name    string
 	Checked bool
@@ -156,10 +121,7 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "Invalid execution provider: "+newProvider)
 		return
 	}
-	// Probe the requested execution provider before persisting the change so
-	// the user sees any library/device issue immediately instead of waiting
-	// for a tagger run to fail. ORT env init is not re-entrant so refuse
-	// while a tagger job is holding it.
+	// ORT env init is not re-entrant, so no probe while a job runs.
 	if newProvider != s.executionProvider() {
 		if s.jobs.IsRunning() {
 			writeInlineFlash(w, "err", "A job is running; try again when it finishes.")
@@ -191,8 +153,8 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
-	// Drop the cached ORT session so the freed RAM is visible immediately
-	// rather than after idle_release_after_minutes elapses.
+	// The old provider's session would otherwise hold its memory until
+	// the idle release.
 	if providerChanged {
 		tagger.ReleaseAll()
 	}
@@ -204,25 +166,14 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// settingsTaggerEnablePost flips one tagger's enabled flag to true without
-// going through the full tagger form. Mirrors settingsTaggerDisablePost.
 func (s *Server) settingsTaggerEnablePost(w http.ResponseWriter, r *http.Request) {
 	s.applyTaggerEnabled(w, strings.TrimSpace(r.PathValue("name")), true)
 }
 
-// settingsTaggerDisablePost flips one tagger's enabled flag to false without
-// going through the full tagger form. An HX-Refresh header re-renders the
-// settings page so the row's enabled state and Actions column reflect the
-// new state.
 func (s *Server) settingsTaggerDisablePost(w http.ResponseWriter, r *http.Request) {
 	s.applyTaggerEnabled(w, strings.TrimSpace(r.PathValue("name")), false)
 }
 
-// updateTagger applies mutate to the named TaggerInstance under cfgMu,
-// seeding a fresh entry from the on-disk catalog when one doesn't exist
-// yet, then persists the config to disk. Returns the saveConfig error
-// or nil. Callers that need to surface a save failure to the operator
-// pass its error string through their usual flash helper.
 func (s *Server) updateTagger(name string, mutate func(*config.TaggerInstance)) error {
 	modelPath := s.modelPath()
 	s.cfgMu.Lock()
@@ -244,9 +195,6 @@ func (s *Server) updateTagger(name string, mutate func(*config.TaggerInstance)) 
 	return s.saveConfig()
 }
 
-// applyTaggerEnabled flips a tagger's Enabled flag, seeding a TOML
-// entry from the on-disk catalog when one doesn't exist yet so the
-// preference persists across disable/enable round trips.
 func (s *Server) applyTaggerEnabled(w http.ResponseWriter, name string, enabled bool) {
 	if err := tagger.ValidateTaggerName(name); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -263,17 +211,11 @@ func (s *Server) applyTaggerEnabled(w http.ResponseWriter, name string, enabled 
 		verb = "disabled"
 	}
 	logx.Infof("settings: tagger %q %s", name, verb)
-	// The flash rides monbooru:flash so it survives the refresh; an
-	// inline body would be discarded before the swap ever painted.
+	// A header flash: the refresh discards an inline body before it paints.
 	setFlashHeader(w, "Tagger "+name+" "+verb+".", "ok", nil)
 	w.Header().Set("HX-Refresh", "true")
 }
 
-// settingsTaggerConfigGet renders the tabbed dialog body for one
-// tagger: a galleries panel, a thresholds panel, a mappings panel.
-// HTMX lazy-loads the body via hx-get on first dialog open; the tab
-// strip only toggles panel visibility, so one Save submits every
-// panel's fields.
 func (s *Server) settingsTaggerConfigGet(w http.ResponseWriter, r *http.Request) {
 	name, ok := pathTaggerName(w, r)
 	if !ok {
@@ -340,21 +282,11 @@ func (s *Server) settingsTaggerConfigGet(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// exportLine is one rendered line of the export panel's file views.
-// Mark selects the color: "" (as shipped), "add" (this install's
-// change), "del" (the shipped rule an overlay entry displaces - shown
-// struck, absent from the copied file), "gap" (an elided run of
-// unchanged rules).
 type exportLine struct {
 	Text string
 	Mark string
 }
 
-// exportRuleLines renders the merged dispatch table as display lines:
-// overlay-only sources read as added, overridden defaults as a struck
-// shipped line above the replacement, and runs of more than five
-// untouched defaults collapse into a count so a 1500-rule table stays
-// scannable.
 func exportRuleLines(embedded, overlay []tagger.DispatchEntry) []exportLine {
 	embByte := map[string]tagger.DispatchEntry{}
 	for _, e := range embedded {
@@ -414,33 +346,23 @@ func exportRuleLines(embedded, overlay []tagger.DispatchEntry) []exportLine {
 	return lines
 }
 
-// taggerLabelRow is the render shape of one mappings-panel result row.
 type taggerLabelRow struct {
 	Source      string
 	CatName     string
 	TagName     string
 	Color       string
-	Muted       bool   // dropped by a rule
-	CategoryOff bool   // effective category is in disabled_categories
-	Rule        string // "", "default", "custom"
+	Muted       bool
+	CategoryOff bool
+	Rule        string
 }
 
-// taggerLabelPageSize is how many rows the mappings panel shows at
-// once, and the step the trailing "[+ more]" grows the list by.
-// taggerLabelMaxRows is where growing stops: past it the table costs
-// more to render and scroll than the search costs to type.
+// Growing stops at taggerLabelMaxRows: past it the table costs more to
+// render than a search costs to type.
 const (
 	taggerLabelPageSize = 50
 	taggerLabelMaxRows  = 500
 )
 
-// settingsTaggerLabelsGet renders the mappings panel's rows: the
-// model's label list resolved through the dispatch chain, filtered by
-// q (substring on the raw label and the effective tag name) and filter
-// (all | customized | muted). "customized" is this install's own rules,
-// not the shipped ones. "muted" covers rule-muted labels and labels
-// whose effective category the tagger has disabled - the row says
-// which is which.
 func (s *Server) settingsTaggerLabelsGet(w http.ResponseWriter, r *http.Request) {
 	name, ok := pathTaggerName(w, r)
 	if !ok {
@@ -449,9 +371,6 @@ func (s *Server) settingsTaggerLabelsGet(w http.ResponseWriter, r *http.Request)
 	s.renderTaggerLabels(w, r, name)
 }
 
-// renderTaggerLabels writes the mappings panel's result list for the
-// current q / filter / limit. Shared by the search GET and the rule
-// POST so an applied edit comes back through the same rendering path.
 func (s *Server) renderTaggerLabels(w http.ResponseWriter, r *http.Request, name string) {
 	inst, ok := s.resolveTaggerInstance(name)
 	if !ok {
@@ -522,8 +441,6 @@ func (s *Server) renderTaggerLabels(w http.ResponseWriter, r *http.Request, name
 	})
 }
 
-// taggerTagsFile mirrors the discovery fallback for instances whose
-// TOML entry doesn't pin a label file.
 func taggerTagsFile(inst config.TaggerInstance) string {
 	if inst.TagsFile != "" {
 		return inst.TagsFile
@@ -531,9 +448,6 @@ func taggerTagsFile(inst config.TaggerInstance) string {
 	return tagger.DefaultTagsFile
 }
 
-// categoryChoices returns the gallery's categories as both the name→id
-// map the dispatch compiler needs and a name-sorted list for the rule
-// editor's category select.
 func (s *Server) categoryChoices() (map[string]int64, []string) {
 	ids := map[string]int64{}
 	var names []string
@@ -549,12 +463,7 @@ func (s *Server) categoryChoices() (map[string]int64, []string) {
 	return ids, names
 }
 
-// parseThresholdForm reads the thresholds panel out of the config form.
-// A category row with an empty Threshold or Max-tags value clears the
-// matching override. Every row submits its category hidden input; the
-// per-row Enable checkbox is only present when ticked, so a category
-// whose box is absent is muted. errMsg is non-empty on a validation
-// failure.
+// Every row posts its category, so an absent Enable box means muted.
 func parseThresholdForm(r *http.Request) (global float64, overrides map[string]float64, topK map[string]int, disabled []string, errMsg string) {
 	globalRaw := strings.TrimSpace(r.FormValue("global_threshold"))
 	global, err := strconv.ParseFloat(globalRaw, 64)
@@ -591,17 +500,8 @@ func parseThresholdForm(r *http.Request) (global float64, overrides map[string]f
 	return global, overrides, topK, disabled, ""
 }
 
-// parseGalleriesForm reads the galleries panel out of the config form.
-// Three submitted shapes:
-//   - `all=on`                       → nil (every gallery, legacy)
-//   - `all=off` with selected names  → those names
-//   - `all=off` with no selection    → []string{} (no gallery, dormant)
-//
-// The explicit-empty case is preserved by storing a non-nil empty slice
-// so the TOML round-trip writes `galleries = []` and AppliesToGallery
-// returns false everywhere on the next read. Submitted names are
-// filtered against the configured galleries so a stale form value can't
-// poison the config.
+// nil means every gallery; a non-nil empty slice means none and must stay
+// non-nil so the TOML keeps galleries = [].
 func (s *Server) parseGalleriesForm(r *http.Request) []string {
 	if r.FormValue("all") == "on" {
 		return nil
@@ -623,12 +523,6 @@ func (s *Server) parseGalleriesForm(r *http.Request) []string {
 	return galleries
 }
 
-// settingsTaggerMappingPost applies one mappings-panel edit to the
-// tagger's dispatch overlay and answers with the panel's result list
-// re-read from disk, so the edited row comes back carrying the rule it
-// now has. A validation failure retargets the swap at the dialog's
-// flash slot: the list is left alone and the editor stays open on the
-// value the operator has to fix.
 func (s *Server) settingsTaggerMappingPost(w http.ResponseWriter, r *http.Request) {
 	name, ok := taggerNameAndForm(w, r)
 	if !ok {
@@ -640,24 +534,17 @@ func (s *Server) settingsTaggerMappingPost(w http.ResponseWriter, r *http.Reques
 		writeInlineFlash(w, "err", errMsg)
 		return
 	}
-	// Clear whatever error the previous attempt left in the dialog's
-	// flash slot; the main swap owns the result list.
 	writeFlashOOB(w, "flash-tagger-config-"+name, "", "")
 	s.renderTaggerLabels(w, r, name)
 }
 
-// applyMappingRule folds one edit into the tagger's dispatch overlay
-// and rewrites it. `rule_reset` drops the custom rule for the label,
-// `rule_mute` stores a drop rule, otherwise rule_category / rule_name
-// become the rule. errMsg is non-empty on a validation failure;
-// nothing is written in that case.
 func (s *Server) applyMappingRule(name, modelPath string, r *http.Request) (errMsg string) {
 	source := strings.TrimSpace(r.FormValue("rule_source"))
 	if source == "" {
 		return "Malformed mapping rule."
 	}
-	// Everything the form can reject is checked before the overlay lock
-	// so the held cycle is just read, swap one key, write.
+	// Validated before the overlay lock, so the locked section is only
+	// read, swap, write.
 	reset := r.FormValue("rule_reset") != ""
 	entry := tagger.DispatchEntry{Source: source}
 	if !reset && r.FormValue("rule_mute") == "" {
@@ -673,6 +560,9 @@ func (s *Server) applyMappingRule(name, modelPath string, r *http.Request) (errM
 				return "Invalid rename for label " + source + ": " + err.Error()
 			}
 			rename = valid
+		}
+		if target := cmp.Or(rename, source); category == "rating" && !tags.IsCanonicalRating(target) {
+			return "A rating label must become general, sensitive, questionable or explicit, not " + target + "."
 		}
 		entry = tagger.DispatchEntry{Source: source, Category: category, Name: rename}
 	}
@@ -690,12 +580,6 @@ func (s *Server) applyMappingRule(name, modelPath string, r *http.Request) (errM
 	return ""
 }
 
-// settingsTaggerConfigPost saves the dialog's gallery scope and
-// thresholds in one pass; mapping rules are written as they are
-// applied and don't ride this form. On validation error the inline
-// flash inside the dialog is updated and the dialog stays open; on
-// success the page refreshes so the row summary, Reset button, and any
-// state badges all reflect the new configuration.
 func (s *Server) settingsTaggerConfigPost(w http.ResponseWriter, r *http.Request) {
 	name, ok := taggerNameAndForm(w, r)
 	if !ok {
@@ -731,11 +615,6 @@ func (s *Server) settingsTaggerConfigPost(w http.ResponseWriter, r *http.Request
 	w.Header().Set("HX-Refresh", "true")
 }
 
-// settingsTaggerResetPost restores one tagger to stock: catalog-seeded
-// thresholds, every gallery, and no dispatch overlay. The row's Reset
-// button only renders when something differs, so this is always a
-// deliberate act; the page refreshes so the button disappears with the
-// state it reported.
 func (s *Server) settingsTaggerResetPost(w http.ResponseWriter, r *http.Request) {
 	name, ok := taggerNameAndForm(w, r)
 	if !ok {
@@ -763,13 +642,8 @@ func (s *Server) settingsTaggerResetPost(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("HX-Refresh", "true")
 }
 
-// resolveTaggerInstance looks up the named tagger. Discovery covers
-// both the configured instances and the subfolders without a TOML
-// entry, and it is the only path that fills ModelFile / TagsFile from
-// what is actually on disk - a seeded entry carries neither, so a
-// tagger whose label file isn't the `tags.csv` default (joytag,
-// camie-v2) would otherwise resolve to a filename that doesn't exist.
-// ok=false means the tagger isn't in cfg or on disk.
+// Through discovery: only it fills ModelFile and TagsFile from disk, and
+// a seeded entry assumes tags.csv, which some taggers do not ship.
 func (s *Server) resolveTaggerInstance(name string) (config.TaggerInstance, bool) {
 	for _, t := range tagger.DiscoverTaggers(s.cfgSnapshot()) {
 		if t.Name == name {
@@ -779,15 +653,8 @@ func (s *Server) resolveTaggerInstance(name string) (config.TaggerInstance, bool
 	return config.TaggerInstance{}, false
 }
 
-// thresholdDialogData assembles the per-row state the template renders:
-// the profile's natively emitted categories first, then the categories
-// its dispatch rules route into (flagged ViaRules), then every other
-// category on the gallery - so a category no shipped tagger reaches
-// (person, species) is still tunable ahead of the dispatch rule that
-// would use it. Each group is name-sorted. Stale overrides pointing at
-// categories the gallery no longer has trail last so they stay
-// clearable. global is the live ConfidenceThreshold. ok=false means the
-// tagger isn't in cfg or on disk.
+// Every gallery category is listed, so one no tagger reaches yet can be
+// tuned before a rule routes into it.
 func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global float64, ok bool) {
 	inst, ok := s.resolveTaggerInstance(name)
 	if !ok {
@@ -801,9 +668,8 @@ func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global f
 
 	colors := s.categoryColors()
 
-	// Catalog-seeded defaults drive the per-row Reset so it restores the
-	// same per-category values the row-level Reset would
-	// (see settingsTaggerResetPost).
+	// Seeded as the tagger Reset seeds, so a category's Reset lands on
+	// the same values.
 	defaults := tagger.SeedTaggerInstance(name, false, catalogEntryByName(modelPath, name))
 
 	seen := map[string]bool{}
@@ -844,9 +710,8 @@ func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global f
 		rest = append(rest, cat)
 	}
 	appendSorted(rest, false)
-	// Stale overrides (threshold, top-K, or disabled) pointing at
-	// categories the gallery no longer has still render so the operator
-	// can clear them.
+	// Overrides for categories the gallery no longer has still render, so
+	// they can be cleared.
 	var stale []string
 	for cat := range inst.CategoryThresholds {
 		stale = append(stale, cat)
@@ -866,9 +731,7 @@ func formatOverride(m map[string]float64, key string) string {
 	return ""
 }
 
-// formatTopKOverride mirrors formatOverride for the per-category cap.
-// A missing key returns "" so the input shows the placeholder; an
-// explicit zero returns "0" so the operator's opt-out persists.
+// An explicit zero stays "0": it is the operator's opt-out of the cap.
 func formatTopKOverride(m map[string]int, key string) string {
 	if v, ok := m[key]; ok {
 		return strconv.Itoa(v)
@@ -876,12 +739,6 @@ func formatTopKOverride(m map[string]int, key string) string {
 	return ""
 }
 
-// taggerThresholdSummary renders the inline summary the table cell
-// shows next to the Configure button: "global 0.40" or "global 0.40,
-// character 0.85, copyright 0.50". Disabled categories trail in a
-// "(disabled: ...)" group so a muted category is visible without
-// opening the dialog. Both lists are sorted by category name so two
-// equivalent configs render the same string.
 func taggerThresholdSummary(global float64, overrides map[string]float64, disabled []string) string {
 	out := fmt.Sprintf("global %.2f", global)
 	for _, k := range slices.Sorted(maps.Keys(overrides)) {
@@ -895,12 +752,6 @@ func taggerThresholdSummary(global float64, overrides map[string]float64, disabl
 	return out
 }
 
-// galleryDialogData returns one row per configured gallery, with
-// Checked reflecting the tagger's current Galleries list. allChecked
-// is true when Galleries is nil (legacy "every gallery") so the
-// master toggle renders pre-ticked. A non-nil empty slice means
-// "no galleries", which surfaces as the master toggle off and every
-// row unchecked.
 func (s *Server) galleryDialogData(name string) (rows []taggerGalleryRow, allChecked bool, ok bool) {
 	inst, ok := s.resolveTaggerInstance(name)
 	if !ok {
@@ -923,10 +774,6 @@ func (s *Server) galleryDialogData(name string) (rows []taggerGalleryRow, allChe
 	return rows, allChecked, true
 }
 
-// catalogEntryByName looks up a catalog row by name, returning nil for
-// taggers that aren't in the catalog (homegrown subfolders). Used by
-// the per-row Enable / Disable handlers to seed catalog-supplied
-// thresholds onto fresh TaggerInstance rows.
 func catalogEntryByName(modelPath, name string) *tagger.CatalogEntry {
 	for _, e := range tagger.LoadCatalog(modelPath) {
 		if e.Name == name {
@@ -937,10 +784,7 @@ func catalogEntryByName(modelPath, name string) *tagger.CatalogEntry {
 	return nil
 }
 
-// disableUnavailableTaggers flips Enabled to false on any configured tagger
-// whose model files have gone missing on disk. Persists the result so a
-// re-downloaded model has to be re-enabled deliberately rather than firing
-// off a half-broken job.
+// Persisted, so a re-downloaded model has to be re-enabled deliberately.
 func (s *Server) disableUnavailableTaggers() {
 	available := map[string]bool{}
 	for _, t := range tagger.DiscoverTaggers(s.cfgSnapshot()) {
@@ -963,14 +807,6 @@ func (s *Server) disableUnavailableTaggers() {
 	}
 }
 
-// persistNewlyDiscoveredTaggers materialises a TOML entry for any
-// available subfolder under model_path that has no entry yet, with
-// Enabled=true and the catalog-supplied threshold defaults applied.
-// DiscoverTaggers already surfaces these rows as enabled at render
-// time, but the state was implicit (derived on the fly each call);
-// persisting it makes the intent visible in the config file and
-// removes the chance of a future code path treating "no TOML entry"
-// as "not enabled".
 func (s *Server) persistNewlyDiscoveredTaggers() {
 	discovered := tagger.DiscoverTaggers(s.cfgSnapshot())
 	modelPath := s.modelPath()
@@ -998,10 +834,6 @@ func (s *Server) persistNewlyDiscoveredTaggers() {
 	}
 }
 
-// settingsTaggerDeletePost removes a tagger entry from the config and wipes
-// its subfolder under paths.model_path. Refused if the tagger is currently
-// enabled (the UI hides the button in that case; this is the server gate).
-// The name is validated so it can't escape model_path with `..` segments.
 func (s *Server) settingsTaggerDeletePost(w http.ResponseWriter, r *http.Request) {
 	name, ok := pathTaggerName(w, r)
 	if !ok {
@@ -1015,13 +847,12 @@ func (s *Server) settingsTaggerDeletePost(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	// Read off the held lock rather than through modelPath, which takes
-	// cfgMu for reading and deadlocks against the write lock above.
+	// Not through modelPath: it read-locks cfgMu, which deadlocks under
+	// the write lock held here.
 	dir := filepath.Join(s.cfg.Paths.ModelPath, name)
 	s.cfgMu.Unlock()
-	// The folder goes first: dropping the entry before a removal that
-	// then fails leaves memory and the TOML disagreeing, and the next
-	// settings write persists the memory view.
+	// The folder goes first: an entry dropped before a failed removal
+	// leaves memory and the TOML disagreeing.
 	if err := os.RemoveAll(dir); err != nil {
 		logx.Warnf("delete tagger %q: remove %q: %v", name, dir, err)
 		writeInlineFlash(w, "err", "Could not delete the tagger folder: "+err.Error())

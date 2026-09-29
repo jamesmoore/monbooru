@@ -7,10 +7,6 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 )
 
-// ImageRelations is the per-image relations summary the detail panel
-// and the /images/{id}/relations grid render from. Nil-valued fields
-// mean "no relation of that kind"; the templates hide their section
-// when the field is empty.
 type ImageRelations struct {
 	DupGroup          *DupGroupSummary
 	AltGroupID        *int64
@@ -21,17 +17,12 @@ type ImageRelations struct {
 	Derivatives       []int64
 }
 
-// DupGroupSummary names a duplicate group plus the canonical original
-// and every member id.
 type DupGroupSummary struct {
 	ID       int64
 	Original int64
 	Members  []int64
 }
 
-// HasAny reports whether the image carries at least one declared
-// relation. Used by the templates to suppress the "no relations"
-// stub on the detail-page panel.
 func (r *ImageRelations) HasAny() bool {
 	if r == nil {
 		return false
@@ -51,10 +42,8 @@ func (r *ImageRelations) HasAny() bool {
 	return false
 }
 
-// CommonDerivativeAncestor returns the nearest image both a and b
-// descend from, when one exists. Cousins several levels down are as
-// much tree context as two children of one source, so the walk reads
-// the whole ancestry rather than the source link alone.
+// CommonDerivativeAncestor searches the whole ancestry, not just direct
+// sources: cousins share tree context too.
 func CommonDerivativeAncestor(database *db.DB, a, b int64) (int64, bool, error) {
 	up, err := derivativeAncestors(database, a)
 	if err != nil || len(up) == 0 {
@@ -72,9 +61,7 @@ func CommonDerivativeAncestor(database *db.DB, a, b int64) (int64, bool, error) 
 	return 0, false, nil
 }
 
-// derivativeAncestors collects every image above imageID, nearest
-// first: the walk is breadth-first, so a source two edges up never
-// precedes one directly above. Depth-capped like the service's walks.
+// Nearest first: chainSpan walks breadth-first.
 func derivativeAncestors(database *db.DB, imageID int64) ([]int64, error) {
 	above, _, err := chainSpan(database.Read, "derivative_edges", "source_image_id", "derivative_image_id", imageID)
 	if err != nil {
@@ -83,7 +70,6 @@ func derivativeAncestors(database *db.DB, imageID int64) ([]int64, error) {
 	return above[1:], nil
 }
 
-// HasDerivativeSource reports whether imageID already names a source.
 func HasDerivativeSource(database *db.DB, imageID int64) (bool, error) {
 	var has int
 	err := database.Read.QueryRow(
@@ -92,9 +78,6 @@ func HasDerivativeSource(database *db.DB, imageID int64) (bool, error) {
 	return has != 0, err
 }
 
-// LoadImageRelations gathers every relation the image participates in.
-// Each query rides a covering index; the whole load is sub-millisecond
-// on a 1M-row library.
 func LoadImageRelations(database *db.DB, imageID int64) (*ImageRelations, error) {
 	out := &ImageRelations{}
 

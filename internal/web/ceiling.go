@@ -1,41 +1,43 @@
 package web
 
 import (
+	"database/sql"
 	"net/http"
+	"slices"
 
+	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
 )
 
-// ratingCeilingCookieName is the single point of truth for the cookie
-// name. The handler at POST /internal/rating-ceiling writes it; the
-// resolver below reads it; nowhere else should reference the literal.
 const ratingCeilingCookieName = "monbooru_rating_ceiling"
 
-// duplicatePathsFrom is the FROM clause both file-duplicate surfaces
-// count and list against, with the rating ceiling folded in. Shared
-// because the two must agree on what a duplicate file is and on hiding
-// the same rows: one prints paths the other's counter would deny.
-func duplicatePathsFrom(r *http.Request, cx *galleryCtx) (string, []any) {
-	from := ` FROM images i
+// Shared so the duplicate count and list agree on which rows the ceiling
+// hides. A copy the gallery leaves out is another gallery's file.
+func duplicatePaths(r *http.Request, cx *galleryCtx) ([]sha256DuplicateRow, error) {
+	query := `SELECT i.id, i.canonical_path, ip.id, ip.path FROM images i
 		JOIN image_paths ip ON ip.image_id = i.id AND ip.is_canonical = 0`
 	args := []any{}
 	if where, wargs := resolveCeiling(r, cx).WhereOne("i.id"); where != "" {
-		from += ` WHERE ` + where
+		query += ` WHERE ` + where
 		args = append(args, wargs...)
 	}
-	return from, args
+	rows, err := db.QueryAll(cx.DB.Read, func(rows *sql.Rows) (sha256DuplicateRow, error) {
+		var dr sha256DuplicateRow
+		err := rows.Scan(&dr.ImageID, &dr.CanonicalPath, &dr.PathID, &dr.AliasPath)
+		return dr, err
+	}, query+` ORDER BY i.id, ip.id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	bound := cx.Boundary()
+	return slices.DeleteFunc(rows, func(dr sha256DuplicateRow) bool { return bound.Excludes(dr.AliasPath) }), nil
 }
 
-// resolveCeiling reads the cookie and returns a Ceiling bound to cx, which
-// may be nil when no gallery is active; library.NewCeiling says what the
-// resolver still answers in that state.
 func resolveCeiling(r *http.Request, cx *galleryCtx) *Ceiling {
 	return library.NewCeiling(readRatingCookie(r), cx)
 }
 
-// readRatingCookie parses the cookie value. Empty string and "explicit"
-// both mean "no ceiling"; anything outside the closed enum is dropped to
-// "" so a stale or hand-crafted cookie can't inject arbitrary AST values.
+// The value reaches the search AST: anything outside the closed set is dropped.
 func readRatingCookie(r *http.Request) string {
 	c, err := r.Cookie(ratingCeilingCookieName)
 	if err != nil {
@@ -48,9 +50,6 @@ func readRatingCookie(r *http.Request) string {
 	return ""
 }
 
-// writeRatingCookie sets or clears the cookie. level=explicit (or any
-// out-of-enum value) clears it so the empty-storage steady state means
-// "no ceiling".
 func writeRatingCookie(w http.ResponseWriter, level string) {
 	switch level {
 	case "general", "sensitive", "questionable":

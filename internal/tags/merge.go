@@ -9,46 +9,25 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// ErrAliasNameInUse is returned when CreateAlias is asked to bind a name
-// that already names a non-alias tag carrying image_tags rows. The
-// caller is meant to fall back to the merge flow, which moves those
-// rows onto the canonical before installing the alias.
 var ErrAliasNameInUse = errors.New("a tag with this name already has image_tags rows; merge it instead")
 
-// CreateAlias declares that name (in categoryID) resolves to canonicalID.
-// The cheap path - alias name doesn't yet exist - inserts a fresh
-// is_alias=1 row at zero usage. When a tag with the same (name,
-// category) already exists, three branches:
-//
-//   - same id as canonical → reject (self-alias).
-//   - already an alias → repoint (UPDATE canonical_tag_id).
-//   - non-alias with image_tags rows → ErrAliasNameInUse so the UI can
-//     route through MergeTags, which moves the rows onto the canonical.
-//   - non-alias with zero usage → upgrade in place (set is_alias=1,
-//     canonical_tag_id=canonical, usage_count=0).
-//
-// Mirrors MergeTags's rating and target-not-alias guards so the
-// resolver invariants hold the same way.
 func (s *Service) CreateAlias(name string, categoryID, canonicalID int64) (*models.Tag, error) {
 	return s.CreateAliasFrom(name, categoryID, canonicalID, "user")
 }
 
-// CreateAliasFrom is CreateAlias with an explicit creation origin. The
-// origin is stamped only on a fresh insert; the repoint and
-// upgrade-in-place branches keep the existing row's creator.
+// CreateAliasFrom stamps origin only on a fresh insert; a repointed or
+// upgraded row keeps its creator.
 func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, origin string) (*models.Tag, error) {
 	normalized, err := ValidateTagName(name)
 	if err != nil {
 		return nil, err
 	}
-	// An alias row inside the rating category would either add a fifth
-	// name to the locked vocabulary or upgrade a canonical row in place.
-	// Pointing at one from another category is fine.
 	if s.ratingCatID != 0 && categoryID == s.ratingCatID {
 		return nil, ErrRatingCategoryClosed
 	}
 
 	var resultID int64
+	var gained bool
 	err = s.inWriteTx(func(tx *sql.Tx) error {
 		var canonIsAlias int
 		if err := tx.QueryRow(`SELECT is_alias FROM tags WHERE id = ?`, canonicalID).Scan(&canonIsAlias); err == sql.ErrNoRows {
@@ -60,12 +39,9 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 			return fmt.Errorf("cannot alias to a tag that is itself an alias")
 		}
 
-		// The name-collision branch routes on whether the row carries
-		// image_tags rows, not on usage_count: usage_count deliberately
-		// counts visible carriers only, so a tag whose images all went
-		// missing reads 0 while its rows are intact, and upgrading it in
-		// place would leave them keyed on an alias the images never
-		// received - unsearchable from either spelling.
+		// Test for image_tags rows, not usage_count: a tag whose images
+		// all went missing reads 0 but still has rows, which an alias
+		// would strand.
 		var existingID int64
 		var existingIsAlias, existingCarried int
 		err := tx.QueryRow(
@@ -106,16 +82,12 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 				return err
 			}
 		}
-		// Same alias-keyed-rows invariant MergeTags maintains: a tag
-		// becoming (or repointed as) an alias must not be left as parent or
-		// implied in tag_implications. The branch above already ruled out
-		// orphan image_tags rows, but a future fan-out hitting a dangling
-		// edge would still misbehave.
-		if err := repointImplicationsToCanonicalTx(tx, existingID, canonicalID); err != nil {
+		if gained, err = repointImplicationsToCanonicalTx(tx, existingID, canonicalID); err != nil {
 			return err
 		}
-		// Repoint aliases that pointed at existingID so they don't dead-end
-		// on it now that it resolves onward to canonicalID.
+		if err := moveTagNoteTx(tx, existingID, canonicalID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(
 			`UPDATE tags SET canonical_tag_id = ? WHERE canonical_tag_id = ?`,
 			canonicalID, existingID,
@@ -128,27 +100,25 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 	if err != nil {
 		return nil, err
 	}
+	if gained {
+		if err := s.fanOutCarriersOf(canonicalID); err != nil {
+			return nil, err
+		}
+	}
 	return s.GetTag(resultID)
 }
 
-// MergeTags makes aliasID an alias of canonicalID, moving all
-// image_tags rows from alias to canonical and marking the alias row.
 func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 	if aliasID == canonicalID {
 		return fmt.Errorf("cannot merge a tag into itself")
 	}
-	// Only the source is locked: the merge turns it into an alias, which
-	// would retire one of the four canonical rows. A rating on the target
-	// side is left a plain tag in its own category.
 	if s.isLockedRatingTag(aliasID) {
 		return ErrRatingTagImmutable
 	}
 	ratingTarget := s.isRatingTag(canonicalID)
 
-	return s.inWriteTx(func(tx *sql.Tx) error {
-		// Refuse merge-into-alias: the alias resolver only follows one hop
-		// (COALESCE(canonical_tag_id, id) and GetOrCreateTag's single lookup),
-		// so a two-hop chain would silently drop rows.
+	var gained bool
+	err := s.inWriteTx(func(tx *sql.Tx) error {
 		var targetIsAlias int
 		if err := tx.QueryRow(`SELECT is_alias FROM tags WHERE id = ?`, canonicalID).Scan(&targetIsAlias); err != nil {
 			return fmt.Errorf("target tag not found")
@@ -157,19 +127,10 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 			return fmt.Errorf("cannot merge into a tag that is itself an alias")
 		}
 
-		// (a) Move image_tags from alias to canonical in three set-based
-		// statements instead of three statements per row. The previous
-		// loop paid 3 round-trips per image_tags row through the single
-		// writer; on a popular alias against the documented 10M-image_tags
-		// ceiling that meant tens of millions of statements per merge.
-		//
-		// Step 1: insert canonical-side rows for images that don't already
-		// have one. INSERT OR IGNORE keeps the existing canonical when the
-		// image already had it, so no double-count. Capture the image_ids
-		// that didn't already carry the canonical so step (e) below can fan
-		// out the canonical's implications onto them.
-		newCarrierIDs, err := db.QueryIDs(tx,
-			`SELECT image_id FROM image_tags WHERE tag_id = ?
+		// Images that gain the canonical here need its implications
+		// fanned out below.
+		newCarriers, err := db.QueryAll(tx, scanCarrier,
+			`SELECT image_id, is_auto FROM image_tags WHERE tag_id = ?
 			 AND image_id NOT IN (SELECT image_id FROM image_tags WHERE tag_id = ?)`,
 			aliasID, canonicalID,
 		)
@@ -178,22 +139,19 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 		}
 
 		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO image_tags (image_id, tag_id, is_auto, is_implied, confidence, tagger_name)
-			 SELECT image_id, ?, is_auto, is_implied, confidence, tagger_name
+			`INSERT OR IGNORE INTO image_tags (image_id, tag_id, is_auto, is_implied, confidence, tagger_name, created_at, stale)
+			 SELECT image_id, ?, is_auto, is_implied, confidence, tagger_name, created_at, stale
 			 FROM image_tags WHERE tag_id = ?`,
 			canonicalID, aliasID,
 		); err != nil {
 			return fmt.Errorf("merge insert canonical rows: %w", err)
 		}
-		// Step 2: where the canonical was on the image only as an implied
-		// row but the alias was user-owned, promote canonical to user-
-		// owned. Mirrors addTagToImageTxReportingDup's promotion shape so
-		// the next removal of an unrelated parent does not leave the image
-		// with no user-owned tags. is_auto / confidence / tagger_name are
-		// inherited from the alias row by the same convention.
+		// Where the alias row was owned and the canonical only implied,
+		// the canonical takes that ownership, or removing its parent
+		// would sweep it.
 		if _, err := tx.Exec(
 			`UPDATE image_tags AS c
-			 SET is_implied = 0, is_auto = a.is_auto, confidence = a.confidence, tagger_name = a.tagger_name
+			 SET is_implied = 0, is_auto = a.is_auto, confidence = a.confidence, tagger_name = a.tagger_name, stale = a.stale
 			 FROM image_tags AS a
 			 WHERE c.image_id = a.image_id
 			   AND c.tag_id = ?
@@ -204,8 +162,7 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 		); err != nil {
 			return fmt.Errorf("merge promote canonical rows: %w", err)
 		}
-		// Carry the alias rows' source ledger onto the canonical before
-		// step 3's delete fires the ledger-cleanup trigger on them.
+		// Before the delete below: its trigger drops the alias rows' ledger.
 		if _, err := tx.Exec(
 			`INSERT OR IGNORE INTO image_tag_sources (image_id, tag_id, source, created_at)
 			 SELECT image_id, ?, source, created_at FROM image_tag_sources WHERE tag_id = ?`,
@@ -213,14 +170,12 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 		); err != nil {
 			return fmt.Errorf("merge move tag sources: %w", err)
 		}
-		// Step 3: drop every alias-keyed row.
 		if _, err := tx.Exec(
 			`DELETE FROM image_tags WHERE tag_id = ?`, aliasID,
 		); err != nil {
 			return fmt.Errorf("merge drop alias rows: %w", err)
 		}
 
-		// (b) Mark aliasID as an alias of canonicalID.
 		if _, err := tx.Exec(
 			`UPDATE tags SET is_alias = 1, canonical_tag_id = ?, usage_count = 0 WHERE id = ?`,
 			canonicalID, aliasID,
@@ -228,8 +183,6 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 			return err
 		}
 
-		// Aliases that pointed at aliasID would now dead-end on it (the
-		// resolver only follows one hop); repoint them onto canonicalID.
 		if _, err := tx.Exec(
 			`UPDATE tags SET canonical_tag_id = ? WHERE canonical_tag_id = ?`,
 			canonicalID, aliasID,
@@ -237,19 +190,13 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 			return err
 		}
 
-		// (c) Move tag_implications edges off the alias onto the canonical.
-		// AddImplication refuses aliases on either side, so a row keyed on
-		// aliasID after the flip would mean the implied closure walked from
-		// the canonical never sees it - leaving image_tags rows that were
-		// inserted as is_implied=1 because of the old alias-keyed edge with
-		// no parent on the image to justify them on later removal.
-		if err := repointImplicationsToCanonicalTx(tx, aliasID, canonicalID); err != nil {
+		if gained, err = repointImplicationsToCanonicalTx(tx, aliasID, canonicalID); err != nil {
+			return err
+		}
+		if err := moveTagNoteTx(tx, aliasID, canonicalID); err != nil {
 			return err
 		}
 
-		// (d) Recount canonical's usage_count from non-missing images, the
-		// same convention RecalcDB enforces, so a merge doesn't inflate the
-		// count past what the next recalc would emit.
 		if _, err := tx.Exec(
 			`UPDATE tags SET usage_count = (
 				SELECT COUNT(*) FROM image_tags it
@@ -261,29 +208,20 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 			return err
 		}
 
-		// (e) Fan out the canonical's implication closure onto images that
-		// only carried the alias. Without this an image previously tagged
-		// only with the alias ends up with the canonical but none of its
-		// declared implied children, and a later removeTagFromImageTx walk
-		// on that parent has no is_implied=1 rows to sweep. The closure is
-		// invariant inside the merge tx, so resolve it once instead of
-		// rewalking TransitiveImpliedTx per image.
-		if len(newCarrierIDs) > 0 {
+		if len(newCarriers) > 0 {
 			impliedClosure, err := TransitiveImpliedTx(tx, []int64{canonicalID})
 			if err != nil {
 				return fmt.Errorf("merge resolve canonical closure: %w", err)
 			}
-			for _, imageID := range newCarrierIDs {
-				if err := applyImpliedClosureTx(tx, imageID, impliedClosure, s.ratingCatID, 0); err != nil {
-					return fmt.Errorf("merge fan out implications onto image %d: %w", imageID, err)
+			for _, c := range newCarriers {
+				if err := applyImpliedClosureTx(tx, c.imageID, impliedClosure, s.ratingCatID, c.isAuto); err != nil {
+					return fmt.Errorf("merge fan out implications onto image %d: %w", c.imageID, err)
 				}
-				// A rating canonical lands on carriers that may already be
-				// rated. Keeping the highest holds the one-rating invariant
-				// and means a merge can only raise a level, never expose an
-				// image the ceiling was hiding.
+				// Highest wins here: a merge must never lower a rating
+				// and expose an image the ceiling hides.
 				if ratingTarget {
-					if err := PruneLowerRatingsTx(tx, s.ratingCatID, imageID); err != nil {
-						return fmt.Errorf("merge prune ratings on image %d: %w", imageID, err)
+					if err := PruneLowerRatingsTx(tx, s.ratingCatID, c.imageID); err != nil {
+						return fmt.Errorf("merge prune ratings on image %d: %w", c.imageID, err)
 					}
 				}
 			}
@@ -291,38 +229,110 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 
 		return nil
 	})
-}
-
-// repointImplicationsToCanonicalTx rewrites every tag_implications row
-// that names aliasID as parent or implied to name canonicalID instead,
-// then drops the alias-keyed rows. INSERT OR IGNORE collapses edges
-// the canonical already held; the != canonicalID filters skip the
-// would-be self-edges that an alias-into-its-own-implier merge could
-// otherwise create. A merge can still synthesize a cycle that
-// AddImplication would have refused at create time; the bounded
-// MaxImplicationDepth walk used by every consumer absorbs that.
-func repointImplicationsToCanonicalTx(tx *sql.Tx, aliasID, canonicalID int64) error {
-	if _, err := tx.Exec(
-		`INSERT OR IGNORE INTO tag_implications (parent_tag_id, implied_tag_id, origin)
-		 SELECT ?, implied_tag_id, origin FROM tag_implications
-		 WHERE parent_tag_id = ? AND implied_tag_id != ?`,
-		canonicalID, aliasID, canonicalID,
-	); err != nil {
+	if err != nil || !gained {
 		return err
 	}
+	return s.fanOutCarriersOf(canonicalID)
+}
+
+// An alias left in tag_implications would never fire, stranding the rows
+// its edges implied. The != filters skip would-be self-edges.
+func repointImplicationsToCanonicalTx(tx *sql.Tx, aliasID, canonicalID int64) (gained bool, err error) {
+	if closes, err := repointClosesCycleTx(tx, aliasID, canonicalID); err != nil {
+		return false, err
+	} else if closes {
+		return false, ErrImplicationCycle
+	}
+	res, err := tx.Exec(
+		`INSERT OR IGNORE INTO tag_implications (parent_tag_id, implied_tag_id, origin, created_at, stale)
+		 SELECT ?, implied_tag_id, origin, created_at, stale FROM tag_implications
+		 WHERE parent_tag_id = ? AND implied_tag_id != ?`,
+		canonicalID, aliasID, canonicalID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
 	if _, err := tx.Exec(
-		`INSERT OR IGNORE INTO tag_implications (parent_tag_id, implied_tag_id, origin)
-		 SELECT parent_tag_id, ?, origin FROM tag_implications
+		`INSERT OR IGNORE INTO tag_implications (parent_tag_id, implied_tag_id, origin, created_at, stale)
+		 SELECT parent_tag_id, ?, origin, created_at, stale FROM tag_implications
 		 WHERE implied_tag_id = ? AND parent_tag_id != ?`,
 		canonicalID, aliasID, canonicalID,
 	); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(
 		`DELETE FROM tag_implications WHERE parent_tag_id = ? OR implied_tag_id = ?`,
 		aliasID, aliasID,
 	); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+type carrier struct {
+	imageID int64
+	isAuto  int
+}
+
+func scanCarrier(rows *sql.Rows) (carrier, error) {
+	var c carrier
+	err := rows.Scan(&c.imageID, &c.isAuto)
+	return c, err
+}
+
+// Each chunk rereads its rows: an image may have lost the tag meanwhile.
+func (s *Service) fanOutCarriersOf(tagID int64) error {
+	ids, err := db.QueryIDs(s.db.Read, `SELECT image_id FROM image_tags WHERE tag_id = ?`, tagID)
+	if err != nil {
 		return err
 	}
-	return nil
+	return db.Chunked(ids, 500, func(chunk []int64) error {
+		return s.inWriteTx(func(tx *sql.Tx) error {
+			closure, err := TransitiveImpliedTx(tx, []int64{tagID})
+			if err != nil {
+				return err
+			}
+			placeholders, args := db.InPlaceholders(chunk)
+			carriers, err := db.QueryAll(tx, scanCarrier,
+				`SELECT image_id, is_auto FROM image_tags WHERE tag_id = ? AND image_id IN (`+placeholders+`)`,
+				append([]any{tagID}, args...)...)
+			if err != nil {
+				return err
+			}
+			for _, c := range carriers {
+				if err := applyImpliedClosureTx(tx, c.imageID, closure, s.ratingCatID, c.isAuto); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
+}
+
+// The graph was acyclic, so a new cycle runs through one alias edge.
+func repointClosesCycleTx(tx *sql.Tx, aliasID, canonicalID int64) (bool, error) {
+	implied, err := db.QueryIDs(tx,
+		`SELECT implied_tag_id FROM tag_implications WHERE parent_tag_id = ? AND implied_tag_id != ?`,
+		aliasID, canonicalID)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range implied {
+		if reaches, err := implicationReachesTx(tx, id, canonicalID); err != nil || reaches {
+			return reaches, err
+		}
+	}
+	parents, err := db.QueryIDs(tx,
+		`SELECT parent_tag_id FROM tag_implications WHERE implied_tag_id = ? AND parent_tag_id != ?`,
+		aliasID, canonicalID)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range parents {
+		if reaches, err := implicationReachesTx(tx, canonicalID, id); err != nil || reaches {
+			return reaches, err
+		}
+	}
+	return false, nil
 }

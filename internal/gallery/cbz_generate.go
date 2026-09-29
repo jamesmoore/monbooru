@@ -15,30 +15,14 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// CBZMember is one collection member fed to WriteCollectionCBZ: its
-// canonical path and file type, in the order the pages should appear.
-// filename is the member's basename, used to sort unordered members into
-// natural filename order before packing.
 type CBZMember struct {
 	Path     string
 	FileType string
 	filename string
 }
 
-// WriteCollectionCBZ packs members into a cbz archive at dstPath: every
-// member as a page named 0001.ext, 0002.ext, ... in slice order, plus a
-// ComicInfo.xml carrying the title and page count. Members whose file
-// has vanished since the query are skipped and counted in skipped;
-// numbering stays contiguous over the pages actually written.
-//
-// A member that is not a still image vetoes the whole archive rather
-// than being dropped: a caller asking for a comic out of a set that
-// includes a video wants to hear about it, not to get the rest.
-// Nothing is created on disk before that check clears.
-//
-// The archive is written to a temp file and atomically renamed so a
-// watcher never ingests a half-written archive; pages are stored
-// uncompressed (zip.Store) since images are already compressed.
+// WriteCollectionCBZ refuses the whole set when a member is not a still
+// image, rather than dropping it, so the operator hears about it.
 func WriteCollectionCBZ(ctx context.Context, dstPath string, members []CBZMember, title string, progress func(processed, total int, message string)) (pages, skipped int, err error) {
 	for _, m := range members {
 		if models.MediaKind(m.FileType) != "image" {
@@ -62,17 +46,13 @@ func WriteCollectionCBZ(ctx context.Context, dstPath string, members []CBZMember
 			if ctx != nil && ctx.Err() != nil {
 				return ctx.Err()
 			}
-			// The file can have vanished between the member query and now (a
-			// concurrent delete); skip it rather than failing the generation.
 			f, openErr := os.Open(m.Path)
 			if openErr != nil {
 				skipped++
 				continue
 			}
-			// Entry extension from the stored file type, not the on-disk
-			// name, so extension-less files still produce recognized pages.
-			// Numbered off the written count, not the member index, so a
-			// skipped member leaves no gap in the page sequence.
+			// The extension comes from the stored type: the file on disk
+			// may have none.
 			entry, err := zw.CreateHeader(&zip.FileHeader{
 				Name:   fmt.Sprintf("%04d.%s", pages+1, m.FileType),
 				Method: zip.Store,
@@ -95,8 +75,6 @@ func WriteCollectionCBZ(ctx context.Context, dstPath string, members []CBZMember
 			return errors.New("every member's file is missing from disk")
 		}
 
-		// ComicInfo.xml is deflated since it is text; readers locate it by
-		// name, so its position in the archive is irrelevant.
 		ci, err := metadata.MarshalComicInfo(title, pages)
 		if err != nil {
 			return fmt.Errorf("comic info: %w", err)
@@ -116,9 +94,7 @@ func WriteCollectionCBZ(ctx context.Context, dstPath string, members []CBZMember
 	if err != nil {
 		return pages, skipped, err
 	}
-	// CreateTemp leaves 0600; align with the 0644 of files that land in
-	// the gallery through other paths so host-side tooling sees the same
-	// mode. Best-effort: a chmod failure should not fail the generation.
+	// CreateTemp leaves 0600; other gallery files are 0644.
 	if err := os.Chmod(dstPath, 0o644); err != nil {
 		logx.Warnf("cbz generation: chmod %q: %v", dstPath, err)
 	}

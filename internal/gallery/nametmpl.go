@@ -19,8 +19,8 @@ import (
 // extension and a collision counter.
 const maxNameBytes = 180
 
-// Scope is the call site a template is parsed for. It decides which
-// separators and which tokens that site can honour.
+// Scope is the call site a template is parsed for; it decides which
+// separators and tokens are allowed.
 type Scope int
 
 const (
@@ -32,9 +32,6 @@ const (
 	ScopeUploadName
 )
 
-// Folder reports whether the scope names a directory rather than a file:
-// "/" separates instead of being refused, and an empty render is the
-// gallery root instead of a name that has to fall back.
 func (s Scope) Folder() bool { return s == ScopeMove || s == ScopeMoveBatch || s == ScopeUploadFolder }
 
 func (s Scope) sequence() bool { return s == ScopeRenameBatch || s == ScopeMoveBatch }
@@ -75,8 +72,6 @@ var nameTokens = map[string]nameToken{
 	"folder": tokFolder, "n": tokSeq, "source": tokSource, "post_id": tokPostID,
 }
 
-// refusedNameTokens are the spellings people reach for that name something
-// no rename can know. Answering them by name is cheaper than a help page.
 var refusedNameTokens = map[string]string{
 	"tag":        "tags are not known at ingest time",
 	"artist":     "tags are not known at ingest time",
@@ -91,16 +86,13 @@ type namePart struct {
 	width int
 }
 
-// NameTemplate is a compiled filename template: literal runs and the
-// tokens between them.
 type NameTemplate struct {
 	parts  []namePart
 	scope  Scope
 	tokens bool
 }
 
-// ParseNameTemplate compiles s for the call site sc, refusing anything sc
-// cannot honour. A blank template compiles to nil, which every caller
+// ParseNameTemplate compiles a blank template to nil, which every caller
 // reads as "leave the name alone".
 func ParseNameTemplate(s string, sc Scope) (*NameTemplate, error) {
 	s = strings.TrimSpace(s)
@@ -186,13 +178,8 @@ func parseNameToken(inner string, sc Scope) (namePart, error) {
 	return p, nil
 }
 
-// HasTokens reports whether the template varies per image. Batch rename
-// numbers a plain string itself so a whole run cannot collide on one name.
 func (t *NameTemplate) HasTokens() bool { return t != nil && t.tokens }
 
-// readsMD5 reports whether any of the templates names a file by {md5}.
-// The column is filled lazily, so a row that predates it carries none
-// until something asks for it.
 func readsMD5(tmpls []*NameTemplate) bool {
 	for _, t := range tmpls {
 		if t == nil {
@@ -205,17 +192,12 @@ func readsMD5(tmpls []*NameTemplate) bool {
 	return false
 }
 
-// NameFacts is everything a template can substitute: the row's own
-// columns, the batch position, and the origin a push carried.
 type NameFacts struct {
 	Name string
-	// Ext is lower-cased, which is what makes {name}.{ext} the way to
-	// normalise a shouting extension. Base keeps the on-disk spelling,
-	// since that is the name a rename actually starts from.
-	Ext  string
-	Base string
-	// Folder is the row's directory relative to the gallery root,
-	// "/"-separated and empty when the file sits at the root.
+	// Ext is lower-cased so {name}.{ext} normalises the extension; Base
+	// keeps the on-disk spelling a rename starts from.
+	Ext        string
+	Base       string
 	Folder     string
 	Type       string
 	Gallery    string
@@ -233,16 +215,9 @@ type NameFacts struct {
 	NWidth     int
 }
 
-// LoadNameFacts reads the row's half of a render for tmpls. Source,
-// PostID and the batch position are the caller's to fill. A template
-// naming the file by {md5} hashes what the row has not got yet, so it
-// names the same digest a booru would rather than rendering empty.
-//
-// That hash reads the whole file, so it rides the caller's ctx, and
-// md5Cap bounds it: a row whose file is larger renders {md5} empty and
-// leaves the digest to the backfill job, the way the detail page's md5
-// cell does. 0 means no bound, which is what every caller acting on a
-// file it already read passes.
+// LoadNameFacts leaves Source, PostID and the batch position to the
+// caller. An empty md5 is computed when a template reads it, unless the
+// file is over md5Cap (0 means no cap); then {md5} renders empty.
 func LoadNameFacts(ctx context.Context, database *db.DB, galleryName string, id int64, md5Cap int64, tmpls ...*NameTemplate) (NameFacts, error) {
 	f := NameFacts{ID: id, Gallery: galleryName}
 	var canonical, ingestedAt string
@@ -268,14 +243,9 @@ func LoadNameFacts(ctx context.Context, database *db.DB, galleryName string, id 
 	return f, nil
 }
 
-// Render substitutes f into the template. A column the row does not carry
-// renders empty and the separators around it close up, so a template
-// written for a push still reads right on a file that arrived without one.
-// A file arriving now has to be called something, so a template that named
-// nothing at all falls back to the gallery root or to the id. A rename or
-// move acts on a name and a folder the file already has, so there the same
-// render is a refusal: filing a whole scope under its ids, or flattening it
-// into the root, is not a guess worth making.
+// Render falls back to the root or the id when an arriving file renders
+// empty; a rename or move refuses rather than file a scope under ids or
+// flatten it.
 func (t *NameTemplate) Render(f NameFacts) (string, error) {
 	var b []byte
 	for _, p := range t.parts {
@@ -287,9 +257,8 @@ func (t *NameTemplate) Render(f NameFacts) (string, error) {
 				v = SanitizeFilename(v)
 			}
 			if v == "" {
-				// The separator on each side of a token belongs to the
-				// token, so one of them goes with it: {artist} - {name}
-				// on a row with no artist is the name, not " - name".
+				// The separator before an empty token goes with it:
+				// "{name} - {source}" without a source is the name.
 				b = trimSeparatorSuffix(b)
 				continue
 			}
@@ -300,8 +269,8 @@ func (t *NameTemplate) Render(f NameFacts) (string, error) {
 	switch {
 	case out != "":
 		return out, nil
-	// The gallery root is a real destination for a template that asked for
-	// {folder}: that is where a row sitting at the root already is.
+	// A {folder} template may render the root: that is where a root row
+	// already is.
 	case t.scope.Folder() && (t.scope.source() || t.namesFolder()):
 		return "", nil
 	case t.scope.source():
@@ -311,21 +280,16 @@ func (t *NameTemplate) Render(f NameFacts) (string, error) {
 	}
 }
 
-// namesFolder reports whether the template carries {folder}.
 func (t *NameTemplate) namesFolder() bool {
 	return slices.ContainsFunc(t.parts, func(p namePart) bool { return p.tok == tokFolder })
 }
 
-// identityTokens name one row and no other. Everything else a template can
-// carry - a date, a type, a gallery - groups rows rather than separating
-// them, however many distinct values a given library happens to hold.
+// identityTokens tell rows apart; a date, a type or a gallery groups them
+// however many values a library holds.
 var identityTokens = map[nameToken]bool{
 	tokName: true, tokID: true, tokHash: true, tokMD5: true, tokSeq: true,
 }
 
-// PerImage reports whether the template renders to something different for
-// every row. In a folder scope that means a folder each, which no sampled
-// preview of the destination can show.
 func (t *NameTemplate) PerImage() bool {
 	if t == nil {
 		return false
@@ -391,8 +355,6 @@ func (p namePart) value(f NameFacts) string {
 	return ""
 }
 
-// sizeOrEmpty renders a dimension the decode never filled as nothing, so
-// {w}x{h} on a video collapses instead of reading 0x0.
 func sizeOrEmpty(v int) string {
 	if v <= 0 {
 		return ""
@@ -400,15 +362,14 @@ func sizeOrEmpty(v int) string {
 	return strconv.Itoa(v)
 }
 
-// tidyNamePath cleans each segment and drops the empty ones, so a token
-// that rendered nothing cannot leave a bare separator - or, at the front,
-// a leading slash the destination resolver would read as absolute.
+// Dropping empty segments also keeps out a leading slash, which the
+// resolver would read as absolute.
 func tidyNamePath(s string) string {
 	segs := strings.Split(s, "/")
 	kept := segs[:0]
 	for _, seg := range segs {
-		// Per segment, not per token: a template's own literal text reaches
-		// the path too, and the filesystem refuses it for the same reasons.
+		// Literal text reaches the path too, so each segment is
+		// sanitized, not only the tokens.
 		seg = strings.Trim(SanitizeFilename(seg), "-_ ")
 		if seg = TruncateFilename(seg, maxNameBytes); seg != "" {
 			kept = append(kept, seg)
@@ -417,19 +378,13 @@ func tidyNamePath(s string) string {
 	return strings.Join(kept, "/")
 }
 
-// trimSeparatorSuffix drops the separator run a token that rendered
-// nothing was about to be joined to. Runs inside a rendered value are left
-// alone: my--file was typed that way, and {name} is what it is called.
 func trimSeparatorSuffix(b []byte) []byte {
 	return []byte(strings.TrimRight(string(b), "-_ "))
 }
 
-// SanitizeFilename folds what a filesystem would refuse in one path
-// segment to _. Only that - a name in any script still names its own file
-// instead of collapsing to underscores. The Windows reserved set covers
-// POSIX's, and a gallery is often shared over SMB; trailing dots and
-// spaces go too, since Windows drops them silently and the path would
-// stop round-tripping.
+// SanitizeFilename folds only what a filesystem refuses, so a name in any
+// script keeps its letters. It uses Windows' set, as galleries are often
+// shared over SMB, and trims the trailing dots and spaces Windows drops.
 func SanitizeFilename(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -442,9 +397,6 @@ func SanitizeFilename(s string) string {
 	return strings.Trim(b.String(), " .")
 }
 
-// TruncateFilename cuts s to at most max bytes, backing up to a rune
-// boundary so a multi-byte character is never left in half. The budget is
-// bytes because the filesystem's is.
 func TruncateFilename(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -456,23 +408,17 @@ func TruncateFilename(s string, max int) string {
 	return strings.Trim(s[:cut], " .")
 }
 
-// Naming is where a file is filed and what it is called, plus the gallery
-// name {gallery} resolves to. A zero value leaves the file alone.
 type Naming struct {
 	Folder  *NameTemplate
 	Name    *NameTemplate
 	Gallery string
 }
 
-// Empty reports whether the naming would do nothing.
 func (n Naming) Empty() bool { return n.Folder == nil && n.Name == nil }
 
-// Apply files image id where the naming says it belongs: the folder
-// first, then the name. It runs after ingest, which is what makes {id}
-// and {hash} available at all. site and postID carry the origin only a
-// push knows; every other caller passes empty strings. The final path
-// comes back so a caller tracking paths on disk can follow the file.
-func (n Naming) Apply(ctx context.Context, database *db.DB, galleryPath string, id int64, site, postID string) (string, error) {
+// Apply runs on an ingested row; site and postID are a push's origin,
+// empty for every other caller.
+func (n Naming) Apply(ctx context.Context, database *db.DB, b *Boundary, id int64, site, postID string) (string, error) {
 	if n.Empty() {
 		return "", nil
 	}
@@ -496,19 +442,16 @@ func (n Naming) Apply(ctx context.Context, database *db.DB, galleryPath string, 
 		}
 		name = &rendered
 	}
-	res, err := PlaceImage(database, galleryPath, id, folder, name)
+	res, err := PlaceImage(database, b, id, folder, name)
 	if err != nil {
 		return "", err
 	}
 	return res.NewCanonicalPath, nil
 }
 
-// ReceivedNaming compiles the destination settings for a file monbooru is
-// about to write: the directory the bytes go into now, and what to apply
-// once the row exists. A folder built from tokens cannot be resolved
-// before that row, so those bytes land in the gallery root and the move
-// follows the ingest. A folder named on the request is the caller's own
-// choice and is never a template.
+// ReceivedNaming lands the bytes in the root when the folder has tokens,
+// which need the row, and the move follows the ingest. A folder named on
+// the request is taken literally.
 func ReceivedNaming(galleryName, requestFolder, defaultFolder, defaultName string) (writeDir string, n Naming) {
 	n.Gallery = galleryName
 	n.Name = parseSetting(defaultName, ScopeUploadName, "default_upload_name")
@@ -523,10 +466,8 @@ func ReceivedNaming(galleryName, requestFolder, defaultFolder, defaultName strin
 	return defaultFolder, n
 }
 
-// IngestNaming compiles the destination settings for a file that is
-// already on disk. There is nowhere to write it first, so the folder
-// applies as a move whether or not it carries tokens; a blank folder
-// leaves the file in whatever folder it was dropped in.
+// IngestNaming applies the folder as a move, tokens or not, since the file
+// is already on disk; a blank one leaves the file where it was dropped.
 func IngestNaming(galleryName, folder, name string) Naming {
 	return Naming{
 		Folder:  parseSetting(folder, ScopeUploadFolder, "default_upload_folder"),
@@ -535,10 +476,9 @@ func IngestNaming(galleryName, folder, name string) Naming {
 	}
 }
 
-// ParseBatchRenameTemplate compiles a batch-rename base. A base carrying no
-// token of its own numbers the run, or the whole scope would collide on one
-// name and auto-suffix its way out; the preview and the job both parse
-// through here so they cannot disagree about what a plain name does.
+// ParseBatchRenameTemplate appends {n} to a base with no token, or the
+// whole scope would collide on one name. The preview and the job must both
+// parse through here.
 func ParseBatchRenameTemplate(s string) (*NameTemplate, error) {
 	tmpl, err := ParseNameTemplate(s, ScopeRenameBatch)
 	if err != nil || tmpl == nil || tmpl.HasTokens() {
@@ -547,9 +487,6 @@ func ParseBatchRenameTemplate(s string) (*NameTemplate, error) {
 	return ParseNameTemplate(s+"{n}", ScopeRenameBatch)
 }
 
-// FolderFor renders one row's destination folder, empty when the naming
-// names none. Apply is the whole answer for a caller filing a single row;
-// this is for the one that hangs a subfolder of its own under the result.
 func (n Naming) FolderFor(ctx context.Context, database *db.DB, id int64) (string, error) {
 	if n.Folder == nil {
 		return "", nil
@@ -561,8 +498,6 @@ func (n Naming) FolderFor(ctx context.Context, database *db.DB, id int64) (strin
 	return n.Folder.Render(facts)
 }
 
-// parseSetting compiles a stored setting, reporting a hand-edited value
-// that will not parse rather than filing by half of it.
 func parseSetting(raw string, sc Scope, key string) *NameTemplate {
 	tmpl, err := ParseNameTemplate(raw, sc)
 	if err != nil {

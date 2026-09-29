@@ -1,6 +1,8 @@
 package web
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -12,10 +14,6 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// sha256DuplicateRow is one alias path on the SHA-256 duplicates table:
-// the owning image, its canonical path on disk, and the alias path to
-// remove. The walker page renders one row per alias so a single image
-// with three non-canonical paths shows up three times.
 type sha256DuplicateRow struct {
 	ImageID       int64
 	CanonicalPath string
@@ -23,11 +21,6 @@ type sha256DuplicateRow struct {
 	AliasPath     string
 }
 
-// markedDuplicateRow names one (group, original, non-original) pairing
-// for the marked-duplicates walker table. HasTagsToCopy is true when
-// at least one non-rating tag carried by a duplicate of the group is
-// absent on the original - it gates the [copy tags] button so empty
-// groups don't surface a no-op action.
 type markedDuplicateRow struct {
 	GroupID       int64
 	OriginalID    int64
@@ -36,12 +29,10 @@ type markedDuplicateRow struct {
 	HasTagsToCopy bool
 }
 
-// relationsWalkerData is the shared template payload for the two
-// duplicate walkers. Both render as tables.
 type relationsWalkerData struct {
 	baseData
 	ActiveGallery string
-	Kind          string // "sha256" or "marked"
+	Kind          string
 	Sha256Rows    []sha256DuplicateRow
 	MarkedRows    []markedDuplicateRow
 	Total         int
@@ -49,17 +40,10 @@ type relationsWalkerData struct {
 	TotalPages    int
 }
 
-// HasRows reports whether the walk found anything, which is what gates the
-// delete-all toolbar. Only one of the two slices is ever populated.
 func (d relationsWalkerData) HasRows() bool { return len(d.Sha256Rows) > 0 || len(d.MarkedRows) > 0 }
 
-// duplicatesWalkerPageSize caps each walker page. A find-pairs run can
-// mark tens of thousands of members on a large library, and both tables
-// lift a thumbnail per row.
 const duplicatesWalkerPageSize = 100
 
-// walkerPageOffset resolves ?page= against a row count, clamping a
-// past-the-end page onto the last one the way the gallery does.
 func walkerPageOffset(r *http.Request, total int) (page, totalPages, offset int) {
 	page = 1
 	if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 1 {
@@ -75,61 +59,29 @@ func walkerPageOffset(r *http.Request, total int) (page, totalPages, offset int)
 	return page, totalPages, (page - 1) * duplicatesWalkerPageSize
 }
 
-// sha256WalkerPage renders every non-canonical alias path the gallery
-// carries in one table. The Walk button on the Relations page links
-// here.
 func (s *Server) sha256WalkerPage(w http.ResponseWriter, r *http.Request) {
 	cx, ok := s.requireActive(w)
 	if !ok {
 		return
 	}
-	from, args := duplicatePathsFrom(r, cx)
-	var total int
-	if err := cx.DB.Read.QueryRow(`SELECT COUNT(*)`+from, args...).Scan(&total); err != nil {
-		logx.Warnf("sha256 walker count: %v", err)
-		http.Error(w, "load duplicates", http.StatusInternalServerError)
-		return
-	}
-	page, totalPages, offset := walkerPageOffset(r, total)
-	rows, err := cx.DB.Read.Query(
-		`SELECT i.id, i.canonical_path, ip.id, ip.path`+from+` ORDER BY i.id, ip.id LIMIT ? OFFSET ?`,
-		append(append([]any{}, args...), duplicatesWalkerPageSize, offset)...)
+	all, err := duplicatePaths(r, cx)
 	if err != nil {
 		logx.Warnf("sha256 walker query: %v", err)
 		http.Error(w, "load duplicates", http.StatusInternalServerError)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-	var out []sha256DuplicateRow
-	for rows.Next() {
-		var dr sha256DuplicateRow
-		if scanErr := rows.Scan(&dr.ImageID, &dr.CanonicalPath, &dr.PathID, &dr.AliasPath); scanErr != nil {
-			logx.Warnf("sha256 walker scan: %v", scanErr)
-			http.Error(w, "scan duplicates", http.StatusInternalServerError)
-			return
-		}
-		out = append(out, dr)
-	}
-	if err := rows.Err(); err != nil {
-		http.Error(w, "iterate duplicates", http.StatusInternalServerError)
-		return
-	}
+	page, totalPages, offset := walkerPageOffset(r, len(all))
 	s.renderTemplate(w, "relations_duplicates_sha256.html", relationsWalkerData{
 		baseData:      s.base(r, "relations", "Duplicate files - "+s.booruName()),
 		ActiveGallery: s.activeGallery(),
 		Kind:          "sha256",
-		Sha256Rows:    out,
-		Total:         total,
+		Sha256Rows:    all[offset:min(offset+duplicatesWalkerPageSize, len(all))],
+		Total:         len(all),
 		Page:          page,
 		TotalPages:    totalPages,
 	})
 }
 
-// markedWalkerPage lists every (original, duplicate) pairing across
-// every dup_group in one table. One row per non-original member,
-// ordered by the membership's created_at descending so the freshest
-// markings land at the top - the operator's most recent decisions are
-// the ones most likely to need a follow-up action.
 func (s *Server) markedWalkerPage(w http.ResponseWriter, r *http.Request) {
 	cx, ok := s.requireActive(w)
 	if !ok {
@@ -191,11 +143,6 @@ func (s *Server) markedWalkerPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// annotateTagsToCopy sets HasTagsToCopy on every row whose group still
-// carries at least one non-rating tag missing from its original. Runs
-// one SELECT to gather the set of eligible group ids and stamps the
-// result across the slice in O(N) so the walker doesn't pay a per-row
-// query.
 func annotateTagsToCopy(cx *galleryCtx, rows []markedDuplicateRow) error {
 	if len(rows) == 0 {
 		return nil
@@ -236,9 +183,6 @@ func annotateTagsToCopy(cx *galleryCtx, rows []markedDuplicateRow) error {
 	return nil
 }
 
-// sha256WalkerRemoveOnePost removes a specific alias path (by id) and
-// its file from disk, then bounces back to the walker so the refreshed
-// table no longer carries the deleted row.
 func (s *Server) sha256WalkerRemoveOnePost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -249,12 +193,13 @@ func (s *Server) sha256WalkerRemoveOnePost(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var aliasPath, canonicalPath string
+	var size int64
 	if err := s.db().Read.QueryRow(
-		`SELECT ip.path, i.canonical_path
+		`SELECT ip.path, i.canonical_path, i.file_size
 		 FROM image_paths ip JOIN images i ON i.id = ip.image_id
 		 WHERE ip.id = ? AND ip.is_canonical = 0`,
 		pathID,
-	).Scan(&aliasPath, &canonicalPath); err != nil {
+	).Scan(&aliasPath, &canonicalPath, &size); err != nil {
 		flashStatus(w, http.StatusNotFound, "Not a non-canonical path.")
 		return
 	}
@@ -263,16 +208,13 @@ func (s *Server) sha256WalkerRemoveOnePost(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if aliasPath != "" {
-		if err := unlinkAliasFile(s.galleryPath(), aliasPath, canonicalPath); err != nil {
+		if err := unlinkAliasFile(s.boundary(), aliasPath, canonicalPath, size); err != nil {
 			logx.Warnf("sha256 walker unlink %q: %v", aliasPath, err)
 		}
 	}
 	redirectWalker(w, r, "sha256")
 }
 
-// markedWalkerDeleteOnePost deletes one image from a dup group through
-// the same gallery.DeleteImage path the detail page uses; the
-// relations service's OnImageDeleteTx hook cleans the group membership.
 func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -282,7 +224,22 @@ func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Reques
 		flashStatus(w, http.StatusBadRequest, "Invalid image id.")
 		return
 	}
-	if _, err := gallery.DeleteImage(s.db(), s.galleryPath(), s.thumbnailsPath(), imageID, tags.RemoveAllTagsFromImageTx, s.onImageDeleteCallback()); err != nil {
+	var isOriginal bool
+	if err := s.db().Read.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM dup_groups WHERE original_image_id = ?)`, imageID,
+	).Scan(&isOriginal); err != nil {
+		flashStatus(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if isOriginal {
+		flashStatus(w, http.StatusConflict, fmt.Sprintf("Image #%d is its group's original, so it was kept.", imageID))
+		return
+	}
+	if _, err := gallery.DeleteImage(s.db(), s.boundary(), s.thumbnailsPath(), imageID, tags.RemoveAllTagsFromImageTx, s.onImageDeleteCallback()); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			flashStatus(w, http.StatusNotFound, fmt.Sprintf("Image #%d is already gone.", imageID))
+			return
+		}
 		flashStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -290,12 +247,8 @@ func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Reques
 	redirectWalker(w, r, "marked")
 }
 
-// markedWalkerDeleteAllPost removes every non-original member from
-// every dup_group. Each delete rides gallery.DeleteImage so the file
-// is removed alongside the row. The walker page filters rows by the
-// active ceiling (so members above the cookie level never surface);
-// the bulk-delete mirrors that filter so the operator can't wipe
-// rows they can't see.
+// Ceiling-filtered, so delete-all never removes a member the operator
+// cannot see.
 func (s *Server) markedWalkerDeleteAllPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -323,13 +276,10 @@ func (s *Server) markedWalkerDeleteAllPost(w http.ResponseWriter, r *http.Reques
 		writeInlineFlash(w, "ok", "Removed 0 marked duplicate(s).")
 		return
 	}
-	// Reserve a job slot so the per-image unlinks don't race a concurrent
-	// autotag / rebuild-thumbs / vacuum; the response returns immediately
-	// and the status bar surfaces progress.
 	if !s.startJob(w, models.JobTypeDelete) {
 		return
 	}
-	galleryPath := s.galleryPath()
+	bound := s.boundary()
 	thumbnailsPath := s.thumbnailsPath()
 	onDelete := s.onImageDeleteCallback()
 	go func() {
@@ -343,7 +293,7 @@ func (s *Server) markedWalkerDeleteAllPost(w http.ResponseWriter, r *http.Reques
 				s.active().InvalidateCaches()
 				return
 			}
-			if _, err := gallery.DeleteImage(s.db(), galleryPath, thumbnailsPath, id, tags.RemoveAllTagsFromImageTx, onDelete); err != nil {
+			if _, err := gallery.DeleteImage(s.db(), bound, thumbnailsPath, id, tags.RemoveAllTagsFromImageTx, onDelete); err != nil {
 				logx.Warnf("marked delete-all image %d: %v", id, err)
 				continue
 			}
@@ -358,8 +308,6 @@ func (s *Server) markedWalkerDeleteAllPost(w http.ResponseWriter, r *http.Reques
 	writeInlineFlash(w, "ok", "Marked duplicate removal started.")
 }
 
-// redirectWalker writes an HX-Redirect (or 303) back to the walker
-// page so the refreshed table reflects the just-completed action.
 func redirectWalker(w http.ResponseWriter, r *http.Request, kind string) {
 	target := "/relations/duplicates/" + kind
 	hxRedirect(w, r, target)

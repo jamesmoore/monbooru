@@ -8,23 +8,14 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 )
 
-// image_tag_sources is the per-tag provenance ledger: one row per
-// (image, tag, source) recording every source that applied or
-// re-confirmed the tag, where image_tags.tagger_name only keeps the
-// first. Rows are written by the apply paths (never by implication
-// fan-out) and die with their image_tags row via the
-// trg_image_tags_sources_ad trigger.
-
-// TagSource is one ledger row for an image's tag.
 type TagSource struct {
 	Source    string
 	CreatedAt string
 }
 
-// RecordTagSourceTx records that source applied or confirmed tagID on
-// imageID. An empty source is the anonymous UI add and is stored as
-// 'user'. Exported for the apply paths that write image_tags outside
-// this package (internal/tagger's direct-SQL batch).
+// RecordTagSourceTx adds a ledger row for each source that applies or
+// re-confirms a tag, where tagger_name keeps only the first. Implication
+// fan-out writes none.
 func RecordTagSourceTx(tx *sql.Tx, imageID, tagID int64, source string) error {
 	source = cmp.Or(source, "user")
 	_, err := tx.Exec(
@@ -34,18 +25,14 @@ func RecordTagSourceTx(tx *sql.Tx, imageID, tagID int64, source string) error {
 	return err
 }
 
-// UsedByLabels returns every source that has applied a tag, sorted, for
-// the /tags Used-by filter. Free at any catalog size: SQLite skips ahead
-// per distinct value over idx_image_tag_sources_source rather than
-// walking the ledger.
+// DISTINCT skip-scans idx_image_tag_sources_source, so this is cheap at
+// any size.
 func (s *Service) UsedByLabels() ([]string, error) {
 	return db.QueryStrings(s.db.Read, `SELECT DISTINCT source FROM image_tag_sources ORDER BY source`)
 }
 
-// UsedByForTags reports which of labels applied each of tagIDs, keyed by
-// tag id, for the /tags Used-by column. One EXISTS probe per (tag,
-// label) pair: grouping the ledger by (tag_id, source) would instead
-// walk every row a heavily-applied tag carries.
+// One EXISTS per (tag, label): grouping the ledger would walk every row
+// of a heavily applied tag.
 func (s *Service) UsedByForTags(tagIDs []int64, labels []string) (map[int64][]string, error) {
 	out := make(map[int64][]string, len(tagIDs))
 	if len(tagIDs) == 0 || len(labels) == 0 {
@@ -87,8 +74,6 @@ func (s *Service) UsedByForTags(tagIDs []int64, labels []string) (map[int64][]st
 	return out, nil
 }
 
-// TagSourcesForImage returns the ledger rows for one image keyed by
-// tag id, each tag's sources in recording order.
 func (s *Service) TagSourcesForImage(imageID int64) (map[int64][]TagSource, error) {
 	rows, err := s.db.Read.Query(
 		`SELECT tag_id, source, created_at FROM image_tag_sources

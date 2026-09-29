@@ -7,8 +7,6 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 )
 
-// Row is one backend's recorded history for an image, as the detail page and
-// the API render it.
 type Row struct {
 	Backend    string
 	Attempts   int
@@ -18,18 +16,14 @@ type Row struct {
 	NextDueAt  time.Time
 }
 
-// InFlight reports an attempt still waiting on monloader, for the reconcile
-// sweep.
 type InFlight struct {
 	ImageID int64
 	Backend string
 	JobID   int64
 }
 
-// Enqueued stamps an attempt as in flight. jobID is the id monloader returned
-// in its 202; it is what makes an attempt whose callback goes missing
-// resolvable at all, so a zero id (an older monloader, or a reply we could
-// not read) still records the attempt but leaves it to the grace sweep.
+// A zero jobID still records the attempt, but only the grace sweep can
+// resolve it.
 func Enqueued(database *db.DB, imageID int64, backends []string, jobID int64, now time.Time) error {
 	for _, backend := range backends {
 		if _, err := database.Write.Exec(
@@ -44,15 +38,9 @@ func Enqueued(database *db.DB, imageID int64, backends []string, jobID int64, no
 	return nil
 }
 
-// Record concludes one attempt. Only a hit or a miss is evidence about the
-// image: they stamp last_at / last_result and move the ladder. An error, and
-// the inconclusive result the reconcile sweep produces, are evidence about
-// the plumbing - they clear the in-flight state and leave the image due now,
-// so a monloader that is down for six ladder rungs never walks an image to
-// "nothing found" without a single lookup having run.
-//
-// cursor is monloader's index position and is stored on a PTR miss so the
-// retry can skip an index that has not moved; pass 0 elsewhere.
+// Record advances the ladder only on a hit or a miss. Any other result clears
+// the in-flight state and leaves the image due now, so an outage cannot walk
+// it to "nothing found". cursor is for a PTR result; pass 0 elsewhere.
 func Record(database *db.DB, imageID int64, backend, result string, cursor uint64, now time.Time) error {
 	if result != ResultHit && result != ResultMiss {
 		_, err := database.Write.Exec(
@@ -87,8 +75,6 @@ func Record(database *db.DB, imageID int64, backend, result string, cursor uint6
 	return err
 }
 
-// nextAttempts is the miss counter after this outcome: a hit resets it, a
-// miss advances the stored count.
 func nextAttempts(database *db.DB, imageID int64, backend, result string) (int, error) {
 	if result == ResultHit {
 		return 0, nil
@@ -102,11 +88,8 @@ func nextAttempts(database *db.DB, imageID int64, backend, result string) (int, 
 	return attempts + 1, nil
 }
 
-// RecordInFlight concludes whatever attempts the image currently has in
-// flight. The callbacks carry an image, not a job, so this is how an enrich
-// or a fetch-status report reaches the right rows; backend narrows it when
-// the callback implies one. A row nobody is waiting on is left alone, so a
-// plain source refetch cannot conclude a lookup that never ran.
+// RecordInFlight concludes only attempts in flight, so a plain source refetch
+// cannot conclude a lookup that never ran. An empty backend matches any.
 func RecordInFlight(database *db.DB, imageID int64, backend, result string, now time.Time) error {
 	backends, err := db.QueryStrings(database.Read,
 		`SELECT backend FROM image_lookups
@@ -123,9 +106,6 @@ func RecordInFlight(database *db.DB, imageID int64, backend, result string, now 
 	return nil
 }
 
-// Waiting lists the attempts in flight since before cutoff, for the reconcile
-// sweep. The partial in-flight index keeps this proportional to the rows
-// actually waiting.
 func Waiting(database *db.DB, cutoff time.Time) ([]InFlight, error) {
 	return db.QueryAll(database.Read, func(rows *sql.Rows) (InFlight, error) {
 		var f InFlight
@@ -135,10 +115,8 @@ func Waiting(database *db.DB, cutoff time.Time) ([]InFlight, error) {
 		 WHERE queued_at IS NOT NULL AND queued_at <= ?`, stamp(cutoff))
 }
 
-// Reset puts an image back in the running on one backend: the ladder is
-// zeroed and the backend is due immediately, while last_at and last_result
-// stay so the detail page can still say when it was last looked up. The whole
-// point of [look again] is that the history survives it.
+// Reset keeps last_at and last_result so the detail page still says when
+// the image was last looked up.
 func Reset(database *db.DB, imageID int64, backend string, now time.Time) error {
 	_, err := database.Write.Exec(
 		`UPDATE image_lookups SET attempts = 0, next_due_at = ?, ptr_cursor = NULL
@@ -146,9 +124,8 @@ func Reset(database *db.DB, imageID int64, backend string, now time.Time) error 
 	return err
 }
 
-// ResetMany is Reset across a set of images on every backend at once, for the
-// bulk opt-in. whereIDs is the caller's `image_id IN (...)` placeholder list
-// and args its binds.
+// ResetMany is Reset on every backend for a set of images; whereIDs is
+// the placeholder list for image_id IN (...) and args its binds.
 func ResetMany(e db.Execer, whereIDs string, args []any, now time.Time) error {
 	_, err := e.Exec(
 		`UPDATE image_lookups SET attempts = 0, next_due_at = ?, ptr_cursor = NULL
@@ -156,15 +133,13 @@ func ResetMany(e db.Execer, whereIDs string, args []any, now time.Time) error {
 	return err
 }
 
-// DeleteForImage drops an image's recorded attempts. Called where the file's
-// bytes change: the misses are about bytes the image no longer has, so
-// keeping them as history would be a lie rather than a record.
+// DeleteForImage must run whenever an image's bytes change: its misses
+// were about the old bytes.
 func DeleteForImage(e db.Execer, imageID int64) error {
 	_, err := e.Exec(`DELETE FROM image_lookups WHERE image_id = ?`, imageID)
 	return err
 }
 
-// ForImage reads an image's recorded attempts, keyed by backend.
 func ForImage(database *db.DB, imageID int64) (map[string]Row, error) {
 	rows, err := database.Read.Query(
 		`SELECT backend, attempts, queued_at, last_at, last_result, next_due_at
@@ -186,10 +161,8 @@ func ForImage(database *db.DB, imageID int64) (map[string]Row, error) {
 	return out, rows.Err()
 }
 
-// Exhausted reports whether the online ladder has given up on the image, the
-// state the detail page reads as "nothing found". Derived rather than stored:
-// a third value in images.scheduled_lookup would let a schedule that has
-// never run display a state the ladder never produced.
+// Exhausted is derived rather than stored, so a schedule that never ran
+// cannot show "nothing found".
 func (r Row) Exhausted() bool {
 	return r.Backend == BackendBooru && r.LastResult == ResultMiss && r.NextDueAt.IsZero()
 }

@@ -14,12 +14,8 @@ import (
 	webFS "github.com/monbooru/monbooru/web"
 )
 
-// themeEntry is one theme: a folder holding theme.css and optionally
-// logo.png and favicon.png, a bare <name>.css for the CSS-only form, or one
-// of the two built into the binary. Path, Logo and Favicon are disk paths
-// for an installed theme and embedded-FS paths for a built-in. Path is empty
-// for the shipped dark look, which is main.css itself rather than an
-// override.
+// Path, Logo and Favicon are disk paths, or embedded-FS paths for a
+// built-in; the dark built-in has no Path because it is main.css.
 type themeEntry struct {
 	Name    string
 	Path    string
@@ -28,13 +24,8 @@ type themeEntry struct {
 	Builtin bool
 }
 
-// builtinLightDir holds the bundled light theme in the same folder shape an
-// installed one takes, so seeding it is a copy of the folder.
 const builtinLightDir = "static/themes/light"
 
-// builtinThemes ship with the binary so both looks work before anything is
-// installed. A theme of the same name on disk takes over (see listThemes),
-// which is what makes the seeded copy of light editable.
 var builtinThemes = []themeEntry{
 	{Name: "dark", Builtin: true},
 	{
@@ -44,17 +35,11 @@ var builtinThemes = []themeEntry{
 	},
 }
 
-// themesDir is where operator-installed themes live, next to monbooru.toml.
 func (s *Server) themesDir() string { return s.configSubdir("themes") }
 
-// seedThemesDir writes the light theme into the config directory the first
-// time monbooru starts, so the folder themes go in exists and carries a
-// worked example: the whole package, logo included, not just the sheet.
-// Later starts fill in only the files that copy lacks and never rewrite one
-// it has: the copy shadows the built-in, so a file a release adds to the
-// bundled theme would otherwise reach new installs only. A copy deleted
-// outright is not rebuilt and an emptied folder is never refilled - the
-// built-in stands in for both.
+// After the first start it adds only the files the copy lacks, never
+// rewriting one: the copy shadows the built-in, so a file a release adds
+// would otherwise reach new installs only. A deleted copy is not rebuilt.
 func (s *Server) seedThemesDir() {
 	dir := s.themesDir()
 	if dir == "" {
@@ -85,11 +70,6 @@ func (s *Server) seedThemesDir() {
 	}
 }
 
-// listThemes returns the built-in themes plus whatever is installed, in
-// both supported shapes. Built-ins come first; installed themes sort after
-// and override a built-in of the same name. Among installed themes the
-// folder form wins a collision, since it is the one that can carry a logo
-// and a tab icon.
 func (s *Server) listThemes() []themeEntry {
 	byName := map[string]themeEntry{}
 	for _, e := range builtinThemes {
@@ -134,8 +114,6 @@ func (s *Server) listThemes() []themeEntry {
 	return orderThemes(byName)
 }
 
-// orderThemes puts the built-ins first in their declared order, then every
-// installed theme by name, so the picker reads dark, light, then yours.
 func orderThemes(byName map[string]themeEntry) []themeEntry {
 	out := make([]themeEntry, 0, len(byName))
 	for _, b := range builtinThemes {
@@ -150,10 +128,7 @@ func orderThemes(byName map[string]themeEntry) []themeEntry {
 	return append(out, rest...)
 }
 
-// activeTheme resolves server.theme against the listing. The stored value is
-// a basename, never a path: anything that does not match a listed entry (a
-// separator, a `..`, a theme that was deleted) falls back to the shipped
-// dark look, whose entry carries no stylesheet because it is main.css.
+// server.theme is only matched against the listing, never used as a path.
 func (s *Server) activeTheme() themeEntry {
 	s.cfgMu.RLock()
 	name := strings.TrimSpace(s.cfg.Server.Theme)
@@ -170,9 +145,6 @@ func (s *Server) activeTheme() themeEntry {
 	return builtinThemes[0]
 }
 
-// themeWarnings dedupes the unresolvable-theme warning by the last value
-// reported; theme resolution runs on every render, so an unconditional warn
-// would flood the log.
 type themeWarnings struct {
 	mu   sync.Mutex
 	last string
@@ -203,9 +175,6 @@ func (s *Server) serveThemeFavicon(w http.ResponseWriter, r *http.Request) {
 	s.serveThemeFile(w, r, e, e.Favicon, "themefavicon")
 }
 
-// serveThemeFile serves one file of the active theme: out of the binary for
-// a built-in, off disk for an installed one, 404 when the theme carries no
-// such file.
 func (s *Server) serveThemeFile(w http.ResponseWriter, r *http.Request, e themeEntry, path, kind string) {
 	if !e.Builtin {
 		s.serveConfiguredFile(w, r, path, kind)
@@ -218,7 +187,6 @@ func (s *Server) serveThemeFile(w http.ResponseWriter, r *http.Request, e themeE
 	http.ServeFileFS(w, r, webFS.FS, path)
 }
 
-// themeCluster is the picker's view: every theme, with the active one marked.
 type themeCluster struct {
 	Names  []string
 	Active string
@@ -233,7 +201,6 @@ func (s *Server) themeCluster() themeCluster {
 	return themeCluster{Names: names, Active: s.activeTheme().Name}
 }
 
-// settingsThemePost switches the active theme.
 func (s *Server) settingsThemePost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -251,7 +218,6 @@ func (s *Server) settingsThemePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logx.Infof("settings: theme set to %q", name)
-	// The stylesheet link and the logo both change, so the page repaints.
 	w.Header().Set("HX-Refresh", "true")
 	w.WriteHeader(http.StatusNoContent)
 }

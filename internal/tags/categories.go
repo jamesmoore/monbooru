@@ -10,11 +10,8 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// CategoryIDByName resolves a category by name. The package that owns
-// tag_categories answers the question, so a consumer does not have to
-// re-spell the SELECT. A name that matched nothing is reported apart
-// from a read that failed: answering "unknown category" to a broken
-// read blames the caller for the server's fault.
+// A failed read is an error, not ok=false: "unknown category" would blame
+// the caller for the server's fault.
 func CategoryIDByName(database *db.DB, name string) (int64, bool, error) {
 	var id int64
 	err := database.Read.QueryRow(`SELECT id FROM tag_categories WHERE name = ?`, name).Scan(&id)
@@ -26,9 +23,6 @@ func CategoryIDByName(database *db.DB, name string) (int64, bool, error) {
 	}
 	return id, true, nil
 }
-
-// Tag-category vocabulary: listing, create/rename/recolor, and the
-// move-or-delete teardown.
 
 func (s *Service) ListCategories() ([]models.TagCategory, error) {
 	return db.QueryAll(s.db.Read, func(rows *sql.Rows) (models.TagCategory, error) {
@@ -55,9 +49,6 @@ func (s *Service) GetCategory(id int64) (models.TagCategory, error) {
 
 func (s *Service) CreateCategory(name, color string) (*models.TagCategory, error) {
 	name = strings.TrimSpace(strings.ToLower(name))
-	if name == "" {
-		return nil, fmt.Errorf("category name must not be empty")
-	}
 	if !categoryNameRe.MatchString(name) {
 		return nil, ErrInvalidCategoryName
 	}
@@ -83,9 +74,6 @@ func (s *Service) CreateCategory(name, color string) (*models.TagCategory, error
 	return &models.TagCategory{ID: id, Name: name, Color: color}, nil
 }
 
-// builtinCategoryColors mirrors the tag_categories seed in schema.sql; a
-// theme's --cat-<rrggbb> variables name these values, so returning to one
-// is what puts a recoloured category back under the theme.
 var builtinCategoryColors = map[string]string{
 	"general":   "#3d90e3",
 	"character": "#00aa00",
@@ -99,8 +87,6 @@ var builtinCategoryColors = map[string]string{
 	"species":   "#ed5d1f",
 }
 
-// DefaultCategoryColor returns the seeded colour of a built-in category,
-// or "" for one the operator created.
 func DefaultCategoryColor(name string) string { return builtinCategoryColors[name] }
 
 func (s *Service) UpdateCategoryColor(id int64, color string) error {
@@ -116,9 +102,6 @@ func (s *Service) UpdateCategoryColor(id int64, color string) error {
 
 func (s *Service) RenameCategory(id int64, newName string) error {
 	newName = strings.TrimSpace(strings.ToLower(newName))
-	if newName == "" {
-		return fmt.Errorf("category name must not be empty")
-	}
 	if !categoryNameRe.MatchString(newName) {
 		return ErrInvalidCategoryName
 	}
@@ -143,12 +126,8 @@ func (s *Service) RenameCategory(id int64, newName string) error {
 	return err
 }
 
-// collideNamesShown caps how many names a collision reports; the point is
-// to name what to fix, not to print the whole category.
 const collideNamesShown = 5
 
-// ErrCategoryMoveCollision reports the names a category-delete move cannot
-// reparent because the destination already holds a tag under each.
 type ErrCategoryMoveCollision struct {
 	Names []string
 	More  int
@@ -162,8 +141,6 @@ func (e *ErrCategoryMoveCollision) Error() string {
 	return msg
 }
 
-// collidingNames lists the tag names the category holds that the target
-// already has, capped for the message.
 func collidingNames(tx *sql.Tx, id, targetID int64) ([]string, error) {
 	return db.QueryStrings(tx,
 		`SELECT t.name FROM tags t
@@ -172,10 +149,6 @@ func collidingNames(tx *sql.Tx, id, targetID int64) ([]string, error) {
 		 ORDER BY t.name`, id, targetID)
 }
 
-// isUniqueConstraintErr reports whether err is the SQLite UNIQUE
-// constraint violation (raw error code 2067). Detecting it via the
-// stringified message lets the handlers map a clean "name already
-// exists" to the user without exposing the column or the error code.
 func isUniqueConstraintErr(err error) bool {
 	if err == nil {
 		return false
@@ -183,7 +156,6 @@ func isUniqueConstraintErr(err error) bool {
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-// GetCategoryTagCount returns the number of tags in a category.
 func (s *Service) GetCategoryTagCount(id int64) (int, error) {
 	var count int
 	err := s.db.Read.QueryRow(
@@ -192,10 +164,10 @@ func (s *Service) GetCategoryTagCount(id int64) (int, error) {
 	return count, err
 }
 
-// DeleteCategoryMoveOrDelete deletes a category. action="delete_all"
-// deletes all tags in the category; "move" reparents them to targetID.
+// DeleteCategoryMoveOrDelete deletes the tags on "delete_all" and
+// otherwise moves them to targetID, general when 0.
 func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID int64) error {
-	var closure []int64
+	var swept []int64
 	err := s.inWriteTx(func(tx *sql.Tx) error {
 		var isBuiltin int
 		if err := tx.QueryRow(
@@ -215,10 +187,7 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 			if err != nil {
 				return err
 			}
-			// Route through the same closure sweep DeleteTag uses so an implied
-			// child in a surviving category isn't orphaned when its only parent
-			// here is deleted.
-			closure, err = deleteTagsTx(tx, tagIDs)
+			swept, err = deleteTagsTx(tx, tagIDs)
 			if err != nil {
 				return err
 			}
@@ -226,8 +195,6 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 				return err
 			}
 		default: // "move"
-			// The rating category holds its four canonical rows and nothing
-			// else, the same refusal the single-tag move makes.
 			if s.ratingCatID != 0 && targetID == s.ratingCatID {
 				return ErrRatingCategoryClosed
 			}
@@ -241,8 +208,6 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 			case id:
 				return ErrInvalidMoveTarget
 			default:
-				// Reparenting onto a row that is about to go, or was never
-				// there, trips the foreign key; answer in our own words.
 				var exists int
 				switch err := tx.QueryRow(
 					`SELECT 1 FROM tag_categories WHERE id = ?`, targetID,
@@ -253,9 +218,6 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 					return err
 				}
 			}
-			// UNIQUE(name, category_id) makes the bulk reparent all-or-nothing,
-			// so the names that would collide are named before it runs rather
-			// than surfacing as the constraint's own error text.
 			clash, err := collidingNames(tx, id, targetID)
 			if err != nil {
 				return err
@@ -279,8 +241,8 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 	if err != nil {
 		return err
 	}
-	if len(closure) > 0 {
-		return s.RecalcIDs(closure)
+	if len(swept) > 0 {
+		return s.RecalcIDs(swept)
 	}
 	return nil
 }

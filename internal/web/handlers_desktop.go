@@ -17,20 +17,9 @@ import (
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
-// desktopLocal gates the controls that reach the machine itself rather than
-// the library: the directory picker, the folder opener and Quit. The profile
-// keeps a server install out entirely - it is a launch flag, not something a
-// request can set - and the remote address keeps a LAN viewer out. The bind
-// address is deliberately not a condition: the wizard offers the network as
-// a choice, and gating on it would take Restart away from the operator at
-// the moment the choice needs one.
-//
-// A forwarded hop is refused whatever the peer says: a same-host proxy
-// makes every request look loopback, which would otherwise hand a LAN
-// viewer a filesystem browser and a Quit button.
-//
-// A refusal is a 404 rather than a 403 so the endpoints do not advertise
-// themselves where they are switched off.
+// The bind address is no condition: Restart must survive the wizard's
+// network choice. A forwarded hop is refused: behind a same-host proxy
+// every peer is loopback. Callers 404 so nothing is advertised.
 func (s *Server) desktopLocal(r *http.Request) bool {
 	if !s.desktop {
 		return false
@@ -46,41 +35,28 @@ func (s *Server) desktopLocal(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// maxBrowseEntries bounds one listing. A directory holding tens of
-// thousands of subfolders is a page nobody can read and a render nobody
-// waits for; the operator types the path in that case.
 const maxBrowseEntries = 500
 
-// browseIntoRe gates the id the chosen path is written back into. It ends
-// up in an attribute the picker's script reads, so it stays an identifier.
+// The value lands in an attribute the picker's script reads: identifiers only.
 var browseIntoRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// browseEntry is one row of the picker: a directory to descend into, or a
-// drive root on Windows.
 type browseEntry struct {
 	Name string
 	Path string
 }
 
 type browseData struct {
-	Into    string
-	Path    string
-	Parent  string
-	Entries []browseEntry
-	Roots   []browseEntry
-	// Sandboxed changes the empty state: under Flatpak a folder the user
-	// knows exists can simply be invisible, which reads as a bug unless
-	// the page says who grants it.
+	Into      string
+	Path      string
+	Parent    string
+	Entries   []browseEntry
+	Roots     []browseEntry
 	Sandboxed bool
 	Err       string
 	Truncated bool
 	Limit     int
 }
 
-// browseDirs lists the subdirectories of path so a browser can hand the
-// server a filesystem location, which it otherwise cannot do. Directories
-// only, never files; an unreadable entry is skipped rather than failing the
-// whole listing.
 func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
 	if !s.desktopLocal(r) {
 		http.NotFound(w, r)
@@ -117,9 +93,7 @@ func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		full := filepath.Join(data.Path, e.Name())
-		// The dirent answers for a real directory on its own; only a
-		// symlink has to be resolved, so a folder with tens of thousands
-		// of entries does not pay a stat for each one to list 500.
+		// Only a symlink needs a stat; the dirent answers for a real directory.
 		if !e.IsDir() {
 			if e.Type()&fs.ModeSymlink == 0 {
 				continue
@@ -130,10 +104,7 @@ func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
 		}
 		data.Entries = append(data.Entries, browseEntry{Name: e.Name(), Path: full})
 	}
-	// ReadDir already sorts by byte order, which puts every capitalised
-	// folder above every lowercase one; a picker reads better folded. Sort
-	// before the cap, or the listing is an arbitrary slice of the folder
-	// rather than its alphabetical head.
+	// Sorted before the cap, so the listing is the folder's alphabetical head.
 	slices.SortFunc(data.Entries, func(a, b browseEntry) int {
 		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
 	})
@@ -144,14 +115,9 @@ func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "partials/dir_picker.html", data)
 }
 
-// openFolderKinds are the folders the opener will show. The request names a
-// kind, never a path: every folder worth opening is one the server can name
-// itself, so putting an operator string into a launcher argument buys
-// nothing.
+// A kind, never a path, so no operator string reaches the launcher.
 var openFolderKinds = []string{"config", "data", "gallery", "logs", "models"}
 
-// openFolder shows one of monbooru's own directories in the desktop's file
-// manager, creating it first when it is one monbooru owns.
 func (s *Server) openFolder(w http.ResponseWriter, r *http.Request) {
 	if !s.desktopLocal(r) {
 		http.NotFound(w, r)
@@ -166,10 +132,7 @@ func (s *Server) openFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir, ours := s.desktopFolder(kind)
-	// The one sub-folder a request may name is a tagger's, and it names the
-	// tagger rather than the path: the name is checked against the same
-	// allowlist the folder itself has to match, so nothing operator-supplied
-	// reaches the launcher.
+	// A tagger name passes the allowlist, so it cannot leave the models folder.
 	if kind == "models" && dir != "" {
 		name := r.FormValue("name")
 		if name != "" {
@@ -198,10 +161,7 @@ func (s *Server) openFolder(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Opened "+dir+".")
 }
 
-// desktopFolder maps a kind to a directory and reports whether monbooru
-// owns it, which is what decides between creating it and only opening it.
-// The gallery is the operator's: an empty one created behind their back
-// would be a second library nobody asked for.
+// The gallery is not ours to create: an empty one would be a second library.
 func (s *Server) desktopFolder(kind string) (string, bool) {
 	s.cfgMu.RLock()
 	dataPath := s.cfg.Paths.DataPath
@@ -224,8 +184,6 @@ func (s *Server) desktopFolder(kind string) (string, bool) {
 	return "", false
 }
 
-// availableFolders drops the kinds this install has nowhere to point at, so
-// the row never offers a button that can only refuse.
 func (s *Server) availableFolders() []string {
 	out := make([]string, 0, len(openFolderKinds))
 	for _, kind := range openFolderKinds {
@@ -236,15 +194,8 @@ func (s *Server) availableFolders() []string {
 	return out
 }
 
-// DesktopHook is desktopHook for the command, which builds the tray menu
-// from the same identity the Settings controls use.
 func (s *Server) DesktopHook() desktop.Hook { return s.desktopHook() }
 
-// desktopHook describes this install to the platform's integration points.
-// The icon is appicon.png, the mascot on monbooru's accent plate: it is
-// square at a size the icon theme declares, and the plate is what tells the
-// two apps apart in a launcher. A theme's logo is a browsing decoration,
-// not the identity a launcher should show.
 func (s *Server) desktopHook() desktop.Hook {
 	icon, _ := fs.ReadFile(s.staticFS, "appicon.png")
 	return desktop.Hook{
@@ -255,10 +206,7 @@ func (s *Server) desktopHook() desktop.Hook {
 	}
 }
 
-// desktopIntegration is what the Settings controls render from. The menu
-// and autostart states are read back from disk on every load so a file
-// removed by hand shows as off; the tray is a config key, since a tray icon
-// leaves nothing behind to read.
+// Menu and autostart are read from disk so a hand-removed file shows as off.
 type desktopIntegration struct {
 	MenuSupported      bool
 	MenuEnabled        bool
@@ -268,8 +216,6 @@ type desktopIntegration struct {
 	TrayEnabled        bool
 }
 
-// Supported reports whether either switch can be written here, which is
-// what decides whether a screen offering them is worth rendering at all.
 func (d desktopIntegration) Supported() bool { return d.MenuSupported || d.AutostartSupported }
 
 func (s *Server) desktopIntegration() desktopIntegration {
@@ -284,18 +230,12 @@ func (s *Server) desktopIntegration() desktopIntegration {
 	}
 }
 
-// TrayEnabled is the tray switch, read by the command at startup and by the
-// Settings render.
 func (s *Server) TrayEnabled() bool {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return s.cfg.Desktop.Tray
 }
 
-// settingsDesktopPost applies the integration switches. The menu entry and
-// start-at-login are files (or, on Windows, a registry value) rather than
-// config keys, so the form posts what it wants and the answer is re-read
-// from disk.
 func (s *Server) settingsDesktopPost(w http.ResponseWriter, r *http.Request) {
 	if !s.desktopLocal(r) {
 		http.NotFound(w, r)
@@ -332,11 +272,6 @@ func (s *Server) settingsDesktopPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Saved.")
 }
 
-// desktopJobWarning is the danger line Stop and Restart carry. What either
-// actually costs is the work in flight, and nothing here resumes on the
-// next start, so the line names the job rather than warning in the
-// abstract. Empty while nothing is running, which leaves both controls
-// asking a plain question.
 func (s *Server) desktopJobWarning() string {
 	st := s.jobs.Get()
 	if st == nil || !st.Running {
@@ -345,13 +280,9 @@ func (s *Server) desktopJobWarning() string {
 	return runningJobName(st.JobType) + " is running and will not resume."
 }
 
-// quitDelay lets the response reach the browser before the listener goes
-// away. Long enough for a loopback write, short enough that the click
-// feels like it did something.
+// quitDelay lets the flushed page reach the browser before the listener closes.
 const quitDelay = 300 * time.Millisecond
 
-// settingsQuit stops the process from the UI, for the case where the tray
-// did not appear and a task manager is the only other route.
 func (s *Server) settingsQuit(w http.ResponseWriter, r *http.Request) {
 	s.stopAfterRender(w, r, map[string]any{
 		"Heading": s.booruName() + " has stopped",
@@ -359,8 +290,6 @@ func (s *Server) settingsQuit(w http.ResponseWriter, r *http.Request) {
 	}, "quit", s.RequestQuit)
 }
 
-// settingsRestart stops the process and has the command start it again, for
-// the settings that only take effect at boot - the bind address and the tray.
 func (s *Server) settingsRestart(w http.ResponseWriter, r *http.Request) {
 	s.stopAfterRender(w, r, map[string]any{
 		"Heading": s.booruName() + " is restarting",
@@ -369,9 +298,6 @@ func (s *Server) settingsRestart(w http.ResponseWriter, r *http.Request) {
 	}, "restart", s.requestRestart)
 }
 
-// stopAfterRender answers with the message page, gets it onto the wire,
-// and only then asks the command to stop - the listener is about to go
-// away, so the browser has to have the page first.
 func (s *Server) stopAfterRender(w http.ResponseWriter, r *http.Request, page map[string]any, verb string, then func()) {
 	if !s.desktopLocal(r) {
 		http.NotFound(w, r)
@@ -389,14 +315,11 @@ func (s *Server) stopAfterRender(w http.ResponseWriter, r *http.Request, page ma
 	}()
 }
 
-// RequestQuit asks the command to shut down, for the tray's Quit entry and
-// for the settings control once its page has reached the browser.
+// Idempotent: the shutdown posts the tray's window close, which quits again.
 func (s *Server) RequestQuit() {
 	s.quitOnce.Do(func() { close(s.quit) })
 }
 
-// requestRestart stops the process and asks the command to start it again,
-// for the settings that only take effect at boot.
 func (s *Server) requestRestart() {
 	s.restart.Store(true)
 	s.RequestQuit()

@@ -1,15 +1,4 @@
-// Package web is the HTTP transport: the mux, the handlers, the templates
-// they render and the session, CSRF and rating-cookie plumbing around
-// them. It owns how a request becomes a response and nothing about what a
-// gallery is - that is internal/library, which this holds a pointer to and
-// every handler reaches its state through.
-//
-// The two things that still live here and read as though they should not:
-// the daily scheduler, because the loop needs the config lock and the job
-// manager as much as it needs the galleries; and the peer surfaces for
-// monloader and plugins, whose panels and receipts are transport but whose
-// catalog reconciliation is the tag domain. Moving either one means
-// threading the aggregate through the packages below it first.
+// Package web is the HTTP transport: routes, handlers and templates.
 package web
 
 import (
@@ -22,6 +11,7 @@ import (
 	"html/template"
 	"io/fs"
 	"maps"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -51,9 +41,6 @@ import (
 	webFS "github.com/monbooru/monbooru/web"
 )
 
-// groupOrdered buckets items by key in first-appearance order. skip drops
-// an item entirely (nil keeps all); newGroup builds a bucket from its first
-// item; add appends the item to its bucket.
 func groupOrdered[T, G any](items []T, skip func(T) bool, key func(T) string, newGroup func(T) *G, add func(*G, T)) []G {
 	order := []string{}
 	groups := map[string]*G{}
@@ -75,14 +62,12 @@ func groupOrdered[T, G any](items []T, skip func(T) bool, key func(T) string, ne
 	return out
 }
 
-// tagGroup is used by the groupByCategory template function.
 type tagGroup struct {
 	Name  string
 	Color string
 	Tags  []models.Tag
 }
 
-// Server holds all shared state for the HTTP server.
 type Server struct {
 	cfg        *config.Config
 	configPath string
@@ -91,38 +76,26 @@ type Server struct {
 	pairs      *pairStore
 	sessions   *SessionStore
 	loginRL    *loginRateLimiter
-	csrfSecret []byte // per-instance HMAC key for CSRF tokens
+	csrfSecret []byte
 	tmpl       *template.Template
 	staticFS   fs.FS
-	done       chan struct{} // closed on Close() to stop background goroutines
+	done       chan struct{}
 
-	// desktop marks the -desktop profile. It gates the controls that only
-	// make sense on the machine the operator is sitting at: the directory
-	// picker, the folder opener, Quit, and the first-run redirect.
 	desktop bool
-	// folderOpener hands a folder to the platform opener. A field so the
-	// handler runs where none is installed and pops no window.
+	// A field so a test can run the handler without an opener popping a window.
 	folderOpener func(string) error
-	// logDir is where the profile put the log file. Only the command knows:
-	// it resolves the layout before the config is loaded.
-	logDir string
-	// quit carries a Quit click to the command's shutdown select, so the
-	// stop path is the same one SIGTERM takes. quitOnce keeps a second
-	// click from closing it twice. A Restart click rides the same path with
-	// the flag set, and the command starts a fresh process once it has
-	// drained.
-	quit     chan struct{}
-	quitOnce sync.Once
-	restart  atomic.Bool
+	logDir       string
+	quit         chan struct{}
+	quitOnce     sync.Once
+	restart      atomic.Bool
 
-	// ctxMu serialises the gallery mutations and is held read-locked for the
-	// length of a gallery-read request, so a swap cannot land mid-render. The
-	// state itself is read through the atomic pointer, never through the
-	// lock: a handler re-entering ctxMu while its registration holds it
-	// read-locked would block behind a pending writer, and that writer waits
-	// on the read lock the handler is inside.
+	// ctxMu serialises gallery mutations and is read-held for a whole read
+	// request, whose handler reads galState and never re-locks ctxMu: a nested
+	// RLock queues behind a pending writer, which waits on the outer one.
 	ctxMu    sync.RWMutex
 	galState atomic.Pointer[galleryState]
+	// Serialises rebuildBoundaries so an older rebuild cannot be stored last.
+	boundsMu sync.Mutex
 
 	sched *scheduler
 
@@ -133,20 +106,17 @@ type Server struct {
 	peers *plugins.Peers
 
 	fetchStatus *fetchStatusStore
+
+	downloads downloadList
 }
 
-// Desktop is what the -desktop profile tells the server: whether it is
-// active, and where it put the log file. The second is not derivable here
-// because the command resolves the layout before the config is loaded, and
-// a config that moved data_path by hand would send the Logs button
-// somewhere the log never was.
+// Desktop.LogDir is not derived from the config: the command opens the
+// log before the config loads, and data_path may point elsewhere.
 type Desktop struct {
 	Active bool
 	LogDir string
 }
 
-// NewServer creates the HTTP server with all routes wired. One *db.DB is
-// opened per configured gallery.
 func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, dk Desktop) (*Server, error) {
 	sessions := NewSessionStore()
 
@@ -183,6 +153,7 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 	s.peers = plugins.NewPeers(s.pluginCallbackURL, s.done)
 
 	applyRelationsConfig(cfg.Relations)
+	gallery.MetaTagsEnabled.Store(cfg.Gallery.AutoMetaTags)
 
 	opened := &galleryState{contexts: map[string]*galleryCtx{}, active: cfg.DefaultGallery}
 	for _, g := range cfg.Galleries {
@@ -196,13 +167,23 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 		opened.contexts[g.Name] = cx
 	}
 	s.galState.Store(opened)
+	s.rebuildBoundaries()
+	for i, a := range cfg.Galleries {
+		for _, b := range cfg.Galleries[i+1:] {
+			if gallery.SameFolder(a.GalleryPath, b.GalleryPath) {
+				logx.Warnf("galleries %q and %q share the folder %q: each indexes all of it", a.Name, b.Name, a.GalleryPath)
+			}
+		}
+		if err := s.inOwnFolder(a.GalleryPath); err != nil {
+			logx.Warnf("gallery %q: %v", a.Name, err)
+		}
+	}
 
 	if cfg.Server.ThemeColor != "" && !tags.IsValidCategoryColor(cfg.Server.ThemeColor) {
 		logx.Warnf("server.theme_color %q is not a #rgb / #rrggbb colour; the bundled palette is used", cfg.Server.ThemeColor)
 		s.cfg.Server.ThemeColor = ""
 	}
 
-	// Periodically sweep expired sessions and login rate-limiter entries.
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
@@ -219,7 +200,6 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 
 	go s.runMemoryReclaim()
 
-	// Daily scheduled maintenance runs driven by cfg.Schedule.
 	go s.runScheduler()
 
 	go s.runPluginProbes()
@@ -230,30 +210,27 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 	return s, nil
 }
 
-// idleIndexReleaseAfter is how long a gallery's phash and counted-tag
-// indexes may sit unread before the reclaim loop drops them. Long
-// enough that a browse session pausing doesn't pay the rebuild, short
-// enough that a finished one gives the memory back.
+// Long enough that a paused browse skips the rebuild, short enough that a
+// finished one frees the memory.
 const idleIndexReleaseAfter = 30 * time.Minute
 
-// reclaimTick is how often the reclaim loop looks at the process,
-// reclaimInterval how often it reclaims while nothing else happens. The
-// two differ so a job's peak working set - the largest this process ever
-// holds - is handed back when the job ends instead of staying resident
-// until the interval comes round.
+// The short tick hands a job's peak working set back when the job ends,
+// not at the next interval.
 const (
 	reclaimTick     = 30 * time.Second
 	reclaimInterval = 5 * time.Minute
 )
 
-// reclaimDue reports whether an idle tick owes a reclaim: a job ended
-// since the last one, or the interval has elapsed.
 func reclaimDue(jobEnded bool, since time.Duration) bool { return jobEnded || since >= reclaimInterval }
 
-// runMemoryReclaim wakes every reclaimTick and, when no job is active,
-// drops each gallery's idle in-memory indexes, shrinks its SQLite page
-// cache, returns the Go heap, and tears down the cached auto-tagger
-// session set if it has been idle for tagger.idle_release_after_minutes.
+// An export holds a read connection the shrink would wait on for the whole stream.
+func shrinkGalleryMemory(cx *galleryCtx) error {
+	if cx.Exporting() {
+		return nil
+	}
+	return cx.DB.ShrinkMemory(context.Background())
+}
+
 func (s *Server) runMemoryReclaim() {
 	ticker := time.NewTicker(reclaimTick)
 	defer ticker.Stop()
@@ -279,7 +256,7 @@ func (s *Server) runMemoryReclaim() {
 				if dropped {
 					logx.Debugf("memory reclaim %q: dropped idle indexes", cx.Name)
 				}
-				if err := cx.DB.ShrinkMemory(context.Background()); err != nil {
+				if err := shrinkGalleryMemory(cx); err != nil {
 					logx.Warnf("memory reclaim %q: %v", cx.Name, err)
 				}
 			}
@@ -307,57 +284,45 @@ func (s *Server) runMemoryReclaim() {
 	}
 }
 
-// galleryState is the set of open galleries and the name of the active one,
-// published as one immutable value so every reader is a single atomic load.
-// Writers hold ctxMu, copy, mutate the copy and store it.
+// Published values are immutable: writers hold ctxMu, clone, mutate the
+// clone and store it.
 type galleryState struct {
 	contexts map[string]*galleryCtx
 	active   string
 }
 
-// clone returns a copy for a writer to mutate before publishing.
 func (st *galleryState) clone() *galleryState {
 	next := &galleryState{contexts: make(map[string]*galleryCtx, len(st.contexts)+1), active: st.active}
 	maps.Copy(next.contexts, st.contexts)
 	return next
 }
 
-// galleryState returns the published gallery state.
 func (s *Server) galleryState() *galleryState { return s.galState.Load() }
 
-// activeGallery names the runtime-active gallery.
 func (s *Server) activeGallery() string { return s.galleryState().active }
 
-// active returns the currently-active gallery context.
 func (s *Server) active() *galleryCtx {
 	st := s.galleryState()
 	return st.contexts[st.active]
 }
 
-// get returns the gallery context with the given name, or nil.
 func (s *Server) get(name string) *galleryCtx { return s.galleryState().contexts[name] }
 
-// routeMode is what a route says about ctxMu, the lock that keeps a gallery
-// swap from landing in the middle of a request.
 type routeMode int
 
 const (
-	// modeRead holds ctxMu read-locked around the handler, so the gallery it
-	// resolves cannot be closed under it. The default, and what any route
-	// that renders or queries a gallery wants.
 	modeRead routeMode = iota
-	// modeWrite takes no lock here: the handler takes ctxMu.Lock itself, and
-	// deadlocks against a read the registration had already taken.
+	// The handler takes ctxMu.Lock itself; a read lock taken at
+	// registration would deadlock it.
 	modeWrite
-	// modeFree takes no lock and promises not to hold a gallery context
-	// across the unlocked window - either it reads no gallery at all, or its
-	// slow part is an outbound call that a held read lock would stall a
-	// gallery switch behind.
+	// No lock: the handler must not keep a gallery context across a
+	// window a mutation could close it in. For routes that read no
+	// gallery, wait on a peer, or stream after a locked start.
 	modeFree
 )
 
-// routes is the only way to reach the mux: registerRoutes never names it, so
-// a route has to pick a mode to compile at all.
+// registerRoutes must not reach rt.mux directly: every route picks a mode
+// through add.
 type routes struct {
 	s     *Server
 	mux   *http.ServeMux
@@ -378,6 +343,9 @@ func (rt *routes) read(pattern string, h http.HandlerFunc) {
 	rt.add(pattern, modeRead, func(w http.ResponseWriter, r *http.Request) {
 		s.ctxMu.RLock()
 		defer s.ctxMu.RUnlock()
+		if pageGalleryStale(w, r, s.activeGallery()) {
+			return
+		}
 		h(w, r)
 	})
 }
@@ -386,15 +354,8 @@ func (rt *routes) write(pattern string, h http.HandlerFunc) { rt.add(pattern, mo
 
 func (rt *routes) free(pattern string, h http.HandlerFunc) { rt.add(pattern, modeFree, h) }
 
-// StartWatchers starts a watcher on every configured gallery at startup. Each
-// gallery owns its own watcher for the lifetime of the process so file drops
-// into any gallery are picked up in real time, not just the active one.
-//
-// Also spawns a pre-warm goroutine per gallery that populates the FolderTree,
-// source-label, and visible-count caches. The first user request then hits
-// warm caches instead of paying a cold aggregation scan against every
-// visible image - on libraries with tens of thousands of images that walk
-// was the dominant contributor to first-sidebar latency.
+// StartWatchers watches every gallery, not just the active one, and
+// pre-warms each one's caches.
 func (s *Server) StartWatchers() {
 	s.ctxMu.Lock()
 	defer s.ctxMu.Unlock()
@@ -404,14 +365,11 @@ func (s *Server) StartWatchers() {
 	}
 }
 
-// Handler returns the root HTTP handler with all middleware applied.
 func (s *Server) Handler() http.Handler {
 	rt := s.newRoutes()
 	s.registerRoutes(rt)
 
-	// Middleware order, outermost first: logging, session, first-run gate,
-	// CSRF. The gallery lock is not among them any more - every route takes
-	// it at its own registration, or names the reason it does not.
+	// Outermost first: logging, session, first-run gate, CSRF.
 	var h http.Handler = rt.mux
 	h = s.cSRFMiddleware(h)
 	h = s.setupMiddleware(h)
@@ -421,32 +379,28 @@ func (s *Server) Handler() http.Handler {
 	return h
 }
 
-// registerRoutes wires every route with the gallery-context mode it needs.
 func (s *Server) registerRoutes(rt *routes) {
-	// The assets are free because none of them reads a gallery row; the
-	// thumbnail route resolves a context only to take its directory.
+	// The thumbnail route needs no lock: it takes only the directory from
+	// its context.
 	rt.free("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.staticFS))).ServeHTTP)
 	rt.free("GET /theme.css", s.serveThemeCSS)
 	rt.free("GET /theme.logo", s.serveThemeLogo)
 	rt.free("GET /theme.favicon", s.serveThemeFavicon)
 	rt.free("GET /manifest.json", s.manifestHandler)
 	rt.free("GET /thumbnails/{gallery}/{file}", s.serveThumbnail)
-	// Fallback icon for tabs with no <link rel="icon"> (a raw image opened
-	// in a new tab). Route through the override so server.logo applies;
-	// non-permanent since that target can change.
+	// Found, not permanent: the target follows the active theme.
 	rt.read("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, s.booruFaviconURL(), http.StatusFound)
 	})
 
 	rt.read("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		// A liveness probe is not worth refusing over its Origin: the browser
-		// enforces the block on its own, and a monitor that happens to send
-		// one should still get an answer.
+		// Not refused over its Origin: the browser blocks a cross-origin
+		// read itself, and a monitor sending one still gets an answer.
 		api.SetCORS(w, r, s.cfgSnapshot())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		// "app" is what lets a second launch tell our own instance from
-		// whatever else already took the port.
+		// A second launch reads "app" to tell this instance from another
+		// program on the port.
 		_ = json.NewEncoder(w).Encode(map[string]string{"app": "monbooru", "status": "ok", "version": Version})
 	})
 
@@ -454,10 +408,8 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /login", s.loginPost)
 	rt.read("POST /logout", s.logoutPost)
 
-	rt.read("POST /upload", s.uploadPost)
+	rt.free("POST /upload", s.uploadPost)
 
-	// Root only; `GET /` below is the catch-all for unmatched paths. The
-	// `/{$}` pattern wins over `/` for the exact root.
 	rt.read("GET /{$}", s.galleryHandler)
 	rt.read("GET /", s.notFoundHandler)
 
@@ -493,9 +445,6 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /images/{id}/annotations/set", s.setAnnotation)
 	rt.read("POST /images/{id}/annotations/remove", s.removeAnnotation)
 	rt.read("POST /images/{id}/markup/preview", s.previewMarkup)
-	// The peer-bound routes are free so the outbound call is not made under
-	// a read lock a gallery switch would then queue behind; each reads its
-	// own rows under a short lock instead.
 	rt.free("POST /images/{id}/sources/fetch", s.fetchSource)
 	rt.free("POST /images/{id}/lookup", s.lookupImage)
 	rt.free("POST /images/{id}/replace", s.replaceImage)
@@ -534,9 +483,10 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /tags/{id}/implications", s.addImplicationPost)
 	rt.read("POST /tags/{id}/implied-by", s.addImpliedByPost)
 	rt.read("POST /tags/{id}/aliases", s.addTagAliasPost)
-	// The group deletes carry the /group suffix because a bare
-	// `DELETE /tags/{id}/aliases` overlaps `DELETE /tags/categories/{id}`
-	// with neither pattern more specific, which the mux refuses.
+	rt.read("POST /tags/{id}/note", s.setTagNote)
+	rt.read("POST /tags/{id}/markup/preview", s.previewMarkup)
+	// The /group suffix: a bare DELETE /tags/{id}/aliases would conflict
+	// with DELETE /tags/categories/{id} in the mux.
 	rt.read("DELETE /tags/{id}/implications/group", s.removeImplicationsDelete)
 	rt.read("DELETE /tags/{id}/implied-by/group", s.removeImpliedByDelete)
 	rt.read("DELETE /tags/{id}/aliases/group", s.removeTagAliasesDelete)
@@ -558,6 +508,7 @@ func (s *Server) registerRoutes(rt *routes) {
 
 	rt.read("GET /settings", s.settingsHandler)
 	rt.read("POST /settings/general", s.settingsGeneralPost)
+	rt.read("POST /settings/general/ignore", s.settingsIgnorePost)
 	rt.read("POST /settings/monloader", s.settingsMonloaderPost)
 	rt.read("POST /settings/tagger", s.settingsTaggerPost)
 	rt.read("POST /settings/auth/password", s.settingsPasswordPost)
@@ -585,8 +536,6 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /settings/maintenance/tag-conflicts", s.tagCategoryConflictsPost)
 	rt.read("POST /settings/maintenance/find-folded-duplicates", s.findFoldedDuplicatesPost)
 	rt.read("POST /settings/maintenance/lookup-due", s.lookupDuePost)
-	// Relocated to /relations/file-duplicates/* in v1.8; old routes
-	// stay alive as 301 redirects for one release so bookmarks survive.
 	rt.read("GET /settings/maintenance/duplicates-list", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/relations/file-duplicates/list", http.StatusMovedPermanently)
 	})
@@ -612,6 +561,9 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /settings/maintenance/re-extract-metadata", s.reExtractMetadataPost)
 	rt.read("POST /settings/maintenance/rebuild-thumbnails", s.rebuildThumbnailsPost)
 	rt.read("POST /settings/maintenance/compute-hashes", s.computeHashesPost)
+	rt.read("POST /settings/maintenance/meta-tags", s.generateMetaTagsPost)
+	rt.read("POST /settings/maintenance/index-workflows", s.indexWorkflowsPost)
+	rt.read("POST /settings/maintenance/meta-tags/remove", s.removeMetaTagsPost)
 	rt.read("POST /relations/find-pairs", s.findRelationPairsPost)
 	rt.read("POST /relations/reset-skipped", s.resetSkippedPost)
 	rt.read("POST /relations/phash/{id}/recompute", s.recomputePhashPost)
@@ -635,7 +587,6 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /settings/tagger/{name}/mapping", s.settingsTaggerMappingPost)
 	rt.read("POST /settings/tagger/{name}/reset", s.settingsTaggerResetPost)
 
-	// Saved searches are managed from the sidebar (no dedicated search page).
 	rt.read("POST /search/saved", s.createSavedSearch)
 	rt.read("DELETE /search/saved/{id}", s.deleteSavedSearch)
 
@@ -654,6 +605,8 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /internal/batch-favorite", s.batchFavorite)
 	rt.read("POST /internal/batch-collection", s.batchCollection)
 	rt.read("POST /internal/batch-lookup", s.batchLookup)
+	rt.free("POST /internal/batch-download", s.batchDownload)
+	rt.read("POST /internal/batch-download/count", s.batchDownloadCount)
 	rt.read("POST /internal/delete-search", s.deleteSearchPost)
 	rt.read("POST /tags/delete-search", s.deleteTagsSearchPost)
 	rt.free("POST /tags/ptr-lookup-search", s.ptrLookupSearchPost)
@@ -678,29 +631,18 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /images/{id}/autotag", s.autotagImage)
 	rt.read("GET /images/{id}/tags", s.getImageTagsHandler)
 
-	// The gallery mutations take the write lock themselves. The export is
-	// not one of them: it streams a whole database out and holds the read
-	// lock for the length of it, so a removal waits rather than closing the
-	// handles mid-stream.
 	rt.write("POST /internal/gallery/switch", s.gallerySwitchHandler)
 	rt.write("POST /settings/galleries", s.settingsGalleriesPost)
 	rt.write("POST /settings/galleries/{name}/rename", s.settingsGalleryRenamePost)
 	rt.write("POST /settings/galleries/{name}/delete", s.settingsGalleryDeletePost)
 	rt.write("POST /settings/galleries/{name}/default", s.settingsGalleryDefaultPost)
-	rt.read("GET /settings/galleries/{name}/export", s.settingsGalleryExport)
+	rt.free("GET /settings/galleries/{name}/export", s.settingsGalleryExport)
 	rt.write("POST /settings/galleries/{name}/import", s.settingsGalleryImport)
 
-	// The /api/v1 namespace's other three routes. They are here and not in
-	// internal/api because pairing writes the config and the plugin
-	// registry, which the REST handler does not hold - moving the routes
-	// would move that state. They answer through api.WriteJSON and
-	// api.SetCORS so a peer sees one namespace either way.
 	rt.read("POST /api/v1/pair/request", s.pairRequest)
 	rt.read("GET /api/v1/pair/status", s.pairStatus)
 	rt.read("POST /api/v1/pair/remove", s.pairTeardown)
 	rt.read("GET /internal/plugins/pairing", s.pluginPairingFragment)
-	// Free for the same outbound reason: the plugin mount is the longest of
-	// them, serving a peer's page for as long as the peer takes.
 	rt.free("POST /settings/plugins/pair/{id}/approve", s.pluginPairApprove)
 	rt.free("POST /settings/plugins/pair/{id}/deny", s.pluginPairDeny)
 	rt.free("POST /settings/plugins/{name}/remove", s.pluginPairRemove)
@@ -711,22 +653,27 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.free("POST /internal/monloader/disconnect", s.monloaderLightDisconnect)
 	rt.free("POST /internal/monloader/reconnect", s.monloaderLightReconnect)
 	rt.free("POST /internal/plugin/relay", s.pluginRelay)
-	// What a page needs: its own GETs (HEAD rides along) and its form posts.
 	rt.free("GET "+pluginMountPrefix+"{name}/", s.pluginMount)
 	rt.free("POST "+pluginMountPrefix+"{name}/", s.pluginMount)
 
-	// The API package registers on a mux of its own so its routes ride the
-	// read mode as a subtree instead of reaching past the modes. The methods
-	// are spelled out because a bare "/api/v1/" answers more of them than
-	// the catch-all "GET /" does, which the mux refuses as a conflict.
+	// A mux of its own so the API subtree takes the read mode. The
+	// methods are spelled out: a bare "/api/v1/" conflicts with "GET /".
 	apiMux := http.NewServeMux()
-	api.New(s.cfgSnapshot, s.jobs, s.apiResolver, Version).Mount(apiMux)
+	api.New(s.cfgSnapshot, s.jobs, s.apiResolver, Version).WithGalleryLock(func() func() {
+		s.ctxMu.RLock()
+		return s.ctxMu.RUnlock
+	}).Mount(apiMux)
+	// The exact pairing routes above answer ahead of this subtree, so
+	// they skip notePeerAddress: none of them may move a peer.
+	apiHandler := s.notePeerAddress(apiMux.ServeHTTP)
+	// The uploads take the gallery lock themselves, once their body is in.
+	rt.free("POST /api/v1/images", apiHandler)
+	rt.free("POST /api/v1/images/{id}/file", apiHandler)
 	for _, method := range []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"} {
-		rt.read(method+" /api/v1/", apiMux.ServeHTTP)
+		rt.read(method+" /api/v1/", apiHandler)
 	}
 }
 
-// allContexts lists every open gallery.
 func (s *Server) allContexts() []*galleryCtx {
 	st := s.galleryState()
 	out := make([]*galleryCtx, 0, len(st.contexts))
@@ -736,8 +683,6 @@ func (s *Server) allContexts() []*galleryCtx {
 	return out
 }
 
-// apiResolver looks up a gallery by name for the API package. Empty name
-// falls back to the active gallery.
 func (s *Server) apiResolver(name string) (api.Gallery, bool) {
 	var cx *galleryCtx
 	if name == "" {
@@ -756,9 +701,6 @@ func (s *Server) apiResolver(name string) (api.Gallery, bool) {
 	}, true
 }
 
-// isNoisyPath reports paths that are requested constantly (polling, static
-// assets, thumbnails, health probes). They log at debug so the default info
-// level stays readable.
 func isNoisyPath(path string) bool {
 	switch path {
 	case "/internal/job/status", "/internal/monloader-status", "/health":
@@ -767,11 +709,8 @@ func isNoisyPath(path string) bool {
 	return strings.HasPrefix(path, "/static/") || strings.HasPrefix(path, "/thumbnails/")
 }
 
-// requestStartKey carries the wall-clock time at which the outermost
-// middleware first saw the request. base() reads it back so the footer's
-// "page loaded in N ms" reflects everything between the request hitting
-// our handler chain and the layout footer rendering, not just the
-// handler's tail end.
+// Stamped by the outermost middleware so the footer's load time covers
+// the whole chain.
 type requestStartKey struct{}
 
 func requestStartFromContext(ctx context.Context) time.Time {
@@ -793,30 +732,21 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Version is set at build time via -ldflags, or read from VERSION.md.
+// Version is set at build time via -ldflags.
 var Version = "dev"
 
-// RepoURL is the canonical git repository URL, set at build time via -ldflags.
+// RepoURL is set at build time via -ldflags.
 var RepoURL = "https://github.com/monbooru/monbooru"
 
-// DocURL is the online documentation URL, set at build time via -ldflags from
-// DOC.md.
+// DocURL is set at build time via -ldflags.
 var DocURL = "https://monbooru.github.io/mondocs/index.html"
 
-// Variant identifies the build flavour (e.g. "cuda") and is injected at
-// build time via -ldflags from the CUDA Dockerfile. Empty for the default
-// CPU build; rendered in parentheses in the footer when non-empty.
+// Variant names the provider build, set via -ldflags; empty on the CPU build.
 var Variant = ""
 
-// Package names whatever produced this artifact ("docker", "tarball", "zip",
-// "installer", "flatpak", "appimage"), injected at build time via -ldflags.
-// With several artifacts in circulation every bug report opens on the
-// question it answers.
-// "source" is a plain go build and renders as nothing.
+// Package names the artifact, set via -ldflags; "source" is a plain go build.
 var Package = "source"
 
-// BuildLabel joins the two build stamps for the footer and -version, so
-// which artifact and which provider are one parenthesis rather than two.
 func BuildLabel() string {
 	parts := make([]string, 0, 2)
 	if Package != "" && Package != "source" {
@@ -828,17 +758,11 @@ func BuildLabel() string {
 	return strings.Join(parts, ", ")
 }
 
-// ratingLevel is one cell in the footer rating selector. Value is the
-// underlying tag name (used as the cookie value and the AST key); Label
-// is the user-facing text - "general" renders as "sfw" so the toggle
-// doesn't lead with the implicit-default name.
 type ratingLevel struct {
 	Value string
 	Label string
 }
 
-// ratingFooterLevels is the fixed left-to-right footer order, low to
-// high. Active is "explicit" when the cookie is unset (no ceiling).
 var ratingFooterLevels = []ratingLevel{
 	{Value: "general", Label: "sfw"},
 	{Value: "sensitive", Label: "sensitive"},
@@ -846,7 +770,6 @@ var ratingFooterLevels = []ratingLevel{
 	{Value: "explicit", Label: "explicit"},
 }
 
-// baseData is common template data present on every page.
 type baseData struct {
 	Title       string
 	ActiveNav   string
@@ -856,100 +779,41 @@ type baseData struct {
 	Version     string
 	RepoURL     string
 	DocURL      string
-	// Build is the artifact-and-provider stamp rendered beside the version;
-	// empty on a plain source build.
-	Build string
-	// Theme is true while an operator-installed theme resolves, gating the
-	// /theme.css link that follows the bundled sheet.
-	Theme bool
-	// SidebarCollapsed hides the sidebar column on the layout's first paint.
-	// Rendered server-side so a navigation doesn't flash the column in and
-	// back out once main.js runs.
-	SidebarCollapsed bool
-	// BooruName is the operator's brand override (or "Monbooru" by
-	// default). Rendered into every page <title>, the topbar wordmark,
-	// and the login screen so a deployment that wants a different name
-	// only edits monbooru.toml.
-	BooruName string
-	// BooruLogo is the resolved URL for the topbar logo: the active
-	// theme's "/theme.logo" when it ships one, the bundled logo.png
-	// otherwise. BooruFavicon is the same for the favicon <link>, taking
-	// the theme's "/theme.favicon" when it ships one. A theme moves each
-	// surface only through the file drawn for it.
-	BooruLogo    string
-	BooruFavicon string
-	// MonloaderURL is the browser-facing monloader base for the footer
-	// "connected to monloader" link, trailing slash trimmed; falls back to
-	// the api url when unset, so only both being unset drops the link.
-	MonloaderURL  string
-	ActiveGallery string
-	Galleries     []config.Gallery
-	// Counts surfaced on the footer status bar. Populated per-request;
-	// zero when the active gallery is missing or a query failed.
-	VisibleCount     int
-	InboxCount       int
-	TagCount         int
-	CollectionsCount int
-	// InboxNavActive marks the top-nav "Inbox" entry as the active
-	// page when the current URL's `q` parameter positively asserts
-	// inbox:true at the top level. Same parser-based gate the inline
-	// upload drop zone uses.
-	InboxNavActive bool
-	// HiddenByCeiling drives the "N hidden images in the current search"
-	// footer cell. Only the gallery handler populates it; on every other
-	// page the field stays at 0 and the cell renders empty.
-	HiddenByCeiling int
-	// Rating ceiling state for the footer selector. ActiveRating is the
-	// effective level - "explicit" when no cookie is set.
-	RatingLevels []ratingLevel
-	ActiveRating string
-	// RequestStart is the wall-clock time captured by loggingMiddleware
-	// when the request first entered our handler chain. The footer
-	// renders time.Since(RequestStart) so the indicator covers all
-	// middleware + handler work + template execution, not just the
-	// tail-end after base() runs.
-	RequestStart time.Time
-	// MonloaderPaired gates the footer "connected to monloader" light:
-	// it renders (and starts polling) only while a monloader pairing exists.
-	MonloaderPaired bool
-	// MonloaderUsable gates the monloader-backed actions (online lookup, find
-	// tags, source refetch): paired and the link is neither paused nor a probe
-	// found it unreachable / rejecting.
-	MonloaderUsable bool
-	// MonloaderConn / MonloaderVersion seed the light on the initial render;
-	// the poller swaps in live values. They live here so the partial resolves
-	// on every page struct, not just the poll handler's map.
-	MonloaderConn    string
-	MonloaderVersion string
-	// MonloaderPTR gates the PTR-backed lookup controls: true when the last
-	// cached probe saw monloader report its PTR index enabled and caught up,
-	// the only state it answers a read in. Stale reads are fine - monloader
-	// answers 409 and the UI degrades in place.
-	MonloaderPTR bool
-	// MonloaderContrib gates every PTR contribution surface: true when the
-	// last cached probe saw monloader report a usable personal account
-	// (contrib.account && !contrib.banned). An absent contrib field on an
-	// older monloader reads as false, so contribution UI never renders
-	// against a monloader that can't serve it. Stale reads degrade in
-	// place on the 409, like the lookup gating.
-	MonloaderContrib bool
-	// MonloaderPTRSyncing caveats the lookup backend dialog while the PTR
-	// index is still building: it answers on partial data by design.
+	Build       string
+	Theme       bool
+	// Server-rendered so a navigation does not flash the column before
+	// main.js runs.
+	SidebarCollapsed    bool
+	BooruName           string
+	BooruLogo           string
+	BooruFavicon        string
+	MonloaderURL        string
+	ActiveGallery       string
+	Galleries           []config.Gallery
+	VisibleCount        int
+	InboxCount          int
+	TagCount            int
+	CollectionsCount    int
+	InboxNavActive      bool
+	HiddenByCeiling     int
+	RatingLevels        []ratingLevel
+	ActiveRating        string
+	RequestStart        time.Time
+	MonloaderPaired     bool
+	MonloaderUsable     bool
+	MonloaderConn       string
+	MonloaderVersion    string
+	MonloaderPTR        bool
+	MonloaderContrib    bool
 	MonloaderPTRSyncing bool
-	// MonloaderPTRPresent gates the PTR-backed surfaces' render, where
-	// MonloaderPTR gates whether they are live. A paused or unreachable
-	// link reports no PTR either way, so the flag has to say "and we
-	// cannot currently tell" or the surfaces vanish on a pause.
+	// The render gate, where MonloaderPTR is the live one: a paused or
+	// unreachable link reports no PTR, so it counts as present.
 	MonloaderPTRPresent bool
 }
 
-// sidebarCookieName records the collapsed sidebar. The topbar toggle in
-// main.js writes it; only the layout reads it.
+// main.js writes it; the name and the "collapsed" value must match.
 const sidebarCookieName = "monbooru_sidebar"
 
-// sidebarCollapsed reports whether the operator hid the sidebar. Anything
-// other than the one stored value reads as shown, so a stale or
-// hand-edited cookie can't leave the column missing with no way back.
 func sidebarCollapsed(r *http.Request) bool {
 	c, err := r.Cookie(sidebarCookieName)
 	return err == nil && c.Value == "collapsed"
@@ -963,24 +827,18 @@ func (s *Server) base(r *http.Request, nav, title string) baseData {
 	if cx != nil {
 		degraded = cx.Degraded
 		visible, _ = cx.VisibleCount()
-		// Inbox count is ceiling-aware here because every surface that
-		// renders it (top-nav "Inbox (N)" link, inline drop zone, search
-		// suggestions) promises the post-click match count.
+		// Ceiling-aware: every surface showing it promises the count a
+		// click will match.
 		inbox, _ = cx.InboxCountUnder(resolveCeiling(r, cx))
 		tagCount, _ = cx.TagCount()
 		collectionsCount, _ = cx.CollectionsCount()
 	}
-	inboxNavActive := false
-	if expr, parseErr := search.Parse(r.URL.Query().Get("q")); parseErr == nil {
-		inboxNavActive = inboxFilterActive(expr)
-	}
+	inboxNavActive := inboxFilterActive(search.Parse(r.URL.Query().Get("q")))
 	galleries := s.galleries()
 	active := readRatingCookie(r)
 	active = cmp.Or(active, "explicit")
 	ml := s.mlStatus.Seed()
 	if s.monloaderPaused() {
-		// A paused link renders as paused everywhere and hides the
-		// PTR-gated surfaces, regardless of the last probe's cache.
 		ml = monloader.Status{Conn: "paused"}
 	}
 	paired := s.pairedWith("monloader")
@@ -1025,9 +883,7 @@ func (s *Server) base(r *http.Request, nav, title string) baseData {
 
 func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Buffer so we can still send a clean 500 when template execution fails;
-	// streaming directly into w would leak partial output and race with
-	// http.Error (producing "superfluous response.WriteHeader" warnings).
+	// Buffered so a failed execution can still send a clean 500.
 	var buf bytes.Buffer
 	if err := s.tmpl.ExecuteTemplate(&buf, name, data); err != nil {
 		logx.Errorf("template %q: %v", name, err)
@@ -1035,21 +891,14 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 		return
 	}
 	if _, err := buf.WriteTo(w); err != nil {
-		// Client disconnected mid-write. Nothing to do but log.
 		logx.Warnf("template %q write: %v", name, err)
 	}
 }
 
-// thumbnailNameRe matches the two on-disk filename patterns emitted by the
-// thumbnail pipeline: `{id}.jpg` for static previews and `{id}_hover.webp`
-// for animated hovers. Anything else under the thumbnails directory (stray
-// files, editor backups, etc.) is not served.
 var thumbnailNameRe = regexp.MustCompile(`^\d+(?:_hover\.webp|\.jpg)$`)
 
-// serveThumbnail serves a thumbnail file from the named gallery's
-// thumbnails directory. The gallery name is part of the URL so each
-// gallery's thumbnails live at distinct URLs and the browser cache can't
-// show a stale preview from another gallery after a switch.
+// The gallery is in the URL so a switch cannot show another gallery's
+// cached preview.
 func (s *Server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 	file := filepath.Base(r.PathValue("file"))
 	if !thumbnailNameRe.MatchString(file) {
@@ -1062,30 +911,18 @@ func (s *Server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fullPath := filepath.Join(cx.ThumbnailsPath, file)
-	// Hover variants are generated by ffmpeg after the static thumb and are
-	// absent for recently-ingested animated files; static thumbs are absent
-	// when generation failed on an undecodable file. Respond 204 so the img
-	// tag's onerror still fires but the console doesn't log a 404 per card.
+	// 204, not 404: the img onerror still fires, and the console logs no
+	// error per card.
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// SQLite reuses the highest deleted INTEGER PRIMARY KEY id, so a
-	// deleted image's URL can be reborn the next ingest with brand-new
-	// thumbnail bytes at the same path. Without revalidation the browser
-	// keeps serving the prior bytes from cache (heuristic freshness on a
-	// bare Last-Modified). The ETag includes the file mtime so a rewrite
-	// invalidates the cached response; same trick serveImageFile uses.
+	// SQLite reuses the highest id once its row is deleted, so a
+	// thumbnail URL can come back with new bytes.
 	setGalleryScopedCache(w, r.PathValue("gallery"), file, fullPath)
 	http.ServeFile(w, r, fullPath)
 }
 
-// serveConfiguredFile serves one file of an installed theme off disk. An
-// empty path 404s so the layout's gated <link> and the bundled-asset
-// fallbacks degrade cleanly when the theme ships no such file. The cache
-// tag revalidates against the file mtime so an edited file is picked up at
-// once; a bare Last-Modified would go heuristically stale until the
-// operator disabled the browser cache.
 func (s *Server) serveConfiguredFile(w http.ResponseWriter, r *http.Request, path, kind string) {
 	if path == "" {
 		http.NotFound(w, r)
@@ -1095,9 +932,6 @@ func (s *Server) serveConfiguredFile(w http.ResponseWriter, r *http.Request, pat
 	http.ServeFile(w, r, path)
 }
 
-// booruName resolves server.name with a "Monbooru" fallback so every
-// title-suffix callsite reads a single source of truth instead of
-// repeating the default.
 func (s *Server) booruName() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -1107,20 +941,11 @@ func (s *Server) booruName() string {
 	return "Monbooru"
 }
 
-// modelPath reads paths.model_path under the config lock. Fixed after
-// boot, but every tagger handler reaches for it and one lock discipline
-// beats nine open-coded reads.
 func (s *Server) modelPath() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return s.cfg.Paths.ModelPath
 }
-
-// The settings handlers rewrite these fields at runtime under the write
-// lock, so every serving path reads them under the read lock - through one
-// of the accessors below, or through a caller that takes several at once
-// (ingestNaming, receivedNaming). A string field is two words, and a torn
-// read of one yields a slice header that never existed.
 
 func (s *Server) authEnabled() bool {
 	s.cfgMu.RLock()
@@ -1140,12 +965,8 @@ func (s *Server) sessionLifetimeDays() int {
 	return s.cfg.Auth.SessionLifetimeDays
 }
 
-// thumbSizeCookieName records the grid's cell-size step.
 const thumbSizeCookieName = "monbooru_thumb_size"
 
-// thumbSize reads the step for this request. "m" is the default and the
-// only one that renders no class; anything outside the closed set reads as
-// "m", so a stale cookie cannot leave the grid at a size nothing offers.
 func thumbSize(r *http.Request) string {
 	c, err := r.Cookie(thumbSizeCookieName)
 	if err != nil {
@@ -1158,19 +979,12 @@ func thumbSize(r *http.Request) string {
 	return "m"
 }
 
-// pageSizeCookieName records a per-view page size. The gallery's Show
-// select writes it through viewPrefsPost; pageSize reads it back.
 const pageSizeCookieName = "monbooru_page_size"
 
-// PageSizeOptions is the closed set the Show select offers and the only
-// set the cookie is honoured for. ui.page_size stays the default; this is
-// the operator overriding it for the session's browsing, which is why it
-// is a cookie and not config.
 var PageSizeOptions = []int{20, 40, 60, 100, 250, 500}
 
-// pageSizeOverride is the per-browser size in force, or 0 when no cookie is
-// set. A value outside the offered set is dropped rather than clamped, so a
-// hand-edited cookie cannot ask for a page the budgets never covered.
+// The cookie is client-writable, and the query budgets cover only the
+// offered sizes.
 func pageSizeOverride(r *http.Request) int {
 	c, err := r.Cookie(pageSizeCookieName)
 	if err != nil {
@@ -1183,8 +997,6 @@ func pageSizeOverride(r *http.Request) int {
 	return n
 }
 
-// pageSize is the size of one listing page for this request: the browser's
-// own override, else the configured default.
 func (s *Server) pageSize(r *http.Request) int {
 	if n := pageSizeOverride(r); n > 0 {
 		return n
@@ -1206,8 +1018,7 @@ func (s *Server) maxFileSizeMB() int {
 	return s.cfg.Gallery.MaxFileSizeMB
 }
 
-// watcherSettings pairs the two knobs every startWatcher call passes, so
-// a save landing between them cannot start a watcher on half of one.
+// One read lock for both, so a save cannot land between them.
 func (s *Server) watcherSettings() (bool, int) {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -1238,11 +1049,8 @@ func (s *Server) executionProvider() string {
 	return s.cfg.Tagger.ExecutionProvider
 }
 
-// cfgSnapshot copies the config for readers that hold it past the lock -
-// the tagger, which reads it for the length of a job, and the API layer,
-// which has no lock of its own. The four slices the settings writers edit
-// in place are cloned; everything they hold is replaced wholesale rather
-// than written through, so one level is enough.
+// The slices settings writers edit in place are cloned; what their elements
+// hold is replaced wholesale, never written through, so one level is enough.
 func (s *Server) cfgSnapshot() *config.Config {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -1254,10 +1062,6 @@ func (s *Server) cfgSnapshot() *config.Config {
 	return &c
 }
 
-// galleries copies cfg.Galleries under the lock its mutators take. A
-// slice-header read torn against a reallocating append pairs the old
-// array pointer with the new length, so the copy walks off the end of
-// the old backing array and hands garbage strings to a template.
 func (s *Server) galleries() []config.Gallery {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -1266,8 +1070,6 @@ func (s *Server) galleries() []config.Gallery {
 	return out
 }
 
-// booruLogoURL points the topbar logo at the active theme's logo.png,
-// else the bundled asset.
 func (s *Server) booruLogoURL() string {
 	if s.activeTheme().Logo != "" {
 		return "/theme.logo"
@@ -1275,17 +1077,8 @@ func (s *Server) booruLogoURL() string {
 	return "/static/logo.png"
 }
 
-// booruFaviconURL is the same for the favicon. A theme's logo.png does not
-// reach it - it is drawn for the topbar and at 16px in a tab reduces to
-// mush - so a theme that wants the tab too ships the icon it wants drawn
-// there.
-//
-// The URL carries the file's version because a browser keeps favicons in a
-// store of its own rather than the page cache, and Firefox loads them with
-// revalidation off: on one fixed URL the first icon a profile saw is the
-// icon it keeps, so switching themes changed everything but the tab. A
-// version in the URL makes each icon a URL of its own. Nothing else linked
-// off a theme needs it - a stylesheet and an <img> revalidate normally.
+// Versioned: browsers keep favicons outside the page cache and Firefox
+// does not revalidate them, so a fixed URL keeps the first icon seen.
 func (s *Server) booruFaviconURL() string {
 	e := s.activeTheme()
 	if e.Favicon == "" {
@@ -1294,9 +1087,6 @@ func (s *Server) booruFaviconURL() string {
 	return "/theme.favicon?v=" + themeFaviconVersion(e)
 }
 
-// themeFaviconVersion identifies the active theme's tab icon: the file's
-// mtime for a copy on disk, which also moves when the operator edits it, and
-// the build for a built-in, whose files only change with the binary.
 func themeFaviconVersion(e themeEntry) string {
 	if e.Builtin {
 		return cmp.Or(Version, "builtin")
@@ -1308,8 +1098,6 @@ func themeFaviconVersion(e themeEntry) string {
 	return strconv.FormatInt(info.ModTime().UnixNano(), 10)
 }
 
-// monloaderWebBase is the browser-facing monloader base for the footer
-// "connected to monloader" link: the configured web url when set, else the api url.
 func (s *Server) monloaderWebBase() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -1318,41 +1106,6 @@ func (s *Server) monloaderWebBase() string {
 	return strings.TrimRight(base, "/")
 }
 
-// uppercasePercentEscapes rewrites every %XX hex pair in s to use
-// uppercase hex while leaving all other characters untouched. Used to
-// align url.QueryEscape's lowercase output with the browser address
-// bar's RFC 3986 normalization so the same logical query doesn't show
-// up twice in autocomplete history.
-func uppercasePercentEscapes(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		if s[i] == '%' && i+2 < len(s) && isHexDigit(s[i+1]) && isHexDigit(s[i+2]) {
-			b.WriteByte('%')
-			b.WriteByte(toUpperHex(s[i+1]))
-			b.WriteByte(toUpperHex(s[i+2]))
-			i += 2
-			continue
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
-
-func isHexDigit(c byte) bool {
-	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
-}
-
-func toUpperHex(c byte) byte {
-	if c >= 'a' && c <= 'f' {
-		return c - 'a' + 'A'
-	}
-	return c
-}
-
-// resolveMangaImage looks up a manga row's canonical_path. Returns
-// (path, true) when the row is a cbz; (_, false) for non-manga ids and
-// missing rows. Callers respond 404 on the false return.
 func (s *Server) resolveMangaImage(idStr string) (string, bool) {
 	cx := s.active()
 	if cx == nil {
@@ -1367,36 +1120,24 @@ func (s *Server) resolveMangaImage(idStr string) (string, bool) {
 	if fileType != "cbz" {
 		return "", false
 	}
-	// Refuse a canonical_path that drifted outside the gallery root before
-	// the archive extractor opens it, mirroring serveImageFile.
 	if !gallery.NamedInside(cx.GalleryPath, canonPath) {
 		return "", false
 	}
 	return canonPath, true
 }
 
-// serveMangaPage serves the n-th page of a manga (1-based) from the
-// per-image cache, extracting on miss. Cache-Control fixes browser
-// behavior under prefetch / back-button so the same page isn't refetched
-// constantly during reader navigation.
 func (s *Server) serveMangaPage(w http.ResponseWriter, r *http.Request) {
-	s.serveMangaPagePath(w, r, gallery.EnsureMangaPage, "")
+	s.serveMangaPagePath(w, r, gallery.EnsureMangaPage, "", true)
 }
 
-// serveMangaPageThumb serves the n-th page's thumbnail (300px-longest-
-// side JPEG) used by the pages-grid view. Same lazy-extract +
-// idle-evict path as serveMangaPage.
 func (s *Server) serveMangaPageThumb(w http.ResponseWriter, r *http.Request) {
-	s.serveMangaPagePath(w, r, gallery.EnsureMangaPageThumb, "-thumb")
+	s.serveMangaPagePath(w, r, gallery.EnsureMangaPageThumb, "-thumb", false)
 }
 
-// serveMangaPagePath is the shared body behind serveMangaPage and
-// serveMangaPageThumb. cacheSuffix keeps the thumb-vs-bytes cache keys
-// disjoint so a gallery switch invalidates each independently.
 func (s *Server) serveMangaPagePath(
 	w http.ResponseWriter, r *http.Request,
 	ensure func(thumbnailsPath, canonPath string, imageID int64, n int) (string, error),
-	cacheSuffix string,
+	cacheSuffix string, negotiate bool,
 ) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -1419,23 +1160,29 @@ func (s *Server) serveMangaPagePath(
 		http.NotFound(w, r)
 		return
 	}
-	// Scope the cached bytes to the active gallery so a gallery switch
-	// invalidates them; see serveImageFile for the same trick.
-	setGalleryScopedCache(w, s.activeGallery(), fmt.Sprintf("%s-%d%s", idStr, n, cacheSuffix), page)
+	if fileType := gallery.ExtFileType(page); negotiate && gallery.IsFFmpegStill(fileType) {
+		w.Header().Add("Vary", "Accept")
+		if !acceptsMediaType(r.Header.Get("Accept"), gallery.MIMEForFileType(fileType)) {
+			if view, err := gallery.EnsureMangaPageView(s.thumbnailsPath(), canonPath, id, n); err != nil {
+				logx.Warnf("view copy for page %d of image %s: %v", n, idStr, err)
+			} else {
+				page, cacheSuffix = view, "-view"
+			}
+		}
+	}
+	// The archive's mtime, not the page's: every hit touches the page to keep
+	// it cached, which would make each ETag new.
+	setGalleryScopedCache(w, s.activeGallery(), fmt.Sprintf("%s-%d%s", idStr, n, cacheSuffix), canonPath)
 	http.ServeFile(w, r, page)
 }
 
-// serveImageFile serves the raw image/video file.
 func (s *Server) serveImageFile(w http.ResponseWriter, r *http.Request) {
 	s.serveImageBytes(w, r, false)
 }
 
-// serveImageView is what every viewer in the UI points at: the original
-// bytes, or - for a still past the display ceiling, which no browser will
-// decode - the bounded rendition instead. One endpoint rather than a
-// template branch so the lightbox and the relations surfaces, which build
-// their src in JS and hold no dimensions, get the same answer. The download
-// link and the <video> src stay on /file: those are the bytes themselves.
+// The viewers' URL; downloads and <video> stay on /file. A still past the
+// display ceiling, or an AVIF or JPEG XL the browser does not accept, is
+// served as a JPEG rendition.
 func (s *Server) serveImageView(w http.ResponseWriter, r *http.Request) {
 	s.serveImageBytes(w, r, true)
 }
@@ -1456,30 +1203,32 @@ func (s *Server) serveImageBytes(w http.ResponseWriter, r *http.Request, scaled 
 		http.NotFound(w, r)
 		return
 	}
-	// A canonical_path that drifted outside the gallery root does not get
-	// opened, whatever put it there.
 	if !gallery.NamedInside(cx.GalleryPath, canonPath) {
 		http.NotFound(w, r)
 		return
 	}
-	// /images/{id}/file is the same URL across galleries, so the
-	// browser's cache key alone can't tell them apart - switching
-	// galleries used to keep showing the prior gallery's id=N bytes
-	// until a hard reload. Set an ETag that names the active gallery
-	// so the conditional check (http.serveContent uses If-None-Match)
-	// invalidates on a gallery switch even when mtimes happen to
-	// match. no-cache forces revalidation on every visit so the
-	// matching gallery still hits 304.
-	if scaled && !gallery.IsVideoType(fileType) && fileType != "cbz" &&
-		gallery.NeedsViewRendition(int(width.Int64), int(height.Int64)) {
-		rendition, err := gallery.EnsureViewRendition(canonPath, cx.ThumbnailsPath, id)
-		if err != nil {
-			logx.Warnf("view rendition for image %s: %v", idStr, err)
-		} else {
-			setGalleryScopedCache(w, s.activeGallery(), idStr+"-view", rendition)
-			w.Header().Set("Content-Type", "image/jpeg")
-			http.ServeFile(w, r, rendition)
-			return
+	if scaled && !gallery.IsVideoType(fileType) && fileType != "cbz" {
+		past := gallery.NeedsViewRendition(int(width.Int64), int(height.Int64))
+		// Not every browser decodes AVIF or JPEG XL: one that does names
+		// the type in Accept, and any other gets a full-size JPEG.
+		negotiated := gallery.IsFFmpegStill(fileType)
+		if negotiated {
+			w.Header().Add("Vary", "Accept")
+		}
+		if past || (negotiated && !acceptsMediaType(r.Header.Get("Accept"), gallery.MIMEForFileType(fileType))) {
+			maxDim := 0
+			if past {
+				maxDim = gallery.ViewMaxDim
+			}
+			rendition, err := gallery.EnsureViewRendition(canonPath, cx.ThumbnailsPath, id, fileType, maxDim)
+			if err != nil {
+				logx.Warnf("view rendition for image %s: %v", idStr, err)
+			} else {
+				setGalleryScopedCache(w, s.activeGallery(), idStr+"-view", rendition)
+				w.Header().Set("Content-Type", "image/jpeg")
+				http.ServeFile(w, r, rendition)
+				return
+			}
 		}
 	}
 	setGalleryScopedCache(w, s.activeGallery(), idStr, canonPath)
@@ -1490,13 +1239,22 @@ func (s *Server) serveImageBytes(w http.ResponseWriter, r *http.Request, scaled 
 	http.ServeFile(w, r, canonPath)
 }
 
-// setGalleryScopedCache writes an ETag that includes the gallery name
-// so a browser's cached copy from a different gallery's id=N is
-// invalidated on the next conditional request. Falls back silently if
-// the file can't be stat'd. The mtime is nanoseconds: a plugin turning
-// an image twice inside one second writes two different files, and at
-// whole-second resolution the second one rides the first one's tag and
-// the browser keeps painting the bytes it already has.
+// A wildcard does not count: every browser sends image/*, whether or not
+// it decodes JPEG XL.
+func acceptsMediaType(accept, mediaType string) bool {
+	for _, part := range strings.Split(accept, ",") {
+		t, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil || t != mediaType {
+			continue
+		}
+		q, err := strconv.ParseFloat(cmp.Or(params["q"], "1"), 64)
+		return err == nil && q > 0
+	}
+	return false
+}
+
+// The gallery is in the tag because /images/{id} URLs repeat across galleries,
+// and the mtime is in nanoseconds so two rewrites in a second differ.
 func setGalleryScopedCache(w http.ResponseWriter, gallery, id, path string) {
 	w.Header().Set("Cache-Control", "private, no-cache")
 	info, err := os.Stat(path)
@@ -1506,23 +1264,20 @@ func setGalleryScopedCache(w http.ResponseWriter, gallery, id, path string) {
 	w.Header().Set("ETag", fmt.Sprintf(`"%s-%s-%d"`, gallery, id, info.ModTime().UnixNano()))
 }
 
-// RestartRequested reports whether the shutdown under way should be followed
-// by a fresh process. Read by the command once it has drained.
 func (s *Server) RestartRequested() bool { return s.restart.Load() }
 
-// QuitRequested fires when the Quit control asks the process to stop. The
-// command selects on it beside the signal channel so both routes run the
-// same graceful shutdown.
+// QuitRequested closes on a Quit or a Restart; RestartRequested tells
+// them apart.
 func (s *Server) QuitRequested() <-chan struct{} { return s.quit }
 
-// Close stops background goroutines and closes every gallery's database.
 func (s *Server) Close() {
 	select {
 	case <-s.done:
-		// already closed
 	default:
 		close(s.done)
 	}
+	// Otherwise ReleaseAll waits out a running auto-tag chunk.
+	s.jobs.Cancel()
 	s.peers.StopAll()
 	tagger.ReleaseAll()
 	s.ctxMu.Lock()
@@ -1532,9 +1287,6 @@ func (s *Server) Close() {
 	}
 }
 
-// withConfig mutates the in-memory config under the write lock and persists it
-// atomically, so a read-modify-write on a config slice can't lose a concurrent
-// settings change. A non-nil fn error aborts the save.
 func (s *Server) withConfig(fn func(*config.Config) error) error {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
@@ -1548,7 +1300,4 @@ func (s *Server) withConfig(fn func(*config.Config) error) error {
 	return nil
 }
 
-// saveConfig persists the config as it stands, for callers that have
-// already made their edit. Returns any error so they can surface the
-// failure instead of leaving the in-memory cfg out of sync with disk.
 func (s *Server) saveConfig() error { return s.withConfig(func(*config.Config) error { return nil }) }

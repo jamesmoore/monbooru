@@ -14,10 +14,6 @@ import (
 	"time"
 )
 
-// fetchStatusEntry is the last known outcome of a source metadata fetch for one
-// image. State is "pending" while monloader works, then "ok" once the enrich
-// lands. Hashes names what a hash lookup searched ("md5 …" / "md5 …, sha256 …"),
-// recorded at enqueue time so a not-found outcome can show it.
 type fetchStatusEntry struct {
 	State  string
 	Msg    string
@@ -26,11 +22,8 @@ type fetchStatusEntry struct {
 }
 
 const (
-	// fetchStatusTTL bounds how long a recorded outcome lingers, so a batch
-	// fetch that no detail page polls can't grow the map without bound.
-	fetchStatusTTL = 10 * time.Minute
-	// fetchPollMax caps the pill's self-poll (~2s cadence) so a fetch that
-	// never completes stops nagging instead of polling forever.
+	// A batch fetch no page polls would otherwise grow the map without bound.
+	fetchStatusTTL   = 10 * time.Minute
 	fetchPollMax     = 30
 	fetchPollDelayMs = 2000
 )
@@ -39,10 +32,6 @@ func fetchStatusKey(gallery string, id int64) string {
 	return gallery + "\x00" + strconv.FormatInt(id, 10)
 }
 
-// fetchStatusStore is the last-known outcome of each image's source
-// metadata fetch. monloader runs the fetch asynchronously and calls the
-// enrich endpoint back; the detail page polls for the outcome so the tags
-// show up (or the failure surfaces) without a manual reload.
 type fetchStatusStore struct {
 	mu sync.Mutex
 	m  map[string]fetchStatusEntry
@@ -52,10 +41,8 @@ func newFetchStatusStore() *fetchStatusStore {
 	return &fetchStatusStore{m: map[string]fetchStatusEntry{}}
 }
 
-// record stores the latest fetch outcome for (gallery, id), pruning
-// entries past fetchStatusTTL first. A terminal report inherits the pending
-// entry's Hashes (monloader's callback doesn't know them); a fresh pending
-// resets them so a plain refetch never shows a stale hash line.
+// A terminal report inherits Hashes, which monloader's callback does not
+// know; a fresh pending drops them.
 func (f *fetchStatusStore) record(gallery string, id int64, state, msg string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -69,9 +56,8 @@ func (f *fetchStatusStore) record(gallery string, id int64, state, msg string) {
 	f.m[key] = entry
 }
 
-// recordLookup records the pending state for a hash lookup, remembering
-// the searched hashes so a not-found outcome can name them. Set before the
-// enqueue so a fast local (PTR) callback can't be overwritten back to pending.
+// Callers set it before the enqueue, or a fast PTR callback could be
+// overwritten back to pending.
 func (f *fetchStatusStore) recordLookup(gallery string, id int64, hashes string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -80,18 +66,13 @@ func (f *fetchStatusStore) recordLookup(gallery string, id int64, hashes string)
 	f.m[fetchStatusKey(gallery, id)] = fetchStatusEntry{State: "pending", At: now, Hashes: hashes}
 }
 
-// prune evicts entries past the TTL. The recording paths
-// prune as they write, so this is for the reclaim loop: once the last
-// fetch of a session lands, nothing writes again and the entries would
-// outlive their TTL until the next one does.
+// The writers prune too, but once the last fetch lands nothing writes again.
 func (f *fetchStatusStore) prune() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pruneLocked(time.Now())
 }
 
-// pruneLocked initialises the map and evicts entries past the TTL.
-// Callers hold f.mu.
 func (f *fetchStatusStore) pruneLocked(now time.Time) {
 	if f.m == nil {
 		f.m = map[string]fetchStatusEntry{}
@@ -115,9 +96,6 @@ func (f *fetchStatusStore) clear(gallery string, id int64) {
 	delete(f.m, fetchStatusKey(gallery, id))
 }
 
-// writeFetchPending renders the "fetching..." pill into the target slot. Each
-// render re-arms a delayed poll of fetchStatusHandler; n is the attempt count
-// that fetchPollMax bounds.
 func writeFetchPending(w http.ResponseWriter, id, n int64) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprintf(w,
@@ -125,8 +103,6 @@ func writeFetchPending(w http.ResponseWriter, id, n int64) {
 		id, n+1, fetchPollDelayMs)
 }
 
-// respondFetchPending is the tail every enqueue-and-poll handler ends in:
-// the pending pill for an htmx caller, the image page for anyone else.
 func respondFetchPending(w http.ResponseWriter, r *http.Request, id int64) {
 	if isHTMXRequest(r) {
 		writeFetchPending(w, id, 0)
@@ -135,18 +111,13 @@ func respondFetchPending(w http.ResponseWriter, r *http.Request, id int64) {
 	http.Redirect(w, r, "/images/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
 }
 
-// writeFetchOutcome swaps a terminal outcome into the top #fetch-status slot
-// out-of-band, leaving the main body empty so the pending pill clears wherever
-// the triggering button placed it (#fetch-status or #fetch-pending). body must
-// be valid HTML; escaping is the caller's responsibility.
+// Out of band with an empty main body, so the pill clears wherever it was
+// placed. body is raw HTML: the caller escapes it.
 func writeFetchOutcome(w http.ResponseWriter, kind, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(`<div id="fetch-status" class="fetch-status" hx-swap-oob="true"><div class="flash flash-` + kind + `">` + body + `</div></div>`))
 }
 
-// fetchStatusHandler is the detail page's poll for a source fetch's outcome.
-// While pending it re-emits the polling pill; on success it triggers a page
-// reload so the freshly-applied tags render.
 func (s *Server) fetchStatusHandler(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
@@ -155,7 +126,7 @@ func (s *Server) fetchStatusHandler(w http.ResponseWriter, r *http.Request) {
 	n, _ := strconv.ParseInt(r.URL.Query().Get("n"), 10, 64)
 	e, ok := s.fetchStatus.load(s.activeGallery(), id)
 	if !ok {
-		// Nothing in flight (or already consumed): stop polling, clear the slot.
+		// Nothing in flight: an empty body stops the poll and clears the slot.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		return
 	}
@@ -167,8 +138,7 @@ func (s *Server) fetchStatusHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		writeFetchPending(w, id, n)
 	case "ok":
-		// The refresh reloads the page so the applied tags render; the flash
-		// rides the stash-and-show bridge to survive the reload.
+		// The flash survives HX-Refresh through the stash-and-show bridge.
 		s.fetchStatus.clear(s.activeGallery(), id)
 		msg := e.Msg
 		msg = cmp.Or(msg, "Fetched tags from the source.")
@@ -176,52 +146,31 @@ func (s *Server) fetchStatusHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("HX-Refresh", "true")
 		w.WriteHeader(http.StatusOK)
 	case "hash_not_found":
-		// A lookup found no site (or the PTR) holding the hash. Common and
-		// expected - a resized or re-encoded copy won't match - so it reads
-		// as a result, not an error. monloader's message is a "; "-joined
-		// per-source trail; render it as a list with the searched hashes
-		// recorded at enqueue time.
+		// Common and expected, since an altered copy never matches, so it
+		// reads as a result, not an error.
 		s.fetchStatus.clear(s.activeGallery(), id)
 		writeFetchOutcome(w, "warn", lookupMissBody(e.Msg, e.Hashes))
 	case "canceled":
-		// monloader dropped the job before it ran - an operator cancel, or a
-		// restart draining its queue. Nothing was tried, so it reads as a
-		// standing state rather than a failure.
 		s.fetchStatus.clear(s.activeGallery(), id)
 		writeFetchOutcome(w, "warn", "monloader dropped this job before it ran; nothing was looked up.")
 	case "already_exists":
-		// A replace found its original already in the library as another
-		// image; the pair was recorded as potential duplicates. A standing
-		// state the operator resolves in the dup workflow, not an error.
 		s.fetchStatus.clear(s.activeGallery(), id)
 		writeFetchOutcome(w, "warn", alreadyExistsBody(e.Msg))
 	default:
-		// Any other state is terminal: a hash mismatch or apply error from
-		// enrich, or a code monloader reported for a fetch that failed before
-		// it could enrich. Surface it inline and stop polling.
 		s.fetchStatus.clear(s.activeGallery(), id)
 		writeFetchOutcome(w, "err", html.EscapeString(fetchFailureMessage(e.State, e.Msg)))
 	}
 }
 
-// imageRefRe matches the "image N" reference the already-exists refusal
-// names.
 var imageRefRe = regexp.MustCompile(`image (\d+)`)
 
-// alreadyExistsBody renders the already-exists refusal with the image it
-// names linked, so the operator can jump straight to the recorded pair.
 func alreadyExistsBody(msg string) string {
 	return imageRefRe.ReplaceAllString(html.EscapeString(msg), `<a href="/images/$1">image $1</a>`)
 }
 
-// ptrTrailName is how monloader's trail entries name its local PTR backend.
+// Must match how monloader's trail names its PTR backend.
 const ptrTrailName = "Public Tag Repository"
 
-// lookupMissBody renders a hash lookup's not-found outcome: the PTR's own
-// line when it was searched, the online per-source trail as a list, then the
-// searched hashes, then a hint that altered copies don't match by hash. Trail
-// and hashes come pre-shaped - the trail from monloader's report, the hashes
-// from the enqueue record - so an empty value just drops its section.
 func lookupMissBody(trail, hashes string) string {
 	var b strings.Builder
 	if trail == "" {
@@ -233,9 +182,8 @@ func lookupMissBody(trail, hashes string) string {
 				online = append(online, entry)
 				continue
 			}
-			// The PTR is local and populates no source URL, so its answer -
-			// match or miss - reads apart from the online walk. A match means
-			// tags already landed even though the lookup reports a miss.
+			// A PTR match sets no source URL, so the lookup reports a
+			// miss even though its tags landed.
 			b.WriteString("<div>" + html.EscapeString(entry))
 			if strings.HasPrefix(entry, ptrTrailName+": match") {
 				b.WriteString(" (reload the page to see them)")
@@ -259,9 +207,6 @@ func lookupMissBody(trail, hashes string) string {
 	return b.String()
 }
 
-// linkifyTrailEntry escapes one trail entry, turning bare http(s) URLs (the
-// closest candidates monloader lists on a similarity miss) into links
-// labeled by their host so the list stays scannable.
 func linkifyTrailEntry(entry string) string {
 	var b strings.Builder
 	for {
@@ -289,9 +234,6 @@ func linkifyTrailEntry(entry string) string {
 	}
 }
 
-// similarityLookupRan reports whether the miss trail shows one of monloader's
-// similarity services (iqdb, SauceNAO) answering; a "skipped, needs ..." entry
-// means it isn't set up. When one ran, the set-it-up hint is noise.
 func similarityLookupRan(trail string) bool {
 	for _, entry := range strings.Split(trail, "; ") {
 		name, reason, ok := strings.Cut(entry, ": ")
@@ -305,11 +247,7 @@ func similarityLookupRan(trail string) bool {
 	return false
 }
 
-// fetchFailureMessage renders a terminal fetch state into operator-facing text.
-// monloader reports a fetch that failed before it could enrich with one of its
-// queue's stable error codes; map the actionable ones to a plain sentence and
-// fall back to the recorded message otherwise (the enrich path already supplies
-// a readable one for a hash mismatch or an apply error).
+// Keyed on monloader's stable queue error codes.
 var fetchFailureMessages = map[string]string{
 	"unsupported_url":      "monloader can't fetch this source URL.",
 	"network_unreachable":  "monloader couldn't reach the source.",

@@ -39,12 +39,12 @@ modules:
     sources:
       - type: archive
         only-arches: [x86_64]
-        url: https://github.com/monbooru/ffmpeg-builds/releases/download/v8.1.2-mb2/ffmpeg-8.1.2-mb2-linux64.tar.xz
-        sha256: 256131407bd62df7ff2d870073d9f7cc14e6cc0123cebd3616497805bc45f168
+        url: https://github.com/monbooru/ffmpeg-builds/releases/download/v8.1.2-mb4/ffmpeg-8.1.2-mb4-linux64.tar.xz
+        sha256: 66f8f4627e1cc9ad26caa9fcd9799e88db84711ef03c1565c923694804c11000
       - type: archive
         only-arches: [aarch64]
-        url: https://github.com/monbooru/ffmpeg-builds/releases/download/v8.1.2-mb2/ffmpeg-8.1.2-mb2-linuxarm64.tar.xz
-        sha256: f77a5808571b6716bf66f5d25fbb01078e6e2930defdaa5606617f0e4c7b1644
+        url: https://github.com/monbooru/ffmpeg-builds/releases/download/v8.1.2-mb4/ffmpeg-8.1.2-mb4-linuxarm64.tar.xz
+        sha256: 937a346aa931764d5bde26d70b51ec1f8720360777ff93d1cde66006a7a2241f
 
   - name: monbooru
     buildsystem: simple

@@ -1,10 +1,5 @@
-// Package markup renders the bracket vocabulary that annotation bodies,
-// operator notes and artist commentary carry: a few inline marks plus links to
-// a tag search, to another image, or off-site. Bodies are stored as this
-// vocabulary and nothing else - a source's HTML is converted by FromHTML on
-// the way in - so the renderer only ever emits elements it picked itself, with
-// every byte of stored text escaped and every attribute assembled from a
-// resolved value.
+// Package markup renders the bracket markup that annotation bodies, notes and
+// commentary are stored in; source HTML is converted to it, never stored.
 package markup
 
 import (
@@ -14,8 +9,6 @@ import (
 	"strings"
 )
 
-// maxDepth caps nesting. Past it a construct renders as the characters it is,
-// like any other thing the parser does not recognise.
 const maxDepth = 4
 
 type nodeKind uint8
@@ -36,14 +29,12 @@ type node struct {
 	child []node
 }
 
-// Doc is a parsed body.
 type Doc struct {
 	nodes []node
 }
 
-// Parse scans src. Anything that is not a complete, known construct stays the
-// characters it is, so a body written before the vocabulary existed renders
-// unchanged and a body truncated mid-construct degrades to visible text.
+// Parse keeps anything that is not a complete, known construct as literal
+// text, so plain and truncated bodies render as written.
 func Parse(src string) Doc {
 	if !strings.ContainsRune(src, '[') {
 		if src == "" {
@@ -83,10 +74,8 @@ func parseNodes(src string, depth int, inLink bool) []node {
 	return out
 }
 
-// parseConstruct reads one construct at the head of s, which starts with '['.
-// A zero width means s does not open one and the '[' is literal text. Names are
-// lowercase and carry no whitespace: one spelling per construct keeps the
-// parser a scanner and keeps ordinary prose in brackets from becoming markup.
+// No whitespace and one lowercase spelling per name, so prose in brackets
+// never becomes markup.
 func parseConstruct(s string, depth int, inLink bool) (node, int) {
 	if depth >= maxDepth {
 		return node{}, 0
@@ -128,8 +117,8 @@ func parseConstruct(s string, depth int, inLink bool) (node, int) {
 		return node{}, 0
 	}
 
-	// First close wins: nesting a mark inside itself carries no meaning, and
-	// counting pairs would cost a scan per candidate for nothing.
+	// First close wins: a mark nested in itself means nothing, so pairs
+	// are not counted.
 	closing := "[/" + name + "]"
 	rel := strings.Index(s[head+1:], closing)
 	if rel < 0 {
@@ -155,8 +144,6 @@ func parseConstruct(s string, depth int, inLink bool) (node, int) {
 	}
 }
 
-// label parses a link's visible text, falling back to the link's own value so
-// an empty label still shows what it points at.
 func label(body, fallback string, depth int) []node {
 	if strings.TrimSpace(body) == "" {
 		return []node{{kind: nodeText, text: fallback}}
@@ -164,9 +151,8 @@ func label(body, fallback string, depth int) []node {
 	return parseNodes(body, depth+1, true)
 }
 
-// validURL compares the scheme in place rather than lowercasing s: the DText
-// converter calls it at every byte position that could start a link, with s
-// the whole rest of the body, so a copy per position is quadratic.
+// Compared in place, not by lowercasing s: s can be the rest of the body
+// at every byte position, so a copy would be quadratic.
 func validURL(s string) bool {
 	return hasSchemeFold(s, "http://") || hasSchemeFold(s, "https://")
 }
@@ -175,8 +161,6 @@ func hasSchemeFold(s, scheme string) bool {
 	return len(s) >= len(scheme) && strings.EqualFold(s[:len(scheme)], scheme)
 }
 
-// Refs is the set of references a body points at, accumulated across every
-// body on a page so the gallery resolves them in one batch.
 type Refs struct {
 	Tags   map[string]bool
 	Images map[int64]bool
@@ -187,7 +171,6 @@ func NewRefs() Refs {
 	return Refs{Tags: map[string]bool{}, Images: map[int64]bool{}, URLs: map[string]bool{}}
 }
 
-// Collect adds d's references to r.
 func (d Doc) Collect(r Refs) {
 	collect(d.nodes, r)
 }
@@ -206,24 +189,20 @@ func collect(nodes []node, r Refs) {
 	}
 }
 
-// TagRef is a tag reference resolved against the gallery's catalog.
 type TagRef struct {
 	Href  string
 	Color string
 	Known bool
 }
 
-// Resolver carries what the gallery knows about the references a render is
-// about to emit. Every href and colour the renderer writes comes from here,
-// never from the body.
 type Resolver struct {
 	Tags   map[string]TagRef
 	Images map[int64]bool
 	Links  map[string]int64 // external URL -> the image whose origin serves it
 }
 
-// Render emits the document. Text is escaped, elements come from the table
-// below, and attribute values are either a resolved value or digits.
+// Render escapes all body text and takes attribute values only from res,
+// digits, or a URL validURL accepted.
 func (d Doc) Render(res Resolver) template.HTML {
 	var b strings.Builder
 	renderNodes(&b, d.nodes, res)
@@ -250,10 +229,6 @@ func renderNodes(b *strings.Builder, nodes []node, res Resolver) {
 	}
 }
 
-// markVocabulary is the whole mark vocabulary: which names a construct
-// accepts and what each renders as. One table, so adding a mark cannot
-// half-land - a name the parser takes but the renderer does not know would
-// come out as an unstyled span with no sign anything was missed.
 type markVocabulary map[string]struct{ open, closing string }
 
 func (m markVocabulary) has(name string) bool { _, ok := m[name]; return ok }
@@ -320,8 +295,6 @@ func renderImage(b *strings.Builder, n node, res Resolver) {
 	b.WriteString(`<a class="mk-local" href="/images/` + num + `">#` + num + `</a>`)
 }
 
-// Text flattens the document, for the list entries and title attributes that
-// want one scannable line rather than a render.
 func (d Doc) Text() string {
 	var b strings.Builder
 	flatten(&b, d.nodes)

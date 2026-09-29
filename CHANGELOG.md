@@ -1,5 +1,51 @@
 # Changelog
 
+## [v1.22.0] - 2026-09-28
+### Added
+- Automatic meta tags like highres, lowres, animated... derived from each file. ([#66](https://github.com/monbooru/monbooru/issues/66))
+- `comfyui:` searches workflows by node, title or input value. ([#83](https://github.com/monbooru/monbooru/issues/83))
+- A configurable ignore list of files and folders no gallery indexes. ([#91](https://github.com/monbooru/monbooru/issues/91))
+- Download a selection or a whole search as a zip (`d`), optionally with its tags. ([#105](https://github.com/monbooru/monbooru/issues/105))
+- Each scheduled action runs on the galleries picked for it in Settings -> Schedule. ([#116](https://github.com/monbooru/monbooru/issues/116))
+- Support for AVIF and JPEG XL images. ([#132](https://github.com/monbooru/monbooru/issues/132))
+- Tags carry a note and links, edited on the tag's page. ([#134](https://github.com/monbooru/monbooru/issues/134), [#92](https://github.com/monbooru/monbooru/issues/92))
+- The sidebar gets a `?` beside each listed tag to open their detail page.
+- `GET /api/v1/tags/{id}` returns a tag with its note and links.
+
+### Changed
+- A gallery leaves out nested galleries, monbooru's own folders and ignored names. ([#91](https://github.com/monbooru/monbooru/issues/91))
+- Adding a gallery refuses a folder another gallery already uses or one monbooru writes to.
+- Settings -> Maintenance groups its actions, and Rebuild queue moves to the Relations page.
+- Bundled ffmpeg moves to ffmpeg-builds v8.1.2-mb4 for JPEG XL; a system ffmpeg needs libjxl.
+- Plugin buttons that declare `media=image` are offered AVIF and JPEG XL images too.
+
+### Fixed
+- A paired monloader that changes address or comes back online is reached again without re-pairing. ([#141](https://github.com/monbooru/monbooru/issues/141))
+- A page left open across a gallery switch no longer let the user interact with the other gallery's images.
+- A replace-import that fails partway leaves the gallery as it was.
+- A transfer move no longer deletes the source when the target's copy had gone missing.
+- Watchers no longer pause for another gallery's job or decode a whole moved-in folder at once.
+- A gallery export no longer stalls the app, and one that fails shows as failed, not truncated.
+- Merging tags applies moved implications to every image; re-declaring an implication repairs older merges.
+- A batch rename numbers `{n}` in the order a pinned collection or similarity search shows.
+- A1111 and Forge JPEG and WebP files get their generation parameters; run Re-extract metadata for existing ones.
+- Animated WebPs, rotated videos and videos whose picture ends early get correct thumbnails and sizes; run Rebuild thumbnails.
+- Stopping monbooru during an auto-tag run exits promptly instead of waiting out a chunk or crashing.
+- A session ending no longer sends open pages to the login; logging in returns to the page asked for.
+- Changing the password asks for the current one whenever one is stored, and ends other sessions.
+- The plugin mount refuses cross-origin writes and no longer forwards the session cookie.
+- After Back, the search box, selection, upload widget and grid layout match the restored page.
+- Text limits count characters, not bytes, and messages no longer garble Japanese or Chinese text.
+- The schedule no longer runs hours late after a sleep, nor repeats last night's pass at boot.
+- Renaming a gallery keeps its auto-taggers, and a Schedule save while monloader is unpaired keeps the lookups.
+- The API applies tags pushed without a source, and answers client mistakes 400 or 404, not 500.
+- An API upload named .jpg that holds another format is no longer re-encoded to JPEG.
+
+Thanks to @gary-host-laptop for the suggestions (https://github.com/monbooru/monbooru/issues/66, https://github.com/monbooru/monbooru/issues/92, https://github.com/monbooru/monbooru/issues/116).
+Thanks to @QiE2035 for the suggestions (https://github.com/monbooru/monbooru/issues/91, https://github.com/monbooru/monbooru/issues/83, https://github.com/monbooru/monbooru/issues/134).
+Thanks to @CeareDelafont for the suggestion (https://github.com/monbooru/monbooru/issues/105) and the report (https://github.com/monbooru/monbooru/issues/141).
+Thanks to @Mar2ck for the suggestion (https://github.com/monbooru/monbooru/issues/132).
+
 ## [v1.21.1] - 2026-09-16
 ### Added
 - A gallery follows symlinked folders. ([#139](https://github.com/monbooru/monbooru/issues/139))

@@ -1,12 +1,5 @@
-// Package jobs is the one background job at a time: the state machine, its
-// progress and cancellation, and the chunking loop the long runs walk their
-// work in. One lane, deliberately - the deployment is a home box, and two
-// jobs writing the same SQLite file would spend their time contending
-// rather than finishing.
-//
-// It owns when a job may start and how it reports; what a job does belongs
-// to whoever asked for it. That is why this package imports only
-// internal/models and is the leaf the rest of the tree can depend on.
+// Package jobs runs one background job at a time: two jobs writing the
+// same SQLite file would only contend.
 package jobs
 
 import (
@@ -18,42 +11,28 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// ErrJobRunning is returned when a job is already running.
 var ErrJobRunning = errors.New("a job is already running")
 
-// Auto-dismiss windows for a finished job: the full one a summary no
-// client has rendered gets, and the shorter one it drops to afterwards.
 const (
 	dismissDelay       = 30 * time.Second
 	viewedDismissDelay = 6 * time.Second
 )
 
-// Manager is a thread-safe singleton job state machine. Only one job may
-// run at a time.
 type Manager struct {
 	mu     sync.Mutex
 	state  *models.JobState
 	timer  *time.Timer
 	ctx    context.Context
 	cancel context.CancelFunc
-	// scheduleHeld blocks user-Start while a scheduler run is active so
-	// the scheduler's per-phase Start/Complete pairs can't race against
-	// a user job slipping into a phase boundary.
+	// Blocks Start where no job is running, such as between a scheduled
+	// run's phases.
 	scheduleHeld bool
-	// viewed is set after MarkViewed; the auto-dismiss timer then drops
-	// from 30s ("no one is looking") to a few seconds.
-	viewed bool
-	// finished counts terminal transitions. The state itself is cleared
-	// by the auto-dismiss, so a watcher sampling less often than that
-	// would otherwise miss a whole job.
-	finished uint64
+	viewed       bool
+	finished     uint64
 }
 
-// NewManager returns a new Manager with no active job.
 func NewManager() *Manager { return &Manager{} }
 
-// clearStateLocked resets the manager to idle, stopping any armed
-// auto-dismiss timer. Caller must hold m.mu.
 func (m *Manager) clearStateLocked() {
 	if m.timer != nil {
 		m.timer.Stop()
@@ -64,30 +43,24 @@ func (m *Manager) clearStateLocked() {
 	m.viewed = false
 }
 
-// Start begins a new job. Returns ErrJobRunning if a job or scheduler run
-// is already active.
-func (m *Manager) Start(jobType string) error {
+func (m *Manager) Start(jobType string, galleries ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.scheduleHeld {
 		return ErrJobRunning
 	}
-	return m.startLocked(jobType)
+	return m.startLocked(jobType, galleries)
 }
 
-// StartScheduled is the scheduler's entry point. It bypasses the
-// scheduleHeld guard so the scheduler's own per-phase Start calls go
-// through, but still refuses if another job is running. Pair with
-// Complete/Fail; the schedule reservation is owned by
-// BeginSchedule/EndSchedule.
-func (m *Manager) StartScheduled(jobType string) error {
+// StartScheduled skips the reservation check; only the holder of
+// BeginSchedule may call it.
+func (m *Manager) StartScheduled(jobType string, galleries ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.startLocked(jobType)
+	return m.startLocked(jobType, galleries)
 }
 
-// startLocked: caller must hold m.mu.
-func (m *Manager) startLocked(jobType string) error {
+func (m *Manager) startLocked(jobType string, galleries []string) error {
 	if m.state != nil && m.state.Running {
 		return ErrJobRunning
 	}
@@ -100,16 +73,15 @@ func (m *Manager) startLocked(jobType string) error {
 	m.state = &models.JobState{
 		Running:   true,
 		JobType:   jobType,
+		Galleries: galleries,
 		StartedAt: time.Now().UTC(),
 		Message:   "Starting...",
 	}
 	return nil
 }
 
-// BeginSchedule reserves the manager for an in-progress scheduler run so
-// user-facing Start() calls return ErrJobRunning until EndSchedule fires.
-// Returns ErrJobRunning if anything else is already holding the manager.
-// Pair with EndSchedule via defer.
+// BeginSchedule makes Start refuse until EndSchedule, which the caller
+// must defer.
 func (m *Manager) BeginSchedule() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -123,26 +95,18 @@ func (m *Manager) BeginSchedule() error {
 	return nil
 }
 
-// EndSchedule releases the schedule reservation set by BeginSchedule.
 func (m *Manager) EndSchedule() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.scheduleHeld = false
 }
 
-// IsScheduleHeld reports whether a scheduler run is currently active.
-// Used by the scheduler's outer loop to bail between phases when a
-// user cancel has cleared the reservation; without this the cancelled
-// phase finishes and the next phase's StartScheduled fires normally.
 func (m *Manager) IsScheduleHeld() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.scheduleHeld
 }
 
-// Context returns the cancellation context for the running job so the
-// Cancel endpoint can interrupt long-running work. Returns a background
-// context when no job runs.
 func (m *Manager) Context() context.Context {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -152,10 +116,8 @@ func (m *Manager) Context() context.Context {
 	return m.ctx
 }
 
-// Cancel signals the running job's context to abort. It is a no-op when no
-// job is running; workers observe ctx.Done() and wrap up via Complete/Fail.
-// scheduleHeld is released so a cancel mid-schedule abandons the run rather
-// than leaving the reservation pinned across phases the user no longer wants.
+// Cancel also drops the schedule reservation, so a scheduled run stops at
+// its next phase.
 func (m *Manager) Cancel() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -165,7 +127,6 @@ func (m *Manager) Cancel() {
 	m.scheduleHeld = false
 }
 
-// Update sets the processed count and message.
 func (m *Manager) Update(processed, total int, message string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -178,7 +139,6 @@ func (m *Manager) Update(processed, total int, message string) {
 	m.state.Message = message
 }
 
-// Complete marks the job as done with a summary.
 func (m *Manager) Complete(summary string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -195,7 +155,6 @@ func (m *Manager) Complete(summary string) {
 	m.scheduleAutoDismiss()
 }
 
-// Fail marks the job as failed with an error message.
 func (m *Manager) Fail(errMsg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -211,7 +170,6 @@ func (m *Manager) Fail(errMsg string) {
 	m.scheduleAutoDismiss()
 }
 
-// Get returns a copy of the current job state (may be nil).
 func (m *Manager) Get() *models.JobState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -223,9 +181,7 @@ func (m *Manager) Get() *models.JobState {
 	return &copy
 }
 
-// IsRunning returns true if a job is running or a scheduler run holds the
-// manager. Callers that gate user actions on this also get protected
-// during scheduled maintenance.
+// IsRunning is also true while a schedule reservation is held.
 func (m *Manager) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -235,20 +191,17 @@ func (m *Manager) IsRunning() bool {
 	return m.state != nil && m.state.Running
 }
 
-// Finished counts the jobs that have reached a terminal state. It only
-// grows, so a caller can tell that one ended between two samples however
-// far apart they are.
+// Finished only grows, so a watcher sampling less often than the
+// auto-dismiss still sees a job end.
 func (m *Manager) Finished() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.finished
 }
 
-// MarkViewed shortens the auto-dismiss timer to a few seconds once at
-// least one client has rendered the completed state, so the flash
-// doesn't linger across page navigations. The 30s fallback stays for
-// jobs that finish unattended. A failed job never shortens: the status
-// bar is the only place its error is reported.
+// MarkViewed shortens the auto-dismiss, except after a failure: any open
+// tab's poll counts as a view, and the status bar is the only report the
+// error gets.
 func (m *Manager) MarkViewed() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -259,7 +212,6 @@ func (m *Manager) MarkViewed() {
 	m.armDismiss(viewedDismissDelay)
 }
 
-// Dismiss clears the completed/failed job state so the status widget goes idle.
 func (m *Manager) Dismiss() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -269,10 +221,6 @@ func (m *Manager) Dismiss() {
 	m.clearStateLocked()
 }
 
-// SetWatcherMessage surfaces a transient watcher notification. When idle
-// it becomes the status-bar summary; while a job is running it only bumps
-// WatcherNotices so the client refreshes the gallery grid without
-// overwriting the progress line.
 func (m *Manager) SetWatcherMessage(msg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -290,15 +238,12 @@ func (m *Manager) SetWatcherMessage(msg string) {
 	m.scheduleAutoDismiss()
 }
 
-// scheduleAutoDismiss arms the full auto-dismiss for the current
-// completed state. Caller must hold m.mu.
+// Caller must hold m.mu.
 func (m *Manager) scheduleAutoDismiss() {
 	m.armDismiss(dismissDelay)
 }
 
-// armDismiss replaces any pending dismiss with one d from now. It clears
-// only a completed state: a job running by the time it fires owns the
-// widget and keeps it. Caller must hold m.mu.
+// Caller must hold m.mu.
 func (m *Manager) armDismiss(d time.Duration) {
 	if m.timer != nil {
 		m.timer.Stop()

@@ -11,49 +11,42 @@ func (s *Server) jobDismissPost(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// jobCancelPost aborts the running job by cancelling its context. Workers
-// observing ctx.Done() wrap up and call Complete/Fail themselves.
 func (s *Server) jobCancelPost(w http.ResponseWriter, r *http.Request) {
 	s.jobs.Cancel()
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type jobStatusView struct {
+	Job       *models.JobState
+	Downloads []*activeDownload
+}
+
 func (s *Server) jobStatusHandler(w http.ResponseWriter, r *http.Request) {
-	// Mark before Get so the first render of a completed state starts the
-	// short post-view dismiss timer. Subsequent views don't re-arm it.
+	// MarkViewed first: a finished job's first render starts its dismiss timer.
 	s.jobs.MarkViewed()
-	state := s.jobs.Get()
-	s.renderTemplate(w, "partials/job_status.html", state)
+	s.renderTemplate(w, "partials/job_status.html", jobStatusView{Job: s.jobs.Get(), Downloads: s.downloads.snapshot()})
 }
 
 func (s *Server) syncTrigger(w http.ResponseWriter, r *http.Request) {
 	if cx := s.active(); cx == nil || cx.Degraded {
-		// Same escaped-fragment shape as the busy-job refusal below it:
-		// the topbar swaps this body straight into #sync-flash.
 		flashStatus(w, http.StatusServiceUnavailable, "Sync unavailable: gallery path is unreadable.")
 		return
 	}
 	if !s.startJob(w, models.JobTypeSync) {
 		return
 	}
-	// Snapshot the active gallery's state under the request's RLock so the
-	// background goroutine is not racing a subsequent swap. The IsRunning
-	// guard in switchGallery refuses swaps while the sync runs, so these
-	// handles stay valid for the job's lifetime.
+	// Resolved under the request's RLock; the gallery mutations refuse
+	// while a job runs, so cx stays open for the sync.
 	cx := s.active()
 	maxFileSizeMB := s.maxFileSizeMB()
 	go func() {
 		ctx := s.jobs.Context()
-		// cx.Sync wraps gallery.Sync + InvalidateCaches so this caller
-		// can't drift from the contract (a future code path that
-		// returned early between the two would leave caches stale).
 		result, err := cx.Sync(ctx, maxFileSizeMB, s.ingestNaming(cx.Name), s.jobs.Update)
 		_ = s.settleJob(ctx, err, "sync cancelled", result.Summary())
 	}()
 
 	redirectTo := sameOriginReferer(r)
 	if isHTMXRequest(r) {
-		// Signal the client to reload the gallery when the job finishes.
 		w.Header().Set("HX-Trigger", "syncStarted")
 		w.WriteHeader(http.StatusAccepted)
 		return

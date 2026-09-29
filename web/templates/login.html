@@ -13,6 +13,7 @@
       {{if not .AuthDisabled}}
       <form method="POST" action="/login">
         <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+        {{with .Next}}<input type="hidden" name="next" value="{{.}}">{{end}}
         <input type="password" name="password" placeholder="Password" autofocus>
         <button type="submit">Login</button>
       </form>

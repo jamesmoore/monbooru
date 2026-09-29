@@ -1,6 +1,7 @@
 package web
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -20,17 +21,22 @@ import (
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
-// pruneMissingImagesPost queues the missing-row sweep as a background
-// `delete` job so a concurrent submit lands on the shared "A job is
-// already running" path the other long maintenance handlers use, and
-// progress flows through the same status bar.
+type missingRow struct {
+	id   int64
+	path string
+}
+
 func (s *Server) pruneMissingImagesPost(w http.ResponseWriter, r *http.Request) {
-	ids, err := db.QueryIDs(s.db().Read, `SELECT id FROM images WHERE is_missing = 1`)
+	missing, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (missingRow, error) {
+		var m missingRow
+		err := rows.Scan(&m.id, &m.path)
+		return m, err
+	}, `SELECT id, canonical_path FROM images WHERE is_missing = 1`)
 	if err != nil {
 		writeInlineFlash(w, "err", "Error: "+err.Error())
 		return
 	}
-	if len(ids) == 0 {
+	if len(missing) == 0 {
 		writeInlineFlash(w, "ok", "Removed 0 missing image(s).")
 		return
 	}
@@ -44,6 +50,16 @@ func (s *Server) pruneMissingImagesPost(w http.ResponseWriter, r *http.Request) 
 	onDelete := s.onImagesDeleteCallback()
 	go func() {
 		ctx := s.jobs.Context()
+		// The flag is also set for a path the gallery leaves out, or a file
+		// sync skipped; only a file gone from disk takes its row.
+		s.jobs.Update(0, len(missing), "checking files…")
+		var ids []int64
+		for _, m := range missing {
+			if _, err := os.Stat(m.path); os.IsNotExist(err) {
+				ids = append(ids, m.id)
+			}
+		}
+		kept := len(missing) - len(ids)
 		total := len(ids)
 		s.jobs.Update(0, total, "pruning…")
 		done := 0
@@ -84,16 +100,15 @@ func (s *Server) pruneMissingImagesPost(w http.ResponseWriter, r *http.Request) 
 				active.InvalidateCaches()
 			}
 		}
-		s.finishJob(err, cancelled, fmt.Sprintf("prune cancelled (%d/%d removed)", removed, total), fmt.Sprintf("Removed %d missing image(s).", removed))
+		summary := fmt.Sprintf("Removed %d missing image(s).", removed)
+		if kept > 0 {
+			summary = fmt.Sprintf("Removed %d missing image(s); kept %d whose file is still on disk.", removed, kept)
+		}
+		s.finishJob(err, cancelled, fmt.Sprintf("prune cancelled (%d/%d removed)", removed, total), summary)
 	}()
 	writeInlineFlash(w, "ok", "Prune started.")
 }
 
-// pruneOrphanedThumbnailsPost queues the orphan sweep as a background
-// `prune-thumbs` job so the request returns immediately and progress
-// surfaces through the same /internal/job/status poll as the other
-// long maintenance buttons. The body is shared with scheduledRemoveOrphans
-// via runOrphanSweep.
 func (s *Server) pruneOrphanedThumbnailsPost(w http.ResponseWriter, r *http.Request) {
 	cx := s.active()
 	if cx == nil {
@@ -117,21 +132,23 @@ func (s *Server) pruneOrphanedThumbnailsPost(w http.ResponseWriter, r *http.Requ
 // what is listed and scans again.
 const emptyFolderListCap = 2000
 
-// emptyFoldersScanPost lists the folders under the gallery root holding
-// nothing, for the operator to pick from. Read-only, so unlike the removal
-// beside it this takes no job slot.
 func (s *Server) emptyFoldersScanPost(w http.ResponseWriter, r *http.Request) {
 	cx := s.active()
+	// Every outcome but the list clears the list slot, so an old list
+	// never stays under a new flash.
 	if cx == nil || cx.Degraded {
+		writeFlashOOB(w, "flash-empty-folders", "", "")
 		writeInlineFlash(w, "err", "Gallery path is unreadable.")
 		return
 	}
-	dirs, err := gallery.ScanEmptyDirs(cx.GalleryPath)
+	dirs, err := gallery.ScanEmptyDirs(cx.Boundary())
 	if err != nil {
+		writeFlashOOB(w, "flash-empty-folders", "", "")
 		writeInlineFlash(w, "err", "Error: "+err.Error())
 		return
 	}
 	if len(dirs) == 0 {
+		writeFlashOOB(w, "flash-empty-folders", "", "")
 		writeInlineFlash(w, "ok", "No empty folders.")
 		return
 	}
@@ -142,9 +159,7 @@ func (s *Server) emptyFoldersScanPost(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// emptyFoldersRemovePost unlinks the folders left checked in the scan
-// result. Short enough to answer in the request, but it holds a job slot so
-// a concurrent move cannot lose the folder it just created.
+// Holds a job slot so a concurrent move cannot lose a folder it just created.
 func (s *Server) emptyFoldersRemovePost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -157,12 +172,13 @@ func (s *Server) emptyFoldersRemovePost(w http.ResponseWriter, r *http.Request) 
 	if !s.startJob(w, models.JobTypePruneDirs) {
 		return
 	}
-	removed := gallery.RemoveEmptyDirs(s.galleryPath(), paths)
+	removed := gallery.RemoveEmptyDirs(s.boundary(), paths)
 	s.jobs.Complete(fmt.Sprintf("Removed %d empty folder(s).", removed))
 	kept := ""
 	if n := len(paths) - removed; n > 0 {
 		kept = fmt.Sprintf(", %d no longer empty", n)
 	}
+	writeFlashOOB(w, "flash-empty-folders", "", "")
 	writeInlineFlash(w, "ok", fmt.Sprintf("Removed %d empty folder(s)%s.", removed, kept))
 }
 
@@ -176,12 +192,6 @@ func (s *Server) recalcTagsPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", fmt.Sprintf("Recalculated %d tag count(s).", updated))
 }
 
-// tagCategoryConflictsPost counts the tag rows whose name occupies more
-// than one category (the same number the Conflicts badge carries, so the
-// two surfaces agree) and points the operator at the Tags page's filter,
-// where the fix tools live (inline category select with merge-on-collision,
-// the batch bar). The split is legal - a tag's unique key is
-// (name, category_id) - but usually means two sources disagreed. Read-only.
 func (s *Server) tagCategoryConflictsPost(w http.ResponseWriter, r *http.Request) {
 	n, err := s.tagSvc().ConflictsCount()
 	if err != nil {
@@ -205,9 +215,6 @@ func plural(n int) string {
 	return "s"
 }
 
-// findFoldedDuplicatesPost recomputes folded_tag_pairs in the background,
-// pairing each pre-widening folded tag with the richer spelling that
-// superseded it for the /tags Folded-duplicates view.
 func (s *Server) findFoldedDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -226,51 +233,25 @@ func (s *Server) findFoldedDuplicatesPost(w http.ResponseWriter, r *http.Request
 	writeInlineFlash(w, "ok", "Folded-duplicate scan started.")
 }
 
-// duplicatesFragmentCap bounds the one-shot fragment; the paginated
-// walker page is where a long list is meant to be worked through.
 const duplicatesFragmentCap = 100
 
 func (s *Server) duplicatesListHandler(w http.ResponseWriter, r *http.Request) {
-	// The endpoint is an htmx target on the Relations page; non-htmx
-	// callers (refresh, paste, bookmark) get redirected to the page so
-	// the URL produces a useful view either way rather than a naked
-	// <table> fragment.
 	if !isHTMXRequest(r) {
 		http.Redirect(w, r, "/relations#file-duplicates", http.StatusSeeOther)
 		return
 	}
-	// This is the one duplicates surface that renders filenames and ids
-	// rather than counts, so it owes the ceiling the same filter the
-	// sha256 walker and the delete-all branch apply - otherwise a SFW
-	// ceiling still prints the paths of what it hides, and [promote]
+	// Ceiling-filtered: this surface prints paths and ids, and [promote]
 	// acts on them.
-	from, args := duplicatePathsFrom(r, s.active())
-	var total int
-	if err := s.db().Read.QueryRow(`SELECT COUNT(*)`+from, args...).Scan(&total); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	type aliasRow struct {
-		ImageID       int64
-		CanonicalPath string
-		PathID        int64
-		AliasPath     string
-	}
-	aliases, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (aliasRow, error) {
-		var a aliasRow
-		err := rows.Scan(&a.ImageID, &a.CanonicalPath, &a.PathID, &a.AliasPath)
-		return a, err
-	}, `SELECT i.id, i.canonical_path, ip.id as path_id, ip.path`+from+`
-		ORDER BY i.id, ip.id
-		LIMIT ?`, append(append([]any{}, args...), duplicatesFragmentCap)...)
+	aliases, err := duplicatePaths(r, s.active())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	shown := aliases[:min(len(aliases), duplicatesFragmentCap)]
 
 	s.renderTemplate(w, "partials/duplicates_list.html", map[string]any{
-		"Aliases":   aliases,
-		"Withheld":  max(total-len(aliases), 0),
+		"Aliases":   shown,
+		"Withheld":  len(aliases) - len(shown),
 		"CSRFToken": s.csrfToken(sessionFromContext(r.Context())),
 	})
 }
@@ -280,11 +261,8 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Remove a specific subset when the form carries path_id values (one per
-	// listed row), or every non-canonical row when the form carries
-	// `all=true`. Refusing to fall through unless one of the two is set
-	// keeps a stray POST with just a CSRF token from wiping the whole
-	// library of alias files at once.
+	// all=true is required for the whole set, so a stray POST cannot wipe
+	// every alias file.
 	selected := r.Form["path_id"]
 	allFlag := r.FormValue("all") == "true"
 	if len(selected) == 0 && !allFlag {
@@ -295,12 +273,10 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 	var query string
 	var args []any
 	if allFlag {
-		// The sha256 walker filters non-canonical aliases by ceiling
-		// so explicit-rated images don't surface in the table. Mirror
-		// that filter here so "Delete all duplicate files" can't wipe
-		// aliases the operator can't see.
+		// Ceiling-filtered, so delete-all cannot take aliases the
+		// operator cannot see.
 		query = `
-			SELECT ip.id, ip.path, i.canonical_path
+			SELECT ip.id, ip.path, i.canonical_path, i.file_size
 			FROM image_paths ip
 			JOIN images i ON i.id = ip.image_id
 			WHERE ip.is_canonical = 0`
@@ -309,9 +285,8 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 			args = append(args, wargs...)
 		}
 	} else {
-		// Build an IN (?,?,...) query restricted to the supplied path_ids
-		// that still aren't canonical - callers can't use this endpoint to
-		// remove the canonical path for an image.
+		// Only non-canonical paths: this endpoint must never remove an
+		// image's canonical file.
 		ids := make([]int64, 0, len(selected))
 		for _, s := range selected {
 			if id, err := strconv.ParseInt(s, 10, 64); err == nil {
@@ -324,7 +299,7 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 		}
 		var placeholders string
 		placeholders, args = db.InPlaceholders(ids)
-		query = `SELECT ip.id, ip.path, i.canonical_path FROM image_paths ip
+		query = `SELECT ip.id, ip.path, i.canonical_path, i.file_size FROM image_paths ip
 			 JOIN images i ON i.id = ip.image_id
 			 WHERE ip.is_canonical = 0 AND ip.id IN (` + placeholders + `)`
 	}
@@ -333,10 +308,11 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 		ID        int64
 		Path      string
 		Canonical string
+		Size      int64
 	}
 	paths, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (pathRow, error) {
 		var p pathRow
-		err := rows.Scan(&p.ID, &p.Path, &p.Canonical)
+		err := rows.Scan(&p.ID, &p.Path, &p.Canonical, &p.Size)
 		return p, err
 	}, query, args...)
 	if err != nil {
@@ -349,15 +325,10 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reserve a job slot for the duration; sibling long-running
-	// maintenance handlers all do this so a concurrent autotag /
-	// rebuild-thumbs / vacuum doesn't race the per-path unlinks. The
-	// goroutine drives the actual work; the response returns
-	// immediately and the status bar surfaces progress.
 	if !s.startJob(w, models.JobTypeDelete) {
 		return
 	}
-	galleryRoot := s.galleryPath()
+	bound := s.boundary()
 	go func() {
 		ctx := s.jobs.Context()
 		total := len(paths)
@@ -369,8 +340,6 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 			pathIDs[i] = p.ID
 			byID[p.ID] = p
 		}
-		// Batch DELETEs by chunk in one transaction each so the writer
-		// pool sees one Exec per 500 rows instead of one per row.
 		_, cancelled, err := jobs.Chunked(ctx, s.jobs, pathIDs, chunkSize, "removing", func(chunk []int64) error {
 			if err := gallery.DeleteAliasPaths(s.db(), chunk); err != nil {
 				logx.Warnf("remove duplicates chunk delete: %v", err)
@@ -382,7 +351,12 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 					removed++
 					continue
 				}
-				if err := unlinkAliasFile(galleryRoot, row.Path, row.Canonical); err != nil {
+				// Its row goes, but the copy is another gallery's file,
+				// not a duplicate the listing showed.
+				if bound.Excludes(row.Path) {
+					continue
+				}
+				if err := unlinkAliasFile(bound, row.Path, row.Canonical, row.Size); err != nil {
 					logx.Warnf("remove duplicate %q: %v", row.Path, err)
 				}
 				removed++
@@ -394,11 +368,6 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Duplicate-path removal started.")
 }
 
-// promoteAliasPathPost flips an alias path to the canonical path for
-// its image. Used by the Relations page's file-duplicates section,
-// where the operator may have spotted that the preferred copy is
-// living at the alias location and wants to swap which path the gallery
-// considers authoritative.
 func (s *Server) promoteAliasPathPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -426,8 +395,12 @@ func (s *Server) promoteAliasPathPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusBadRequest, "Cannot promote: file is missing on disk.")
 		return
 	}
-	if err := gallery.PromoteCanonicalByPathID(s.db(), s.galleryPath(), imageID, pathID, newPath); err != nil {
-		flashStatus(w, http.StatusInternalServerError, err.Error())
+	if err := gallery.PromoteCanonicalByPathID(s.db(), s.boundary(), imageID, pathID, newPath); err != nil {
+		code := http.StatusInternalServerError
+		if errors.As(err, new(gallery.Exclusion)) {
+			code = http.StatusBadRequest
+		}
+		flashStatus(w, code, err.Error())
 		return
 	}
 	s.active().InvalidateCaches()
@@ -446,10 +419,6 @@ func (s *Server) rebuildThumbnailsPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Thumbnail rebuild started.")
 }
 
-// startRebuildThumbsJob queues a rebuild-thumbs job against the supplied
-// gallery context, reading images and writing thumbnails from that gallery's
-// own DB + thumbnails dir. Reused by the manual handler (active gallery) and
-// the post-import hook (imported non-active gallery).
 func (s *Server) startRebuildThumbsJob(cx *galleryCtx) error {
 	if cx == nil || cx.DB == nil {
 		return fmt.Errorf("no gallery context")
@@ -458,12 +427,13 @@ func (s *Server) startRebuildThumbsJob(cx *galleryCtx) error {
 		ID       int64
 		Path     string
 		FileType string
+		Width    sql.NullInt64
 	}
 	imgs, err := db.QueryAll(cx.DB.Read, func(rows *sql.Rows) (imgRow, error) {
 		var img imgRow
-		err := rows.Scan(&img.ID, &img.Path, &img.FileType)
+		err := rows.Scan(&img.ID, &img.Path, &img.FileType, &img.Width)
 		return img, err
-	}, `SELECT id, canonical_path, file_type FROM images WHERE is_missing = 0`)
+	}, `SELECT id, canonical_path, file_type, width FROM images WHERE is_missing = 0`)
 	if err != nil {
 		return err
 	}
@@ -478,9 +448,6 @@ func (s *Server) startRebuildThumbsJob(cx *galleryCtx) error {
 		ctx := s.jobs.Context()
 		processed, rebuilt := 0, 0
 		total := len(imgs)
-		// A refused row - past the decode budget, or a video with no ffmpeg -
-		// still advances the walk, so the progress bar counts it while the
-		// summary keeps it out of the rebuilt tally.
 		failedNote := func() string {
 			if processed == rebuilt {
 				return ""
@@ -493,16 +460,14 @@ func (s *Server) startRebuildThumbsJob(cx *galleryCtx) error {
 				return
 			}
 			s.jobs.Update(processed, total, fmt.Sprintf("[%s] rebuilding…", galleryName))
-			if err := gallery.Generate(img.Path, thumbnailsPath, img.ID, img.FileType); err != nil {
+			if err := gallery.Rebuild(img.Path, thumbnailsPath, img.ID, img.FileType); err != nil {
 				logx.Warnf("rebuild thumbnail for %d: %v", img.ID, err)
 			} else {
 				rebuilt++
 			}
-			// Backfill width/height for video rows that pre-date the
-			// ingest-time ffprobe probe. Cheap (one ffprobe per row, only
-			// when the file_type is video) and rides the existing rebuild
-			// iteration so the operator gets the fix without a new button.
-			if gallery.IsVideoType(img.FileType) {
+			// An AVIF or JPEG XL decodes to answer, so it is probed only
+			// when its size is missing.
+			if gallery.IsVideoType(img.FileType) || (gallery.IsFFmpegStill(img.FileType) && !img.Width.Valid) {
 				if w, h, ok := gallery.ProbeVideoDimensions(img.Path); ok {
 					if _, err := database.Write.ExecContext(ctx,
 						`UPDATE images SET width = ?, height = ? WHERE id = ?`,
@@ -519,11 +484,8 @@ func (s *Server) startRebuildThumbsJob(cx *galleryCtx) error {
 	return nil
 }
 
-// computeHashesPost backfills the two derived digests for every visible
-// row missing one: images.phash, then images.md5. The phash pass runs
-// first because it reads small cached thumbnails while the md5 pass
-// reads every original byte in the gallery - a cancel a few seconds in
-// leaves the cheap half done rather than nothing.
+// phash first: it reads small thumbnails, so a cancel during the md5 pass
+// over every original still leaves it done.
 func (s *Server) computeHashesPost(w http.ResponseWriter, r *http.Request) {
 	if !s.startJob(w, models.JobTypeHashes) {
 		return
@@ -537,13 +499,9 @@ func (s *Server) computeHashesPost(w http.ResponseWriter, r *http.Request) {
 		phashed, phashUpdated, err := relations.BackfillPhashes(ctx, database, thumbnailsPath, func(p, total int, _ string) {
 			s.jobs.Update(p, total, "Perceptual hashes…")
 		})
-		// Drop the in-memory tree so the next find-pairs / phash: query
-		// rebuilds against the now-fully-phashed DB instead of replaying
-		// thousands of incremental Inserts the hook would have fired
-		// during a built-tree run. Reset is cheap and the rebuild is the
-		// uncached path the same query would pay on a cold server. Runs
-		// before the md5 pass so cancelling that one still leaves the
-		// tree consistent with what was just written.
+		// A rebuild on next use beats thousands of incremental Inserts.
+		// Reset before the md5 pass, so cancelling that still leaves the
+		// tree in step.
 		if tree != nil {
 			tree.Reset()
 		}
@@ -574,29 +532,98 @@ func (s *Server) computeHashesPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Hash backfill started.")
 }
 
+func (s *Server) generateMetaTagsPost(w http.ResponseWriter, r *http.Request) {
+	if !s.startJob(w, models.JobTypeMetaTags) {
+		return
+	}
+	database := s.db()
+	thumbnailsPath := s.thumbnailsPath()
+	active := s.active()
+	go func() {
+		ctx := s.jobs.Context()
+		processed, updated, err := gallery.BackfillMetaTags(ctx, database, thumbnailsPath, func(p, total int, msg string) {
+			s.jobs.Update(p, total, cmp.Or(msg, "Meta tags…"))
+		})
+		active.InvalidateCaches()
+		if err != nil {
+			if ctx.Err() != nil {
+				s.jobs.Complete(fmt.Sprintf("meta tags cancelled (%d processed, %d updated)", processed, updated))
+				return
+			}
+			s.jobs.Fail(err.Error())
+			return
+		}
+		s.jobs.Complete(fmt.Sprintf("Derived meta tags for %d image(s); %d changed.", processed, updated))
+	}()
+	writeInlineFlash(w, "ok", "Meta tag pass started.")
+}
+
+func (s *Server) indexWorkflowsPost(w http.ResponseWriter, r *http.Request) {
+	if !s.startJob(w, models.JobTypeIndexWork) {
+		return
+	}
+	database := s.db()
+	active := s.active()
+	go func() {
+		ctx := s.jobs.Context()
+		if _, err := database.Write.ExecContext(ctx, `UPDATE comfyui_metadata SET terms_version = 0`); err != nil {
+			s.jobs.Fail(err.Error())
+			return
+		}
+		indexed, err := gallery.BackfillComfyTerms(ctx, database, func(p, total int, msg string) {
+			s.jobs.Update(p, total, cmp.Or(msg, "Workflows…"))
+		})
+		active.InvalidateCaches()
+		if err != nil {
+			if ctx.Err() != nil {
+				s.jobs.Complete(fmt.Sprintf("workflow index cancelled (%d indexed)", indexed))
+				return
+			}
+			s.jobs.Fail(err.Error())
+			return
+		}
+		s.jobs.Complete(fmt.Sprintf("Indexed %d ComfyUI workflow(s).", indexed))
+	}()
+	writeInlineFlash(w, "ok", "Workflow indexing started.")
+}
+
+func (s *Server) removeMetaTagsPost(w http.ResponseWriter, r *http.Request) {
+	if !s.startJob(w, models.JobTypeMetaTags) {
+		return
+	}
+	database := s.db()
+	active := s.active()
+	go func() {
+		ctx := s.jobs.Context()
+		processed, removed, err := gallery.RemoveMetaTags(ctx, database, func(p, total int, msg string) {
+			s.jobs.Update(p, total, cmp.Or(msg, "Meta tags…"))
+		})
+		active.InvalidateCaches()
+		if err != nil {
+			if ctx.Err() != nil {
+				s.jobs.Complete(fmt.Sprintf("removal cancelled (%d image(s), %d tag(s) removed)", processed, removed))
+				return
+			}
+			s.jobs.Fail(err.Error())
+			return
+		}
+		s.jobs.Complete(fmt.Sprintf("Removed %d generated tag(s) from %d image(s).", removed, processed))
+	}()
+	writeInlineFlash(w, "ok", "Removing generated meta tags.")
+}
+
 func (s *Server) vacuumDBPost(w http.ResponseWriter, r *http.Request) {
-	// VACUUM holds the writer for tens of seconds on a multi-GB DB. Take
-	// a job slot so the status bar reflects what's running and the
-	// scheduler / a concurrent user-triggered job is refused with the
-	// usual "a job is already running" message instead of silently
-	// queueing behind the writer.
 	if !s.startJob(w, models.JobTypeVacuum) {
 		return
 	}
-	// Run the (long) VACUUM + checkpoint sequence in a goroutine so the
-	// HTTP request returns immediately (mirrors every other long-running
-	// maintenance handler); running synchronously would block the
-	// request thread for tens of seconds.
 	go func() {
 		beforeSize := dbFileSize(s.dbPath())
 		if _, err := s.db().Write.Exec(`VACUUM`); err != nil {
 			s.jobs.Fail(err.Error())
 			return
 		}
-		// VACUUM in WAL mode writes the rebuilt pages into the -wal file,
-		// so the user sees no drop in on-disk footprint until the WAL is
-		// consolidated. Truncate the WAL explicitly so the reclaimed
-		// space is actually released.
+		// In WAL mode VACUUM writes into the -wal file; only a truncating
+		// checkpoint gives the space back.
 		if _, err := s.db().Write.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 			logx.Warnf("vacuum wal_checkpoint: %v", err)
 		}
@@ -607,13 +634,8 @@ func (s *Server) vacuumDBPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Vacuum started. Watch the status bar for the reclaimed-space report.")
 }
 
-// freeMemoryPost runs the on-demand version of runMemoryReclaim: trims
-// every gallery's SQLite page cache, returns the Go heap, and SIGTERMs
-// the auto-tagger worker so its CUDA libraries (when loaded) go with
-// it. Reserves a job slot for the duration so a concurrent autotag /
-// sync starting between our entry and ReleaseAll can't see the worker
-// killed mid-inference; the standard "A job is already running" reply
-// is what the racing handler observes.
+// Holds a job slot so an autotag cannot start before ReleaseAll and lose
+// its worker mid-inference.
 func (s *Server) freeMemoryPost(w http.ResponseWriter, r *http.Request) {
 	if err := s.jobs.Start(models.JobTypeFreeMemory); err != nil {
 		flashStatus(w, http.StatusConflict, "A job is running; try again when it finishes.")
@@ -623,7 +645,7 @@ func (s *Server) freeMemoryPost(w http.ResponseWriter, r *http.Request) {
 	before := readVmRSS()
 	ctxs := s.allContexts()
 	for _, cx := range ctxs {
-		if err := cx.DB.ShrinkMemory(context.Background()); err != nil {
+		if err := shrinkGalleryMemory(cx); err != nil {
 			logx.Warnf("free memory: shrink %q: %v", cx.Name, err)
 		}
 	}
@@ -637,10 +659,8 @@ func (s *Server) freeMemoryPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Memory caches released.")
 }
 
-// dbFileSize returns the total on-disk footprint of the SQLite database -
-// the main file plus the WAL and shared-memory sidecars. A post-VACUUM
-// "reclaimed N" figure that only counts the main file misleads the user
-// whenever the WAL holds the bulk of the pages (common after mass deletes).
+// Counts the WAL and shm too: after a mass delete the WAL can hold most
+// of the pages.
 func dbFileSize(path string) int64 {
 	var total int64
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
@@ -651,8 +671,6 @@ func dbFileSize(path string) int64 {
 	return total
 }
 
-// humanBytesFmt formats a byte count with binary units. The template
-// function "humanBytes" exposes the same body to template authors.
 func humanBytesFmt(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -667,17 +685,12 @@ func humanBytesFmt(b int64) string {
 }
 
 func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
-	// Stream rows into a slice of lightweight structs so the DB cursor is closed
-	// before the long-running goroutine starts. This avoids holding a read
-	// connection open for the entire re-extraction job while keeping memory
-	// usage proportional to the number of images (IDs + short paths only).
+	// Read into a slice so the cursor closes before the job starts,
+	// rather than holding a read connection for the whole run.
 	type imgRow struct {
-		ID       int64
-		Path     string
-		FileType string
-		// Current persisted hashes; we use them to skip the rewrite when the
-		// new extraction would produce the same generation_hash - most runs
-		// on an unchanged library now turn into pure reads.
+		ID        int64
+		Path      string
+		FileType  string
 		sdHash    string
 		comfyHash string
 		source    string
@@ -719,10 +732,6 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.jobs.Update(processed, total, "Processing…")
-			// Recompute phash from the on-disk thumbnail. A decode
-			// failure (missing thumbnail, corrupt jpg) leaves the
-			// previous value in place; the operator can rebuild
-			// thumbnails first if they care about that row.
 			if h, err := gallery.RecomputeAndStorePhash(ctx, database, img.ID, thumbnailsPath); err == nil {
 				relations.PhashStored(database, img.ID, h)
 			} else {
@@ -748,9 +757,6 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 				newComfyHash = comfyMeta.GenerationHash
 			}
 
-			// Probe video duration when ffmpeg is available. NULL stays
-			// NULL for non-video file types so static images don't grow
-			// a phantom duration column.
 			var durationSec *float64
 			if gallery.IsVideoType(img.FileType) {
 				if d, ok := gallery.ProbeDurationSeconds(img.Path); ok {
@@ -758,21 +764,13 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Skip the delete+insert churn when the new extraction lines up
-			// with what the DB already holds. Any pipeline change that adds
-			// or drops fields changes the generation hash, so this stays
-			// responsive to real metadata schema updates. Successful video
-			// probes always re-write: the previous duration_seconds isn't
-			// in the per-image SELECT, so we can't compare, and overwriting
-			// the same float is cheap.
+			// Unchanged hashes skip the rewrite; a probed duration always
+			// rewrites, since the old one is not read to compare.
 			if newSDHash == img.sdHash && newComfyHash == img.comfyHash && sourceType == img.source && durationSec == nil {
 				processed++
 				continue
 			}
 
-			// Single transaction per image so a mid-flight failure can't leave
-			// images.source_type updated against a half-deleted metadata table
-			// or a deleted-but-not-reinserted row.
 			if err := reExtractApply(ctx, database, img.ID, sourceType, durationSec, sdMeta, comfyMeta); err != nil {
 				logx.Warnf("re-extract image %d: %v", img.ID, err)
 				processed++
@@ -780,21 +778,21 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 			}
 			processed++
 			updated++
+			// source_type moved, so the ai-generated tag has to follow it.
+			if err := gallery.ApplyMetaTags(database, thumbnailsPath, img.ID); err != nil {
+				logx.Debugf("re-extract meta tags %d: %v", img.ID, err)
+			}
 		}
 		active.InvalidatePhashMissing()
+		active.InvalidateCaches()
 		s.jobs.Complete(fmt.Sprintf("Re-extracted metadata for %d image(s) (%d updated).", processed, updated))
 	}()
 
 	writeInlineFlash(w, "ok", "Re-extraction started.")
 }
 
-// reExtractApply commits a re-extracted image's source_type, deletes the
-// previous SD/ComfyUI rows, and reinserts whichever the parser produced.
-// All four steps run in one transaction so a partial failure (writer
-// contention, ctx cancellation mid-statement) never leaves the row with
-// updated source_type but missing metadata. durationSec is set on
-// video rows whose ffprobe call succeeded; nil leaves the column
-// untouched so non-videos and probe-failed videos don't churn.
+// One transaction, so a failure never leaves the new source_type over
+// missing metadata. A nil durationSec leaves the column alone.
 func reExtractApply(ctx context.Context, database *db.DB, imageID int64, sourceType string, durationSec *float64, sdMeta *models.SDMetadata, comfyMeta *models.ComfyUIMetadata) error {
 	tx, err := database.Write.BeginTx(ctx, nil)
 	if err != nil {

@@ -32,6 +32,17 @@
           <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
           <button type="submit" class="btn-sm"{{if eq .Counts.QueueSkipped 0}} disabled title="No skipped pairs to reset"{{end}}>Reset skipped{{if gt .Counts.QueueSkipped 0}} ({{.Counts.QueueSkipped}}){{end}}</button>
         </form>
+        <form hx-post="/relations/find-pairs" hx-target="#flash-relations" hx-swap="innerHTML"
+              hx-on::after-request="if(event.detail.successful){document.getElementById('job-status').setAttribute('hx-trigger','load');htmx.trigger('#job-status','load')}"
+              hx-confirm="Wipe the existing pair queue and rescan from scratch?"
+              data-confirm-danger="Skipped pairs and any queue work in progress are dropped."
+              data-confirm-ok="Rebuild"
+              style="display:inline">
+          <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+          <input type="hidden" name="replace" value="true">
+          <input type="hidden" name="confirm" value="REBUILD">
+          <button type="submit" class="btn-danger btn-sm"{{if $emptyQueue}} disabled title="Empty queue - nothing to rebuild"{{end}}>Rebuild queue</button>
+        </form>
       </div>
       <p class="field-hint">
         Queue: <strong>{{.Counts.QueueOpen}}</strong> unresolved, <strong>{{.Counts.QueueSkipped}}</strong> skipped

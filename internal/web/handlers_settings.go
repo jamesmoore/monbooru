@@ -3,6 +3,7 @@ package web
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -16,17 +17,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// executionProviderRow is one execution provider entry for the Settings
-// → Auto-Tagger radio list.
 type executionProviderRow struct {
 	Name  string
 	Label string
 }
 
-// executionProviderRows lists the selectable providers in UI order.
-// Availability is not probed here: ORT env init is not re-entrant and the
-// parent process must not load the library on a page render, so a bad
-// pick is rejected at save time by CheckProviderAvailable instead.
+// Not probed here: the parent must not load ONNX Runtime on a page
+// render, so a bad pick is refused at save time.
 func executionProviderRows() []executionProviderRow {
 	rows := make([]executionProviderRow, 0, len(config.ValidExecutionProviders))
 	for _, name := range config.ValidExecutionProviders {
@@ -35,8 +32,6 @@ func executionProviderRows() []executionProviderRow {
 	return rows
 }
 
-// providerDisplayLabels spells each ONNX Runtime provider the way its
-// vendor does; a name with no entry renders as stored.
 var providerDisplayLabels = map[string]string{
 	"cpu":      "CPU",
 	"cuda":     "CUDA",
@@ -49,8 +44,7 @@ var providerDisplayLabels = map[string]string{
 
 func providerDisplayLabel(name string) string { return cmp.Or(providerDisplayLabels[name], name) }
 
-// settingsData is the /settings page. Galleries shadows the layout's list
-// with the richer per-gallery rows this page's table renders.
+// Galleries shadows the layout's list with the rows this page's table renders.
 type settingsData struct {
 	baseData
 	Galleries          []galleryRow
@@ -58,6 +52,7 @@ type settingsData struct {
 	Taggers            []tagger.TaggerStatus
 	TaggerRows         []taggerRow
 	ScheduleStatus     ScheduleStatus
+	ScheduleScope      scheduleScope
 	Stats              statsData
 	ExecutionProviders []executionProviderRow
 	ScheduleModes      []scheduleModeRow
@@ -67,12 +62,10 @@ type settingsData struct {
 	PluginsDir         string
 	Themes             themeCluster
 	ThemesDir          string
-	// DesktopProfile gates the section's local-machine controls, which the
-	// endpoints behind them refuse to serve anywhere else.
-	DesktopProfile    bool
-	DesktopFolders    []string
-	Desktop           desktopIntegration
-	DesktopJobWarning string
+	DesktopProfile     bool
+	DesktopFolders     []string
+	Desktop            desktopIntegration
+	DesktopJobWarning  string
 }
 
 func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
@@ -80,22 +73,12 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	s.disableUnavailableTaggers()
 	s.persistNewlyDiscoveredTaggers()
 	taggers := tagger.AvailableTaggers(s.cfgSnapshot())
-	// Build a unified row list: catalog-backed rows (installed-and-in-catalog
-	// plus catalog entries whose subfolder isn't on disk yet) come first as
-	// "supported"; user-only installed taggers (not in the catalog) come last
-	// as "unsupported". The template renders a separator between the two
-	// groups when both are non-empty.
 	modelPath := s.modelPath()
 	catalog := tagger.LoadCatalog(modelPath)
 	taggerByName := map[string]tagger.TaggerStatus{}
 	for _, t := range taggers {
 		taggerByName[t.Name] = t
 	}
-	// Supported rows track the catalog order (wd-swinv2 → animetimm-eva02
-	// → joytag → camie-v2 by default) so the table reflects the editorial
-	// recommendation, not the alphabetical disk-readdir order. For each
-	// catalog entry, surface the installed row when present, otherwise
-	// the ghost row.
 	var supportedRows, unsupportedRows []taggerRow
 	totalGalleries := len(s.galleries())
 	catalogNames := map[string]bool{}
@@ -122,8 +105,6 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	// User-installed taggers that aren't in the catalog land below the
-	// supported set in their disk-discovery order.
 	for _, t := range taggers {
 		if catalogNames[t.Name] {
 			continue
@@ -138,6 +119,7 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		Taggers:            taggers,
 		TaggerRows:         taggerRows,
 		ScheduleStatus:     s.scheduleStatus(),
+		ScheduleScope:      scheduleScopeView(s.cfgSnapshot(), base.MonloaderPaired),
 		Stats:              s.gatherStats(),
 		ExecutionProviders: executionProviderRows(),
 		ScheduleModes:      scheduleModeRows(),
@@ -175,8 +157,13 @@ func (s *Server) settingsSchedulePost(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Schedule.RemoveOrphans = r.FormValue("remove_orphans") == "on"
 	s.cfg.Schedule.RunAutoTaggers = r.FormValue("run_auto_taggers") == "on"
 	s.cfg.Schedule.FindRelationPairs = r.FormValue("find_relation_pairs") == "on"
-	s.cfg.Schedule.LookupPTR = r.FormValue("lookup_ptr") == "on"
-	s.cfg.Schedule.LookupBooru = r.FormValue("lookup_booru") == "on"
+	// Drawn only while monloader is paired; a box never on the page was
+	// not unticked.
+	if r.FormValue("lookup_switches") != "" {
+		s.cfg.Schedule.LookupPTR = r.FormValue("lookup_ptr") == "on"
+		s.cfg.Schedule.LookupBooru = r.FormValue("lookup_booru") == "on"
+	}
+	s.cfg.Schedule.Galleries = scheduleGalleriesForm(r, s.cfg.Schedule.Galleries, s.cfg.Galleries)
 	s.cfgMu.Unlock()
 	if err := s.saveConfig(); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
@@ -185,18 +172,107 @@ func (s *Server) settingsSchedulePost(w http.ResponseWriter, r *http.Request) {
 	s.sched.requestReload()
 	logx.Infof("settings: schedule updated (time=%s mode=%s)", timeVal, mode)
 	writeInlineFlash(w, "ok", "Saved.")
-	// The saved mode and time are what the next-run line reports, so it
-	// rides back with the flash rather than waiting for a reload to stop
-	// contradicting the form beside it.
 	s.renderTemplate(w, "partials/schedule_status.html", map[string]any{
 		"Status": s.scheduleStatus(),
 		"OOB":    true,
 	})
 }
 
-// settingsScheduleRunPost starts the nightly pass now. Useful on a container
-// too - "did my settings do anything?" is the same question everywhere - so
-// it is not gated on the desktop profile.
+// Only the columns the table drew are read: a box never on the page was
+// not unticked.
+func scheduleGalleriesForm(r *http.Request, lists map[string][]string, galleries []config.Gallery) map[string][]string {
+	out := maps.Clone(lists)
+	names := galleryNames(galleries)
+	for _, action := range r.Form["scope_action"] {
+		if !slices.Contains(config.ScheduleActions, action) {
+			continue
+		}
+		if out == nil {
+			out = map[string][]string{}
+		}
+		if r.FormValue("every_"+action) == "on" {
+			delete(out, action)
+			continue
+		}
+		picked := []string{}
+		for _, name := range names {
+			if slices.Contains(r.Form["on_"+action], name) {
+				picked = append(picked, name)
+			}
+		}
+		out[action] = picked
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+type scheduleScope struct {
+	Show      bool
+	Galleries []string
+	Columns   []scheduleColumn
+}
+
+type scheduleColumn struct {
+	Action string
+	Label  string
+	Title  string
+	Accent string
+	On     bool
+	Every  bool // no list: every gallery, including ones added later
+	Picked map[string]bool
+	Idle   map[string]bool
+}
+
+var scheduleColumns = []scheduleColumn{
+	{Action: config.ActionSyncGallery, Label: "Sync", Title: "Sync gallery"},
+	{Action: config.ActionRemoveOrphans, Label: "Orphans", Title: "Remove orphaned thumbnails"},
+	{Action: config.ActionRunAutoTaggers, Label: "Auto-tag", Title: "Run enabled auto-taggers", Accent: "tagger-accent"},
+	{Action: config.ActionFindRelationPairs, Label: "Pairs", Title: "Find relation pairs"},
+	{Action: config.ActionLookupPTR, Label: "PTR", Title: "Look up unsourced images in the Public Tag Repository", Accent: "monloader-accent"},
+	{Action: config.ActionLookupBooru, Label: "Boorus", Title: "Look up unsourced images on online boorus", Accent: "monloader-accent"},
+}
+
+// Shown with one gallery too while a list is set, or that list would
+// restrict it unseen.
+func scheduleScopeView(cfg *config.Config, monloaderPaired bool) scheduleScope {
+	sched := cfg.Schedule
+	names := galleryNames(cfg.Galleries)
+	v := scheduleScope{Show: len(names) > 1 || len(sched.Galleries) > 0, Galleries: names}
+	if !v.Show {
+		return v
+	}
+	taggers := tagger.EnabledTaggers(cfg)
+	for _, c := range scheduleColumns {
+		if !monloaderPaired && (c.Action == config.ActionLookupPTR || c.Action == config.ActionLookupBooru) {
+			continue
+		}
+		list, listed := sched.Galleries[c.Action]
+		c.On, c.Every = sched.Enabled(c.Action), !listed
+		c.Picked, c.Idle = map[string]bool{}, map[string]bool{}
+		for _, name := range names {
+			c.Picked[name] = slices.Contains(list, name)
+			if c.Action == config.ActionRunAutoTaggers {
+				c.Idle[name] = !slices.ContainsFunc(taggers, func(t tagger.TaggerStatus) bool { return t.AppliesToGallery(name) })
+			}
+		}
+		v.Columns = append(v.Columns, c)
+	}
+	return v
+}
+
+func galleryNames(galleries []config.Gallery) []string {
+	names := make([]string, len(galleries))
+	for i, g := range galleries {
+		names[i] = g.Name
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Not gated on the desktop profile: a container operator wants to test
+// the schedule too.
 func (s *Server) settingsScheduleRunPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -209,8 +285,6 @@ func (s *Server) settingsScheduleRunPost(w http.ResponseWriter, r *http.Request)
 	writeInlineFlash(w, "ok", "Started. Watch the job status bar.")
 }
 
-// scheduleModeRow is one entry of the mode selector, described in plain
-// words rather than by its stored key.
 type scheduleModeRow struct {
 	Name  string
 	Label string
@@ -219,16 +293,12 @@ type scheduleModeRow struct {
 func scheduleModeRows() []scheduleModeRow {
 	return []scheduleModeRow{
 		{config.ScheduleAtTime, "Every day at the time above"},
-		{config.ScheduleAtTimeCatchup, "Every day at the time above, and at startup if a day was missed"},
+		{config.ScheduleAtTimeCatchup, "Every day at the time above, and later if that run was missed"},
 		{config.ScheduleOnStart, "At startup only, at most once a day"},
 		{config.ScheduleOff, "Never"},
 	}
 }
 
-// settingsGeneralPost saves the unified Settings → General form: the Files
-// subsection (watch toggle + max file size) and the UI subsection (page
-// size + thumbnail fit). One submit covers both so the page has a single
-// Save button.
 func (s *Server) settingsGeneralPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -239,10 +309,10 @@ func (s *Server) settingsGeneralPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", err.Error())
 		return
 	}
-	// A folder built from tokens only resolves per image, so only a literal
-	// one can be containment-checked here.
+	// A tokened folder resolves per image, so only a literal one can be
+	// checked here.
 	if !folderTmpl.HasTokens() {
-		if _, err := gallery.ResolveSubdir(s.galleryPath(), uploadFolder); err != nil {
+		if _, err := s.boundary().ResolveSubdir(uploadFolder); err != nil {
 			writeInlineFlash(w, "err", err.Error())
 			return
 		}
@@ -260,19 +330,56 @@ func (s *Server) settingsGeneralPost(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Gallery.DefaultUploadFolder = uploadFolder
 	s.cfg.Gallery.DefaultUploadName = uploadName
 	s.cfg.Gallery.RenameOnIngest = r.FormValue("rename_on_ingest") == "on"
+	s.cfg.Gallery.AutoMetaTags = r.FormValue("auto_meta_tags") == "on"
 	if n, err := strconv.Atoi(r.FormValue("page_size")); err == nil && n > 0 {
 		s.cfg.UI.PageSize = min(n, config.MaxPageSize)
 	}
 	if fit := r.FormValue("thumbnail_fit"); fit == "square" || fit == "natural" {
 		s.cfg.UI.ThumbnailFit = fit
 	}
+	autoMeta := s.cfg.Gallery.AutoMetaTags
 	s.cfgMu.Unlock()
 	if err := s.saveConfig(); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
+	gallery.MetaTagsEnabled.Store(autoMeta)
 	logx.Infof("settings: general updated")
 	writeInlineFlash(w, "ok", "Saved.")
+}
+
+func (s *Server) settingsIgnorePost(w http.ResponseWriter, r *http.Request) {
+	if !parseFormOK(w, r) {
+		return
+	}
+	ignore, err := config.NormalizeIgnore(strings.Split(r.FormValue("ignore"), "\n"))
+	if err != nil {
+		writeInlineFlash(w, "err", err.Error()+".")
+		return
+	}
+	uploadFolder := s.cfgSnapshot().Gallery.DefaultUploadFolder
+	if tmpl, err := gallery.ParseNameTemplate(uploadFolder, gallery.ScopeUploadFolder); err == nil && !tmpl.HasTokens() {
+		if _, err := s.drawBoundaries(ignore)[s.activeGallery()].ResolveSubdir(uploadFolder); err != nil {
+			writeInlineFlash(w, "err", "Received files go to a folder this list leaves out: "+err.Error()+".")
+			return
+		}
+	}
+	s.cfgMu.Lock()
+	changed := !slices.Equal(s.cfg.Gallery.Ignore, ignore)
+	s.cfg.Gallery.Ignore = ignore
+	s.cfgMu.Unlock()
+	if err := s.saveConfig(); err != nil {
+		writeInlineFlash(w, "err", "Could not save: "+err.Error())
+		return
+	}
+	msg := "Saved."
+	if changed {
+		s.rebuildBoundaries()
+		msg = "Saved. A sync applies the ignore list to what is already indexed."
+	}
+	logx.Infof("settings: ignore list updated")
+	writeInlineFlash(w, "ok", msg)
+	s.renderTemplate(w, "partials/ignore_list.html", map[string]any{"Ignore": ignore, "OOB": true})
 }
 
 func (s *Server) settingsMonloaderPost(w http.ResponseWriter, r *http.Request) {
@@ -301,8 +408,7 @@ func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "New password required.")
 		return
 	}
-	// If a password is already set, require the current one for verification.
-	if current := s.passwordHash(); s.authEnabled() && current != "" {
+	if current := s.passwordHash(); current != "" {
 		if err := bcrypt.CompareHashAndPassword([]byte(current), []byte(currentPass)); err != nil {
 			writeInlineFlash(w, "err", "Current password is incorrect.")
 			return
@@ -322,6 +428,7 @@ func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logx.Infof("settings: password updated from %s", clientIP(r))
+	s.sessions.ClearExcept(sessionFromContext(r.Context()))
 	writeInlineFlash(w, "ok", "Password updated.")
 	s.renderAuthPasswordOOB(w, r)
 }
@@ -353,8 +460,6 @@ func (s *Server) settingsTokenCreate(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`<script>(function(){var i=document.getElementById('token-name-input');if(i)i.value='';})();</script>`))
 }
 
-// tokenPaired reports whether the token with the given id is managed by a
-// pairing, and so must be changed through the pairing rather than directly.
 func (s *Server) tokenPaired(id string) bool {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -389,8 +494,6 @@ func (s *Server) settingsTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	s.renderAuthTokensOOB(w, r)
 }
 
-// renderAuthTokensOOB writes an out-of-band swap of the API-token list so it
-// reflects the latest set without a page reload.
 func (s *Server) renderAuthTokensOOB(w http.ResponseWriter, r *http.Request) {
 	s.cfgMu.Lock()
 	tokens := slices.Clone(s.cfg.Auth.Tokens)
@@ -470,8 +573,6 @@ func (s *Server) settingsTokenPrivilegesPost(w http.ResponseWriter, r *http.Requ
 	writeOOBSummaryFlash(w, "token-scopes-"+id, strings.Join(scopes, " "), "flash-auth", "Token privileges saved.")
 }
 
-// filterScopes keeps only recognized scopes, in canonical order, dropping
-// anything a tampered form might submit.
 func filterScopes(in []string) []string {
 	var out []string
 	for _, sc := range config.AllScopes {
@@ -486,10 +587,8 @@ func (s *Server) settingsRemovePasswordPost(w http.ResponseWriter, r *http.Reque
 	if !parseFormOK(w, r) {
 		return
 	}
-	// Require current password whenever a hash is set, even if
-	// EnablePassword has been flipped off in TOML. Mirrors the password-
-	// change handler so the disable path can't be bypassed by editing
-	// the file in place and then visiting /settings/auth/password/remove.
+	// Whenever a hash is set, even with the password turned off in the
+	// TOML, so a file edit cannot open the remove path.
 	currentPass := r.FormValue("current_password")
 	if current := s.passwordHash(); current != "" {
 		if err := bcrypt.CompareHashAndPassword([]byte(current), []byte(currentPass)); err != nil {
@@ -506,7 +605,7 @@ func (s *Server) settingsRemovePasswordPost(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	logx.Infof("settings: password removed from %s", clientIP(r))
-	// Invalidate all sessions so nobody is locked out of the now-open instance
+	// Old sessions would otherwise stay valid when a password is set again.
 	s.sessions.Clear()
 	writeInlineFlash(w, "ok", "Password removed. Authentication is now disabled.")
 	s.renderAuthPasswordOOB(w, r)

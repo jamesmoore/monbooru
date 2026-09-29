@@ -48,6 +48,7 @@
           <li class="tag-entry{{if not .Removable}} tag-entry-implied{{end}}{{if .Stale}} tag-entry-stale{{end}}"
               data-name="{{.TagName}}" data-tag-id="{{.TagID}}" data-source="{{.Source}}" data-depth="{{.Depth}}">
             {{if not .Removable}}<span class="tag-entry-branch">└</span>{{end}}
+            <a href="/tags/{{.TagID}}" class="tag-wiki" title="Tag details">?</a>
             <a href="/?q={{.Category}}:{{.TagName}}" class="tag-link" style="color:{{catColor .Color}}"
                title="{{.NameHint}}">{{.TagName}}</a>
             {{if .Marker}}<span class="tag-marker tag-marker-{{.MarkerKind}}"{{if .MarkerHint}} title="{{.MarkerHint}}"{{end}}>{{.Marker}}</span>{{end}}

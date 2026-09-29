@@ -17,15 +17,9 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// maxTagDepth caps how deep an implication chain indents. The sidebar
-// column is narrow and tag names are long, so a deeper tail renders at
-// the last level rather than walking off the edge.
+// Deeper chains render at this level: the column is too narrow for more.
 const maxTagDepth = 3
 
-// categoryRank orders the seeded categories for reading: the small
-// metadata block first, then the image's content, most identifying
-// first. Categories the operator created sort alphabetically between
-// the content set and general, which stays last as the biggest group.
 var categoryRank = map[string]int{
 	"rating": 0, "year": 1, "meta": 2, "medium": 3,
 	"person": 4, "artist": 5, "copyright": 6, "character": 7,
@@ -34,61 +28,30 @@ var categoryRank = map[string]int{
 
 const customCategoryRank = 9
 
-// tagSidebarRow is one line of the detail sidebar's tag list.
 type tagSidebarRow struct {
 	models.ImageTag
-	// Depth is 0 for a tag on the image and 1..maxTagDepth for one the
-	// implication graph fanned out under the row above it.
-	Depth int
-	// Marker is the single annotation the row carries: a confidence
-	// percentage when nothing but an auto-tagger vouches for the tag, a
-	// source count when several do, or the stale flag.
+	Depth      int
 	Marker     string
 	MarkerKind string
-	// MarkerHint lists every source that applied or re-confirmed the tag.
 	MarkerHint string
-	// NameHint is the row's hover: the tag in full (the column ellipsises
-	// long names) and then the spellings aliased to it. An implied row
-	// names the parent it hangs under instead.
-	NameHint string
-	// Source is the writer the row is attributed to: where it belongs in
-	// the by-source view, and what the "Just added" list keys off.
-	Source string
-	// Orphaned marks an implied row no parent on the image still
-	// justifies. It hangs under nothing, so it lists on its own and keeps
-	// a remove button - the backend allows that removal precisely because
-	// the row would otherwise be stranded.
-	Orphaned bool
-	// RemoveURL is what the row's button calls. In the by-source view it
-	// withdraws that source's claim rather than deleting the tag, so a
-	// tag another source also vouches for stays on the image.
-	RemoveURL string
+	NameHint   string
+	Source     string
+	Orphaned   bool
+	RemoveURL  string
 }
 
-// Removable reports whether the row owns a remove button. An implied row
-// goes when the parent justifying it goes, so it has none of its own -
-// unless no parent is left to go.
+// An implied row goes with its parent, so it gets a button only once orphaned.
 func (r tagSidebarRow) Removable() bool { return !r.IsImplied || r.Orphaned }
 
-// tagSidebarSection is one group of the sidebar list: a category in the
-// default view, a source in the by-source view.
 type tagSidebarSection struct {
-	Name  string
-	Color string
-	Rows  []tagSidebarRow
-	// DeleteURL clears the whole section, whatever it holds - a one-tag
-	// category is still a category, and hunting for the row button
-	// instead would be a different gesture for the same intent.
-	DeleteURL   string
-	DeleteCount int
-	// DeleteShared counts the section's rows another source also vouches
-	// for. Those survive the withdrawal - they only stop being listed
-	// here - so the confirm can say how much of it stays.
+	Name         string
+	Color        string
+	Rows         []tagSidebarRow
+	DeleteURL    string
+	DeleteCount  int
 	DeleteShared int
 }
 
-// Tag sidebar view modes. The default groups by category; the operator
-// can switch to grouping by the sources that applied each tag.
 const (
 	tagModeCategory = "category"
 	tagModeSource   = "source"
@@ -96,22 +59,14 @@ const (
 
 const tagModeCookieName = "monbooru_tag_mode"
 
-// tagSidebar is everything the detail sidebar's tag section renders.
-// Carried whole so the full page render, the pages grid and the htmx
-// tag refresh all feed the partial the same shape.
 type tagSidebar struct {
 	ImageID    int64
 	CSRFToken  string
 	Sections   []tagSidebarSection
 	StaleCount int
-	// Mode names the grouping in effect. The header offers both, with the
-	// active one rendered as plain text.
-	Mode string
+	Mode       string
 }
 
-// normalizeTagMode drops anything outside the closed pair to the
-// default, so a stale cookie or a hand-edited URL can't ask for a view
-// that does not exist.
 func normalizeTagMode(v string) string {
 	if v == tagModeSource {
 		return tagModeSource
@@ -119,7 +74,6 @@ func normalizeTagMode(v string) string {
 	return tagModeCategory
 }
 
-// readTagModeCookie returns the operator's stored grouping.
 func readTagModeCookie(r *http.Request) string {
 	c, err := r.Cookie(tagModeCookieName)
 	if err != nil {
@@ -143,9 +97,6 @@ func writeTagModeCookie(w http.ResponseWriter, mode string) {
 	http.SetCookie(w, &http.Cookie{Name: tagModeCookieName, Value: "", Path: "/", MaxAge: -1})
 }
 
-// buildTagSidebar reads the provenance an image's tags carry and lays
-// them out for the sidebar: one section per category, natural order
-// within one, and each implied tag under the parent that fanned it out.
 func (s *Server) buildTagSidebar(imageID int64, csrfToken, mode string, imageTags []models.ImageTag) tagSidebar {
 	sb := tagSidebar{ImageID: imageID, CSRFToken: csrfToken, Mode: mode}
 	if len(imageTags) == 0 {
@@ -181,11 +132,7 @@ func (s *Server) buildTagSidebar(imageID int64, csrfToken, mode string, imageTag
 	return sb
 }
 
-// groupTagRowsBySource lays the rows out by the sources that applied
-// them: the operator first, then sites, then auto-taggers. A tag several
-// sources vouch for is listed under each, so the repetition itself is
-// the agreement - which is why the row drops the source-count marker it
-// carries in the category view.
+// A tag several sources vouch for lists under each, so its xN marker goes.
 func groupTagRowsBySource(imageID int64, imageTags []models.ImageTag,
 	rows map[int64]tagSidebarRow, implied map[int64][]int64,
 	ledger map[int64][]tags.TagSource, taggerNames []string) []tagSidebarSection {
@@ -194,15 +141,11 @@ func groupTagRowsBySource(imageID int64, imageTags []models.ImageTag,
 	shared := map[string]int{}
 	for _, t := range imageTags {
 		if t.IsImplied {
-			// Fan-out rows have no ledger of their own; they ride the
-			// parent that justifies them, wherever it is listed.
 			continue
 		}
 		labels := ledger[t.TagID]
 		if len(labels) == 0 {
-			// No ledger row: fall back to the row's own attribution, the
-			// same rule the ledger backfill used, so the withdrawal SQL
-			// and this listing agree on where the tag belongs.
+			// The ledger backfill's rule, which the withdrawal SQL shares.
 			fallback := cmp.Or(t.TaggerName, "user")
 			byLabel[fallback] = append(byLabel[fallback], t)
 			continue
@@ -231,9 +174,7 @@ func groupTagRowsBySource(imageID int64, imageTags []models.ImageTag,
 			DeleteCount:  len(group),
 			DeleteShared: shared[name],
 		}
-		// Each group nests its own copy of the subtrees, so a parent
-		// listed under three sources brings its implied tags along all
-		// three times.
+		// Per group, so each source's copy of a parent nests its subtree.
 		attached := map[int64]bool{}
 		for _, t := range group {
 			row := rows[t.TagID]
@@ -250,8 +191,6 @@ func groupTagRowsBySource(imageID int64, imageTags []models.ImageTag,
 		}
 		out = append(out, section)
 	}
-	// Last, and with no delete: nothing vouches for these, which is the
-	// whole reason they are listed apart from the sources that do.
 	if orphans := orphanedImplied(imageTags, implied); len(orphans) > 0 {
 		sortForDisplay(orphans)
 		section := tagSidebarSection{Name: "implied"}
@@ -265,8 +204,6 @@ func groupTagRowsBySource(imageID int64, imageTags []models.ImageTag,
 	return out
 }
 
-// rankSource puts the operator's own tags first and the auto-taggers
-// last, so the by-source list reads from most to least deliberate.
 func rankSource(name string, taggerNames []string) int {
 	switch {
 	case name == "user":
@@ -278,9 +215,6 @@ func rankSource(name string, taggerNames []string) int {
 	}
 }
 
-// nameHint spells the row's hover. The name comes first because the
-// column ellipsises anything long, and that is what the operator is
-// hovering to read.
 func nameHint(name, aliases string) string {
 	if aliases == "" {
 		return name
@@ -288,7 +222,6 @@ func nameHint(name, aliases string) string {
 	return name + "\naliases: " + aliases
 }
 
-// rowSource names the writer a row is attributed to.
 func rowSource(t models.ImageTag) string {
 	switch {
 	case t.IsImplied:
@@ -302,10 +235,6 @@ func rowSource(t models.ImageTag) string {
 	}
 }
 
-// annotateTagRow picks the row's one marker. A stale tag says so first -
-// it is the fact the operator acts on. Otherwise a tag only an
-// auto-tagger vouches for shows how sure the model was, and a tag
-// several sources agree on shows how many.
 func annotateTagRow(r *tagSidebarRow, sources []tags.TagSource, taggerNames []string) {
 	r.MarkerHint = sourceHint(sources, r.TaggerName, r.Confidence)
 	switch {
@@ -318,9 +247,6 @@ func annotateTagRow(r *tagSidebarRow, sources []tags.TagSource, taggerNames []st
 	}
 }
 
-// autoOnly reports whether an auto-tagger is the only thing vouching for
-// the tag. A row the ledger has no entry for falls back to its own
-// attribution, which is all the pre-ledger rows carry.
 func autoOnly(t models.ImageTag, sources []tags.TagSource, taggerNames []string) bool {
 	if !t.IsAuto {
 		return false
@@ -333,14 +259,11 @@ func autoOnly(t models.ImageTag, sources []tags.TagSource, taggerNames []string)
 	return true
 }
 
-// sourceHint lists every source that applied or re-confirmed the tag,
-// one per line, with the confidence beside the tagger that inferred it.
 func sourceHint(sources []tags.TagSource, taggerName string, confidence *float64) string {
 	lines := make([]string, 0, len(sources))
 	for _, src := range sources {
 		line := src.Source
-		// Ledger rows are stamped ISO; older backfilled ones carry the
-		// image_tags spelling with a space. The date is the useful part.
+		// Ledger dates are ISO, backfilled ones space-separated; keep the date.
 		if i := strings.IndexAny(src.CreatedAt, "T "); i > 0 {
 			line += "  " + src.CreatedAt[:i]
 		}
@@ -352,9 +275,6 @@ func sourceHint(sources []tags.TagSource, taggerName string, confidence *float64
 	return strings.Join(lines, "\n")
 }
 
-// groupTagRowsByCategory lays the rows out as the sidebar renders them:
-// categories in reading order, tags in natural order within one, each
-// implied tag directly under the parent that brought it.
 func groupTagRowsByCategory(imageID int64, imageTags []models.ImageTag,
 	rows map[int64]tagSidebarRow, implied map[int64][]int64) []tagSidebarSection {
 
@@ -364,18 +284,13 @@ func groupTagRowsByCategory(imageID int64, imageTags []models.ImageTag,
 			tops = append(tops, t)
 		}
 	}
-	// Nest in display order, so a tag two parents imply lands under the
-	// one the operator reads first rather than whichever the query
-	// happened to return first.
+	// Sorted first: a tag two parents imply nests under the first one shown.
 	sortForDisplay(tops)
 	attached := map[int64]bool{}
 	subtrees := make(map[int64][]tagSidebarRow, len(tops))
 	for _, t := range tops {
 		subtrees[t.TagID] = nestImplied(nil, t.TagID, 1, rows, implied, attached)
 	}
-	// An implied tag whose parents have all gone - a propagation job still
-	// catching up, or an edge removed through the API - heads its own entry
-	// rather than disappearing.
 	orphans := orphanedImplied(imageTags, implied)
 	tops = append(tops, orphans...)
 	sortForDisplay(tops)
@@ -402,27 +317,9 @@ func groupTagRowsByCategory(imageID int64, imageTags []models.ImageTag,
 	return out
 }
 
-// orphanedImplied lists the implied rows no tag on the image still
-// justifies. They nest under nothing, so each grouping has to give them a
-// home of their own or the tag is on the image, in every search and in the
-// API, and nowhere on the page that is supposed to explain it.
+// Each grouping must list these, or the tag is on the image but not the page.
 func orphanedImplied(imageTags []models.ImageTag, implied map[int64][]int64) []models.ImageTag {
-	justified := map[int64]bool{}
-	var walk func(parent int64)
-	walk = func(parent int64) {
-		for _, child := range implied[parent] {
-			if justified[child] {
-				continue
-			}
-			justified[child] = true
-			walk(child)
-		}
-	}
-	for _, t := range imageTags {
-		if !t.IsImplied {
-			walk(t.TagID)
-		}
-	}
+	justified := tags.JustifiedImplied(imageTags, implied)
 	var out []models.ImageTag
 	for _, t := range imageTags {
 		if t.IsImplied && !justified[t.TagID] {
@@ -432,10 +329,6 @@ func orphanedImplied(imageTags []models.ImageTag, implied map[int64][]int64) []m
 	return out
 }
 
-// nestImplied walks the implication graph down from parent, appending
-// each implied tag the image carries under the row that brought it. A
-// tag reached from two parents renders under the first, so the list
-// stays one line per tag.
 func nestImplied(out []tagSidebarRow, parentID int64, depth int,
 	rows map[int64]tagSidebarRow, implied map[int64][]int64, attached map[int64]bool) []tagSidebarRow {
 
@@ -453,9 +346,6 @@ func nestImplied(out []tagSidebarRow, parentID int64, depth int,
 	return out
 }
 
-// sortForDisplay orders tags the way the sidebar reads them: categories
-// in reading order, names naturally within one so a tag is where the
-// alphabet says it is rather than where its global usage ranks it.
 func sortForDisplay(list []models.ImageTag) {
 	sort.SliceStable(list, func(i, j int) bool {
 		ri, rj := rankCategory(list[i].Category), rankCategory(list[j].Category)
@@ -469,8 +359,6 @@ func sortForDisplay(list []models.ImageTag) {
 	})
 }
 
-// rankCategory places a category in the reading order; anything the
-// operator created sorts alphabetically ahead of general.
 func rankCategory(name string) int {
 	if r, ok := categoryRank[name]; ok {
 		return r
@@ -478,8 +366,6 @@ func rankCategory(name string) int {
 	return customCategoryRank
 }
 
-// aliasNames maps each of the image's tags to the alias spellings
-// pointing at it, joined for the row's hover.
 func (s *Server) aliasNames(imageTags []models.ImageTag) map[int64]string {
 	ids := make([]int64, 0, len(imageTags))
 	for _, t := range imageTags {
@@ -507,9 +393,6 @@ func (s *Server) aliasNames(imageTags []models.ImageTag) map[int64]string {
 	return out
 }
 
-// impliedUnder maps each on-image tag to the implied tags it justifies,
-// so the sidebar can nest a fanned-out tag under the parent that
-// brought it instead of listing it loose.
 func (s *Server) impliedUnder(imageTags []models.ImageTag) map[int64][]int64 {
 	onImage := make(map[int64]bool, len(imageTags))
 	ids := make([]int64, 0, len(imageTags))

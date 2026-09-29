@@ -16,19 +16,14 @@ import (
 )
 
 const (
-	// pluginPayloadVersion is the relay contract version. It bumps only on a
-	// breaking change to the request shape below.
+	// Bumps only on a breaking change to pluginRelayRequest.
 	pluginPayloadVersion = 1
-	// pluginRelayTimeout bounds one relay call. There is no retry: the peer
-	// may have committed the work, and a second call would repeat it.
+	// No retry: the peer may have committed the work, and a second call
+	// would repeat it.
 	pluginRelayTimeout = 10 * time.Second
-	// pluginMessageMax caps the peer's message before it is flashed.
-	pluginMessageMax = 200
+	pluginMessageMax   = 200
 )
 
-// pluginRelayRequest is what monbooru POSTs to a peer when a relay button is
-// clicked. image_ids is the resolved scope: the detail image, or the gallery
-// selection.
 type pluginRelayRequest struct {
 	Payload  int     `json:"payload"`
 	Monbooru string  `json:"monbooru"`
@@ -38,21 +33,15 @@ type pluginRelayRequest struct {
 	ImageIDs []int64 `json:"image_ids"`
 }
 
-// relayRefused answers a click monbooru will not carry, the same way the peer's
-// own outcomes are answered: a flash header on a 204. The click swaps nothing,
-// so an error status leaves htmx with a body it discards and the operator with
-// no sign the button did anything at all.
+// A 204 with a flash, not an error status: the click swaps nothing, and
+// htmx would discard an error body unseen.
 func relayRefused(w http.ResponseWriter, msg string) {
 	setFlashHeader(w, msg, "err", nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// pluginRelay carries one button click to its peer and flashes the answer.
-// The outbound call runs off the gallery read lock (the route registers
-// gallery-free) so a slow peer cannot stall foreground requests for the
-// length of its timeout.
 func (s *Server) pluginRelay(w http.ResponseWriter, r *http.Request) {
-	if !parseFormOK(w, r) {
+	if !parseFormOK(w, r) || pageGalleryStale(w, r, s.activeGallery()) {
 		return
 	}
 	name := r.FormValue("plugin")
@@ -77,9 +66,8 @@ func (s *Server) pluginRelay(w http.ResponseWriter, r *http.Request) {
 		relayRefused(w, "nothing selected that "+name+" handles")
 		return
 	}
-	// The peer never hears about the rows its media excluded, so its own
-	// message cannot account for a selection smaller than the one the
-	// operator built by hand.
+	// The peer never hears of the rows its media excluded, so its message
+	// cannot account for them.
 	var narrowed string
 	if n := len(ids) - len(scoped); n > 0 {
 		narrowed = fmt.Sprintf(" (%d of %d sent; %d not handled by %s)", len(scoped), len(ids), n, name)
@@ -91,8 +79,8 @@ func (s *Server) pluginRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The route is gallery-free so the peer call never runs under ctxMu;
-	// snapshot the active name instead.
+	// The route is gallery-free so the peer call never runs under ctxMu,
+	// hence the snapshot.
 	galleryName := s.activeGallery()
 
 	answer, err := s.callPluginRelay(r.Context(), p.Name, base+button.Path, p.PeerToken, pluginRelayRequest{
@@ -118,16 +106,12 @@ func (s *Server) pluginRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setFlashHeader(w, message+narrowed, "ok", nil)
-	// An in-place edit (a rotate) only shows once the page re-reads it.
 	if answer.Refresh {
 		w.Header().Set("HX-Refresh", "true")
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// scopeForButton drops the ids whose medium the button declared it does not
-// handle, so a mixed selection never sends a peer what it could only refuse.
-// A read that fails leaves the scope as the operator picked it.
 func (s *Server) scopeForButton(b config.PluginButton, ids []int64) []int64 {
 	if b.Media == "" {
 		return ids
@@ -136,39 +120,38 @@ func (s *Server) scopeForButton(b config.PluginButton, ids []int64) []int64 {
 	if d == nil {
 		return ids
 	}
-	in, args := db.InPlaceholders(ids)
-	rows, err := d.Read.Query(`SELECT id, file_type FROM images WHERE id IN (`+in+`)`, args...)
-	if err != nil {
-		return ids
-	}
-	defer func() { _ = rows.Close() }()
 	handled := make(map[int64]bool, len(ids))
-	for rows.Next() {
-		var id int64
-		var fileType string
-		if err := rows.Scan(&id, &fileType); err == nil && b.AppliesTo(fileType) {
-			handled[id] = true
+	err := db.Chunked(ids, 500, func(chunk []int64) error {
+		in, args := db.InPlaceholders(chunk)
+		rows, err := d.Read.Query(`SELECT id, file_type FROM images WHERE id IN (`+in+`)`, args...)
+		if err != nil {
+			return err
 		}
-	}
-	// A read that stopped part-way knows nothing about the rows it never
-	// reached, and dropping them would send the peer a quietly smaller scope.
-	if err := rows.Err(); err != nil {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var id int64
+			var fileType string
+			if err := rows.Scan(&id, &fileType); err == nil && b.AppliesTo(fileType) {
+				handled[id] = true
+			}
+		}
+		return rows.Err()
+	})
+	// A partial read knows nothing of the rows it never reached; dropping
+	// them would quietly shrink the scope.
+	if err != nil {
 		logx.Warnf("plugin scope for %s: %v", b.Label, err)
 		return ids
 	}
 	return slices.DeleteFunc(ids, func(id int64) bool { return !handled[id] })
 }
 
-// pluginRelayAnswer is the peer's reply.
 type pluginRelayAnswer struct {
 	OK      bool   `json:"ok"`
 	Message string `json:"message"`
 	Refresh bool   `json:"refresh"`
 }
 
-// callPluginRelay posts the payload and decodes the answer. A transport error
-// or a non-2xx status is reported as a failure to answer, which also marks the
-// peer down.
 func (s *Server) callPluginRelay(ctx context.Context, peer, target, token string, payload pluginRelayRequest) (pluginRelayAnswer, error) {
 	ctx, cancel := context.WithTimeout(ctx, pluginRelayTimeout)
 	defer cancel()
@@ -197,10 +180,7 @@ func (s *Server) callPluginRelay(ctx context.Context, peer, target, token string
 	return answer, nil
 }
 
-// truncateRunes clips s to at most n runes, so a peer's message can't push
-// arbitrary length into the flash slot and a multi-byte character is never
-// cut in half. Byte length bounds rune count, so the first check skips the
-// conversion for a short string.
+// Byte length bounds rune count, so a short string skips the conversion.
 func truncateRunes(s string, n int) string {
 	if len(s) <= n {
 		return s

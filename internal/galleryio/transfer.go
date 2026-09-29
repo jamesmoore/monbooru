@@ -6,21 +6,15 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// TransferOneImage copies one source image into the target gallery, mirroring
-// applyMergeRecords per image: dedup on sha against the target first (merge tags
-// into the existing row when present), otherwise copy the file and ingest a
-// fresh row with its full provenance. Tags keep their source / auto-tagger
-// attribution. With removeAfter the source image is deleted once the copy
-// succeeds.
-// onDelete is the relations-graph cleanup gallery.DeleteImage takes, passed
-// in for the same reason it is there: internal/relations imports the domain,
-// so nothing below it can name the service.
+// TransferOneImage merges into a target row with the same sha, else
+// copies and ingests the file; removeAfter then deletes the source.
 func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, maxFileSizeMB int, onDelete func(*sql.Tx, int64) error) error {
 	var sha, canonPath, folderPath, origin, note, originalSource string
 	var isFav, isMissing int
@@ -45,12 +39,20 @@ func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, m
 	err = dstCx.DB.Read.QueryRow(`SELECT id, is_missing, canonical_path FROM images WHERE sha256 = ?`, sha).Scan(&dstID, &dstMissing, &dstCanon)
 	switch err {
 	case nil:
-		// Already in the target: merge tags and provenance into the existing row.
-		// If the target's file went missing, restore the bytes and clear the
-		// flag so the merge doesn't report success on a still-unviewable row.
-		if dstMissing == 1 {
+		restore := dstMissing == 1
+		if !restore {
+			// The flag trails the disk until the next sync.
+			if _, statErr := os.Stat(dstCanon); os.IsNotExist(statErr) {
+				restore = true
+			}
+		}
+		// Restore a missing file, or the merge passes on an unviewable row.
+		if restore {
 			if !gallery.NamedInside(dstCx.GalleryPath, dstCanon) {
 				return fmt.Errorf("refusing to restore %q outside gallery root %q", dstCanon, dstCx.GalleryPath)
+			}
+			if err := dstCx.Boundary().Check(dstCanon); err != nil {
+				return fmt.Errorf("refusing to restore %q: %w", dstCanon, err)
 			}
 			if err := os.MkdirAll(filepath.Dir(dstCanon), 0o755); err != nil {
 				return fmt.Errorf("mkdir dest: %w", err)
@@ -58,7 +60,7 @@ func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, m
 			if err := gallery.CopyFileContents(canonPath, dstCanon); err != nil {
 				return fmt.Errorf("restore file: %w", err)
 			}
-			if _, err := dstCx.DB.Write.Exec(`UPDATE images SET is_missing = 0 WHERE id = ?`, dstID); err != nil {
+			if err := unmarkMissing(dstCx.DB, dstID); err != nil {
 				return err
 			}
 		}
@@ -72,6 +74,9 @@ func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, m
 		rel := filepath.ToSlash(filepath.Join(folderPath, filepath.Base(canonPath)))
 		safeBase, err := SafeArchiveDest(dstCx.GalleryPath, rel)
 		if err != nil {
+			return err
+		}
+		if err := dstCx.Boundary().Check(safeBase); err != nil {
 			return err
 		}
 		dst := gallery.UniqueDestPath(filepath.Dir(safeBase), filepath.Base(safeBase))
@@ -96,14 +101,14 @@ func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, m
 		if err := transferProvenance(srcCx, dstCx, id, img.ID, note, originalSource, isFav); err != nil {
 			return err
 		}
-		// The new row keeps Ingest's inbox default whether this is a copy or a
-		// move: relations and collections aren't carried, so it needs re-filing.
+		// The new row stays in the inbox even on a move: relations and
+		// collections don't travel.
 	default:
 		return fmt.Errorf("target sha lookup: %w", err)
 	}
 
 	if removeAfter {
-		if _, err := gallery.DeleteImage(srcCx.DB, srcCx.GalleryPath, srcCx.ThumbnailsPath, id,
+		if _, err := gallery.DeleteImage(srcCx.DB, srcCx.Boundary(), srcCx.ThumbnailsPath, id,
 			tags.RemoveAllTagsFromImageTx, onDelete); err != nil {
 			return fmt.Errorf("remove source: %w", err)
 		}
@@ -111,10 +116,30 @@ func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, m
 	return nil
 }
 
-// transferTagGroup is a set of category:name tokens that shared one attribution
-// on the source image (is_auto plus tagger_name). Grouping lets a transfer
-// re-apply each set with the same origin instead of flattening every tag to a
-// manual user tag.
+// usage_count counts visible images, so the row's tags get back the slot
+// the missing mark took.
+func unmarkMissing(database *db.DB, id int64) error {
+	tx, err := database.Write.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`UPDATE images SET is_missing = 0 WHERE id = ? AND is_missing = 1`, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE tags SET usage_count = usage_count + 1
+		 WHERE id IN (SELECT tag_id FROM image_tags WHERE image_id = ?)`, id,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 type transferTagGroup struct {
 	isAuto     bool
 	taggerName string
@@ -122,11 +147,8 @@ type transferTagGroup struct {
 	confs      []*float64 // aligned with tokens; nil entry means no score
 }
 
-// transferTagGroups reads the source image's tags grouped by attribution and
-// recreates any custom category the target lacks (with the source's color) so a
-// tag keeps its category instead of collapsing into general; built-in
-// categories are seeded in every gallery. The rating tag rides along like any
-// other.
+// Custom categories the target lacks are created first, or their tags
+// would land in general; built-ins exist everywhere.
 func transferTagGroups(srcCx, dstCx gallery.Handle, id int64) ([]transferTagGroup, error) {
 	rows, err := srcCx.DB.Read.Query(
 		`SELECT t.name, tc.name, tc.color, tc.is_builtin, it.is_auto, it.tagger_name, it.confidence
@@ -175,10 +197,8 @@ func transferTagGroups(srcCx, dstCx gallery.Handle, id int64) ([]transferTagGrou
 	return groups, rows.Err()
 }
 
-// transferProvenance copies the sources, per-source commentary and annotations
-// onto the target row, then fills an empty note / original source and raises the
-// favorite flag so a row that already lived in the target keeps the note,
-// original source and favorite it curated.
+// Fills only an empty note or original source and only ever raises
+// is_favorited, so an existing target row keeps what it curated.
 func transferProvenance(srcCx, dstCx gallery.Handle, srcID, dstID int64, note, originalSource string, isFav int) error {
 	sources, err := gallery.SourcesForImage(srcCx.DB, srcID)
 	if err != nil {
@@ -215,9 +235,8 @@ func transferProvenance(srcCx, dstCx gallery.Handle, srcID, dstID int64, note, o
 	if err != nil {
 		return err
 	}
-	// Operator-drawn boxes carry no source identity, so AddManualAnnotation
-	// can't key on one; skip any the target already holds so a re-transfer
-	// stays idempotent instead of stacking duplicate boxes.
+	// Manual boxes have no source key, so dedupe on geometry and body to
+	// keep a re-transfer idempotent.
 	dstAnns, err := gallery.AnnotationsForImage(dstCx.DB, dstID)
 	if err != nil {
 		return err

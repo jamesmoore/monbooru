@@ -51,6 +51,7 @@
     ⚠ Gallery path is unreadable - sync and watch are disabled. Check your configuration.
   </div>
   {{end}}
+  <div id="page-notice" class="degraded-banner" hidden></div>
   <div id="main-layout"{{if .SidebarCollapsed}} class="sidebar-collapsed"{{end}}>
     <aside id="sidebar">
 {{end}}
@@ -153,6 +154,7 @@
           <li><kbd>i</kbd><span>Toggle archive</span></li>
           <li><kbd>f</kbd><span>Toggle favorite</span></li>
           <li><kbd>c</kbd><span>Set collection</span></li>
+          <li><kbd>d</kbd><span>Download as a zip</span></li>
           <li data-when="#batch-transfer"><kbd>T</kbd><span>Transfer</span></li>
           <li data-when="#batch-invert"><kbd>I</kbd><span>Invert</span></li>
           <li data-when="#batch-bar .monloader-accent"><kbd>L</kbd><span>Find tags (monloader)</span></li>
@@ -229,6 +231,7 @@
           <li data-when="#btn-detail-rename"><kbd>t</kbd><kbd>r</kbd><span>Rename</span></li>
           <li data-when="#btn-detail-category"><kbd>t</kbd><kbd>c</kbd><span>Change category</span></li>
           <li data-when="#btn-detail-alias"><kbd>t</kbd><kbd>a</kbd><span>Alias / repoint</span></li>
+          <li data-when="#btn-detail-note"><kbd>t</kbd><kbd>n</kbd><span>Note</span></li>
           <li data-when="#btn-detail-delete"><kbd>Delete</kbd><span>Delete tag</span></li>
           <li><kbd>Esc</kbd><kbd>Backspace</kbd><span>Back to the listing</span></li>
         </ul>
@@ -262,7 +265,8 @@
         <h4>Archive pages grid</h4>
         <ul>
           <li><kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd>&larr;</kbd><kbd>&rarr;</kbd><span>Move grid cursor</span></li>
-          <li><kbd>Enter</kbd><span>Open in the reader</span></li>
+          <li><kbd>Enter</kbd><kbd>o</kbd><span>Open in the reader</span></li>
+          <li><kbd>R</kbd><span>Read from page 1</span></li>
           <li><kbd>Home</kbd><kbd>End</kbd><span>First / last cell</span></li>
           <li><kbd>Esc</kbd><kbd>Backspace</kbd><span>Back to detail</span></li>
         </ul>
@@ -308,7 +312,6 @@
         {{else}}
           <form hx-post="/internal/gallery/switch"
                 hx-target="#gallery-switch-flash" hx-swap="innerHTML"
-                hx-on::after-request="if(event.detail.successful){this.closest('dialog').close()}"
                 style="display:inline">
             <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
             <input type="hidden" name="name" value="{{.Name}}">

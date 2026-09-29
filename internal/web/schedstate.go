@@ -11,12 +11,8 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// scheduleState is what the nightly run leaves behind so a machine that was
-// asleep at schedule.time can tell it missed one. It sits beside the config
-// rather than in a gallery database, because the schedule is global and
-// iterates every gallery, and not in the config itself, because a timestamp
-// monbooru rewrites nightly would show up in every diff of the operator's
-// own file.
+// Kept out of the config: a timestamp rewritten nightly would show in
+// every diff of the operator's file.
 type scheduleState struct {
 	LastRun time.Time `toml:"last_scheduled_run"`
 }
@@ -25,9 +21,6 @@ func (s *Server) scheduleStatePath() string {
 	return filepath.Join(filepath.Dir(s.configPath), "state.toml")
 }
 
-// lastScheduledRun reads the recorded time. A missing or unparseable file
-// reads as "never ran", which is not an error: the worst it costs is one
-// catch-up pass.
 func (s *Server) lastScheduledRun() time.Time {
 	var st scheduleState
 	if _, err := toml.DecodeFile(s.scheduleStatePath(), &st); err != nil {

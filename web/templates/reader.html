@@ -10,7 +10,7 @@
 </head>
 {{$detailHref := printf "/images/%d%s" .Image.ID .BackQS}}{{if .BackToPages}}{{$detailHref = printf "/images/%d/pages%s#page-%d" .Image.ID .BackQS .Page}}{{end}}
 {{$pagesHref := printf "/images/%d/pages%s#page-%d" .Image.ID .BackQS .Page}}
-<body class="reader-body">
+<body class="reader-body" data-gallery="{{.ActiveGallery}}">
   <main id="reader" data-image-id="{{.Image.ID}}" data-page="{{.Page}}" data-total="{{.PageCount}}" data-detail-url="{{$detailHref}}">
     <div class="reader-stage">
       <a href="/images/{{.Image.ID}}/page/{{.Page}}" target="_blank" rel="noopener" class="reader-page-link" title="Zoom page (v)" onclick="return openLightbox(event, this.href)">
@@ -49,6 +49,7 @@
       {{end}}
       <form class="reader-extract" method="POST" action="/images/{{.Image.ID}}/page/{{.Page}}/extract">
         <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+        <input type="hidden" name="_gallery" value="{{.ActiveGallery}}">
         <button type="submit" title="Extract page as image (e)">Extract</button>
       </form>
       <a class="reader-open" href="/images/{{.Image.ID}}/page/{{.Page}}" target="_blank" rel="noopener" title="Open page in new tab (o)">↗</a>
@@ -56,11 +57,10 @@
   </main>
   {{template "partials/image_lightbox.html" .}}
   <dialog id="reader-jump-dialog">
-    <form method="GET" action="/images/{{.Image.ID}}/read">
-      {{if .BackToPages}}<input type="hidden" name="from" value="pages">{{end}}
+    <form onsubmit="event.preventDefault(); submitPageJump('reader-jump-input');">
       <p>Jump to page (1 - {{.PageCount}})</p>
       <div class="field">
-        <input type="number" name="page" id="reader-jump-input" min="1" max="{{.PageCount}}" value="{{.Page}}" autocomplete="off">
+        <input type="number" name="page" id="reader-jump-input" min="1" max="{{.PageCount}}" data-max="{{.PageCount}}" value="{{.Page}}" autocomplete="off">
       </div>
       {{template "dialog_actions" dict "ID" "reader-jump-dialog" "Submit" "Go"}}
     </form>

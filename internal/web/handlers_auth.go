@@ -1,6 +1,7 @@
 package web
 
 import (
+	"cmp"
 	"net/http"
 
 	"github.com/monbooru/monbooru/internal/logx"
@@ -9,31 +10,27 @@ import (
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 	if !s.authEnabled() {
-		// Render the login page with an inline notice instead of silently
-		// redirecting - a user who bookmarked /login after disabling auth
-		// otherwise gets no explanation for why the page vanished. The
-		// template hides the form itself; a dead field and button only
-		// suggest a login that could work.
 		s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{
 			"Error":        "Password authentication is disabled. Enable it from Settings → Authentication.",
 			"AuthDisabled": true,
 		}))
 		return
 	}
-	s.renderTemplate(w, "login.html", s.loginPageData(nil))
+	s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{"Next": loginNext(r.URL.Query().Get("next"))}))
 }
 
-// loginPageData builds the data map for login.html.
+func loginNext(p string) string {
+	if localPath(p) {
+		return p
+	}
+	return ""
+}
+
 func (s *Server) loginPageData(extra map[string]any) map[string]any {
 	return s.standalonePageData("Login - "+s.booruName(), extra)
 }
 
-// standalonePageData is what a page rendered outside layout.html needs to
-// look like the rest of the install: the fields partials/head.html reads.
-// These pages do not run through s.base(), so the brand name, the favicon
-// and the theme have to be threaded explicitly - otherwise the configured
-// branding covers every page except the ones an operator meets first and
-// last.
+// Carries every field partials/head.html reads: these pages skip s.base().
 func (s *Server) standalonePageData(title string, extra map[string]any) map[string]any {
 	data := map[string]any{
 		"Title":        title,
@@ -54,11 +51,13 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	next := loginNext(r.FormValue("next"))
 	ip := clientIP(r)
 	if !s.loginRL.check(ip) {
 		logx.Warnf("login rate-limited from %s", ip)
 		s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{
 			"Error": "Too many attempts. Please wait before trying again.",
+			"Next":  next,
 		}))
 		return
 	}
@@ -71,6 +70,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		logx.Warnf("login failed from %s", ip)
 		s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{
 			"Error": "Invalid password",
+			"Next":  next,
 		}))
 		return
 	}
@@ -91,7 +91,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, cmp.Or(next, "/"), http.StatusSeeOther)
 }
 
 func (s *Server) logoutPost(w http.ResponseWriter, r *http.Request) {
@@ -106,12 +106,10 @@ func (s *Server) logoutPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-// renderAuthPasswordOOB writes an out-of-band swap for the password subsection
-// so the "currently enabled/disabled" text and form fields reflect the latest
-// auth state without requiring a page reload.
 func (s *Server) renderAuthPasswordOOB(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "partials/auth_password_section.html", map[string]any{
 		"AuthEnabled": s.authEnabled(),
+		"HasPassword": s.passwordHash() != "",
 		"CSRFToken":   s.csrfToken(sessionFromContext(r.Context())),
 		"OOB":         true,
 	})

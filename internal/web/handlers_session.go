@@ -15,61 +15,36 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// validOrderModes enumerates the three session walk orders. Anything
-// else collapses to the default (smallest_distance_first).
 var validOrderModes = map[string]bool{
 	"smallest_distance_first": true,
 	"largest_file_first":      true,
 	"random":                  true,
 }
 
-// validDetectors enumerates the session's detector scopes. "both" is
-// the unfiltered walk; anything else collapses to it.
 var validDetectors = map[string]bool{
 	"phash": true,
 	"tags":  true,
 	"both":  true,
 }
 
-// sessionPairView is everything the swipe page needs about one pair.
-// A nil view signals an empty queue; the template renders the
-// "nothing left" stub.
 type sessionPairView struct {
-	A         sessionImageView
-	B         sessionImageView
-	Distance  int
-	Remaining int
-	Order     string
-	// Source names the detector that queued the pair, and Score the tag
-	// similarity behind it (0 on a phash-only row). The card renders
-	// them because provenance shifts the prior: a pixel match suggests
-	// duplicate or version, a tag match suggests variant or based-on.
-	Source string
-	Score  float64
-	// LeftID names whichever of A or B the template should render in
-	// the left slot, so the four verdicts commit the likely direction
-	// without a swap: the bigger-filesize side on a pixel match, the
-	// older image on a tag match. W swap reassigns it client-side.
-	LeftID int64
-	// SharedAncestor names the nearest image both sides descend from,
-	// 0 otherwise. The bridge renders it so a pair from one tree reads
-	// as tree context rather than as two strangers.
+	A              sessionImageView
+	B              sessionImageView
+	Distance       int
+	Remaining      int
+	Order          string
+	Source         string
+	Score          float64
+	LeftID         int64
 	SharedAncestor int64
 }
 
-// ScorePercent renders the tag score the way the card reads it.
 func (v sessionPairView) ScorePercent() int { return int(math.Round(v.Score * 100)) }
 
-// FromTags reports whether tag similarity had a hand in queueing the
-// pair, which is what gates the shared-tag evidence row.
 func (v sessionPairView) FromTags() bool {
 	return v.Source == relations.SourceTags || v.Source == relations.SourceBoth
 }
 
-// sessionImageView mirrors models.Image but only carries the bits the
-// session UI renders (id, size, dimensions, tag count, file type).
-// Loaded alongside the queue row in a single SELECT. FileType drives
-// the compare slider's <img>-vs-<video> branch.
 type sessionImageView struct {
 	ID       int64
 	Width    sql.NullInt64
@@ -80,9 +55,6 @@ type sessionImageView struct {
 	TagCount int
 }
 
-// sessionPage renders /relations/session. Picks the next queue row
-// according to the persisted order mode (or the ?order= override)
-// and serves the two-cell swipe view.
 func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 	cx, ok := s.requireActive(w)
 	if !ok {
@@ -96,15 +68,11 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 		order = "smallest_distance_first"
 	}
 	if validOrderModes[r.URL.Query().Get("order")] {
-		// Operator switched modes from the picker; persist so a reload picks
-		// up the same shuffle. Gate on validity so a bogus ?order= doesn't
-		// overwrite the saved preference with the fallback.
+		// Only a valid ?order= is saved, so a bogus one cannot replace
+		// the stored mode with the fallback.
 		cx.RelationsSvc.SetSessionOrder(order)
 	}
-	// The scope opens on the unfiltered walk every time: narrowing it is
-	// a choice for the sitting, carried on the URL through the decide
-	// loop, not a preference that outlives it. With the tag pass off
-	// only one detector is left, so the walk pins to that one.
+	// Unlike the order, the scope is not stored: it lasts one sitting.
 	tagPairs := s.tagPairsEnabled()
 	detector := "phash"
 	if tagPairs {
@@ -114,8 +82,6 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ceiling := resolveCeiling(r, cx)
-	// review-again links carry the exact pair to reopen; pin it so the
-	// operator lands on the pair they clicked, not whatever sorts first.
 	pinA, _ := strconv.ParseInt(r.URL.Query().Get("a"), 10, 64)
 	pinB, _ := strconv.ParseInt(r.URL.Query().Get("b"), 10, 64)
 	pair, counts, err := loadNextPair(cx, order, detector, ceiling, pinA, pinB)
@@ -128,9 +94,6 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 	var sharedTags []tags.SharedTag
 	var sharedTotal int
 	if pair != nil {
-		// The template puts the bigger-filesize side in slot "left". The
-		// compare table mirrors that orientation so the operator's eye
-		// reads "left vs right" without the W swap reshuffling the rows.
 		leftID := pair.LeftID
 		rightID := pair.A.ID
 		if leftID == pair.A.ID {
@@ -140,9 +103,6 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			logx.Debugf("session compare facts: %v", err)
 		}
-		// A pixel match explains itself on sight; a tag match does not,
-		// so the pair's strongest shared tags ride along as the reason
-		// it is on screen at all.
 		if pair.FromTags() {
 			shared, total, sErr := tags.SharedTags(cx.DB, leftID, rightID, sharedTagsShown)
 			if sErr != nil {
@@ -174,41 +134,25 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sharedTagsShown caps the evidence row at what reads in one line; the
-// total rides alongside as "+N more".
 const sharedTagsShown = 6
 
 type sessionPageData struct {
 	baseData
-	Pair *sessionPairView
-	// Remaining is what the walk can still serve. HiddenByCeiling is the
-	// number of unresolved pairs filtered out because at least one side
-	// carries a rating tag above the cookie ceiling, Skipped the ones
-	// set aside this sitting.
+	Pair            *sessionPairView
 	Remaining       int
 	HiddenByCeiling int
 	Skipped         int
 	Ceiling         string
 	Order           string
 	Detector        string
-	// TagPairs mirrors the tag-similarity switch: with the pass off the
-	// detector picker is hidden, since every queued pair is a pixel match.
-	TagPairs      bool
-	ActiveGallery string
-	// Left / Right hold the comparison-table data oriented to the
-	// template's left/right slots so the table reads consistently with
-	// the thumbs.
-	Left  relationCompareFacts
-	Right relationCompareFacts
-	// SharedTags carries the heaviest tags behind a tag-sourced match,
-	// empty on a phash-only pair. SharedTagsTotal is the full count.
+	TagPairs        bool
+	ActiveGallery   string
+	Left            relationCompareFacts
+	Right           relationCompareFacts
 	SharedTags      []tags.SharedTag
 	SharedTagsTotal int
 }
 
-// loadNextPair pulls the next queue row plus the queue breakdown, and
-// dresses the row for the swipe page: the filename, the tag counts, and
-// which side leads.
 func loadNextPair(cx *galleryCtx, order, detector string, ceiling *Ceiling, pinA, pinB int64) (*sessionPairView, relations.QueueCounts, error) {
 	var rank *int
 	if r, active := ceiling.RankCeiling(); active {
@@ -241,11 +185,9 @@ func loadNextPair(cx *galleryCtx, order, detector string, ceiling *Ceiling, pinA
 			Filename: path.Base(pair.B.CanonicalPath), TagCount: countTags(cx, pair.B.ID),
 		},
 	}
-	// Bigger file first is a duplicate heuristic: the larger file is the
-	// likelier original. A tag-sourced pair is usually a variant or a
-	// derivative, where the buttons read "right is based on left", so
-	// the older image - A, since the queue canonicalises on ascending id
-	// and id follows ingest order - belongs on the left instead.
+	// The larger file is the likelier original; a tag match is more
+	// likely a derivative, so the older image leads - A, as the queue
+	// stores a pair in id order.
 	view.LeftID = view.A.ID
 	if view.Source != relations.SourceTags &&
 		(view.B.FileSize > view.A.FileSize ||
@@ -255,11 +197,6 @@ func loadNextPair(cx *galleryCtx, order, detector string, ceiling *Ceiling, pinA
 	return &view, counts, nil
 }
 
-// relationCompareFacts is one side of the under-thumbs comparison
-// table. Strings are pre-formatted so the template just renders the
-// rows. UniqueTags lists tag names this side carries that the other
-// does not; UniqueTagsTotal is the full count (the template caps the
-// visible names and shows "+N more").
 type relationCompareFacts struct {
 	ImageID         int64
 	ResolutionW     int64
@@ -273,19 +210,12 @@ type relationCompareFacts struct {
 	Collection      string
 }
 
-// compareTag is one tag name in the comparison table, carrying the
-// category it belongs to so the cell renders it in the category's
-// colour like every other tag surface.
 type compareTag struct {
 	Name     string
 	Category string
 	Color    string
 }
 
-// loadCompareFacts loads the comparison table data for two image ids.
-// One SELECT per side covers width/height/file_size/ingested_at/
-// canonical_path; a second SELECT computes the tag-delta lists. Tag
-// counts are loaded through the existing countTags helper.
 func loadCompareFacts(cx *galleryCtx, leftID, rightID int64) (relationCompareFacts, relationCompareFacts, error) {
 	left := relationCompareFacts{ImageID: leftID}
 	right := relationCompareFacts{ImageID: rightID}
@@ -336,11 +266,6 @@ func scanCompareFacts(cx *galleryCtx, id int64, dst *relationCompareFacts) error
 	return nil
 }
 
-// loadTagDelta returns the names of every tag carried by exactly one
-// of the two image ids. The HAVING COUNT(*) = 1 clause splits the join
-// into "left only" vs "right only" by re-reading the per-row image_id.
-// Rating tags are excluded because the table caller is comparing the
-// images, not their ratings.
 func loadTagDelta(cx *galleryCtx, leftID, rightID int64) (left []compareTag, right []compareTag, err error) {
 	rows, err := cx.DB.Read.Query(`
 		WITH delta AS (
@@ -390,16 +315,6 @@ func countTags(cx *galleryCtx, id int64) int {
 	return n
 }
 
-// sessionDecidePost is the swipe page's decision endpoint. Form:
-//   - a, b: image ids (canonical pair order from the queue)
-//   - type: duplicate|alternate|version|derivative|not_related|skip
-//   - left: image id the operator considers "left" after any W swap.
-//     When omitted, "a" is left by default. Every Add* call below
-//     receives (left, right) regardless of relation symmetry so the
-//     directional semantic stays explicit at the call site.
-//
-// On success, redirects (HTMX) back to the session page so the next
-// pair renders.
 func (s *Server) sessionDecidePost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -440,14 +355,12 @@ func (s *Server) sessionDecidePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Every service call takes (left, right): for duplicate the first
-	// arg becomes original when a new group forms; for version/
-	// derivative the first arg is parent/source; the two symmetric
-	// types canonicalise internally so the call shape is uniform.
+	// Left is the original, the parent or the source; the symmetric kinds
+	// ignore the order.
 	var err error
 	switch decision {
 	case "duplicate":
-		err = cx.RelationsSvc.AddDuplicate(left, right)
+		err = cx.RelationsSvc.AddDuplicateOf(left, right)
 	case "alternate":
 		err = cx.RelationsSvc.AddAlternate(left, right)
 	case "version":
@@ -474,15 +387,7 @@ func (s *Server) sessionDecidePost(w http.ResponseWriter, r *http.Request) {
 	sessionRedirect(w, r)
 }
 
-// writeDuplicatePostDecideHeaders fills the X-Relations-Post-Decision
-// header set so the session template can pop a "Delete this duplicate
-// from disk?" dialog instead of auto-advancing. Returns true when the
-// headers were written (the caller skips the redirect) and false when
-// the resolved state doesn't merit a prompt (no group, member missing
-// a row, etc.) - the caller then falls through to the usual redirect.
 func writeDuplicatePostDecideHeaders(w http.ResponseWriter, cx *galleryCtx, left, right int64) bool {
-	// Find the dup group that now contains the pair. Both sides are
-	// members; the non-original side is the one the dialog targets.
 	var gid, original int64
 	if err := cx.DB.Read.QueryRow(`
 		SELECT g.id, g.original_image_id
@@ -495,10 +400,7 @@ func writeDuplicatePostDecideHeaders(w http.ResponseWriter, cx *galleryCtx, left
 		logx.Debugf("dup post-decide group lookup: %v", err)
 		return false
 	}
-	nonOriginal := left
-	if left == original {
-		nonOriginal = right
-	}
+	nonOriginal := right
 	var hasUnique int
 	if err := cx.DB.Read.QueryRow(`
 		SELECT COUNT(*) FROM (
@@ -529,13 +431,10 @@ func writeDuplicatePostDecideHeaders(w http.ResponseWriter, cx *galleryCtx, left
 	return true
 }
 
-// sessionRedirect sends the operator back to /relations/session so
-// the next pair renders. For HTMX requests, emits an HX-Redirect
-// header so the swap reloads the whole page.
 func sessionRedirect(w http.ResponseWriter, r *http.Request) {
 	dest := "/relations/session?order=" + url.QueryEscape(r.FormValue("order"))
-	// The scope is not stored, so it rides the round trip: a decision
-	// taken inside one detector's walk must not drop back to Both.
+	// Carried through, or a decision inside one detector's walk drops
+	// back to both.
 	if d := r.FormValue("detector"); validDetectors[d] {
 		dest += "&detector=" + url.QueryEscape(d)
 	}
