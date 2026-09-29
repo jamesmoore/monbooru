@@ -1,5 +1,5 @@
--- Monbooru Schema
--- All statements use IF NOT EXISTS / INSERT OR IGNORE for idempotency.
+-- Runs on every boot, before Bootstrap's migrations: each statement must
+-- be idempotent, and none may reference a column a migration adds.
 
 CREATE TABLE IF NOT EXISTS tag_categories (
     id         INTEGER PRIMARY KEY,
@@ -20,9 +20,7 @@ INSERT OR IGNORE INTO tag_categories (name, color, is_builtin) VALUES
     ('year',      '#4a8fa8', 1),
     ('species',   '#ed5d1f', 1);
 
--- Promote any pre-existing user-created medium/person/year/species category
--- to built-in so a library that already had one of these as a custom row
--- stops being deletable once the seed catches up.
+-- A library may hold these as custom categories from before they were built in.
 UPDATE tag_categories SET is_builtin = 1 WHERE name IN ('medium', 'person', 'year', 'species');
 
 CREATE TABLE IF NOT EXISTS tags (
@@ -33,21 +31,16 @@ CREATE TABLE IF NOT EXISTS tags (
     is_alias         INTEGER NOT NULL DEFAULT 0,
     canonical_tag_id INTEGER REFERENCES tags(id),
     created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    -- Creation provenance: 'user', a booru site, 'ptr', an auto-tagger
-    -- name, an import label. Stamped once at insert, never overwritten.
+    -- 'user', a booru site, 'ptr', a tagger or an import; set once at insert.
     origin           TEXT    NOT NULL DEFAULT '',
-    -- Most recent application to an image; NULL = never applied.
+    -- NULL = never applied to an image.
     last_used_at     TEXT,
-    -- On PTR alias rows: the latest refresh no longer listed this
-    -- spelling. The row stays until the operator acts.
+    -- 1 = PTR alias the latest refresh dropped; kept until the operator acts.
     stale            INTEGER NOT NULL DEFAULT 0,
     UNIQUE(name, category_id)
 );
 
--- Canonical rating tags. The category accepts only these four names; the
--- tagger routes WD14 rating labels here, search uses the IDs directly via
--- a fixed-name SELECT, and the GetOrCreateTag guard refuses anything else
--- in this category.
+-- Fixed: rating_rank and the tag service key on these four names.
 INSERT OR IGNORE INTO tags (name, category_id) VALUES
     ('general',      (SELECT id FROM tag_categories WHERE name = 'rating')),
     ('sensitive',    (SELECT id FROM tag_categories WHERE name = 'rating')),
@@ -57,10 +50,7 @@ INSERT OR IGNORE INTO tags (name, category_id) VALUES
 CREATE TABLE IF NOT EXISTS images (
     id             INTEGER PRIMARY KEY,
     sha256         TEXT    NOT NULL UNIQUE,
-    -- Digest of the same bytes sha256 addresses, kept because boorus key
-    -- their posts on it. '' until computed; never a dedup key, and never
-    -- written from a source's claimed md5 (image_sources.md5), which is
-    -- allowed to disagree with the file.
+    -- '' until computed. Never a dedup key, never copied from a source's claim.
     md5            TEXT    NOT NULL DEFAULT '',
     canonical_path TEXT    NOT NULL,
     folder_path    TEXT    NOT NULL DEFAULT '',
@@ -70,40 +60,22 @@ CREATE TABLE IF NOT EXISTS images (
     file_size      INTEGER NOT NULL,
     is_missing     INTEGER NOT NULL DEFAULT 0,
     is_favorited   INTEGER NOT NULL DEFAULT 0,
-    -- New ingests land in the inbox (1) for triage; archived rows sit at 0.
-    -- Matching idx_images_inbox_visible is created in db.go Bootstrap so the
-    -- migration's ALTER TABLE on existing libraries runs before the index
-    -- references the new column.
+    -- 1 = in the inbox awaiting triage, 0 = archived.
     is_inbox       INTEGER NOT NULL DEFAULT 1,
     auto_tagged_at TEXT,
     source_type    TEXT    NOT NULL DEFAULT 'none',
     origin         TEXT    NOT NULL DEFAULT 'ingest',
     source         TEXT    NOT NULL DEFAULT '',
     url            TEXT    NOT NULL DEFAULT '',
-    -- Operator's freeform note. The full-JSON export carries it; the
-    -- merge importer leaves it alone.
     note           TEXT    NOT NULL DEFAULT '',
-    -- Operator's image-level original source (where the artist first posted
-    -- it), one URL; distinct from the per-origin image_sources.original a
-    -- booru pull fills. Carried by the full-JSON export since v8; the merge
-    -- importer leaves it alone.
+    -- Operator-set URL of the artist's first post (not image_sources.original).
     original_source TEXT   NOT NULL DEFAULT '',
-    -- Video duration in seconds (REAL so short clips and sub-second
-    -- precision survive). NULL for non-video rows and for video rows
-    -- that pre-date the column or whose ffprobe call failed; the
-    -- search and detail surfaces treat NULL as "unknown" rather than
-    -- "zero". Backfilled on re-extract metadata.
+    -- NULL = unknown (not a video, or not probed), never read as zero.
     duration_seconds REAL,
-    -- 64-bit canonical perceptual hash (DCT-based pHash, mirror-
-    -- canonicalised). NULL until backfilled or when the file has no
-    -- visual surface. Added by ensureColumn on existing libraries;
-    -- the matching idx_images_phash is created in db.Bootstrap.
+    -- Mirror-canonical DCT pHash; NULL = not yet computed or nothing to hash.
     phash          INTEGER,
     ingested_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    -- Upload-batch token (UnixNano) shared by every row from one web-UI
-    -- upload POST; NULL for watcher / sync / API rows. Lets the inbox
-    -- cluster view group a single drop as one batch regardless of the
-    -- 15-minute time-gap rule. Added by ensureColumn on existing libraries.
+    -- UnixNano token shared by one web-UI upload's rows; NULL otherwise.
     upload_batch   INTEGER
 );
 
@@ -112,14 +84,7 @@ CREATE TABLE IF NOT EXISTS image_paths (
     image_id     INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     path         TEXT    NOT NULL UNIQUE,
     is_canonical INTEGER NOT NULL DEFAULT 0,
-    -- File mtime at the time the row was last touched, in Unix seconds and
-    -- again as Unix nanoseconds. Sync's unchanged-shortcut requires (size,
-    -- mtime) parity so a same-size in-place edit is still re-hashed, and it
-    -- reads mtime_nsec when the row has one: whole seconds cannot tell an
-    -- edit that landed in the same second the file was last observed. 0
-    -- marks rows that predate each column on upgraded libraries - a row
-    -- with no nsec keeps the second-grained comparison rather than costing
-    -- the library a full re-hash on upgrade.
+    -- Unix seconds and full Unix nanoseconds; 0 = not recorded.
     mtime_unix   INTEGER NOT NULL DEFAULT 0,
     mtime_nsec   INTEGER NOT NULL DEFAULT 0
 );
@@ -132,15 +97,12 @@ CREATE TABLE IF NOT EXISTS image_tags (
     confidence  REAL,
     tagger_name TEXT,
     created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    -- The attributed source's latest fetch no longer carried this tag.
+    -- 1 = the attributed source's latest fetch no longer carried this tag.
     stale       INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (image_id, tag_id)
 );
 
--- Per-image collection membership. An image can belong to several
--- collections, each with its own position. images.series / series_order
--- mirror one "home" membership so the global order-sort and the
--- adjacency cursor keep riding the scalar columns.
+-- images.series / series_order mirror one "home" membership per image.
 CREATE TABLE IF NOT EXISTS image_collections (
     image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     name     TEXT    NOT NULL COLLATE NOCASE,
@@ -148,31 +110,26 @@ CREATE TABLE IF NOT EXISTS image_collections (
     PRIMARY KEY (image_id, name)
 );
 
--- Collections opted in to find-relations. A row lets the relations
--- session surface pairs whose two images share that collection; absence
--- (the default) hides them, since membership already relates the images.
+-- Opt-ins: other collections' internal pairs stay hidden from find-relations.
 CREATE TABLE IF NOT EXISTS collection_find_relations (
     name TEXT PRIMARY KEY COLLATE NOCASE
 );
 
--- Per-image origin (provenance). An image can carry several sources; each
--- is a site label plus the post URL it came from. images.source / images.url
--- mirror the "primary" (first) origin so existing readers keep riding the
--- scalar columns, the same way images.series mirrors a home collection.
+-- images.source / url mirror each image's first origin.
 CREATE TABLE IF NOT EXISTS image_sources (
     image_id   INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     site       TEXT    NOT NULL DEFAULT '' COLLATE NOCASE,
     post_id    TEXT    NOT NULL DEFAULT '',
     url        TEXT    NOT NULL DEFAULT '',
-    md5        TEXT    NOT NULL DEFAULT '', -- md5 the source last claimed on a push/enrich; audit trail, never a dedup key
-    commentary TEXT    NOT NULL DEFAULT '', -- artist commentary from this source; operator-editable, overwritten by a re-pull
-    commentary_translated TEXT NOT NULL DEFAULT '', -- translation of that commentary where the source carries one; same rules
-    original   TEXT    NOT NULL DEFAULT '', -- upstream artist source the booru post declared (usually a URL, newline-joined when several); operator-editable, overwritten by a re-pull
-    similarity REAL    NOT NULL DEFAULT 0,  -- best similarity-service score (0-100) a lookup matched this origin with; 0 = exact or manual. A matched origin's file differs by design, so refetches skip the md5 verify
-    md5_match  TEXT    NOT NULL DEFAULT '', -- claimed-md5 vs local-file verdict: '' unknown, 'match', 'differ'. Maintained by the trg_*_verdict triggers off the two stored digests; gates the [upgrade] action
-    parent_url TEXT    NOT NULL DEFAULT '', -- canonical URL of the post this booru post declared as its parent; drives derivative-edge linking once both sides are in the gallery
-    upgrade_kept INTEGER NOT NULL DEFAULT 0, -- operator kept the local file; hides the upgrade offer until the post claims a different md5
-    post_width  INTEGER NOT NULL DEFAULT 0,  -- what the post says the file it serves is; 0 / '' where the source published nothing. Never measured here, unlike images.width
+    md5        TEXT    NOT NULL DEFAULT '', -- the source's last claimed md5, as sent; never a dedup key
+    commentary TEXT    NOT NULL DEFAULT '', -- operator-editable, but a re-pull overwrites it
+    commentary_translated TEXT NOT NULL DEFAULT '',
+    original   TEXT    NOT NULL DEFAULT '', -- the post's declared upstream source(s), newline-joined
+    similarity REAL    NOT NULL DEFAULT 0, -- 0-100 best lookup match score; 0 = exact or manual
+    md5_match  TEXT    NOT NULL DEFAULT '', -- claim vs file: '' unknown, 'match' or 'differ'
+    parent_url TEXT    NOT NULL DEFAULT '', -- the declared parent post, in url's canonical form
+    upgrade_kept INTEGER NOT NULL DEFAULT 0, -- 1 = operator kept the local file; a new claimed md5 clears it
+    post_width  INTEGER NOT NULL DEFAULT 0, -- post_*: as the post declares, 0 / '' if unpublished; never measured
     post_height INTEGER NOT NULL DEFAULT 0,
     post_size   INTEGER NOT NULL DEFAULT 0,
     post_ext    TEXT    NOT NULL DEFAULT '',
@@ -180,9 +137,7 @@ CREATE TABLE IF NOT EXISTS image_sources (
     PRIMARY KEY (image_id, site, post_id)
 );
 
--- Positional note boxes overlaid on an image (Danbooru "notes"), in original-
--- image pixel coordinates. Pulled per source; the whole set a source
--- contributed is replaced on a re-pull. Body is plain text.
+-- Danbooru-style notes: x/y/w/h in original-image pixels.
 CREATE TABLE IF NOT EXISTS image_annotations (
     id         INTEGER PRIMARY KEY,
     image_id   INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
@@ -193,9 +148,7 @@ CREATE TABLE IF NOT EXISTS image_annotations (
     w          INTEGER NOT NULL,
     h          INTEGER NOT NULL,
     body       TEXT    NOT NULL DEFAULT '',
-    -- 1 for an operator-drawn box (site/post_id empty), 0 for a source-pulled
-    -- one. Source-keyed deletes/replaces gate on manual = 0 so an operator box
-    -- survives a source edit, removal or re-pull.
+    -- 1 = operator-drawn; source-keyed deletes and replaces must spare it.
     manual     INTEGER NOT NULL DEFAULT 0,
     fetched_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
@@ -205,11 +158,18 @@ CREATE TABLE IF NOT EXISTS tag_implications (
     parent_tag_id  INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
     implied_tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
     created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    -- Same vocabulary as tags.origin; stamped when the edge is created.
+    -- Same values as tags.origin, set when the edge is created.
     origin         TEXT    NOT NULL DEFAULT '',
-    -- On PTR edges: the latest refresh no longer carried the edge.
+    -- 1 = a PTR edge the latest refresh no longer carries.
     stale          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (parent_tag_id, implied_tag_id)
+);
+
+CREATE TABLE IF NOT EXISTS tag_notes (
+    tag_id INTEGER PRIMARY KEY REFERENCES tags(id) ON DELETE CASCADE,
+    body   TEXT    NOT NULL DEFAULT '',
+    -- One link per line; a leading '-' marks a dead one.
+    links  TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sd_metadata (
@@ -236,6 +196,14 @@ CREATE TABLE IF NOT EXISTS comfyui_metadata (
     raw_workflow     TEXT,
     generation_hash  TEXT
 );
+
+-- Workflow search terms: node classes, titles and scalar inputs as name=value.
+-- The FK targets comfyui_metadata so replacing that row clears its terms.
+CREATE TABLE IF NOT EXISTS comfyui_terms (
+    image_id INTEGER NOT NULL REFERENCES comfyui_metadata(image_id) ON DELETE CASCADE,
+    term     TEXT    NOT NULL,
+    PRIMARY KEY (image_id, term)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS manga_metadata (
     image_id         INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
@@ -269,12 +237,8 @@ CREATE TABLE IF NOT EXISTS manga_metadata (
     raw_xml          TEXT
 );
 
--- Duplicate group: a set of images representing the same source content
--- in different quality / format. One member is the "original" (the best
--- representative). original_image_id is NOT NULL and has no ON DELETE
--- cascade so the parent image_delete path is forced to fix the original
--- (or dissolve the group) before the image row goes away - prevents the
--- group from outliving its anchor as a dangling reference.
+-- No ON DELETE on original_image_id: deleting that image must first pick
+-- a new original or dissolve the group.
 CREATE TABLE IF NOT EXISTS dup_groups (
     id                INTEGER PRIMARY KEY,
     original_image_id INTEGER NOT NULL REFERENCES images(id),
@@ -298,19 +262,14 @@ CREATE TABLE IF NOT EXISTS alt_group_members (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
--- Directed version edge. child_image_id is PK (each image has at most
--- one parent); parent_image_id is UNIQUE (each parent has at most one
--- child). Together this enforces a strict chain - branching is a
--- derivative relationship.
+-- A strict chain: one parent and one child per image; a branch is a derivative.
 CREATE TABLE IF NOT EXISTS version_edges (
     child_image_id  INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
     parent_image_id INTEGER NOT NULL UNIQUE REFERENCES images(id) ON DELETE CASCADE,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
--- Directed derivative edge, one row per (derivative, source) pair. A
--- composite is made from several images, so a derivative can name any
--- number of sources and a source can carry any number of derivatives.
+-- Keyed on the pair: a composite derives from several sources.
 CREATE TABLE IF NOT EXISTS derivative_edges (
     derivative_image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     source_image_id     INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
@@ -318,8 +277,7 @@ CREATE TABLE IF NOT EXISTS derivative_edges (
     PRIMARY KEY (derivative_image_id, source_image_id)
 );
 
--- Canonicalised "not related" pair (a < b). Recorded so a rejected pair
--- never resurfaces in the find-pairs queue at any distance.
+-- Canonicalised a < b.
 CREATE TABLE IF NOT EXISTS not_related_pairs (
     a_image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     b_image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
@@ -327,9 +285,6 @@ CREATE TABLE IF NOT EXISTS not_related_pairs (
     PRIMARY KEY (a_image_id, b_image_id)
 );
 
--- Singleton holding the active session's order mode plus the
--- started-at timestamp. id is constrained to 1 so there is at most
--- one row regardless of how the upserts go.
 CREATE TABLE IF NOT EXISTS relation_session (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     order_mode TEXT NOT NULL DEFAULT 'smallest_distance_first',
@@ -338,19 +293,9 @@ CREATE TABLE IF NOT EXISTS relation_session (
     paused_at  TEXT
 );
 
--- Candidate pairs surfaced by the find-pairs background job; the
--- session UI iterates these and either commits a relation (deletes
--- the row), rejects the pair (deletes the row + writes
--- not_related_pairs), or skips (sets skipped_at so the row sorts to
--- the back of the queue). Canonicalised a < b matches the rest of the
--- symmetric tables.
--- collection_hidden stores the collection opt-out verdict per row: 1
--- when both images share a collection absent from
--- collection_find_relations. max_rating_rank mirrors the higher of
--- the two members' images.rating_rank. Both are stamped by the
--- bootstrap triggers on insert and resweeped when the underlying
--- state changes, so the session walk and the hub counters read
--- stored values instead of probing memberships and ratings per row.
+-- find-pairs candidates, a < b; skipped_at sends a row to the back.
+-- Bootstrap's triggers store collection_hidden (the pair shares a
+-- non-opted-in collection) and max_rating_rank (the higher member rank).
 CREATE TABLE IF NOT EXISTS potential_relation_pairs (
     a_image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     b_image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
@@ -374,9 +319,8 @@ CREATE TABLE IF NOT EXISTS saved_searches (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
--- Folded-duplicate pairs: old_id (a pre-widening fold) -> new_id (the richer
--- spelling that superseded it). Recomputed by the Find-folded-duplicates scan;
--- ambiguous = 1 when old_id has more than one candidate new_id.
+-- old_id (a pre-widening fold) -> new_id (the richer spelling that
+-- superseded it); ambiguous = 1 when old_id has several candidates.
 CREATE TABLE IF NOT EXISTS folded_tag_pairs (
     old_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
     new_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
@@ -385,16 +329,9 @@ CREATE TABLE IF NOT EXISTS folded_tag_pairs (
     PRIMARY KEY (old_id, new_id)
 );
 
--- One row per (image, lookup backend), written the moment an attempt is
--- enqueued: an image nobody ever looked up costs no row. attempts counts
--- consecutive concluded misses and drives the retry ladder; queued_at
--- non-NULL is the in-flight state (there is no pending literal to leak into
--- last_result) and job_id is monloader's id for it, which is what makes an
--- attempt whose callback went missing reconcilable at all. next_due_at NULL
--- means nothing is scheduled, for one of three reasons last_result and
--- images.scheduled_lookup tell apart: a hit, an exhausted ladder, or the
--- operator's opt-out. ptr_cursor is monloader's index position at the miss,
--- so a PTR retry can skip an index that has not moved.
+-- Created at first enqueue. queued_at set = in flight (job_id:
+-- monloader's id); attempts = consecutive misses; next_due_at NULL =
+-- nothing scheduled; ptr_cursor = monloader's index position at the miss.
 CREATE TABLE IF NOT EXISTS image_lookups (
     image_id    INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     backend     TEXT    NOT NULL,
@@ -408,31 +345,16 @@ CREATE TABLE IF NOT EXISTS image_lookups (
     PRIMARY KEY (image_id, backend)
 );
 
--- Indexes
 CREATE INDEX IF NOT EXISTS idx_tags_name         ON tags(name);
 CREATE INDEX IF NOT EXISTS idx_tags_category     ON tags(category_id);
 CREATE INDEX IF NOT EXISTS idx_tags_usage        ON tags(usage_count DESC);
 CREATE INDEX IF NOT EXISTS idx_tags_active_usage ON tags(usage_count DESC, name) WHERE is_alias = 0;
 CREATE INDEX IF NOT EXISTS idx_tags_alias_canonical ON tags(canonical_tag_id, name) WHERE is_alias = 1;
--- Composite covering index: a `tag_id = ?` lookup gets `image_id`
--- straight from the index entry, so the multi-leg INTERSECT in the
--- AND-driver doesn't pay one row-fetch per matched image. The
--- `image_id` suffix also makes `tag_id = ? AND image_id >= ?` a real
--- range seek for the recent-id-bounded INTERSECT shape. This index
--- supersedes the older single-column `idx_image_tags_tag(tag_id)`;
--- Bootstrap drops that one explicitly when upgrading.
+-- image_id makes tag seeks covering, and tag_id = ? AND image_id >= ? a range.
 CREATE INDEX IF NOT EXISTS idx_image_tags_tag_image ON image_tags(tag_id, image_id);
 CREATE INDEX IF NOT EXISTS idx_image_tags_image  ON image_tags(image_id);
--- Covers the collection: filter (name -> image_id semi-join), the
--- sidebar collection counts (GROUP BY name), and the pinned-order
--- position lookup. The PRIMARY KEY (image_id, name) covers the inverse
--- "collections of one image" read.
 CREATE INDEX IF NOT EXISTS idx_image_collections_name ON image_collections(name, image_id, position);
--- Covers the source: filter (site -> image_id semi-join) and the sidebar
--- source-label counts (GROUP BY site), mirroring idx_image_collections_name.
 CREATE INDEX IF NOT EXISTS idx_image_sources_site ON image_sources(site, image_id);
--- Covers the parent-side probe of the derivative-edge linking (find the
--- image holding a pushed post's declared parent URL).
 CREATE INDEX IF NOT EXISTS idx_image_sources_url ON image_sources(url) WHERE url != '';
 CREATE INDEX IF NOT EXISTS idx_tag_implications_implied ON tag_implications(implied_tag_id);
 CREATE INDEX IF NOT EXISTS idx_image_tags_user_tag ON image_tags(tag_id) WHERE is_auto = 0;
@@ -442,53 +364,30 @@ CREATE INDEX IF NOT EXISTS idx_images_sha256     ON images(sha256);
 CREATE INDEX IF NOT EXISTS idx_images_ingested   ON images(ingested_at DESC);
 CREATE INDEX IF NOT EXISTS idx_images_favorited  ON images(is_favorited);
 CREATE INDEX IF NOT EXISTS idx_images_source_type ON images(source_type);
--- idx_images_source(source) is created in db.Bootstrap so the migration's
--- ALTER TABLE ADD COLUMN source on libraries that predate the column
--- runs before this index references it (schema.sql is executed before
--- ensureColumn).
 CREATE INDEX IF NOT EXISTS idx_images_missing    ON images(is_missing);
 CREATE INDEX IF NOT EXISTS idx_images_folder     ON images(folder_path);
 CREATE INDEX IF NOT EXISTS idx_images_folder_visible ON images(folder_path) WHERE is_missing = 0;
 CREATE INDEX IF NOT EXISTS idx_images_filesize_visible ON images(file_size DESC, id DESC) WHERE is_missing = 0;
 CREATE INDEX IF NOT EXISTS idx_images_ingested_visible ON images(ingested_at DESC, id DESC) WHERE is_missing = 0;
--- Partial visible indexes over columns the original schema already
--- carries (file_type, source_type) so mime: / type: / ai: filters
--- seek the visibility-bounded set instead of falling back on
--- idx_images_missing. idx_images_source_visible and
--- idx_images_duration_visible reference columns added by ensureColumn
--- migrations (source, duration_seconds) and live in db.Bootstrap
--- below the matching ensureColumn call - adding them here would
--- error on libraries that predate the columns.
+-- Visible-only, so mime:, type: and ai: don't fall back on idx_images_missing.
 CREATE INDEX IF NOT EXISTS idx_images_file_type_visible   ON images(file_type)   WHERE is_missing = 0;
 CREATE INDEX IF NOT EXISTS idx_images_source_type_visible ON images(source_type) WHERE is_missing = 0;
 CREATE INDEX IF NOT EXISTS idx_image_paths_image ON image_paths(image_id);
--- Partial index over the non-canonical alias rows so the sha256 / file-
--- duplicates walkers and the name: filter's alias-paths EXISTS ride a
--- covering seek instead of scanning every image_paths row to filter
--- for is_canonical = 0. A canonical image_paths row sits on every
--- image; the non-canonical rows are typically a small subset (renames,
--- sha-collisions, sync moves), so the partial index stays cheap.
+-- Aliases are a small slice of image_paths; alias walks seek here, not scan.
 CREATE INDEX IF NOT EXISTS idx_image_paths_aliases ON image_paths(image_id) WHERE is_canonical = 0;
 CREATE INDEX IF NOT EXISTS idx_sd_metadata_genhash      ON sd_metadata(generation_hash)      WHERE generation_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_comfyui_metadata_genhash ON comfyui_metadata(generation_hash) WHERE generation_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sd_metadata_seed         ON sd_metadata(seed)                 WHERE seed IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_comfyui_metadata_seed    ON comfyui_metadata(seed)            WHERE seed IS NOT NULL;
--- Relations covering indexes. The PRIMARY KEY on dup_group_members.image_id
--- and alt_group_members.image_id already covers the per-image group lookup;
--- the (group_id, image_id) shape below covers the inverse - listing a
--- group's members ordered. version_edges and derivative_edges get inverse
--- indexes from the parent / source side. not_related_pairs picks up an
--- index on (b, a) so pair-existence checks ride a covering seek regardless
--- of which side the caller passed first.
+-- NOCASE so a lowercase comfyui: query seeks the stored CamelCase term.
+CREATE INDEX IF NOT EXISTS idx_comfyui_terms_term ON comfyui_terms(term COLLATE NOCASE, image_id);
 CREATE INDEX IF NOT EXISTS idx_dup_group_members_group ON dup_group_members(group_id, image_id);
 CREATE INDEX IF NOT EXISTS idx_alt_group_members_group ON alt_group_members(group_id, image_id);
 CREATE INDEX IF NOT EXISTS idx_derivative_edges_source ON derivative_edges(source_image_id);
 CREATE INDEX IF NOT EXISTS idx_not_related_b           ON not_related_pairs(b_image_id, a_image_id);
 CREATE INDEX IF NOT EXISTS idx_potential_pairs_distance ON potential_relation_pairs(skipped_at, distance, a_image_id);
--- b-side seek for the collection_hidden resweep triggers; the a side
--- rides the primary key prefix.
+-- b-side seek for the resweep triggers; the a side rides the primary key.
 CREATE INDEX IF NOT EXISTS idx_potential_pairs_b        ON potential_relation_pairs(b_image_id);
 CREATE INDEX IF NOT EXISTS idx_image_lookups_due        ON image_lookups(backend, next_due_at);
--- The partial in-flight index is what keeps the reconcile sweep proportional
--- to the handful of rows actually waiting rather than to the table.
+-- Keeps the reconcile sweep proportional to in-flight rows, not the table.
 CREATE INDEX IF NOT EXISTS idx_image_lookups_inflight   ON image_lookups(queued_at) WHERE queued_at IS NOT NULL;

@@ -21,14 +21,11 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// FolderPath computes the relative directory of filePath under
-// galleryPath. Returns "" for files at the gallery root, and for paths
-// that fall outside it. The result is always "/"-separated:
-// folder_path is a DB value, not a filesystem path, so it must be
-// portable across platforms.
+// FolderPath returns "" for the root and outside it; the value is stored,
+// so it is "/"-separated on every platform.
 func FolderPath(galleryPath, filePath string) string {
-	// Rel cleans both sides, so a gallery_path configured with "/" still
-	// matches the native separators the filesystem walk hands back.
+	// Rel cleans both sides, so a "/"-configured gallery path still
+	// matches native walk paths.
 	rel, err := filepath.Rel(galleryPath, filepath.Dir(filePath))
 	if err != nil || rel == "." || !filepath.IsLocal(rel) {
 		return ""
@@ -36,10 +33,8 @@ func FolderPath(galleryPath, filePath string) string {
 	return filepath.ToSlash(rel)
 }
 
-// Ingest processes a single file: hash, dimension probe, metadata
-// extraction, DB insert, thumbnail. Returns (image, isDuplicate, error).
-// origin records how the file got in ("ingest" / "upload" / caller-supplied
-// string); empty defaults to "ingest".
+// Ingest's bool reports a duplicate of an existing image; an empty origin
+// records OriginIngest.
 func Ingest(database *db.DB, galleryPath, thumbnailsPath, path, origin string) (*models.Image, bool, error) {
 	hash, sum, err := hashFileDigests(path)
 	if err != nil {
@@ -49,9 +44,6 @@ func Ingest(database *db.DB, galleryPath, thumbnailsPath, path, origin string) (
 	return ingestWithHash(database, galleryPath, thumbnailsPath, path, hash, sum, origin)
 }
 
-// decodeImageDimensions reads just the header of the image at path and
-// returns its dimensions, or nils when the file can't be opened or
-// decoded - callers treat missing dimensions as non-fatal.
 func decodeImageDimensions(path string) (w, h *int) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -65,9 +57,18 @@ func decodeImageDimensions(path string) (w, h *int) {
 	return &cfg.Width, &cfg.Height
 }
 
-// ingestWithHash is the body of Ingest minus the hashFileDigests +
-// claimOwnership preamble. Sync uses it directly to avoid double-hashing
-// the same file on large libraries.
+func stillDimensions(path, fileType string) (w, h *int) {
+	if !IsFFmpegStill(fileType) {
+		return decodeImageDimensions(path)
+	}
+	pw, ph, ok := ProbeVideoDimensions(path)
+	if !ok {
+		return nil, nil
+	}
+	return &pw, &ph
+}
+
+// The caller supplies path's digests and claims its ownership.
 func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, sum, origin string) (*models.Image, bool, error) {
 	origin = cmp.Or(origin, models.OriginIngest)
 	var existingID int64
@@ -88,10 +89,6 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		img.IsMissing = isMissingInt == 1
 
 		if img.IsMissing {
-			// Previously-missing file has reappeared; reactivate it.
-			// Demote the previous canonical to alias and upsert the new
-			// path as canonical (mirrors the watcher-mv branch below) so
-			// the prior path stays in image_paths for history.
 			newFolder := FolderPath(galleryPath, path)
 			tx, txErr := database.Write.Begin()
 			if txErr != nil {
@@ -104,9 +101,8 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			if _, err := tx.Exec(`UPDATE images SET md5 = ? WHERE id = ?`, sum, existingID); err != nil {
 				return nil, false, fmt.Errorf("reactivate image md5: %w", err)
 			}
-			// Restore the usage_count slots markFileMissing decremented
-			// when the file vanished. usage_count tracks visible images,
-			// so a reactivated row owes +1 to every tag still attached.
+			// usage_count counts visible images, so every tag still
+			// attached gets back the slot the missing mark took.
 			if _, err := tx.Exec(
 				`UPDATE tags SET usage_count = usage_count + 1
 				 WHERE id IN (SELECT tag_id FROM image_tags WHERE image_id = ?)`,
@@ -125,11 +121,8 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			return &img, false, nil
 		}
 
-		// Watcher-observed mv inside the gallery: fsnotify emits a Create
-		// for the new path while the old canonical_path is already gone
-		// from disk. Promote the new path and drop the old one - a path
-		// whose file no longer exists must not linger as an alias, or it
-		// resurfaces as a phantom duplicate on the detail page.
+		// The old canonical is gone, so this is a move: the old path kept
+		// as an alias would show as a phantom duplicate.
 		if _, statErr := os.Stat(img.CanonicalPath); statErr != nil {
 			newFolder := FolderPath(galleryPath, path)
 			tx, txErr := database.Write.Begin()
@@ -149,7 +142,6 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			return &img, false, nil
 		}
 
-		// Normal duplicate: record this path as an alias.
 		_, aliasErr := database.Write.Exec(
 			`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 0)`,
 			existingID, path,
@@ -163,12 +155,8 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		return nil, false, fmt.Errorf("checking sha256: %w", err)
 	}
 
-	// DetectFileType trusts the extension so the sync walk stays free of
-	// per-file reads, which leaves bytes that are not media at all - a
-	// text file renamed .png - reaching here, where they would insert a
-	// row with no dimensions, no thumbnail and no phash. The signature
-	// decides both whether to commit a row and what type it records, so
-	// a PNG saved as .jpg keeps its metadata and answers type:png.
+	// The walk trusts extensions, so the signature decides here whether
+	// to add a row and which type it records.
 	fileType, err := detectMagicType(path)
 	if err != nil {
 		logx.Warnf("ingest: skip %q: contents are not a supported media type", path)
@@ -182,11 +170,8 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 
 	folderPath := FolderPath(galleryPath, path)
 
-	// The path is already registered under a different SHA: the file was
-	// rewritten where it stands (a crop in an external editor, a watcher
-	// WRITE on a known file). image_paths.path is UNIQUE, so the insert
-	// below would die on the constraint and roll the whole ingest back,
-	// leaving the row describing bytes that are gone.
+	// A path registered under another SHA was rewritten in place;
+	// image_paths.path is UNIQUE, so the insert below would fail.
 	var prevID int64
 	var prevCanonical int
 	switch pathErr := database.Read.QueryRow(
@@ -203,9 +188,8 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			FileType: fileType, FileSize: fi.Size(), Phash: phash,
 		}, false, nil
 	case pathErr == nil:
-		// An alias path whose bytes no longer match the image it was a copy
-		// of. The row it pointed at still has its own file; this one is a
-		// new image and needs the path.
+		// A rewritten alias: the image keeps its own file, and this path
+		// becomes a new image.
 		if _, delErr := database.Write.Exec(`DELETE FROM image_paths WHERE path = ?`, path); delErr != nil {
 			return nil, false, fmt.Errorf("dropping stale alias path: %w", delErr)
 		}
@@ -229,10 +213,6 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 	if fileType == models.FileTypeCBZ {
 		archive, openErr := OpenManga(path)
 		if openErr != nil {
-			// Empty / corrupt cbz: log and skip without inserting a
-			// row. The watcher / sync caller treats this as a
-			// non-fatal "skip" the same way a video without ffmpeg is
-			// treated - the file stays on disk for the operator.
 			logx.Warnf("ingest: skip manga %q: %v", path, openErr)
 			return nil, false, fmt.Errorf("ingest manga: %w", openErr)
 		}
@@ -253,14 +233,13 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		pageCount = &pcVal
 		_ = archive.Close()
 	} else if !IsVideoType(fileType) {
-		imgWidth, imgHeight = decodeImageDimensions(path)
+		imgWidth, imgHeight = stillDimensions(path, fileType)
 	}
 
 	sdMeta, comfyMeta, sourceType := extractGenerationMeta(path, fileType)
 
-	// ON CONFLICT(sha256) DO NOTHING so a concurrent ingest that wrote the
-	// same SHA between our read-pool check and this transaction falls into
-	// the duplicate branch instead of failing with a UNIQUE constraint.
+	// ON CONFLICT DO NOTHING: a concurrent ingest may have written this
+	// SHA since the read-pool check.
 	tx, err := database.Write.Begin()
 	if err != nil {
 		return nil, false, err
@@ -277,9 +256,6 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 	).Scan(&imgID)
 
 	if insertErr == sql.ErrNoRows {
-		// Lost the race to another concurrent ingest. Record this path as
-		// an alias of whichever id now owns the SHA and return a duplicate
-		// result so the caller logs "duplicate" instead of an error.
 		var existingID int64
 		if err := tx.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, hash).Scan(&existingID); err != nil {
 			return nil, false, fmt.Errorf("race: fetch existing sha: %w", err)
@@ -293,7 +269,6 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		if err := tx.Commit(); err != nil {
 			return nil, false, fmt.Errorf("race: commit alias: %w", err)
 		}
-		// Reload the existing image record so callers see the real state.
 		var img models.Image
 		var isMissingInt int
 		if err := database.Read.QueryRow(
@@ -334,7 +309,6 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			return nil, false, fmt.Errorf("inserting manga_metadata: %w", err)
 		}
 	}
-	// Mirror the prefilled home collection into image_collections.
 	if prefilledSeries != "" {
 		if _, err := tx.Exec(
 			`INSERT OR IGNORE INTO image_collections (image_id, name, position) VALUES (?, ?, NULL)`,
@@ -349,6 +323,10 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 	}
 
 	phash := regenerateDerived(database, thumbnailsPath, path, imgID, fileType, "ingest")
+	// After the thumbnail, which is what the greyscale probe reads.
+	if err := ApplyMetaTags(database, thumbnailsPath, imgID); err != nil {
+		logx.Warnf("ingest: meta tags for %q: %v", path, err)
+	}
 
 	img := &models.Image{
 		Phash:         phash,
@@ -384,9 +362,7 @@ func toNullFloat(v *float64) interface{} {
 	return *v
 }
 
-// extractGenerationMeta reads whichever generation blobs the file
-// carries and classifies the pair into the source_type the row records.
-// Every path that rewrites a file's bytes owes the row all three.
+// A path that rewrites a file's bytes must store all three.
 func extractGenerationMeta(path, fileType string) (*models.SDMetadata, *models.ComfyUIMetadata, string) {
 	sd, comfy, _ := metadata.Extract(path, fileType)
 	switch {
@@ -400,10 +376,8 @@ func extractGenerationMeta(path, fileType string) (*models.SDMetadata, *models.C
 	return sd, comfy, models.SourceTypeNone
 }
 
-// ReplaceGenerationMetadata swaps the sd / comfyui side-table rows for
-// imageID. An edit, a replace or a re-extract can add a recipe, change it,
-// or strip one, so the old rows go whether or not new ones arrive - which
-// also makes the inserts' OR IGNORE moot here, on a single-writer DB.
+// ReplaceGenerationMetadata drops the old rows even when no new ones
+// arrive: a rewrite can strip a recipe.
 func ReplaceGenerationMetadata(ctx context.Context, tx *sql.Tx, imageID int64, sd *models.SDMetadata, comfy *models.ComfyUIMetadata) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sd_metadata WHERE image_id = ?`, imageID); err != nil {
 		return fmt.Errorf("clear sd_metadata: %w", err)
@@ -436,12 +410,14 @@ func insertSDMeta(ctx context.Context, tx *sql.Tx, sd *models.SDMetadata) error 
 }
 
 func insertComfyMeta(ctx context.Context, tx *sql.Tx, comfy *models.ComfyUIMetadata) error {
-	_, err := tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO comfyui_metadata (image_id, prompt, model_checkpoint, seed, sampler, steps, cfg_scale, raw_workflow, generation_hash)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		comfy.ImageID, comfy.Prompt, comfy.ModelCheckpoint, comfy.Seed, comfy.Sampler, comfy.Steps, comfy.CFGScale, comfy.RawWorkflow, comfy.GenerationHash,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	return WriteComfyTerms(ctx, tx, comfy.ImageID, comfy.RawWorkflow)
 }
 
 func insertMangaMeta(tx *sql.Tx, m *models.MangaMetadata) error {
@@ -462,13 +438,8 @@ func insertMangaMeta(tx *sql.Tx, m *models.MangaMetadata) error {
 	return err
 }
 
-// DropDuplicateCopy removes the file and the alias row an ingest recorded for
-// bytes the gallery already holds under another path. A re-uploaded archive
-// would otherwise cost its own size again with no UI to reclaim it. The row's
-// own canonical path is not another path - an ingest reads bytes the caller
-// just wrote back there as a duplicate - and unlinking it would take the
-// image's only copy. logCtx names the caller in the warnings; failures are
-// logged, never fatal, since the row the caller keeps is already correct.
+// DropDuplicateCopy leaves the canonical path alone: an ingest of bytes
+// rewritten there also reports a duplicate, and that file is the only copy.
 func DropDuplicateCopy(database *db.DB, imageID int64, path, logCtx string) {
 	var canonical string
 	if err := database.Read.QueryRow(
@@ -478,6 +449,10 @@ func DropDuplicateCopy(database *db.DB, imageID int64, path, logCtx string) {
 		return
 	}
 	if canonical == path {
+		return
+	}
+	// With the canonical gone from disk this copy is the only one, and a sync promotes it.
+	if _, err := os.Stat(canonical); err != nil {
 		return
 	}
 	if _, err := database.Write.Exec(

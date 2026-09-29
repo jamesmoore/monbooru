@@ -11,11 +11,6 @@ import (
 	"golang.org/x/image/draw"
 )
 
-// inputTensorPools holds one float32-slice sync.Pool per model input
-// size. buildTensor writes every element of the returned slice so a
-// recycled buffer needs no zeroing; ort.NewTensor aliases the slice in
-// place, and callers must put the buffer back only after Destroy on
-// the tensor.
 var inputTensorPools sync.Map
 
 // The pool holds *[]float32, not []float32: pooling the slice itself boxes
@@ -36,31 +31,21 @@ func releaseTensor(size int, buf []float32) {
 	}
 }
 
-// imageNetMean / imageNetStd are the per-channel ImageNet statistics most
-// EfficientNet / ResNet exports were trained with. Camie v2 documents
-// these directly.
 var (
 	imageNetMean = [3]float32{0.485, 0.456, 0.406}
 	imageNetStd  = [3]float32{0.229, 0.224, 0.225}
 )
 
-// clipMean / clipStd come from joytag's preprocess step (OpenAI CLIP
-// values). Kept verbatim so the joytag inference path stays bit-identical
-// across the refactor.
+// OpenAI CLIP values from joytag's preprocess, kept verbatim to match its
+// reference output.
 var (
 	clipMean = [3]float32{0.48145466, 0.4578275, 0.40821073}
 	clipStd  = [3]float32{0.26862954, 0.26130258, 0.27577711}
 )
 
-// camieDefaultFill is the fill colour Camie's onnx_inference.py pads with
-// when the source image's aspect ratio doesn't fill the model's square
-// input. Used when a profile picks pad="mean_color_aspect" without an
-// explicit FillColor override.
+// camieDefaultFill is the padding colour of Camie's onnx_inference.py.
 var camieDefaultFill = [3]uint8{124, 116, 104}
 
-// padAndResize pads src into a square according to the profile's pad
-// strategy, then resizes to size×size. Returns *image.RGBA so the caller
-// can read .Pix directly.
 func padAndResize(src image.Image, size int, profile Profile) *image.RGBA {
 	switch profile.Pad {
 	case "mean_color_aspect":
@@ -69,16 +54,8 @@ func padAndResize(src image.Image, size int, profile Profile) *image.RGBA {
 	return padWhiteSquare(src, size)
 }
 
-// padWhiteSquare resizes src preserving aspect ratio so the long side is
-// `size`, centres it on a `size×size` white canvas, then forces fully-
-// transparent pixels (e.g. PNG corners) to opaque white so the tensor
-// sees the same background regardless of source alpha.
-//
-// image.NewRGBA returns a zero-initialised buffer (alpha=0 everywhere),
-// so draw.Src into the scaled sub-rect leaves the padding region with
-// alpha=0. One final walk over alpha covers both jobs - the padding
-// region and any transparent source pixel land on the same "fill white"
-// branch in a single pass instead of two.
+// The canvas starts at alpha 0, so one pass over alpha turns both the
+// padding and any transparent source pixel white.
 func padWhiteSquare(src image.Image, size int) *image.RGBA {
 	scaled, offX, offY := resizeAspect(src, size)
 
@@ -95,10 +72,6 @@ func padWhiteSquare(src image.Image, size int) *image.RGBA {
 	return dst
 }
 
-// padMeanColorAspect resizes src preserving aspect ratio so the long side
-// is `size`, then centres it on a `size×size` canvas filled with the
-// profile's FillColor (defaulting to camieDefaultFill). Camie's published
-// inference recipe.
 func padMeanColorAspect(src image.Image, size int, fill [3]uint8) *image.RGBA {
 	if fill == ([3]uint8{}) {
 		fill = camieDefaultFill
@@ -116,11 +89,8 @@ func padMeanColorAspect(src image.Image, size int, fill [3]uint8) *image.RGBA {
 	return dst
 }
 
-// resizeAspect scales src so its long side is size, preserving aspect
-// (short side clamped to >= 1 px), and returns the centring offsets on a
-// size x size canvas. Resize-first keeps peak transient allocation
-// bounded by size^2 so a parallel inference burst on multi-megapixel
-// sources stays inside small container caps.
+// Resizing before padding bounds each transient buffer by size^2, which keeps
+// a parallel burst on huge sources inside small container memory caps.
 func resizeAspect(src image.Image, size int) (scaled *image.RGBA, offX, offY int) {
 	b := src.Bounds()
 	w, h := b.Max.X-b.Min.X, b.Max.Y-b.Min.Y
@@ -131,33 +101,19 @@ func resizeAspect(src image.Image, size int) (scaled *image.RGBA, offX, offY int
 		scaleW = max(1, w*size/h)
 	}
 	scaled = image.NewRGBA(image.Rect(0, 0, scaleW, scaleH))
-	// Only the kernel scalers widen their support as they shrink.
-	// ApproxBiLinear reads four source pixels at any ratio, and the
-	// aliasing that leaves is what a tagger scores as pixel art.
+	// Not ApproxBiLinear: it reads four source pixels at any ratio, and
+	// the aliasing it leaves gets tagged as pixel art.
 	draw.BiLinear.Scale(scaled, scaled.Bounds(), src, b, draw.Src, nil)
 	return scaled, (size - scaleW) / 2, (size - scaleH) / 2
 }
 
-// buildTensor fills the supplied ORT input buffer from the resized RGBA
-// image. tensor must have len >= 3*size*size; every element is
-// overwritten so a recycled buffer needs no zeroing. Reading Pix
-// directly skips the per-pixel image.Image interface dispatch that
-// would otherwise keep the GPU idle between inferences.
-//
-// The branches diverge on layout (NHWC vs NCHW), channel order (BGR vs
-// RGB), and per-channel normalisation (none, ImageNet, CLIP). A profile
-// resolved to (NHWC, BGR, none) reproduces the WD14 path bit-for-bit;
-// (NCHW, RGB, CLIP) reproduces joytag's.
+// buildTensor overwrites every element: pooled buffers are not zeroed.
 func buildTensor(img *image.RGBA, tensor []float32, size int, profile Profile) (ort.Shape, error) {
 	pix := img.Pix
 	stride := img.Stride
 
 	switch profile.Layout {
 	case "nhwc":
-		// WD14 is the only NHWC profile in tree and ships with
-		// normalize="none" (sigmoid in the model handles its own scaling).
-		// A future NHWC profile that needs a per-channel transform can
-		// fold it in here.
 		if profile.Normalize != "" && profile.Normalize != "none" {
 			return nil, fmt.Errorf("buildTensor: NHWC + normalize=%q is not implemented", profile.Normalize)
 		}

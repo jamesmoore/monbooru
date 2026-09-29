@@ -13,8 +13,6 @@ import (
 	"github.com/monbooru/monbooru/internal/desktop"
 )
 
-// runHealthcheck is the body of the `monbooru healthcheck` subcommand. It
-// GETs the local /health endpoint and exits 0 on a 2xx, non-zero otherwise.
 func runHealthcheck(argv []string) {
 	fs := flag.NewFlagSet("healthcheck", flag.ExitOnError)
 	configPath := fs.String("config", "", "optional monbooru.toml to read server.bind_address from")
@@ -38,9 +36,7 @@ func runHealthcheck(argv []string) {
 	}
 }
 
-// resolveHealthAddr picks the address to probe the same way the server picks
-// its bind address, but WITHOUT config.LoadWithDefaults's side effect of
-// rewriting the TOML on every call (a healthcheck runs every interval).
+// Not config.LoadWithDefaults, which writes a default config where none exists.
 func resolveHealthAddr(configPath string) string {
 	addr := os.Getenv("MONBOORU_SERVER_BIND_ADDRESS")
 	if addr == "" && configPath != "" {

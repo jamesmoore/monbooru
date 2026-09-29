@@ -69,7 +69,7 @@
     {{end}}
   </ul>
 
-  {{$base := printf "/collections?q=%s&sort=%s&page=" .Prefix .Sort}}
+  {{$base := printf "/collections?q=%s&sort=%s&page=" (urlQ .Prefix) (urlQ .Sort)}}
   <div hx-boost="true" hx-target="#collections-page" hx-select="#collections-page" hx-swap="outerHTML" hx-select-oob="#sidebar-inner" hx-push-url="true">
   {{template "partials/pagination.html" (dict "Base" $base "Page" .Page "Total" .TotalPages)}}
   </div>
@@ -102,9 +102,6 @@
 </dialog>
 
 <script>
-// htmx swaps #collections-page in place on filter clicks and the live
-// search, so the card buttons bind through delegated document-level
-// listeners that resolve their element at event time.
 function openCollectionRename(btn) {
   var name = btn.dataset.name;
   document.getElementById('collection-rename-prev').value = name;
@@ -144,11 +141,39 @@ function captureOrigOrder() {
     function(t) { return t.dataset.id; });
 }
 
-// applyOrderMode reflows the tiles for the current mode - filename mode sorts
-// them by filename (natural), order mode restores the server's reading order -
-// then flips the toggle's active button and the mode-specific lines. The
-// mode only arranges the grid; it assigns no order on its own (that is a click,
-// or Save while in filename mode).
+// A port of gallery.NaturalLess, then the id: the order Save stores.
+function filenameKey(name) {
+  return Array.from(name, function(c) { return c.toLowerCase().codePointAt(0); });
+}
+
+function isDigit(c) { return c >= 48 && c <= 57; }
+
+function compareFilenameKeys(a, b) {
+  var i = 0;
+  while (i < a.length && i < b.length) {
+    if (isDigit(a[i]) && isDigit(b[i])) {
+      var ae = i, be = i;
+      while (ae < a.length && isDigit(a[ae])) ae++;
+      while (be < b.length && isDigit(b[be])) be++;
+      var as = i, bs = i;
+      while (as < ae && a[as] === 48) as++;
+      while (bs < be && b[bs] === 48) bs++;
+      if (ae - as !== be - bs) return (ae - as) - (be - bs);
+      for (var k = 0; k < ae - as; k++) {
+        if (a[as + k] !== b[bs + k]) return a[as + k] - b[bs + k];
+      }
+      if (ae !== be) return ae - be;
+      i = ae;
+      continue;
+    }
+    if (a[i] !== b[i]) return a[i] - b[i];
+    i++;
+  }
+  return a.length - b.length;
+}
+
+// Only rearranges the grid: an order comes from clicks, or from Save in
+// filename mode.
 function applyOrderMode() {
   document.querySelectorAll('#collection-order-body [data-order-mode]').forEach(function(b) {
     b.classList.toggle('active', b.dataset.orderMode === _orderMode);
@@ -164,8 +189,10 @@ function applyOrderMode() {
     grid.classList.toggle('filename-preview', _orderMode === 'filename');
     var tiles = Array.prototype.slice.call(grid.querySelectorAll('.collection-order-tile'));
     if (_orderMode === 'filename') {
+      var keys = {};
+      tiles.forEach(function(t) { keys[t.dataset.id] = filenameKey(t.dataset.filename || ''); });
       tiles.sort(function(a, b) {
-        return (a.dataset.filename || '').localeCompare(b.dataset.filename || '', undefined, {numeric: true, sensitivity: 'base'});
+        return compareFilenameKeys(keys[a.dataset.id], keys[b.dataset.id]) || Number(a.dataset.id) - Number(b.dataset.id);
       });
       tiles.forEach(function(t) { grid.appendChild(t); });
     } else {
@@ -178,8 +205,6 @@ function applyOrderMode() {
   renumberOrderTiles();
 }
 
-// renumberOrderTiles labels each tile with its click position, if picked. The
-// mode only rearranges the grid; it never assigns an order on its own.
 function renumberOrderTiles() {
   document.querySelectorAll('#collection-order-body .collection-order-tile').forEach(function(tile) {
     var i = _orderClicks.indexOf(tile.dataset.id);
@@ -203,9 +228,7 @@ function openCollectionOrder(btn) {
   dlg.showModal();
 }
 
-// startTileRename swaps a tile's filename overlay for an input; Enter
-// posts the rename and writes back the final name (a collision may have
-// suffixed it), Escape or leaving the field cancels.
+// The rename writes back the server's name: a collision may have suffixed it.
 function startTileRename(span) {
   if (span.querySelector('input')) return;
   var tile = span.closest('.collection-order-tile');
@@ -239,9 +262,14 @@ function startTileRename(span) {
     body.set('inline', '1');
     fetch('/images/' + tile.dataset.id + '/place', {
       method: 'POST',
-      headers: {'X-CSRF-Token': getCSRFToken(), 'Content-Type': 'application/x-www-form-urlencoded'},
+      headers: {'X-CSRF-Token': getCSRFToken(), 'X-Monbooru-Gallery': activeGallery(), 'Content-Type': 'application/x-www-form-urlencoded'},
       body: body
     }).then(function(r) {
+      if (sessionLost(r)) {
+        showLoginNotice();
+        finish();
+        return;
+      }
       if (!r.ok) {
         setFlashText(document.getElementById('collection-order-error'), 'err', 'Rename failed.');
         finish();
@@ -271,8 +299,6 @@ document.getElementById('collection-order-body').addEventListener('click', funct
   }
   var more = e.target.closest('.collection-order-more');
   if (more) {
-    // Re-fetch the window with a larger limit; picked ids live in
-    // _orderClicks, so renumbering restores them on the fresh tiles.
     var dlg = document.getElementById('collection-order-dialog');
     var body = document.getElementById('collection-order-body');
     more.disabled = true;
@@ -314,8 +340,6 @@ document.getElementById('collection-order-form').addEventListener('submit', func
     failMsg: 'Reorder failed.',
     catchMsg: 'Reorder request failed.',
     onOK: function(res) {
-      // Stash the server's "Ordered N image(s)." flash so it survives
-      // the reload that refreshes the sample strips.
       res.text().then(function(t) {
         stashActionFlash(t, 'ok');
         window.location.reload();
@@ -350,6 +374,7 @@ function confirmGenerateCBZ(btn) {
   }, 'The collection itself is not modified; its images become the pages of a new manga item.', 'Generate cbz');
 }
 
+// Delegated: htmx swaps #collections-page on filters and the live search.
 document.addEventListener('click', function(e) {
   if (!e.target.closest) return;
   var el = e.target.closest('.btn-rename-collection');

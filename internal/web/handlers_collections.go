@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
@@ -14,11 +15,9 @@ import (
 
 const collectionsPerPage = 60
 
-// Preview tiles fetched per collection. Generous so the strip fills a wide
-// row; the template clips the overflow to a single line.
+// Generous on purpose: the template clips the strip to one line.
 const collectionPreviewSamples = 16
 
-// Tiles per fetch of the click-to-order dialog body.
 const collectionOrderWindow = 200
 
 type collectionsPageData struct {
@@ -32,8 +31,7 @@ type collectionsPageData struct {
 }
 
 func (s *Server) collectionsHandler(w http.ResponseWriter, r *http.Request) {
-	// Rename / dissolve mutate the listing; opt out of caching so a reload
-	// after a job never serves a stale render.
+	// A rename or dissolve job changes the listing a reload must show.
 	w.Header().Set("Cache-Control", "no-store")
 	q := r.URL.Query()
 	prefix := strings.TrimSpace(q.Get("q"))
@@ -86,8 +84,7 @@ func (s *Server) collectionsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// renameCollectionPost relabels a collection across every member as a
-// background tag job. Renaming onto an existing label merges the two.
+// Renaming onto an existing label merges the two.
 func (s *Server) renameCollectionPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -98,7 +95,7 @@ func (s *Server) renameCollectionPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusBadRequest, "Both the current and the new collection name are required.")
 		return
 	}
-	if len(newName) > maxExternalSourceLen {
+	if utf8.RuneCountInString(newName) > maxExternalSourceLen {
 		flashStatus(w, http.StatusBadRequest, "Collection label too long.")
 		return
 	}
@@ -111,9 +108,6 @@ func (s *Server) renameCollectionPost(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// collectionFindRelationsPost flips a collection's find-relations opt-in
-// and answers with the refreshed switch so the htmx swap shows the new
-// state in place.
 func (s *Server) collectionFindRelationsPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -139,15 +133,7 @@ func (s *Server) collectionFindRelationsPost(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// collectionOrderDialog renders the click-to-order dialog body: the
-// first visible members of the collection under the caller's ceiling,
-// in the current reading order. Windowed by limit so a huge label
-// doesn't render tens of thousands of tiles in one dialog body; the
-// [show more] button re-fetches with a larger limit.
 func (s *Server) collectionOrderDialog(w http.ResponseWriter, r *http.Request) {
-	// Fetched as a fragment by the collections page's order dialog; a
-	// non-htmx caller (refresh, bookmark, shared link) gets the listing
-	// rather than a chrome-less fragment.
 	if !isHTMXRequest(r) {
 		http.Redirect(w, r, "/collections", http.StatusSeeOther)
 		return
@@ -182,8 +168,6 @@ func (s *Server) collectionOrderDialog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// reorderCollectionPost applies the dialog's click order: the listed ids
-// get positions 1..N, every other member goes unordered.
 func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -192,8 +176,6 @@ func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Filename mode ignores the clicked ids and orders the whole collection by
-	// filename, ceiling-blind.
 	if r.FormValue("mode") == "filename" {
 		if err := gallery.SortCollectionByFilename(s.db(), name); err != nil {
 			flashStatus(w, http.StatusInternalServerError, "Could not reorder the collection.")
@@ -217,9 +199,8 @@ func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, id)
 	}
 	clicked := len(ids)
-	// The dialog only offers the members the ceiling lets through, so the
-	// hidden ones ride behind the arranged block instead of being cleared
-	// with everything the operator did not click.
+	// The dialog shows only what the ceiling lets through, so hidden members
+	// go after the clicked ones rather than losing their position.
 	hidden, err := gallery.CollectionHiddenOrderedIDs(s.db(), name, resolveCeiling(r, s.active()).ExcludedTagIDs())
 	if err != nil {
 		flashStatus(w, http.StatusInternalServerError, "Could not reorder the collection.")
@@ -234,9 +215,6 @@ func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", fmt.Sprintf("Ordered %d image(s).", clicked))
 }
 
-// startCollectionJob materialises the collection's membership and spawns run
-// as the jobs-lane background job, answering 202; shared by rename and
-// dissolve.
 func (s *Server) startCollectionJob(w http.ResponseWriter, name string, run func([]int64)) {
 	ids, err := gallery.CollectionMemberIDs(s.db(), name)
 	if err != nil {
@@ -254,9 +232,6 @@ func (s *Server) startCollectionJob(w http.ResponseWriter, name string, run func
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// dissolveCollectionPost drops a collection label from every member as a
-// background tag job. Images and files are left untouched; it reuses the
-// batch-collection remove path over the full membership.
 func (s *Server) dissolveCollectionPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -267,8 +242,7 @@ func (s *Server) dissolveCollectionPost(w http.ResponseWriter, r *http.Request) 
 	}
 	s.startCollectionJob(w, name, func(ids []int64) {
 		s.runBatchCollection(ids, name, "remove")
-		// Drop the find-relations opt-in so a later collection reusing the
-		// label starts from the disabled default.
+		// So a later collection reusing the label starts opted out.
 		if _, err := s.db().Write.Exec(
 			`DELETE FROM collection_find_relations WHERE name = ?`, name); err != nil {
 			logx.Debugf("dissolve collection find-relations flag: %v", err)
@@ -276,23 +250,16 @@ func (s *Server) dissolveCollectionPost(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// runRenameCollection relabels old to new across ids in chunks. An image
-// already holding new keeps its existing membership (the old one is
-// dropped so the relabel can't collide on the (image_id, name) key); the
-// home mirror follows for rows homed on the old label. On a merge the
-// incoming members are renumbered past the target's last position, so the
-// two reading orders append instead of interleaving.
 func (s *Server) runRenameCollection(ids []int64, oldName, newName string) {
 	ctx := s.jobs.Context()
 	const chunkSize = 500
 	total := len(ids)
-	// A case-only rename ("New" -> "new") targets the same NOCASE label, so
-	// there is nothing to merge; the collision delete below would otherwise
-	// drop the very rows the relabel is meant to recase.
+	// A case-only rename hits the same NOCASE label: merging would delete
+	// the very rows it is meant to recase.
 	merging := !strings.EqualFold(oldName, newName)
 
-	// Read once, before any chunk relabels: the target's own members are
-	// never renumbered, so the offset stays valid for the whole job.
+	// Read once before any chunk: the target's own members are never
+	// renumbered, so the offset holds for the whole job.
 	var posOffset int
 	if merging {
 		if err := s.db().Read.QueryRow(
@@ -306,9 +273,8 @@ func (s *Server) runRenameCollection(ids []int64, oldName, newName string) {
 		return gallery.RenameCollectionForImages(s.db(), chunk, oldName, newName, posOffset, merging)
 	})
 	if err == nil {
-		// Carry the find-relations opt-in to the new label; on a merge the
-		// target's own row wins. The DELETE only runs when merging - on a
-		// case-only rename it would match the row the UPDATE just recased.
+		// On a merge the target's own flag wins; the DELETE is merge-only,
+		// since on a case-only rename it would match the recased row.
 		if _, e := s.db().Write.Exec(
 			`UPDATE OR IGNORE collection_find_relations SET name = ? WHERE name = ?`, newName, oldName); e != nil {
 			logx.Debugf("rename collection find-relations flag: %v", e)

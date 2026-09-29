@@ -1,17 +1,11 @@
-// Package galleryio moves a whole gallery in or out: export, import,
-// merge, and transfer between two live galleries, in each format the app
-// ships. It writes most tables directly rather than through the domain
-// services, and that is deliberate - a restore has to reproduce what was
-// exported, and routing it through the services would fire implication
-// fan-outs and usage recounts that the document already carries.
-//
-// It sits beside internal/gallery rather than inside it because what it
-// owns is a document format and the round trip through it, which is a
-// different thing from the files and rows a live gallery is made of.
+// Package galleryio exports, imports, merges and transfers whole
+// galleries. A restore writes tables directly: the services would fire
+// implication fan-outs and recounts the document already carries.
 package galleryio
 
 import (
 	"archive/zip"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -28,10 +22,8 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// SafeArchiveDest joins a relative archive path under root and returns the
-// resolved absolute destination, rejecting paths that escape root through
-// `..` segments or absolute roots. Routes through gallery.PathInside so a
-// legal name like "foo..bar.ext" isn't caught by a `..` substring check.
+// SafeArchiveDest rejects an absolute entry or one that escapes root. It uses
+// PathInside, not a ".." substring test, so "foo..bar.ext" stays legal.
 func SafeArchiveDest(root, rel string) (string, error) {
 	if filepath.IsAbs(rel) {
 		return "", fmt.Errorf("absolute archive entry path")
@@ -50,38 +42,15 @@ func SafeArchiveDest(root, rel string) (string, error) {
 	return dst, nil
 }
 
-// ExportVersion is the full-export JSON document's `"version"`
-// field. v2 carries manga_metadata + images.page_count + images.series;
-// v3 adds image_collections, image_sources, image_annotations and
-// images.note; v4 adds image_annotations.manual (operator-drawn boxes);
-// v5 adds the relation tables (duplicate / alternate / version / derivative /
-// not-related); v6 adds image_sources.similarity; v7 adds
-// image_sources.original; v8 adds images.original_source; v9 adds images.md5
-// and image_sources.md5_match / parent_url / upgrade_kept / post_width /
-// post_height / post_size / post_ext; v10 adds images.phash /
-// last_read_page / scheduled_lookup / scheduled_lookup_ptr / upload_batch,
-// image_tags.stale, image_paths.mtime_unix / mtime_nsec, tags.stale,
-// tag_implications.stale and the image_lookups /
-// collection_find_relations tables; v11 adds image_tag_sources. Older
-// imports down to ExportMinSupported still round-trip (the new columns
-// default, the new tables stay empty or, for image_collections, derive
-// from images.series, for image_tag_sources from image_tags.tagger_name
-// and, for the scheduled-lookup opt-ins, from the schema default the
-// pre-v10 library was running under).
-const ExportVersion = 11
+// Bump ExportVersion when the document gains a field; loadExportIntoDB
+// must still read every version down to ExportMinSupported.
+const ExportVersion = 12
 
-// ExportMinSupported is the oldest full-export version this
-// server reads; anything below is rejected.
 const ExportMinSupported = 1
 
-// LightManifestVersion is the on-disk version of the light tags.json
-// manifest. The light format carries only sha256 / path / tags per
-// row, so it doesn't track full-export schema bumps.
+// LightManifestVersion does not follow ExportVersion.
 const LightManifestVersion = 1
 
-// DecodeExport reads a full-export JSON document and rejects any
-// version outside the supported range. The caller owns opening/closing
-// the reader.
 func DecodeExport(r io.Reader) (Export, error) {
 	var exp Export
 	if err := json.NewDecoder(r).Decode(&exp); err != nil {
@@ -93,8 +62,6 @@ func DecodeExport(r io.Reader) (Export, error) {
 	return exp, nil
 }
 
-// Export is the root JSON document. Field order mirrors schema.sql so a
-// human opening the file reads the schema top-down.
 type Export struct {
 	Version          int                  `json:"version"`
 	GalleryName      string               `json:"gallery_name"`
@@ -102,6 +69,7 @@ type Export struct {
 	TagCategories    []TagCategoryRow     `json:"tag_categories"`
 	Tags             []TagRow             `json:"tags"`
 	TagImplications  []TagImplicationRow  `json:"tag_implications"`
+	TagNotes         []TagNoteRow         `json:"tag_notes,omitempty"`
 	Images           []ImageRow           `json:"images"`
 	ImageCollections []ImageCollectionRow `json:"image_collections,omitempty"`
 	FindRelations    []FindRelationsRow   `json:"collection_find_relations,omitempty"`
@@ -145,42 +113,37 @@ type TagRow struct {
 }
 
 type ImageRow struct {
-	ID              int64           `json:"id"`
-	SHA256          string          `json:"sha256"`
-	MD5             string          `json:"md5,omitempty"`
-	CanonicalPath   string          `json:"canonical_path"`
-	FolderPath      string          `json:"folder_path"`
-	FileType        string          `json:"file_type"`
-	Width           sql.NullInt64   `json:"width"`
-	Height          sql.NullInt64   `json:"height"`
-	FileSize        int64           `json:"file_size"`
-	IsMissing       int             `json:"is_missing"`
-	IsFavorited     int             `json:"is_favorited"`
-	IsInbox         int             `json:"is_inbox"`
-	AutoTaggedAt    sql.NullString  `json:"auto_tagged_at"`
-	SourceType      string          `json:"source_type"`
-	Origin          string          `json:"origin"`
-	Source          string          `json:"source"`
-	URL             string          `json:"url"`
-	PageCount       sql.NullInt64   `json:"page_count,omitempty"`
-	DurationSeconds sql.NullFloat64 `json:"duration_seconds,omitempty"`
-	Series          string          `json:"collection,omitempty"`
-	SeriesOrder     sql.NullInt64   `json:"collection_order,omitempty"`
-	Note            string          `json:"note,omitempty"`
-	OriginalSource  string          `json:"original_source,omitempty"`
-	Phash           sql.NullInt64   `json:"phash,omitempty"`
-	LastReadPage    sql.NullInt64   `json:"last_read_page,omitempty"`
-	UploadBatch     sql.NullInt64   `json:"upload_batch,omitempty"`
-	IngestedAt      string          `json:"ingested_at"`
-	// The two scheduled-lookup opt-ins default to 1 in the schema, so a
-	// pre-v10 document decoding to 0 would silently opt every imported
-	// image out; loadExportIntoDB restores the default for those.
-	ScheduledLookup    int `json:"scheduled_lookup"`
-	ScheduledLookupPTR int `json:"scheduled_lookup_ptr"`
+	ID                 int64           `json:"id"`
+	SHA256             string          `json:"sha256"`
+	MD5                string          `json:"md5,omitempty"`
+	CanonicalPath      string          `json:"canonical_path"`
+	FolderPath         string          `json:"folder_path"`
+	FileType           string          `json:"file_type"`
+	Width              sql.NullInt64   `json:"width"`
+	Height             sql.NullInt64   `json:"height"`
+	FileSize           int64           `json:"file_size"`
+	IsMissing          int             `json:"is_missing"`
+	IsFavorited        int             `json:"is_favorited"`
+	IsInbox            int             `json:"is_inbox"`
+	AutoTaggedAt       sql.NullString  `json:"auto_tagged_at"`
+	SourceType         string          `json:"source_type"`
+	Origin             string          `json:"origin"`
+	Source             string          `json:"source"`
+	URL                string          `json:"url"`
+	PageCount          sql.NullInt64   `json:"page_count,omitempty"`
+	DurationSeconds    sql.NullFloat64 `json:"duration_seconds,omitempty"`
+	Series             string          `json:"collection,omitempty"`
+	SeriesOrder        sql.NullInt64   `json:"collection_order,omitempty"`
+	Note               string          `json:"note,omitempty"`
+	OriginalSource     string          `json:"original_source,omitempty"`
+	Phash              sql.NullInt64   `json:"phash,omitempty"`
+	LastReadPage       sql.NullInt64   `json:"last_read_page,omitempty"`
+	UploadBatch        sql.NullInt64   `json:"upload_batch,omitempty"`
+	IngestedAt         string          `json:"ingested_at"`
+	ScheduledLookup    int             `json:"scheduled_lookup"`
+	ScheduledLookupPTR int             `json:"scheduled_lookup_ptr"`
 }
 
-// FindRelationsRow is one opted-in collection label; absence is the
-// default, so the table only ever holds the operator's opt-ins.
 type FindRelationsRow struct {
 	Name string `json:"name"`
 }
@@ -256,9 +219,8 @@ type ImageTagRow struct {
 	Stale      int             `json:"stale,omitempty"`
 }
 
-// ImageTagSourceRow is one line of the per-tag provenance ledger. It
-// travels on its own because image_tags.tagger_name keeps only the first
-// writer, so a tag several sources agree on cannot be rebuilt from it.
+// ImageTagSourceRow travels on its own: image_tags.tagger_name keeps only
+// the first source, so the ledger can't be rebuilt from it.
 type ImageTagSourceRow struct {
 	ImageID   int64  `json:"image_id"`
 	TagID     int64  `json:"tag_id"`
@@ -272,6 +234,12 @@ type TagImplicationRow struct {
 	CreatedAt    string `json:"created_at"`
 	Origin       string `json:"origin"`
 	Stale        int    `json:"stale,omitempty"`
+}
+
+type TagNoteRow struct {
+	TagID int64  `json:"tag_id"`
+	Body  string `json:"body"`
+	Links string `json:"links"`
 }
 
 type SDMetadataRow struct {
@@ -382,9 +350,8 @@ type NotRelatedPairRow struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// ExportGalleryDB produces a clean, WAL-consolidated SQLite snapshot via
-// VACUUM INTO and streams it to w. Safe to call while the source gallery is
-// being read/written; VACUUM INTO sees a consistent point-in-time view.
+// VACUUM INTO gives a consistent, WAL-folded snapshot of the live gallery,
+// and it only reads, so the read pool runs it and writes carry on.
 func ExportGalleryDB(cx gallery.Handle, w io.Writer) error {
 	tmp, err := os.CreateTemp(filepath.Dir(cx.DBPath), "export-*.db")
 	if err != nil {
@@ -394,7 +361,7 @@ func ExportGalleryDB(cx gallery.Handle, w io.Writer) error {
 	_ = tmp.Close()
 	defer func() { _ = os.Remove(tmpPath) }()
 
-	if _, err := cx.DB.Write.Exec("VACUUM INTO ?", tmpPath); err != nil {
+	if _, err := cx.DB.Read.Exec("VACUUM INTO ?", tmpPath); err != nil {
 		return fmt.Errorf("vacuum into: %w", err)
 	}
 	f, err := os.Open(tmpPath)
@@ -406,10 +373,8 @@ func ExportGalleryDB(cx gallery.Handle, w io.Writer) error {
 	return err
 }
 
-// exportScope narrows a per-image table to a chosen id set. The ids ride
-// as one JSON parameter through json_each rather than a placeholder list,
-// because a scope is a whole search and SQLite stops at 32766 parameters.
-// A nil set is the whole gallery and adds nothing to the query.
+// The ids ride as one json_each parameter, since a scope is a whole search
+// and SQLite caps parameters at 32766. nil means the whole gallery.
 type exportScope struct {
 	ids  []int64
 	json string
@@ -423,8 +388,6 @@ func newExportScope(ids []int64) exportScope {
 	return exportScope{ids: ids, json: string(b)}
 }
 
-// where returns the predicate to append and the argument it binds, for a
-// table whose image key is col. "" and nil for a whole-gallery export.
 func (sc exportScope) where(col string) (string, []any) {
 	if sc.ids == nil {
 		return "", nil
@@ -432,14 +395,15 @@ func (sc exportScope) where(col string) (string, []any) {
 	return " WHERE " + col + " IN (SELECT value FROM json_each(?))", []any{sc.json}
 }
 
-// ExportGalleryJSON streams every table of the gallery as a single JSON
-// document. Streams array-by-array so memory stays proportional to the
-// largest single table (image_tags on a big library).
-//
-// ids narrows it to those images and everything hanging off them; nil is
-// the whole gallery. The tag catalog is exported whole either way - a
-// scoped document still has to carry the tags its images reference.
+// nil ids exports the whole gallery. A scoped export still carries the
+// whole tag catalog, which its images reference.
 func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
+	// One snapshot: a row committed between two sections would dangle in the import.
+	tx, err := cx.DB.Read.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	sc := newExportScope(ids)
 	var scopeWhere string
 	var scopeArgs []any
@@ -450,21 +414,24 @@ func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
 	bw.field("gallery_name", cx.Name)
 	bw.field("gallery_path", cx.GalleryPath)
 
-	streamRows(bw, "tag_categories", cx.DB,
+	streamRows(bw, "tag_categories", tx,
 		`SELECT id, name, color, is_builtin FROM tag_categories ORDER BY id`,
 		scanRow(func(r *TagCategoryRow) []any { return []any{&r.ID, &r.Name, &r.Color, &r.IsBuiltin} }))
-	streamRows(bw, "tags", cx.DB,
+	streamRows(bw, "tags", tx,
 		`SELECT id, name, category_id, usage_count, is_alias, canonical_tag_id, created_at, origin, last_used_at, stale FROM tags ORDER BY id`,
 		scanRow(func(r *TagRow) []any {
 			return []any{&r.ID, &r.Name, &r.CategoryID, &r.UsageCount, &r.IsAlias, &r.CanonicalTagID, &r.CreatedAt, &r.Origin, &r.LastUsedAt, &r.Stale}
 		}))
-	streamRows(bw, "tag_implications", cx.DB,
+	streamRows(bw, "tag_implications", tx,
 		`SELECT parent_tag_id, implied_tag_id, created_at, origin, stale FROM tag_implications ORDER BY parent_tag_id, implied_tag_id`,
 		scanRow(func(r *TagImplicationRow) []any {
 			return []any{&r.ParentTagID, &r.ImpliedTagID, &r.CreatedAt, &r.Origin, &r.Stale}
 		}))
+	streamRows(bw, "tag_notes", tx,
+		`SELECT tag_id, body, links FROM tag_notes ORDER BY tag_id`,
+		scanRow(func(r *TagNoteRow) []any { return []any{&r.TagID, &r.Body, &r.Links} }))
 	scopeWhere, scopeArgs = sc.where("id")
-	streamRows(bw, "images", cx.DB,
+	streamRows(bw, "images", tx,
 		`SELECT id, sha256, md5, canonical_path, folder_path, file_type, width, height,
 		        file_size, is_missing, is_favorited, is_inbox, auto_tagged_at, source_type, origin, source, url, page_count, duration_seconds, series, series_order, note, original_source,
 		        phash, last_read_page, upload_batch, scheduled_lookup, scheduled_lookup_ptr, ingested_at
@@ -478,14 +445,14 @@ func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
 			return r, err
 		}, scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "image_collections", cx.DB,
+	streamRows(bw, "image_collections", tx,
 		`SELECT image_id, name, position FROM image_collections`+scopeWhere+` ORDER BY image_id, name`,
 		scanRow(func(r *ImageCollectionRow) []any { return []any{&r.ImageID, &r.Name, &r.Position} }), scopeArgs...)
-	streamRows(bw, "collection_find_relations", cx.DB,
+	streamRows(bw, "collection_find_relations", tx,
 		`SELECT name FROM collection_find_relations ORDER BY name`,
 		scanRow(func(r *FindRelationsRow) []any { return []any{&r.Name} }))
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "image_sources", cx.DB,
+	streamRows(bw, "image_sources", tx,
 		`SELECT image_id, site, post_id, url, md5, commentary, commentary_translated, original, similarity,
 		        md5_match, parent_url, upgrade_kept, post_width, post_height, post_size, post_ext, fetched_at
 		 FROM image_sources`+scopeWhere+` ORDER BY rowid`,
@@ -496,29 +463,29 @@ func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
 			return r, err
 		}, scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "image_annotations", cx.DB,
+	streamRows(bw, "image_annotations", tx,
 		`SELECT image_id, site, post_id, x, y, w, h, body, manual, fetched_at FROM image_annotations`+scopeWhere+` ORDER BY id`,
 		scanRow(func(r *ImageAnnotationRow) []any {
 			return []any{&r.ImageID, &r.Site, &r.PostID, &r.X, &r.Y, &r.W, &r.H, &r.Body, &r.Manual, &r.FetchedAt}
 		}), scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "image_paths", cx.DB,
+	streamRows(bw, "image_paths", tx,
 		`SELECT id, image_id, path, is_canonical, mtime_unix, mtime_nsec FROM image_paths`+scopeWhere+` ORDER BY id`,
 		scanRow(func(r *ImagePathRow) []any {
 			return []any{&r.ID, &r.ImageID, &r.Path, &r.IsCanonical, &r.MtimeUnix, &r.MtimeNsec}
 		}), scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "image_tags", cx.DB,
+	streamRows(bw, "image_tags", tx,
 		`SELECT image_id, tag_id, is_auto, is_implied, confidence, tagger_name, created_at, stale FROM image_tags`+scopeWhere,
 		scanRow(func(r *ImageTagRow) []any {
 			return []any{&r.ImageID, &r.TagID, &r.IsAuto, &r.IsImplied, &r.Confidence, &r.TaggerName, &r.CreatedAt, &r.Stale}
 		}), scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "image_tag_sources", cx.DB,
+	streamRows(bw, "image_tag_sources", tx,
 		`SELECT image_id, tag_id, source, created_at FROM image_tag_sources`+scopeWhere+` ORDER BY image_id, tag_id, source`,
 		scanRow(func(r *ImageTagSourceRow) []any { return []any{&r.ImageID, &r.TagID, &r.Source, &r.CreatedAt} }), scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "sd_metadata", cx.DB,
+	streamRows(bw, "sd_metadata", tx,
 		`SELECT image_id, prompt, negative_prompt, model, seed, sampler, steps, cfg_scale, raw_params, generation_hash FROM sd_metadata`+scopeWhere,
 		func(rows *sql.Rows) (any, error) {
 			var r SDMetadataRow
@@ -527,7 +494,7 @@ func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
 			return r, err
 		}, scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "comfyui_metadata", cx.DB,
+	streamRows(bw, "comfyui_metadata", tx,
 		`SELECT image_id, prompt, model_checkpoint, seed, sampler, steps, cfg_scale, raw_workflow, generation_hash FROM comfyui_metadata`+scopeWhere,
 		func(rows *sql.Rows) (any, error) {
 			var r ComfyMetadataRow
@@ -536,7 +503,7 @@ func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
 			return r, err
 		}, scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "manga_metadata", cx.DB,
+	streamRows(bw, "manga_metadata", tx,
 		`SELECT image_id, title, series, number, volume, count, summary, notes,
 		        year, month, day, writer, penciller, inker, colorist, letterer, cover_artist, editor, publisher,
 		        imprint, genre, web, language_iso, format, manga, age_rating, community_rating, xml_page_count, raw_xml
@@ -549,39 +516,39 @@ func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
 				&r.CommunityRating, &r.XMLPageCount, &r.RawXML)
 			return r, err
 		}, scopeArgs...)
-	streamRows(bw, "dup_groups", cx.DB,
+	streamRows(bw, "dup_groups", tx,
 		`SELECT id, original_image_id, created_at FROM dup_groups ORDER BY id`,
 		scanRow(func(r *DupGroupRow) []any { return []any{&r.ID, &r.OriginalImageID, &r.CreatedAt} }))
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "dup_group_members", cx.DB,
+	streamRows(bw, "dup_group_members", tx,
 		`SELECT image_id, group_id, created_at FROM dup_group_members`+scopeWhere+` ORDER BY image_id`,
 		scanRow(func(r *DupGroupMemberRow) []any { return []any{&r.ImageID, &r.GroupID, &r.CreatedAt} }), scopeArgs...)
-	streamRows(bw, "alt_groups", cx.DB,
+	streamRows(bw, "alt_groups", tx,
 		`SELECT id, created_at FROM alt_groups ORDER BY id`,
 		scanRow(func(r *AltGroupRow) []any { return []any{&r.ID, &r.CreatedAt} }))
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "alt_group_members", cx.DB,
+	streamRows(bw, "alt_group_members", tx,
 		`SELECT image_id, group_id, created_at FROM alt_group_members`+scopeWhere+` ORDER BY image_id`,
 		scanRow(func(r *AltGroupMemberRow) []any { return []any{&r.ImageID, &r.GroupID, &r.CreatedAt} }), scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("child_image_id")
-	streamRows(bw, "version_edges", cx.DB,
+	streamRows(bw, "version_edges", tx,
 		`SELECT child_image_id, parent_image_id, created_at FROM version_edges`+scopeWhere+` ORDER BY child_image_id`,
 		scanRow(func(r *VersionEdgeRow) []any { return []any{&r.ChildImageID, &r.ParentImageID, &r.CreatedAt} }), scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("derivative_image_id")
-	streamRows(bw, "derivative_edges", cx.DB,
+	streamRows(bw, "derivative_edges", tx,
 		`SELECT derivative_image_id, source_image_id, created_at FROM derivative_edges`+scopeWhere+` ORDER BY derivative_image_id, source_image_id`,
 		scanRow(func(r *DerivativeEdgeRow) []any { return []any{&r.DerivativeImageID, &r.SourceImageID, &r.CreatedAt} }), scopeArgs...)
 	scopeWhere, scopeArgs = sc.where("a_image_id")
-	streamRows(bw, "not_related_pairs", cx.DB,
+	streamRows(bw, "not_related_pairs", tx,
 		`SELECT a_image_id, b_image_id, created_at FROM not_related_pairs`+scopeWhere+` ORDER BY a_image_id, b_image_id`,
 		scanRow(func(r *NotRelatedPairRow) []any { return []any{&r.AImageID, &r.BImageID, &r.CreatedAt} }), scopeArgs...)
-	streamRows(bw, "saved_searches", cx.DB,
+	streamRows(bw, "saved_searches", tx,
 		`SELECT id, name, query, sort, sort_order, seed, created_at FROM saved_searches ORDER BY id`,
 		scanRow(func(r *SavedSearchRow) []any {
 			return []any{&r.ID, &r.Name, &r.Query, &r.Sort, &r.Order, &r.Seed, &r.CreatedAt}
 		}))
 	scopeWhere, scopeArgs = sc.where("image_id")
-	streamRows(bw, "image_lookups", cx.DB,
+	streamRows(bw, "image_lookups", tx,
 		`SELECT image_id, backend, attempts, queued_at, job_id, last_at, last_result, next_due_at, ptr_cursor
 		 FROM image_lookups`+scopeWhere+` ORDER BY image_id, backend`,
 		scanRow(func(r *ImageLookupRow) []any {
@@ -591,16 +558,10 @@ func ExportGalleryJSON(cx gallery.Handle, w io.Writer, ids []int64) error {
 	return bw.err
 }
 
-// ExportGalleryArchive packs the chosen export format together with every
-// source file under the gallery root into a ZIP archive. The inner DB/JSON
-// file is at the root; images live under `gallery/<relative_path>` so an
-// import restores them into the same subfolder layout.
 func ExportGalleryArchive(cx gallery.Handle, format string, w io.Writer) error {
 	zw := zip.NewWriter(w)
 	defer func() { _ = zw.Close() }()
 
-	// Inner DB/JSON gets deflated (usually compresses well); image files are
-	// already compressed so they go in as Store.
 	header := &zip.FileHeader{Method: zip.Deflate}
 	switch format {
 	case "db":
@@ -625,39 +586,44 @@ func ExportGalleryArchive(cx gallery.Handle, format string, w io.Writer) error {
 		}
 	}
 
-	if err := writeGalleryFilesToZip(zw, cx.GalleryPath); err != nil {
+	if err := writeGalleryFilesToZip(zw, cx.Boundary()); err != nil {
 		return err
 	}
-	// Close writes the central directory; until it succeeds the response
-	// body is not a readable archive. The deferred close stays for the
-	// error paths, where its already-closed error is discarded.
+	// Close writes the central directory, so its error must reach the
+	// caller; the deferred Close covers the error paths.
 	return zw.Close()
 }
 
-// writeGalleryFilesToZip walks galleryPath and appends every file under it
-// as `gallery/<relative_path>` entries in zw, using zip.Store for the
-// already-compressed image payloads. A missing root surfaces as an empty
-// section (degraded mode) so the inner db/json still rides along for a
-// headers-only restore.
-func writeGalleryFilesToZip(zw *zip.Writer, galleryPath string) error {
+// Files go in as Store: images are already compressed. An unreadable root
+// is skipped so the db/json still exports.
+func writeGalleryFilesToZip(zw *zip.Writer, b *gallery.Boundary) error {
+	galleryPath := b.Root()
 	if _, err := os.Stat(galleryPath); err != nil {
 		logx.Warnf("export: gallery path %q unreadable; archive will not include gallery files: %v", galleryPath, err)
 		return nil
 	}
-	return gallery.WalkTree(galleryPath, func(path string, d fs.DirEntry, walkErr error) error {
+	return gallery.WalkTree(b, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			logx.Warnf("export: skip %q: %v", path, walkErr)
+			return nil
 		}
 		if d.IsDir() {
 			return nil
 		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
 		rel, err := filepath.Rel(galleryPath, path)
 		if err != nil {
 			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			logx.Warnf("export: skip %q: %v", path, err)
+			return nil
+		}
+		defer func() { _ = f.Close() }()
+		info, err := f.Stat()
+		if err != nil {
+			logx.Warnf("export: skip %q: %v", path, err)
+			return nil
 		}
 		fh := &zip.FileHeader{
 			Name:   "gallery/" + filepath.ToSlash(rel),
@@ -668,48 +634,33 @@ func writeGalleryFilesToZip(zw *zip.Writer, galleryPath string) error {
 		if err != nil {
 			return err
 		}
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = f.Close() }()
 		_, err = io.Copy(entry, f)
 		return err
 	})
 }
 
-// ApplyImport replaces the gallery's db, thumbnails and, for an archive,
-// its files. The caller closes the target first and reopens it after; this
-// runs with no lock held, since it is minutes of work on a real library.
-// Kept as a package function so the early-return error paths are linear.
-// maxFileSizeMB caps each archive entry's decompressed size; <= 0 disables
-// the cap.
-func ApplyImport(format, tmpPath, dbPath, thumbsPath, galleryPath string, maxFileSizeMB int) error {
+// The caller closes the target before ApplyImport, so no watcher ingests
+// what it extracts, and reopens it after. maxFileSizeMB <= 0 lifts the
+// per-entry cap; the count is the entries b excludes.
+func ApplyImport(format, tmpPath, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int) (int, error) {
 	switch format {
 	case "db":
-		return replaceDBFromFile(tmpPath, dbPath, thumbsPath, galleryPath)
+		return 0, replaceDBFromFile(tmpPath, dbPath, thumbsPath, b)
 	case "json":
-		// A .json upload may be either a full monbooru export or a bare
-		// light tags.json manifest; sniff the document so each routes to
-		// its own replacer rather than misdecoding into the wrong shape.
 		isLight, err := isLightManifestJSON(tmpPath)
 		if err != nil {
-			return fmt.Errorf("inspect json: %w", err)
+			return 0, fmt.Errorf("inspect json: %w", err)
 		}
 		if isLight {
-			return replaceFromLightManifest(tmpPath, dbPath, thumbsPath, galleryPath)
+			return 0, replaceFromLightManifest(tmpPath, dbPath, thumbsPath, b)
 		}
-		return replaceDBFromJSON(tmpPath, dbPath, thumbsPath, galleryPath)
+		return 0, replaceDBFromJSON(tmpPath, dbPath, thumbsPath, b)
 	case "zip":
-		return replaceFromArchive(tmpPath, dbPath, thumbsPath, galleryPath, maxFileSizeMB)
+		return replaceFromArchive(tmpPath, dbPath, thumbsPath, b, maxFileSizeMB)
 	}
-	return fmt.Errorf("unknown import format %q", format)
+	return 0, fmt.Errorf("unknown import format %q", format)
 }
 
-// isLightManifestJSON peeks the JSON file at path and reports whether it
-// looks like a light tags.json (only {version, images:[...]}) rather than a
-// full monbooru export. The full export carries a non-empty gallery_name and
-// a tag_categories array; the light manifest carries neither.
 func isLightManifestJSON(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -726,50 +677,60 @@ func isLightManifestJSON(path string) (bool, error) {
 	return probe.GalleryName == "" && len(probe.TagCategories) == 0, nil
 }
 
-// replaceDBFromFile atomically swaps the target DB file with the uploaded
-// snapshot, wipes the thumbnails directory so stale thumbnail ids don't
-// reference images that no longer exist, and rebases every image path onto
-// the target gallery_path so an import into a gallery whose filesystem root
-// differs from the source doesn't leave every image pointing at the old
-// location.
-func replaceDBFromFile(srcPath, dbPath, thumbsPath, galleryPath string) error {
-	// Validate the snapshot opens cleanly before clobbering the live DB.
+func replaceDBFromFile(srcPath, dbPath, thumbsPath string, b *gallery.Boundary) error {
 	if err := validateSQLiteFile(srcPath); err != nil {
 		return fmt.Errorf("uploaded file is not a valid monbooru database: %w", err)
+	}
+	return loadThenInstall(srcPath, dbPath, thumbsPath, func(database *db.DB) error {
+		// Bootstrap first: a sanitiser may read a column an older snapshot lacks.
+		if err := db.Bootstrap(database); err != nil {
+			return fmt.Errorf("bootstrap imported db: %w", err)
+		}
+		if err := sanitizeImportedCategoryColors(database); err != nil {
+			return fmt.Errorf("sanitize colors: %w", err)
+		}
+		if err := sanitizeImportedAliasChains(database); err != nil {
+			return fmt.Errorf("sanitize alias chains: %w", err)
+		}
+		return rebaseImagePaths(database, b)
+	})
+}
+
+// The database at path is loaded and swapped in for dbPath only on
+// success, so a failed load leaves the gallery untouched.
+func loadThenInstall(path, dbPath, thumbsPath string, load func(*db.DB) error) error {
+	defer func() {
+		for _, p := range []string{path + "-wal", path + "-shm"} {
+			_ = os.Remove(p)
+		}
+	}()
+	database, err := db.Open(path)
+	if err != nil {
+		return fmt.Errorf("open new db: %w", err)
+	}
+	loadErr := load(database)
+	if loadErr == nil {
+		// Fold the WAL in so the rename below carries every committed page.
+		if _, err := database.Write.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			loadErr = fmt.Errorf("checkpoint: %w", err)
+		}
+	}
+	if err := database.Close(); err != nil && loadErr == nil {
+		loadErr = fmt.Errorf("close new db: %w", err)
+	}
+	if loadErr != nil {
+		return loadErr
 	}
 	if err := resetDBAndThumbs(dbPath, thumbsPath); err != nil {
 		return err
 	}
-	if err := os.Rename(srcPath, dbPath); err != nil {
+	if err := os.Rename(path, dbPath); err != nil {
 		return fmt.Errorf("install db: %w", err)
 	}
-	database, err := db.Open(dbPath)
-	if err != nil {
-		return fmt.Errorf("reopen installed db: %w", err)
-	}
-	defer func() { _ = database.Close() }()
-	// Bring the imported snapshot up to current schema before any sanitisation
-	// pass touches it. Today's sanitisers happen to query columns present in
-	// every monbooru release; a future helper that touches a newer column
-	// would otherwise hit `no such column` only on imports of older DBs.
-	if err := db.Bootstrap(database); err != nil {
-		return fmt.Errorf("bootstrap imported db: %w", err)
-	}
-	if err := sanitizeImportedCategoryColors(database); err != nil {
-		return fmt.Errorf("sanitize colors: %w", err)
-	}
-	if err := sanitizeImportedAliasChains(database); err != nil {
-		return fmt.Errorf("sanitize alias chains: %w", err)
-	}
-	return rebaseImagePaths(database, galleryPath)
+	return nil
 }
 
-// sanitizeImportedCategoryColors walks tag_categories on a freshly imported
-// DB and replaces any color value that doesn't match the documented hex
-// shape with the neutral fallback. Mirrors the per-row coercion that the
-// JSON import path applies on insert; needed here because a `.db` import
-// drops the entire SQLite file in place without going through monbooru's
-// validators.
+// A .db import skips every validator, so its colors are coerced after the fact.
 func sanitizeImportedCategoryColors(database *db.DB) error {
 	type row struct {
 		id    int64
@@ -798,19 +759,13 @@ func sanitizeImportedCategoryColors(database *db.DB) error {
 	return nil
 }
 
-// sanitizeImportedAliasChains normalizes the canonical_tag_id graph of a
-// freshly imported DB. The write paths keep it one hop deep and only on
-// alias rows, but imported rows arrive verbatim, and the resolvers follow
-// COALESCE(canonical_tag_id, id) exactly once with no is_alias check - a
-// chained alias silently drops out of search and a pointer on a plain tag
-// misdirects it. Aliases resolving through other aliases are re-pointed at
-// their terminal plain tag; an alias with nowhere to land (cycle member,
-// missing canonical) is promoted to a plain tag; a plain tag's stray
-// pointer is cleared.
+// Resolvers follow COALESCE(canonical_tag_id, id) once, without an
+// is_alias check, so an imported chain drops out of search and a plain
+// tag's pointer misdirects it.
 func sanitizeImportedAliasChains(database *db.DB) error {
 	type node struct {
 		alias     bool
-		canonical int64 // 0 when NULL
+		canonical int64
 	}
 	type idNode struct {
 		id int64
@@ -835,8 +790,7 @@ func sanitizeImportedAliasChains(database *db.DB) error {
 	// Sorted walk order keeps the promoted cycle member deterministic.
 	slices.Sort(ids)
 
-	// root[id] is the plain tag id's pointer chain lands on; promoted rows
-	// become their own root.
+	// root[id] is where id's chain ends; a promoted row is its own root.
 	root := make(map[int64]int64)
 	promoted := make(map[int64]bool)
 	for _, id := range ids {
@@ -905,13 +859,7 @@ func sanitizeImportedAliasChains(database *db.DB) error {
 	return nil
 }
 
-// replaceDBFromJSON decodes the uploaded JSON document, builds a fresh DB
-// from it at a temp path, and only once the load fully succeeded swaps it
-// over the target - so a failed import leaves the target gallery untouched.
-// Keeps primary keys from the export so image_tags still line up. Also
-// rebases every canonical_path / image_paths.path onto the target
-// gallery_path so a cross-root import doesn't dangle every link.
-func replaceDBFromJSON(srcPath, dbPath, thumbsPath, galleryPath string) error {
+func replaceDBFromJSON(srcPath, dbPath, thumbsPath string, b *gallery.Boundary) error {
 	f, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("open json: %w", err)
@@ -928,16 +876,8 @@ func replaceDBFromJSON(srcPath, dbPath, thumbsPath, galleryPath string) error {
 	}
 	tmpPath := tmp.Name()
 	_ = tmp.Close()
-	defer func() {
-		for _, p := range []string{tmpPath, tmpPath + "-wal", tmpPath + "-shm"} {
-			_ = os.Remove(p)
-		}
-	}()
-	database, err := db.Open(tmpPath)
-	if err != nil {
-		return fmt.Errorf("open new db: %w", err)
-	}
-	loadErr := func() error {
+	defer func() { _ = os.Remove(tmpPath) }()
+	return loadThenInstall(tmpPath, dbPath, thumbsPath, func(database *db.DB) error {
 		if err := db.Bootstrap(database); err != nil {
 			return fmt.Errorf("bootstrap: %w", err)
 		}
@@ -947,34 +887,10 @@ func replaceDBFromJSON(srcPath, dbPath, thumbsPath, galleryPath string) error {
 		if err := sanitizeImportedAliasChains(database); err != nil {
 			return fmt.Errorf("sanitize alias chains: %w", err)
 		}
-		return rebaseImagePaths(database, galleryPath)
-	}()
-	if loadErr == nil {
-		// Fold the WAL into the main file so the rename below moves every
-		// committed page.
-		if _, err := database.Write.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			loadErr = fmt.Errorf("checkpoint: %w", err)
-		}
-	}
-	if err := database.Close(); err != nil && loadErr == nil {
-		loadErr = fmt.Errorf("close new db: %w", err)
-	}
-	if loadErr != nil {
-		return loadErr
-	}
-
-	if err := resetDBAndThumbs(dbPath, thumbsPath); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, dbPath); err != nil {
-		return fmt.Errorf("install db: %w", err)
-	}
-	return nil
+		return rebaseImagePaths(database, b)
+	})
 }
 
-// classifyArchive picks the three shapes an export archive can carry and
-// the source files beside them. Shared with the merge importer, which
-// reads the same archive layout and would otherwise say so twice.
 func classifyArchive(files []*zip.File) (innerDB, innerJSON, innerLight *zip.File, gallery []*zip.File) {
 	for _, f := range files {
 		switch {
@@ -991,50 +907,50 @@ func classifyArchive(files []*zip.File) (innerDB, innerJSON, innerLight *zip.Fil
 	return innerDB, innerJSON, innerLight, gallery
 }
 
-// replaceFromArchive opens the uploaded ZIP, extracts the inner DB or JSON
-// via the matching replaceDBFrom* helper, and when `gallery/` entries are
-// present wipes the source folder and extracts them into it. maxFileSizeMB
-// caps each entry's decompressed size; <= 0 disables the cap.
-func replaceFromArchive(srcPath, dbPath, thumbsPath, galleryPath string, maxFileSizeMB int) error {
+func replaceFromArchive(srcPath, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int) (int, error) {
 	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
 	zr, err := zip.OpenReader(srcPath)
 	if err != nil {
-		return fmt.Errorf("open zip: %w", err)
+		return 0, fmt.Errorf("open zip: %w", err)
 	}
 	defer func() { _ = zr.Close() }()
 
 	innerDB, innerJSON, innerLight, galleryFiles := classifyArchive(zr.File)
 	if innerDB == nil && innerJSON == nil && innerLight == nil {
-		// No monbooru-native shape inside; fall through to the foreign-format translators.
-		// They synthesise a light manifest plus a {rel → zip.File} map and
-		// route through the same wipe+ingest path the native light replacer
-		// uses, so the import flow stays identical past this point.
 		if format := detectCompatFormat(zr.File); format != "" {
-			return replaceFromCompatArchive(zr.File, format, dbPath, thumbsPath, galleryPath, maxFileSizeMB)
+			return replaceFromCompatArchive(zr.File, format, dbPath, thumbsPath, b, maxFileSizeMB)
 		}
-		return fmt.Errorf("archive missing monbooru.db, monbooru.json, or tags.json")
+		return 0, fmt.Errorf("archive missing monbooru.db, monbooru.json, or tags.json")
 	}
-	// A light archive ships only tags.json + gallery/; route to the light
-	// replacer which bootstraps a fresh db and ingests each image. A full
-	// archive takes priority when both a monbooru.{db,json} and a tags.json
-	// are present - that combination is unusual but the full payload wins.
 	if innerDB == nil && innerJSON == nil {
-		return replaceFromLightArchive(innerLight, galleryFiles, dbPath, thumbsPath, galleryPath, maxFileSizeMB)
+		return replaceFromLightArchive(innerLight, galleryFiles, dbPath, thumbsPath, b, maxFileSizeMB)
 	}
 
-	// Extract the inner DB/JSON to a temp file alongside the upload, then
-	// delegate to the single-file path so both import formats share the
-	// thumbnail-wipe and validation behaviour.
+	// Before anything is replaced: a refused archive leaves the gallery whole.
+	dsts := make([]string, len(galleryFiles))
+	for i, f := range galleryFiles {
+		dst, err := SafeArchiveDest(b.Root(), strings.TrimPrefix(f.Name, "gallery/"))
+		if err != nil {
+			return 0, fmt.Errorf("rejecting archive entry %q: %w", f.Name, err)
+		}
+		if !b.Excludes(dst) {
+			if err := checkEntrySize(f, maxBytes); err != nil {
+				return 0, err
+			}
+		}
+		dsts[i] = dst
+	}
+
 	dataDir := filepath.Dir(dbPath)
 	innerTmp, err := os.CreateTemp(dataDir, "inner-*.import")
 	if err != nil {
-		return fmt.Errorf("create inner temp: %w", err)
+		return 0, fmt.Errorf("create inner temp: %w", err)
 	}
 	innerTmpPath := innerTmp.Name()
 	defer func() { _ = os.Remove(innerTmpPath) }()
 
 	var innerFile *zip.File
-	var applyInner func(string, string, string, string) error
+	var applyInner func(string, string, string, *gallery.Boundary) error
 	if innerDB != nil {
 		innerFile = innerDB
 		applyInner = replaceDBFromFile
@@ -1044,51 +960,44 @@ func replaceFromArchive(srcPath, dbPath, thumbsPath, galleryPath string, maxFile
 	}
 	if err := copyZipEntry(innerTmp, innerFile, maxBytes); err != nil {
 		_ = innerTmp.Close()
-		return err
+		return 0, err
 	}
 	_ = innerTmp.Close()
-	if err := applyInner(innerTmpPath, dbPath, thumbsPath, galleryPath); err != nil {
-		return err
+	if err := applyInner(innerTmpPath, dbPath, thumbsPath, b); err != nil {
+		return 0, err
 	}
 
 	if len(galleryFiles) == 0 {
-		return nil
+		return 0, nil
 	}
 
-	// Wipe the gallery tree and extract the archive's files into it. The
-	// watcher is already stopped (caller's cx.close()), so the CREATE events
-	// produced here do not re-ingest the new files behind our back.
-	if err := wipeDirContents(galleryPath); err != nil {
-		return fmt.Errorf("wipe gallery: %w", err)
+	if _, err := gallery.RemoveOwned(b); err != nil {
+		return 0, fmt.Errorf("wipe gallery: %w", err)
 	}
-	for _, f := range galleryFiles {
-		rel := strings.TrimPrefix(f.Name, "gallery/")
-		dst, err := SafeArchiveDest(galleryPath, rel)
-		if err != nil {
-			return fmt.Errorf("rejecting archive entry %q: %w", f.Name, err)
+	leftOut := 0
+	for i, f := range galleryFiles {
+		if b.Excludes(dsts[i]) {
+			leftOut++
+			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
+		if err := os.MkdirAll(filepath.Dir(dsts[i]), 0o755); err != nil {
+			return leftOut, err
 		}
-		if err := copyZipFile(f, dst, maxBytes); err != nil {
-			return err
+		if err := copyZipFile(f, dsts[i], maxBytes); err != nil {
+			return leftOut, err
 		}
 	}
 
-	// applyInner reconciled is_missing before these files existed on disk;
-	// redo it now that the archive's images are extracted.
+	// applyInner reconciled before these files existed, so reconcile again.
 	database, err := db.Open(dbPath)
 	if err != nil {
-		return fmt.Errorf("reopen db for reconcile: %w", err)
+		return leftOut, fmt.Errorf("reopen db for reconcile: %w", err)
 	}
 	defer func() { _ = database.Close() }()
-	return reconcileMissingFiles(database, galleryPath)
+	return leftOut, reconcileMissingFiles(database, b)
 }
 
-// storedBasename is filepath.Base for a path read back out of a
-// database or an export. Those carry the separators of the machine
-// that wrote them, which filepath.Base on another OS would not
-// recognise as separators at all.
+// Not filepath.Base: a stored path carries the writing machine's separators.
 func storedBasename(p string) string {
 	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
 		return p[i+1:]
@@ -1096,27 +1005,17 @@ func storedBasename(p string) string {
 	return p
 }
 
-// rebaseImagePaths rewrites every images.canonical_path and
-// image_paths.path so that the absolute prefix matches the target gallery's
-// root. The export format stores absolute paths by design (the gallery is
-// authoritatively at /foo/bar and everything keys off it); without this
-// rewrite an import from a differently-mounted source gallery leaves every
-// image dangling at its old location.
-//
-// folder_path is relative to gallery_path by construction, so rebuilding
-// <targetRoot>/<folder_path>/<basename(old canonical)> gives us the new
-// absolute path without needing to know what the source root was.
-func rebaseImagePaths(database *db.DB, targetGalleryPath string) error {
-	root := strings.TrimRight(targetGalleryPath, "/")
+func rebaseImagePaths(database *db.DB, b *gallery.Boundary) error {
+	root := strings.TrimRight(b.Root(), "/")
 	tx, err := database.Write.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Ahead of the scan, and ahead of any canonical_path rewrite: the
-	// statement keys off the separators in canonical_path to prove the
-	// row came from Windows, and the rebase below erases that evidence.
+	// Imported rows can arrive after Bootstrap's one-shot ran, so
+	// normalise here: before the scan reads folder_path, and before the
+	// rewrite erases the backslashes that mark a Windows row.
 	if _, err := tx.Exec(db.NormalizeWindowsFolderPathSQL); err != nil {
 		return fmt.Errorf("normalize folder paths: %w", err)
 	}
@@ -1126,12 +1025,8 @@ func rebaseImagePaths(database *db.DB, targetGalleryPath string) error {
 		return fmt.Errorf("scan images for rebase: %w", err)
 	}
 
-	// Infer the source-root from the first canonical row: each row
-	// stores canonical_path = <sourceRoot>/<folder_path>/<basename>, so
-	// stripping the trailing folder+basename leaves the root the export
-	// came from. Used below to rebase alias paths from their stored
-	// folder rather than the canonical's folder - operator-maintained
-	// aliases in non-canonical folders survive the rebase intact.
+	// The source root, inferred from the first canonical row, lets an alias
+	// keep its own folder instead of collapsing into the canonical's.
 	sourceRoot := ""
 	for _, r := range imgs {
 		if r.canonical == "" {
@@ -1151,10 +1046,6 @@ func rebaseImagePaths(database *db.DB, targetGalleryPath string) error {
 		}
 	}
 
-	// image_paths has its own absolute column; rebuild it from the row's
-	// image_id by looking up the matching image's folder_path + basename.
-	// Image_paths include the canonical (is_canonical=1) and any aliases.
-	// We rebuild each one by computing newPath the same way.
 	for _, r := range imgs {
 		newCanonical := filepath.Join(root, r.folder, storedBasename(r.canonical))
 		if newCanonical == r.canonical {
@@ -1167,11 +1058,6 @@ func rebaseImagePaths(database *db.DB, targetGalleryPath string) error {
 		}
 	}
 
-	// Rebase image_paths per-row. image_paths uniqueness is on the path
-	// column; rebased paths can collide with existing rows on the same
-	// basename across folders only when the export carried alias rows
-	// that happen to share a name - rare but possible, so we dedupe by
-	// letting the INSERT conflict drop the collider.
 	type pathRow struct {
 		id, imageID int64
 		path        string
@@ -1193,22 +1079,13 @@ func rebaseImagePaths(database *db.DB, targetGalleryPath string) error {
 	}
 
 	for _, p := range paths {
-		// Canonical rows always rebase to the row's stored folder_path so
-		// the images.canonical_path computed above agrees. Alias rows
-		// preserve their original folder by stripping the source root
-		// from their stored path; this keeps an alias that lived at
-		// /old/photos/cat.jpg landing at /new/photos/cat.jpg instead of
-		// being collapsed into the canonical's folder (which would also
-		// risk a UNIQUE-on-path collision with the canonical row).
+		// Canonical rows rebuild exactly as images.canonical_path did.
 		var newPath string
 		if p.isCanonical || sourceRoot == "" {
 			newPath = filepath.Join(root, p.folder, storedBasename(p.path))
 		} else if rel := strings.TrimPrefix(p.path, sourceRoot+string(filepath.Separator)); rel != p.path {
 			newPath = filepath.Join(root, rel)
 		} else {
-			// Alias path was outside the inferred source root (operator
-			// hand-edit). Fall back to the canonical-folder shape rather
-			// than leaving the alias dangling at the foreign absolute.
 			newPath = filepath.Join(root, p.folder, storedBasename(p.path))
 		}
 		if newPath == p.path {
@@ -1221,13 +1098,7 @@ func rebaseImagePaths(database *db.DB, targetGalleryPath string) error {
 		}
 	}
 
-	// After rebasing, reconcile is_missing against the target root in both
-	// directions: flag a row whose canonical file is absent (so missing:true
-	// surfaces it instead of a healthy-looking row that 404s on click), and
-	// clear a row that was exported missing but exists here (otherwise it
-	// stays hidden until a manual Sync the import flow never queues). Mirrors
-	// what Sync does for vanished/reappeared files.
-	if err := reconcileMissingFlags(tx, root, imgs); err != nil {
+	if err := reconcileMissingFlags(tx, b, imgs); err != nil {
 		return err
 	}
 
@@ -1237,11 +1108,8 @@ func rebaseImagePaths(database *db.DB, targetGalleryPath string) error {
 	return recalcImportedTagCounts(database)
 }
 
-// recalcImportedTagCounts rebases usage_count on what the reconcile just
-// decided is visible. The export carries the counts verbatim, so an
-// import whose files are not at the target path leaves every tag
-// claiming usages the gallery cannot show - "1 match" over "No images
-// found" until the operator finds Maintenance -> Recalculate.
+// The export's usage counts include images the reconcile just marked
+// missing; left as they are, tags claim matches the gallery can't show.
 func recalcImportedTagCounts(database *db.DB) error {
 	if _, err := tags.RecalcDBCount(database); err != nil {
 		return fmt.Errorf("recalculate tag counts: %w", err)
@@ -1249,15 +1117,12 @@ func recalcImportedTagCounts(database *db.DB) error {
 	return nil
 }
 
-// imgPathRow is the stored path triple the rebase and reconcile passes walk.
 type imgPathRow struct {
 	id        int64
 	folder    string
 	canonical string
 }
 
-// loadImagePathRows reads every image's stored paths. The rebase passes its
-// transaction, since it rewrites what it reads; reconcile passes the pool.
 func loadImagePathRows(q db.Querier) ([]imgPathRow, error) {
 	return db.QueryAll(q, func(rows *sql.Rows) (imgPathRow, error) {
 		var r imgPathRow
@@ -1266,13 +1131,11 @@ func loadImagePathRows(q db.Querier) ([]imgPathRow, error) {
 	}, `SELECT id, folder_path, canonical_path FROM images`)
 }
 
-// reconcileMissingFlags re-derives is_missing from what is on disk under
-// root, in both directions: a row whose canonical file is absent is flagged
-// so missing:true surfaces it instead of a healthy-looking row that 404s on
-// click, and a row exported missing but present here is cleared.
-func reconcileMissingFlags(x db.Execer, root string, imgs []imgPathRow) error {
+// Both directions: an absent file is flagged, and a row exported missing
+// but present here is cleared, since an import queues no Sync.
+func reconcileMissingFlags(x db.Execer, b *gallery.Boundary, imgs []imgPathRow) error {
 	for _, r := range imgs {
-		flag := fileMissingFlag(root, r.folder, r.canonical)
+		flag := fileMissingFlag(b, r.folder, r.canonical)
 		if _, err := x.Exec(`UPDATE images SET is_missing = ? WHERE id = ?`, flag, r.id); err != nil {
 			return fmt.Errorf("reconcile is_missing for image %d: %w", r.id, err)
 		}
@@ -1280,48 +1143,25 @@ func reconcileMissingFlags(x db.Execer, root string, imgs []imgPathRow) error {
 	return nil
 }
 
-// fileMissingFlag reports 1 when the image's canonical file is absent from
-// galleryRoot and 0 when it is present, matching what Sync records.
-func fileMissingFlag(galleryRoot, folder, canonical string) int {
-	if _, err := os.Stat(filepath.Join(galleryRoot, folder, storedBasename(canonical))); err == nil {
+func fileMissingFlag(b *gallery.Boundary, folder, canonical string) int {
+	path := filepath.Join(b.Root(), folder, storedBasename(canonical))
+	if _, err := os.Stat(path); err == nil && !b.Excludes(path) {
 		return 0
 	}
 	return 1
 }
 
-// reconcileMissingFiles re-runs the is_missing reconcile against galleryPath.
-// The archive import installs the DB before extracting its bundled images, so
-// this second pass runs once the files are actually on disk.
-func reconcileMissingFiles(database *db.DB, galleryPath string) error {
-	root := strings.TrimRight(galleryPath, "/")
+func reconcileMissingFiles(database *db.DB, b *gallery.Boundary) error {
 	imgs, err := loadImagePathRows(database.Read)
 	if err != nil {
 		return fmt.Errorf("scan images for reconcile: %w", err)
 	}
-	if err := reconcileMissingFlags(database.Write, root, imgs); err != nil {
+	if err := reconcileMissingFlags(database.Write, b, imgs); err != nil {
 		return err
 	}
 	return recalcImportedTagCounts(database)
 }
 
-// wipeDirContents removes everything inside dir but keeps the directory
-// itself (so a bind mount survives).
-func wipeDirContents(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// validateSQLiteFile opens the file as a SQLite DB, checks the expected
-// tables exist, and closes it. Cheaper than running the schema bootstrap
-// twice and surfaces "uploaded an arbitrary blob" before we remove the live DB.
 func validateSQLiteFile(path string) error {
 	database, err := db.Open(path)
 	if err != nil {
@@ -1342,10 +1182,6 @@ func validateSQLiteFile(path string) error {
 	return nil
 }
 
-// scanRow is insertAll's mirror on the read side: one row type, one field
-// list, and the Scan / return dance the export's streamRows calls would
-// otherwise each spell out. Having both sides read the same way is what
-// makes a column-list drift between them visible.
 func scanRow[T any](fields func(*T) []any) func(*sql.Rows) (any, error) {
 	return func(rows *sql.Rows) (any, error) {
 		var r T
@@ -1354,20 +1190,13 @@ func scanRow[T any](fields func(*T) []any) func(*sql.Rows) (any, error) {
 	}
 }
 
-// loader carries the error rather than each insert returning one, so the
-// twenty-odd calls that make up one import read as the list of tables they
-// are. The first failure stops the rest from running and is what the caller
-// sees.
 type loader struct {
 	tx  *sql.Tx
 	err error
 }
 
-// insertAll writes one row per element, mapping each to its argument list.
-// label names the table and the leading arguments name the row, which is
-// what an import failure has to carry: a constraint violation is only
-// actionable when it says which row broke. Two of them, because the tables
-// whose key is a pair are the ones that collide.
+// The error names the first two arguments: the pair-keyed tables are the
+// ones that collide.
 func insertAll[T any](l *loader, label, query string, rows []T, args func(T) []any) {
 	if l.err != nil {
 		return
@@ -1381,9 +1210,6 @@ func insertAll[T any](l *loader, label, query string, rows []T, args func(T) []a
 	}
 }
 
-// loadExportIntoDB reinserts every table from the export document into a
-// freshly-bootstrapped DB. The bootstrap seeds built-in tag_categories; we
-// overwrite their rows so any customized colors round-trip.
 func loadExportIntoDB(database *db.DB, exp Export) error {
 	tx, err := database.Write.Begin()
 	if err != nil {
@@ -1391,19 +1217,12 @@ func loadExportIntoDB(database *db.DB, exp Export) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Defer FK checks until COMMIT so alias rows can reference canonical
-	// tags that haven't been inserted yet (tags are emitted in ID order,
-	// and an alias created before its canonical legitimately has a lower
-	// id). The pragma is scoped to the current transaction.
+	// Deferred: an alias created before its canonical has the lower id.
 	if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
 		return fmt.Errorf("defer fk: %w", err)
 	}
 
-	// Wipe every table the export populates so seeded rows from
-	// db.Bootstrap (built-in categories, canonical rating tags, anything
-	// future seeds add) can't collide with imported ids. Order respects
-	// FK dependencies and `defer_foreign_keys = ON` smooths over the
-	// rest until commit.
+	// Clears what Bootstrap seeded, which would collide with the imported ids.
 	for _, stmt := range []string{
 		`DELETE FROM image_tags`,
 		`DELETE FROM image_tag_sources`,
@@ -1434,10 +1253,7 @@ func loadExportIntoDB(database *db.DB, exp Export) error {
 	l := &loader{tx: tx}
 
 	for _, r := range exp.TagCategories {
-		// Imported colours haven't been through CreateCategory's regex; coerce
-		// anything that doesn't match the documented #rgb / #rrggbb shape to
-		// the neutral fallback so a malicious export can't drop arbitrary
-		// strings into the inline `style="color:..."` template context.
+		// The color lands in an inline style attribute: don't trust it.
 		safeColor := tags.SafeCategoryColor(r.Color)
 		if safeColor != r.Color {
 			logx.Warnf("import: replaced invalid color %q for tag_category %q with %s", r.Color, r.Name, safeColor)
@@ -1460,9 +1276,10 @@ func loadExportIntoDB(database *db.DB, exp Export) error {
 		exp.TagImplications, func(r TagImplicationRow) []any {
 			return []any{r.ParentTagID, r.ImpliedTagID, r.CreatedAt, r.Origin, r.Stale}
 		})
-	// A pre-v10 document carries no scheduled-lookup opt-in, and the
-	// schema default is on; reading the absent field as 0 would opt every
-	// imported image out of the ladder.
+	insertAll(l, "tag_note",
+		`INSERT INTO tag_notes (tag_id, body, links) VALUES (?, ?, ?)`,
+		exp.TagNotes, func(r TagNoteRow) []any { return []any{r.TagID, r.Body, r.Links} })
+	// Pre-v10 documents lack the opt-ins, which would decode as 0: opted out.
 	preV10 := exp.Version < 10
 	insertAll(l, "image",
 		`INSERT INTO images (id, sha256, md5, canonical_path, folder_path, file_type, width, height,
@@ -1479,8 +1296,7 @@ func loadExportIntoDB(database *db.DB, exp Export) error {
 				r.Phash, r.LastReadPage, r.UploadBatch, scheduled, scheduledPTR, r.IngestedAt}
 		})
 	if exp.Version < 3 {
-		// Pre-v3 exports carry no image_collections table; the memberships
-		// derive from each image's home label mirror.
+		// Pre-v3 documents hold collections only in images.series.
 		if _, err := tx.Exec(
 			`INSERT OR IGNORE INTO image_collections (image_id, name, position)
 			 SELECT id, series, series_order FROM images WHERE series != ''`,
@@ -1537,9 +1353,7 @@ func loadExportIntoDB(database *db.DB, exp Export) error {
 			return []any{r.ImageID, r.TagID, r.Source, r.CreatedAt}
 		})
 	if exp.Version < 11 {
-		// Pre-v11 documents carry no ledger; derive the one source each row
-		// can attest the way the upgrade backfill does, so an imported
-		// library answers per-tag provenance rather than nothing at all.
+		// Pre-v11 documents carry no ledger, so derive one.
 		if _, err := tx.Exec(
 			`INSERT OR IGNORE INTO image_tag_sources (image_id, tag_id, source, created_at)
 			 SELECT image_id, tag_id, COALESCE(NULLIF(tagger_name, ''), 'user'), created_at
@@ -1609,11 +1423,9 @@ func loadExportIntoDB(database *db.DB, exp Export) error {
 		exp.DerivativeEdges, func(r DerivativeEdgeRow) []any {
 			return []any{r.DerivativeImageID, r.SourceImageID, r.CreatedAt}
 		})
-	// The table is keyed (a < b) and the relations service only ever
-	// matches that shape. A document written by an older version, or by
-	// hand, can carry the pair the other way round, so it is normalised
-	// here rather than restored as it stands; OR IGNORE because a document
-	// carrying both orientations then names one row twice.
+	// The relations service only matches a < b, which an older or
+	// hand-written document may not follow; OR IGNORE for one that names
+	// both orientations.
 	insertAll(l, "not_related_pair",
 		`INSERT OR IGNORE INTO not_related_pairs (a_image_id, b_image_id, created_at) VALUES (?, ?, ?)`,
 		exp.NotRelatedPairs, func(r NotRelatedPairRow) []any {
@@ -1636,11 +1448,7 @@ func loadExportIntoDB(database *db.DB, exp Export) error {
 	return tx.Commit()
 }
 
-// jsonWriter emits a single JSON object incrementally so each table's rows
-// stream out as we query them, bounding memory to one row at a time. Caller
-// drives it with objStart / field / arrayStart+arrayItem+arrayEnd / objEnd;
-// the first-field bookkeeping keeps commas correct without the caller
-// juggling them.
+// jsonWriter streams so an export holds one row in memory, never a whole table.
 type jsonWriter struct {
 	w     io.Writer
 	err   error
@@ -1713,15 +1521,13 @@ func (j *jsonWriter) marshalAndWrite(value any) {
 	j.raw(b)
 }
 
-// streamRows runs query and emits each row as one element of a JSON array
-// named `key`. scan builds the per-row value that will be JSON-marshaled.
-func streamRows(j *jsonWriter, key string, database *db.DB, query string, scan func(*sql.Rows) (any, error), args ...any) {
+func streamRows(j *jsonWriter, key string, q db.Querier, query string, scan func(*sql.Rows) (any, error), args ...any) {
 	if j.err != nil {
 		return
 	}
 	j.arrayStart(key)
 	first := true
-	rows, err := database.Read.Query(query, args...)
+	rows, err := q.Query(query, args...)
 	if err != nil {
 		j.arrayEnd()
 		j.err = err

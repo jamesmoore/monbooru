@@ -13,32 +13,22 @@ import (
 	"github.com/monbooru/monbooru/internal/plugins"
 )
 
-// monloaderApp is the reserved peer name the companion pairs under. It keeps
-// its own config section and its own surfaces; every other name routes to the
-// generic plugin path.
 const monloaderApp = "monloader"
 
-// pluginClient is the outbound client for third-party peers: probes and relay
-// calls. Per-call deadlines belong to the request contexts; this timeout is
-// only a backstop above the longest of them (the 10 s relay).
+// A backstop only: it must stay above every per-call deadline.
 var pluginClient = &http.Client{Timeout: 15 * time.Second}
 
 const (
-	// pluginProbeInterval is how often the background prober refreshes every
-	// peer, so buttons stop rendering within half a minute of a peer dying
-	// even on pages nobody reloads.
 	pluginProbeInterval = 30 * time.Second
 	pluginProbeTimeout  = 4 * time.Second
 )
 
-// plugins copies the configured blocks under the lock its mutators take.
 func (s *Server) plugins() []config.PluginConfig {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return slices.Clone(s.cfg.Plugins)
 }
 
-// plugin returns the block with the given name, or false.
 func (s *Server) plugin(name string) (config.PluginConfig, bool) {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -48,9 +38,7 @@ func (s *Server) plugin(name string) (config.PluginConfig, bool) {
 	return config.PluginConfig{}, false
 }
 
-// pluginBase is the address monbooru calls a peer at. A paused block reports
-// none, so every outbound call short-circuits while the credentials stay on
-// disk.
+// A paused block answers "", so every outbound call short-circuits.
 func (s *Server) pluginBase(p config.PluginConfig) string {
 	if p.Paused {
 		return ""
@@ -58,9 +46,6 @@ func (s *Server) pluginBase(p config.PluginConfig) string {
 	return s.pluginAddress(p)
 }
 
-// pluginAddress is where the peer lives regardless of the pause flag, which
-// suspends calls rather than moving the peer: the operator's override when
-// set, else the address learned at pairing (stored on the paired token).
 func (s *Server) pluginAddress(p config.PluginConfig) string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -73,9 +58,7 @@ func (s *Server) pluginAddress(p config.PluginConfig) string {
 	return ""
 }
 
-// pluginUsable reports whether a peer's surfaces should render: not paused
-// and not known down. A cold probe cache stays optimistic so a fresh boot
-// doesn't blank the buttons before the first probe lands.
+// A cold probe cache counts as up so a fresh boot does not blank the buttons.
 func (s *Server) pluginUsable(p config.PluginConfig) bool {
 	if p.Paused {
 		return false
@@ -83,8 +66,6 @@ func (s *Server) pluginUsable(p config.PluginConfig) bool {
 	return s.peers.ProbeSeed(p.Name).Conn != "down"
 }
 
-// pluginOffState names why a paired peer cannot be reached, for the title on
-// its inert buttons.
 func pluginOffState(p config.PluginConfig) string {
 	if p.Paused {
 		return "paused"
@@ -92,9 +73,6 @@ func pluginOffState(p config.PluginConfig) string {
 	return "not responding"
 }
 
-// peerOverrideURL is the operator's configured address for a peer, before any
-// pairing has stored one. monloader keeps its own key; plugins carry theirs on
-// the block a re-pair may reuse.
 func (s *Server) peerOverrideURL(app string) string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -107,10 +85,7 @@ func (s *Server) peerOverrideURL(app string) string {
 	return ""
 }
 
-// probePeer reports whether base answers a health probe, and the version it
-// names when it reports one. Any other body is ignored, so answering 200 with
-// nothing is enough to pass. The client is the caller's: monloader and the
-// plugins keep separate pools.
+// A 200 with any body passes; the version is optional.
 func probePeer(ctx context.Context, client *http.Client, base string) (string, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/health", nil)
 	if err != nil {
@@ -131,9 +106,6 @@ func probePeer(ctx context.Context, client *http.Client, base string) (string, b
 	return h.Version, true
 }
 
-// notifyPeerTeardown asks a peer to drop its side of the pairing and returns
-// an error when it could not be reached, so the caller can tell the operator
-// to remove the far end by hand. Shared by monloader and plugin removals.
 func notifyPeerTeardown(app, baseURL, token string) error {
 	base := strings.TrimRight(baseURL, "/")
 	if base == "" || token == "" {
@@ -151,19 +123,25 @@ func notifyPeerTeardown(app, baseURL, token string) error {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Any 2xx: the teardown is idempotent and carries no body worth reading,
-	// so a peer answering 204 has done what was asked.
+	// Any 2xx: the teardown is idempotent, so a 204 has done what was asked.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return peerStatusError{app, resp.Status}
 	}
 	return nil
 }
 
-// refreshPluginProbes probes every paired, unpaused peer whose cached state
-// has aged past the TTL. Peers are probed concurrently so one slow host can't
-// serialise the rest.
 func (s *Server) refreshPluginProbes(ctx context.Context) {
 	var wg sync.WaitGroup
+	// The scheduled lookup phases gate on monloader's cached state and
+	// run with no page open to poll the light, so without this a
+	// monloader down once is skipped every night after.
+	if s.pairedWith(monloaderApp) && !s.monloaderPaused() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.monloaderStatusCached(ctx)
+		}()
+	}
 	for _, p := range s.plugins() {
 		if p.PeerToken == "" || p.Paused {
 			continue
@@ -184,17 +162,12 @@ func (s *Server) refreshPluginProbes(ctx context.Context) {
 				s.peers.MarkDown(name)
 				return
 			}
-			// A peer that stops reporting its version keeps the one it gave
-			// at pairing rather than blanking the settings row.
 			s.peers.SetProbe(name, plugins.Probe{Conn: "ok", Version: version, CheckedAt: time.Now()})
 		}(p.Name, base)
 	}
 	wg.Wait()
 }
 
-// runPluginProbes keeps every peer's connectivity state fresh so the button
-// surfaces gate on something current. It costs nothing on an install with no
-// plugins: the refresh walks an empty list.
 func (s *Server) runPluginProbes() {
 	ticker := time.NewTicker(pluginProbeInterval)
 	defer ticker.Stop()

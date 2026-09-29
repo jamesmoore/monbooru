@@ -4,30 +4,24 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"fmt"
 	"html"
 	"net/http"
 	"os"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	meta "github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// setFlashHeader merges a `monbooru:flash` HX-Trigger event into the
-// response so a post-redirect / post-reload page can surface the
-// summary via the shared #gallery-flash / #detail-flash slot. extras
-// carries other triggers the handler also wants to fire (e.g. the
-// delete handler's delete-go-back). kind picks the flash-ok / flash-err
-// palette; pass "" for ok.
 func setFlashHeader(w http.ResponseWriter, text, kind string, extras map[string]any) {
 	kind = cmp.Or(kind, "ok")
-	// The client renders this through innerHTML (showActionFlash), so the
-	// text is escaped here at the single boundary, the same way
-	// writeInlineFlash escapes the body path. Without it an operator-
-	// supplied value spliced into the message (e.g. a folder name in the
-	// move flash) would land as live markup.
+	// The client renders this through innerHTML, so the text is escaped here.
 	triggers := map[string]any{
 		"monbooru:flash": map[string]any{"text": html.EscapeString(text), "kind": kind},
 	}
@@ -35,13 +29,28 @@ func setFlashHeader(w http.ResponseWriter, text, kind string, extras map[string]
 		triggers[k] = v
 	}
 	if b, err := json.Marshal(triggers); err == nil {
-		w.Header().Set("HX-Trigger", string(b))
+		w.Header().Set("HX-Trigger", asciiJSON(b))
 	}
 }
 
-// hxDone finishes a successful mutating handler: HTMX callers get the ok
-// flash plus a full refresh (hxDest == "") or an HX-Redirect to hxDest;
-// plain form submits get a 303 to fallback.
+// XHR hands a header to the page one byte per character, so UTF-8 would
+// arrive as Latin-1 mojibake; a JSON \u escape arrives intact.
+func asciiJSON(b []byte) string {
+	var sb strings.Builder
+	for _, r := range string(b) {
+		switch {
+		case r < utf8.RuneSelf:
+			sb.WriteRune(r)
+		case r > 0xFFFF:
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(&sb, `\u%04x\u%04x`, hi, lo)
+		default:
+			fmt.Fprintf(&sb, `\u%04x`, r)
+		}
+	}
+	return sb.String()
+}
+
 func hxDone(w http.ResponseWriter, r *http.Request, flash, hxDest, fallback string) {
 	if isHTMXRequest(r) {
 		setFlashHeader(w, flash, "ok", nil)
@@ -56,9 +65,6 @@ func hxDone(w http.ResponseWriter, r *http.Request, flash, hxDest, fallback stri
 	http.Redirect(w, r, fallback, http.StatusSeeOther)
 }
 
-// hxRedirect sends an htmx caller to dest via the HX-Redirect header and
-// everyone else via a 303. The bare counterpart to hxDone, which carries
-// a flash along with the redirect.
 func hxRedirect(w http.ResponseWriter, r *http.Request, dest string) {
 	if isHTMXRequest(r) {
 		w.Header().Set("HX-Redirect", dest)
@@ -68,30 +74,18 @@ func hxRedirect(w http.ResponseWriter, r *http.Request, dest string) {
 	http.Redirect(w, r, dest, http.StatusSeeOther)
 }
 
-// writeInlineFlash writes a `<div class="flash flash-{kind}">...</div>`
-// fragment with text HTML-escaped, for handlers that need the flash
-// payload in the response body (htmx partial swap target) rather than
-// only as an HX-Trigger. kind is "ok" / "err" / "warn" (callers pass
-// the bare suffix; the function adds the `flash-` prefix). text is
-// taken verbatim and HTML-escaped here so every call site shares one
-// escape boundary.
 func writeInlineFlash(w http.ResponseWriter, kind, text string) {
 	kind = cmp.Or(kind, "ok")
 	_, _ = w.Write([]byte(`<div class="flash flash-` + kind + `">` + html.EscapeString(text) + `</div>`))
 }
 
-// writeInlineFlashHTML mirrors writeInlineFlash but takes a body that is
-// already valid HTML; escaping is the caller's responsibility. Used by
-// the few flashes that carry markup (e.g. links to affected rows) which
-// the plain-text escaper would render as literal angle brackets.
+// writeInlineFlashHTML writes body as is: the caller escapes anything
+// operator-supplied in it.
 func writeInlineFlashHTML(w http.ResponseWriter, kind, body string) {
 	kind = cmp.Or(kind, "ok")
 	_, _ = w.Write([]byte(`<div class="flash flash-` + kind + `">` + body + `</div>`))
 }
 
-// writeFlashOOB swaps a flash into a slot out-of-band so the message outlives a
-// polling fragment that would otherwise overwrite the region it sat in. Empty
-// text clears the slot.
 func writeFlashOOB(w http.ResponseWriter, id, kind, text string) {
 	body := ""
 	if text != "" {
@@ -101,14 +95,8 @@ func writeFlashOOB(w http.ResponseWriter, id, kind, text string) {
 	_, _ = w.Write([]byte(`<div id="` + id + `" hx-swap-oob="true">` + body + `</div>`))
 }
 
-// notFoundHandler renders a styled 404 for any unmatched GET path. The
-// mux's default behaviour is unstyled `404 page not found` text on a
-// white page; routing through the standard layout keeps the user inside
-// the app with a back link.
 func (s *Server) notFoundHandler(w http.ResponseWriter, r *http.Request) {
-	// Routes are registered slash-less; retry /categories/ style paths
-	// without the trailing slash before giving up.
-	if p := strings.TrimRight(r.URL.Path, "/"); p != "" && p != r.URL.Path {
+	if p := strings.TrimRight(r.URL.Path, "/"); p != "" && p != r.URL.Path && localPath(p) {
 		if r.URL.RawQuery != "" {
 			p += "?" + r.URL.RawQuery
 		}
@@ -118,9 +106,8 @@ func (s *Server) notFoundHandler(w http.ResponseWriter, r *http.Request) {
 	s.renderNotFound(w, r)
 }
 
-// renderNotFound is notFoundHandler without the slash retry, for a route
-// registered as a subtree: the mux already redirects its slash-less form
-// onto the trailing slash, so retrying it there is a redirect loop.
+// For a subtree route: the mux redirects its slash-less form onto the
+// slash, so the slash retry would loop.
 func (s *Server) renderNotFound(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotFound)
 	s.renderTemplate(w, "notfound.html", s.base(r, "", "Not found - "+s.booruName()))
@@ -173,12 +160,9 @@ func loadComfyMeta(ctx context.Context, database *db.DB, id int64) *models.Comfy
 	return &m
 }
 
-// userAndStaleTags reports what the remove-tags dialog needs to know about
-// an image's tag list: whether it carries any of the operator's own, and
-// whether any of them went stale.
 func userAndStaleTags(imageTags []models.ImageTag) (hasUser, hasStale bool) {
 	for _, t := range imageTags {
-		if !t.IsAuto && t.TaggerName == "" {
+		if !t.IsAuto && t.TaggerName == "" && !t.IsImplied {
 			hasUser = true
 		}
 		if t.Stale {
@@ -191,13 +175,11 @@ func userAndStaleTags(imageTags []models.ImageTag) (hasUser, hasStale bool) {
 	return hasUser, hasStale
 }
 
-// extraImagePaths counts the copies a delete takes alongside the canonical
-// one. A read that came back empty is not a negative count.
 func extraImagePaths(paths []models.ImagePath) int {
 	return max(len(paths)-1, 0)
 }
 
-func loadImagePaths(ctx context.Context, database *db.DB, id int64) []models.ImagePath {
+func loadImagePaths(ctx context.Context, database *db.DB, b *gallery.Boundary, id int64) []models.ImagePath {
 	rows, err := database.Read.QueryContext(ctx,
 		`SELECT id, image_id, path, is_canonical FROM image_paths WHERE image_id = ? ORDER BY is_canonical DESC, id`,
 		id,
@@ -215,10 +197,10 @@ func loadImagePaths(ctx context.Context, database *db.DB, id int64) []models.Ima
 			continue
 		}
 		p.IsCanonical = isCanon == 1
-		// A non-canonical path whose file is gone is move/copy history, not
-		// a live duplicate; keep it out of the Duplicates panel.
+		// A gone file is move history, and one outside the boundary is
+		// another gallery's; neither is a live duplicate.
 		if !p.IsCanonical {
-			if _, statErr := os.Stat(p.Path); os.IsNotExist(statErr) {
+			if _, statErr := os.Stat(p.Path); os.IsNotExist(statErr) || b.Check(p.Path) != nil {
 				continue
 			}
 		}
@@ -230,14 +212,9 @@ func loadImagePaths(ctx context.Context, database *db.DB, id int64) []models.Ima
 	return paths
 }
 
-// defaultThemeColor mirrors the stylesheet's --bg, the splash a viewer
-// gets when server.theme_color is unset.
+// Must match the stylesheet's --bg.
 const defaultThemeColor = "#0e0e0e"
 
-// manifestHandler serves the web app manifest behind the layout's
-// <link rel="manifest">, so a browser can install the gallery as a
-// home-screen app. No theme file reaches the icon: the installed-app icon
-// is drawn at 192px, which is neither the topbar logo nor the tab icon.
 func (s *Server) manifestHandler(w http.ResponseWriter, r *http.Request) {
 	icon := map[string]any{
 		"src":     "/static/icon-192.png",
@@ -248,9 +225,8 @@ func (s *Server) manifestHandler(w http.ResponseWriter, r *http.Request) {
 	name := s.booruName()
 	color := cmp.Or(s.themeColor(), defaultThemeColor)
 	w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
-	// Built from live config, so a heuristic cache would keep serving the
-	// old name after a rename; an installed theme's files revalidate for
-	// the same reason.
+	// Built from live config, so a cached copy would keep the old name
+	// after a rename.
 	w.Header().Set("Cache-Control", "no-cache")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"name":             name,

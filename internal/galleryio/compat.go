@@ -9,27 +9,20 @@ import (
 	"github.com/monbooru/monbooru/internal/galleryio/compatibility"
 )
 
-// Importing the compatibility package here runs its providers' init()
-// functions, registering the per-application translators.
 func detectCompatFormat(files []*zip.File) string { return compatibility.Detect(files) }
 
-// replaceFromCompatArchive routes a foreign-format zip through the native
-// light-replacer path. format is propagated to ApplyLightReplace so the
-// detail page credits the originating app instead of the generic "import".
-func replaceFromCompatArchive(files []*zip.File, format, dbPath, thumbsPath, galleryPath string, maxFileSizeMB int) error {
+func replaceFromCompatArchive(files []*zip.File, format, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int) (int, error) {
 	result, err := compatibility.Translate(files, format)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return ApplyLightReplace(
 		toLightManifest(result.Manifest),
 		translatedFilesFromCompat(result.Files),
-		dbPath, thumbsPath, galleryPath, format, maxFileSizeMB,
+		dbPath, thumbsPath, b, format, maxFileSizeMB,
 	)
 }
 
-// mergeFromCompatArchive routes a foreign-format zip through the zip-merge
-// path: tags onto existing SHAs, ingest-and-tag for new SHAs.
 func mergeFromCompatArchive(cx gallery.Handle, files []*zip.File, format string, maxFileSizeMB int) (MergeResult, error) {
 	result, err := compatibility.Translate(files, format)
 	if err != nil {

@@ -1,4 +1,2 @@
-// Package procx holds the child-process primitives more than one package
-// needs and none of them owns. It sits beside fsx, below every domain
-// package.
+// Package procx holds child-process helpers shared across packages.
 package procx

@@ -7,12 +7,9 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// HideConsole keeps a console child from opening a window of its own. The
-// Windows binary is linked for the GUI subsystem, so it has no console to
-// lend and Windows allocates a fresh one per console child: an ffmpeg run
-// flashes a window up and takes the focus with it. The child is left with
-// no console at all, which costs nothing while every caller reads it
-// through a pipe.
+// HideConsole leaves the child no console, so read its output through
+// pipes. The GUI-subsystem binary has none to lend, and Windows would open
+// a window per console child that flashes up and takes the focus.
 func HideConsole(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}

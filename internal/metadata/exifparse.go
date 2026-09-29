@@ -8,11 +8,11 @@ import (
 	"math"
 	"strings"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 )
 
-// TIFF 6.0 value types. A type outside this set has no defined width, so
-// an entry carrying one cannot be located and the block is refused.
+// TIFF 6.0 field type codes.
 const (
 	exifByte      uint16 = 1
 	exifASCII     uint16 = 2
@@ -28,15 +28,13 @@ const (
 	exifDouble    uint16 = 12
 )
 
-// exifTypeSize is each type's width in bytes; a missing entry means the
-// type is unknown.
 var exifTypeSize = map[uint16]uint64{
 	exifByte: 1, exifASCII: 1, exifShort: 2, exifLong: 4,
 	exifRational: 8, exifSByte: 1, exifUndefined: 1, exifSShort: 2,
 	exifSLong: 4, exifSRational: 8, exifFloat: 4, exifDouble: 8,
 }
 
-// The sub-IFD pointer tags, by the name the tables give them.
+// Looked up by the names the tag tables give them.
 const (
 	exifIFDPointer    = "ExifIFDPointer"
 	gpsIFDPointer     = "GPSInfoIFDPointer"
@@ -51,13 +49,11 @@ var (
 	errEXIFNoDirs = errors.New("exif: no image file directory")
 )
 
-// maxEXIFDirs bounds the IFD chain. Real files carry one or two; the cap
-// only has to keep a hostile chain from walking forever, and the visited
-// set below already rejects the cycles that would.
+// Real files carry one or two directories; the cap only bounds a hostile chain.
 const maxEXIFDirs = 64
 
-// exifTag is one decoded IFD entry. val always holds exactly
-// size(typ)*count bytes, so the accessors below cannot run off the end.
+// val holds exactly size(typ)*count bytes, which the accessors rely on
+// for bounds.
 type exifTag struct {
 	id    uint16
 	typ   uint16
@@ -66,8 +62,6 @@ type exifTag struct {
 	order binary.ByteOrder
 }
 
-// exifData is the named tags an EXIF block yielded, keyed by EXIF field
-// name. Tags the tables do not name are dropped.
 type exifData struct {
 	tags map[string]*exifTag
 }
@@ -77,25 +71,16 @@ func (x *exifData) get(name string) (*exifTag, bool) {
 	return t, ok
 }
 
-// walk calls fn for every named tag. Map order, so callers that render a
-// list sort it themselves.
+// Map order: a caller that renders the tags sorts them.
 func (x *exifData) walk(fn func(name string, t *exifTag)) {
 	for name, t := range x.tags {
 		fn(name, t)
 	}
 }
 
-// decodeEXIF parses a raw TIFF/EXIF block: the header, the IFD chain, and
-// the Exif, GPS and Interoperability sub-IFDs the chain points at. Every
-// offset and length is checked against the block, so a truncated or
-// hostile block is read within its bounds or not at all.
-//
-// Decoding past IFD0 is best-effort. IFD0 is where the tags an operator
-// recognises live, so a block whose header or IFD0 will not parse yields
-// nothing; but a later directory or a sub-IFD that will not parse is
-// dropped rather than discarding what already decoded. A directory that
-// fails contributes no tags either way, so keeping the rest cannot
-// surface a wrong value - only fewer of them.
+// Every offset and length is checked against the block. Only the header
+// and IFD0 must parse: past them, what fails to decode is dropped, which
+// can lose tags but never surface a wrong one.
 func decodeEXIF(data []byte) (*exifData, error) {
 	order, first, err := exifHeader(data)
 	if err != nil {
@@ -108,8 +93,7 @@ func decodeEXIF(data []byte) (*exifData, error) {
 
 	x := &exifData{tags: make(map[string]*exifTag)}
 	x.load(dirs[0], exifTagNames)
-	// IFD1 describes the embedded thumbnail, so its ids are read against
-	// the thumbnail table rather than IFD0's.
+	// IFD1 is the embedded thumbnail's, so it has its own table.
 	if len(dirs) > 1 {
 		x.load(dirs[1], thumbTagNames)
 	}
@@ -128,8 +112,6 @@ func decodeEXIF(data []byte) (*exifData, error) {
 	return x, nil
 }
 
-// exifHeader reads the 8-byte TIFF header and returns the byte order and
-// the offset of the first IFD.
 func exifHeader(data []byte) (binary.ByteOrder, uint64, error) {
 	if len(data) < 8 {
 		return nil, 0, errEXIFHeader
@@ -149,10 +131,6 @@ func exifHeader(data []byte) (binary.ByteOrder, uint64, error) {
 	return order, uint64(order.Uint32(data[4:8])), nil
 }
 
-// exifDirs walks the IFD chain from off, stopping at the first directory
-// that will not decode and returning the ones before it. A directory
-// already visited also ends the walk: a chain that revisits one is cyclic,
-// and following it would not terminate.
 func exifDirs(data []byte, order binary.ByteOrder, off uint64) ([][]*exifTag, error) {
 	var dirs [][]*exifTag
 	seen := make(map[uint64]bool)
@@ -171,8 +149,6 @@ func exifDirs(data []byte, order binary.ByteOrder, off uint64) ([][]*exifTag, er
 	return dirs, nil
 }
 
-// exifDir decodes the directory at off and returns its entries plus the
-// offset of the next directory in the chain.
 func exifDir(data []byte, order binary.ByteOrder, off uint64) ([]*exifTag, uint64, error) {
 	start := off
 	if start+2 > uint64(len(data)) {
@@ -197,8 +173,8 @@ func exifDir(data []byte, order binary.ByteOrder, off uint64) ([]*exifTag, uint6
 	return tags, uint64(order.Uint32(data[end-4 : end])), nil
 }
 
-// exifEntry decodes one 12-byte IFD entry, resolving its value either
-// inline or through the offset field.
+// A value of up to 4 bytes sits inline in the entry; a longer one at the
+// offset it holds.
 func exifEntry(data []byte, order binary.ByteOrder, e []byte) (*exifTag, error) {
 	id := order.Uint16(e[0:2])
 	typ := order.Uint16(e[2:4])
@@ -208,8 +184,7 @@ func exifEntry(data []byte, order binary.ByteOrder, e []byte) (*exifTag, error) 
 	if !ok {
 		return nil, errEXIFType
 	}
-	// The product is computed in 64 bits, so a count chosen to wrap a
-	// 32-bit width cannot make an oversized value look small.
+	// In 64 bits, so a hostile count cannot wrap the length small.
 	length := size * uint64(count)
 	if length == 0 {
 		return nil, errEXIFEntry
@@ -228,9 +203,8 @@ func exifEntry(data []byte, order binary.ByteOrder, e []byte) (*exifTag, error) 
 	return &exifTag{id: id, typ: typ, count: count, val: val, order: order}, nil
 }
 
-// load records every entry the table names. A later directory overwrites
-// an earlier one's tag of the same name, which is how a sub-IFD's copy of
-// a field wins over IFD0's.
+// A later load overwrites an earlier one's tag, so a sub-IFD's copy wins
+// over IFD0's.
 func (x *exifData) load(tags []*exifTag, names map[uint16]string) {
 	for _, t := range tags {
 		if name, ok := names[t.id]; ok {
@@ -239,9 +213,6 @@ func (x *exifData) load(tags []*exifTag, names map[uint16]string) {
 	}
 }
 
-// loadSubIFD follows a pointer tag loaded from IFD0 and reads the
-// directory it addresses. A pointer that is absent, not an integer, or
-// aimed at something that will not decode leaves the tag set as it was.
 func (x *exifData) loadSubIFD(data []byte, order binary.ByteOrder, pointer string, names map[uint16]string) {
 	t, ok := x.get(pointer)
 	if !ok {
@@ -258,7 +229,6 @@ func (x *exifData) loadSubIFD(data []byte, order binary.ByteOrder, pointer strin
 	x.load(tags, names)
 }
 
-// intAt returns the i'th value of an integer-typed tag.
 func (t *exifTag) intAt(i int) (int64, bool) {
 	vals := t.ints()
 	if vals == nil || i >= len(vals) {
@@ -267,8 +237,6 @@ func (t *exifTag) intAt(i int) (int64, bool) {
 	return vals[i], true
 }
 
-// stringVal returns the text of an ASCII tag, stopping at the first NUL so
-// a padded or over-counted value does not carry its padding along.
 func (t *exifTag) stringVal() (string, bool) {
 	if t.typ != exifASCII {
 		return "", false
@@ -277,6 +245,61 @@ func (t *exifTag) stringVal() (string, bool) {
 		return string(t.val[:n]), true
 	}
 	return string(t.val), true
+}
+
+// UserComment opens with an 8-byte charset code. piexif, which A1111,
+// Forge and the ComfyUI savers write through, stores "UNICODE\0" and
+// UTF-16 as UNDEFINED; JIS is left undecoded.
+func (t *exifTag) userCommentText() (string, bool) {
+	if t.typ != exifASCII && t.typ != exifUndefined {
+		return "", false
+	}
+	if len(t.val) >= 8 {
+		switch body := t.val[8:]; string(t.val[:8]) {
+		case "ASCII\x00\x00\x00", "\x00\x00\x00\x00\x00\x00\x00\x00":
+			if n := bytes.IndexByte(body, 0); n >= 0 {
+				body = body[:n]
+			}
+			return string(body), true
+		case "UNICODE\x00":
+			return decodeUTF16(body), true
+		}
+	}
+	if t.typ == exifASCII {
+		return t.stringVal()
+	}
+	return "", false
+}
+
+// A BOM decides the byte order; without one, mostly-ASCII text puts its
+// zero bytes on the high side, and big-endian is piexif's own.
+func decodeUTF16(b []byte) string {
+	var order binary.ByteOrder = binary.BigEndian
+	switch {
+	case len(b) >= 2 && b[0] == 0xFE && b[1] == 0xFF:
+		b = b[2:]
+	case len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE:
+		order, b = binary.LittleEndian, b[2:]
+	default:
+		var even, odd int
+		for i, c := range b {
+			if c == 0 {
+				if i%2 == 0 {
+					even++
+				} else {
+					odd++
+				}
+			}
+		}
+		if odd > even {
+			order = binary.LittleEndian
+		}
+	}
+	units := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		units = append(units, order.Uint16(b[i:]))
+	}
+	return strings.TrimRight(string(utf16.Decode(units)), "\x00")
 }
 
 func (t *exifTag) ints() []int64 {
@@ -310,7 +333,6 @@ func (t *exifTag) ints() []int64 {
 			u = uint64(t.order.Uint32(b))
 		}
 		if signed {
-			// Sign-extend from the type's width.
 			shift := 64 - width*8
 			out[i] = int64(u<<shift) >> shift
 			continue
@@ -352,10 +374,6 @@ func (t *exifTag) rats() [][2]int64 {
 	return out
 }
 
-// String renders the tag for the detail page's metadata panel: a bare
-// value when the tag holds one, a bracketed list when it holds several.
-// Text and undefined tags render quoted, and the quoting plus the
-// single-value unwrapping are what the panel has always shown.
 func (t *exifTag) String() string {
 	body := t.render()
 	if t.count == 1 {
@@ -386,10 +404,8 @@ func (t *exifTag) render() string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
-// quotePrintable renders raw tag bytes as a quoted string, dropping the
-// bytes that would not print. Dropping them one byte at a time can split a
-// multi-byte rune, so a result that is no longer valid UTF-8 is reported
-// as empty rather than handed to a template as broken text.
+// Bytes are dropped one at a time, which can split a rune, so an invalid
+// UTF-8 result renders as empty.
 func quotePrintable(in []byte) string {
 	var b strings.Builder
 	b.WriteByte('"')

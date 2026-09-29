@@ -1,6 +1,7 @@
 package gallery
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
@@ -13,29 +14,22 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// ResolveSubdir validates a user-supplied folder path and returns the
-// absolute destination directory under galleryPath. An empty folder
-// yields the gallery root. Absolute paths, and relative ones that still
-// climb out once normalized, are rejected so callers cannot escape the
-// root; a ".." that cancels out on the way ("a/../b") is just "b".
-func ResolveSubdir(galleryPath, folder string) (string, error) {
+func resolveSubdir(galleryPath, folder string) (string, error) {
 	folder = strings.TrimSpace(folder)
 	if folder == "" {
 		return galleryPath, nil
 	}
-	// Reject absolute paths before the slash trim, otherwise "/tmp/x"
-	// becomes "tmp/x" and looks relative by the time IsAbs runs.
+	// Before the trim, which would turn "/tmp/x" into a relative "tmp/x".
 	if filepath.IsAbs(folder) {
 		return "", fmt.Errorf("folder must be relative to the gallery root")
 	}
 	folder = strings.Trim(folder, "/\\")
-	// Judged after cleaning, so an interior `..` that cancels out ("a/../b")
-	// is a plain relative path and only a genuine climb is refused.
 	cleaned := filepath.Clean(filepath.ToSlash(folder))
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {
 		return "", fmt.Errorf("folder path escapes the gallery root")
@@ -54,34 +48,22 @@ func ResolveSubdir(galleryPath, folder string) (string, error) {
 	return abs, nil
 }
 
-// PathInside reports whether target is named inside root. Both arguments
-// should be cleaned and absolute. Uses filepath.Rel so a sibling directory
-// sharing a literal prefix (`/data/gallery` vs `/data/gallery_backup`) is
-// correctly rejected. A target equal to root counts as inside.
+// PathInside wants both paths clean and absolute, and counts root itself
+// as inside. Rel, not a prefix test, which /data/gallery_backup would pass
+// for /data/gallery.
 func PathInside(root, target string) bool {
 	rel, err := filepath.Rel(root, target)
-	if err != nil {
-		return false
-	}
-	if rel == "." {
-		return true
-	}
-	return !strings.HasPrefix(rel, "..")
+	return err == nil && !climbsOut(rel)
 }
 
-// NamedInside is PathInside for paths not already known to be absolute,
-// and is the gate every serve path runs before opening a stored file.
-// Under any profile the config hands those paths down absolute, and Rel
-// cleans what it is given, so the two answer alike today; a gallery path
-// that ever arrives relative is what this one still gets right.
-//
-// It stops at the name deliberately. A gallery folder may be a symlink and
-// may hold them, so bytes behind one belong to the gallery even though they
-// do not sit under the root - resolving the links here would refuse to
-// serve exactly those files. Traversal is still caught: the name has to
-// fall under the root, and only monbooru writes the paths this reads.
-// Where the bytes actually sit is the other question, and storedInside is
-// the one that asks it.
+// A name that only starts with two dots, like "..drafts", is inside.
+func climbsOut(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// NamedInside checks the name, not the resolved path: bytes behind a
+// symlinked folder belong to the gallery. It trusts that only monbooru
+// writes the stored paths it gates.
 func NamedInside(root, target string) bool {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
@@ -94,40 +76,27 @@ func NamedInside(root, target string) bool {
 	return PathInside(rootAbs, targetAbs)
 }
 
-// ErrUnsupportedType is returned when the file type is not recognized.
 var ErrUnsupportedType = errors.New("unsupported file type")
 
-// SupportedMIMETypes is the accept attribute value for file inputs, listing all
-// MIME types that Monbooru can ingest. The cbz line covers both `.cbz` and
-// plain `.zip` uploads; both ingest as one manga row.
-const SupportedMIMETypes = "image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,application/vnd.comicbook+zip,application/zip,application/x-cbz"
+// SupportedMIMETypes lists bare .avif and .jxl so a picker on an OS that
+// maps no type to them does not hide those files.
+const SupportedMIMETypes = "image/jpeg,image/png,image/webp,image/avif,image/jxl,.avif,.jxl,image/gif,video/mp4,video/webm,application/vnd.comicbook+zip,application/zip,application/x-cbz"
 
-// UniqueDestPath returns a path under destDir that does not currently
-// exist, appending `_1`, `_2`, ... to the stem on collision. Shared by
-// the upload form, API createImage, and merge-extract paths so the
-// rename rule is consistent. The stat check is racy (TOCTOU); callers
-// needing stronger guarantees should O_CREATE|O_EXCL themselves.
+// UniqueDestPath's stat check is racy: a caller that must not clobber a
+// file opens with O_CREATE|O_EXCL.
 func UniqueDestPath(destDir, filename string) string {
 	return uniquePathBy(destDir, filename, uploadSuffix)
 }
 
 func uploadSuffix(stem, ext string, i int) string { return fmt.Sprintf("%s_%d%s", stem, i, ext) }
 
-// uniquePathBy returns dir/filename when it is free, else the first name
-// nameNth produces that is. The stat check is racy (TOCTOU); callers needing
-// stronger guarantees should O_CREATE|O_EXCL themselves.
 func uniquePathBy(dir, filename string, nameNth func(stem, ext string, i int) string) string {
 	return uniquePathIn(dir, filename, nil, nameNth)
 }
 
-// uniquePathIn is uniquePathBy plus the destinations earlier rows of the same
-// run have taken but not written yet, so a dry run numbers the way the run
-// will instead of promising every row the same name.
 func uniquePathIn(dir, filename string, claimed map[string]struct{}, nameNth func(stem, ext string, i int) string) string {
-	// Only a successful stat says the name is taken. A name the filesystem
-	// refuses outright - too long, a component that is not a directory -
-	// is not free at any suffix either, and numbering past it never ends;
-	// handing it back lets the write report what is actually wrong.
+	// Any stat error counts as free: a name the filesystem refuses would
+	// be refused at every suffix, and the loop would never end.
 	free := func(p string) bool {
 		if _, taken := claimed[p]; taken {
 			return false
@@ -148,8 +117,6 @@ func uniquePathIn(dir, filename string, claimed map[string]struct{}, nameNth fun
 	}
 }
 
-// cancellableReader stops a read once its context is done. io.Copy has no
-// cancellation of its own, and an original can be gigabytes.
 type cancellableReader struct {
 	ctx context.Context
 	r   io.Reader
@@ -162,8 +129,6 @@ func (c cancellableReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// streamFile copies the file at path into w in 32 KB chunks, giving up
-// between chunks when ctx is done.
 func streamFile(ctx context.Context, path string, w io.Writer) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -177,7 +142,6 @@ func streamFile(ctx context.Context, path string, w io.Writer) error {
 	return nil
 }
 
-// hashFileWith streams the file at path through h.
 func hashFileWith(ctx context.Context, path string, h hash.Hash) (string, error) {
 	if err := streamFile(ctx, path, h); err != nil {
 		return "", err
@@ -185,19 +149,16 @@ func hashFileWith(ctx context.Context, path string, h hash.Hash) (string, error)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// HashFile computes the SHA-256 of the file at path.
 func HashFile(path string) (string, error) {
 	return hashFileWith(context.Background(), path, sha256.New())
 }
 
-// Md5File computes the MD5 of the file at path. Boorus key their posts on
-// md5; sha256 remains the content address, and md5 is never a dedup key.
+// Md5File is for booru lookups only; sha256 stays the content address and
+// the dedup key.
 func Md5File(path string) (string, error) { return hashFileWith(context.Background(), path, md5.New()) }
 
-// hashFileDigests computes both stored digests of the file at path in one
-// read. Every path that writes images.sha256 goes through here, so the two
-// columns cannot drift apart: an md5 describing bytes the row no longer
-// holds is what a later booru lookup would search for.
+// One read for both digests, so the md5 a booru lookup searches by always
+// describes the sha256's bytes.
 func hashFileDigests(path string) (sha, sum string, err error) {
 	shaH, md5H := sha256.New(), md5.New()
 	if err := streamFile(context.Background(), path, io.MultiWriter(shaH, md5H)); err != nil {
@@ -206,8 +167,8 @@ func hashFileDigests(path string) (sha, sum string, err error) {
 	return hex.EncodeToString(shaH.Sum(nil)), hex.EncodeToString(md5H.Sum(nil)), nil
 }
 
-// DetectFileType returns the file type constant for the given path,
-// trying extension matching first and falling back to magic bytes.
+// DetectFileType trusts the extension so the sync walk opens no file it
+// can name.
 func DetectFileType(path string) (string, error) {
 	if t := ExtFileType(path); t != "" {
 		return t, nil
@@ -215,9 +176,6 @@ func DetectFileType(path string) (string, error) {
 	return detectMagicType(path)
 }
 
-// ExtFileType returns the type the path's extension claims, or "" when it
-// claims none. Ingest records what the bytes say, so comparing the two is
-// what tells the operator a file is misnamed.
 func ExtFileType(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".jpg", ".jpeg":
@@ -226,6 +184,10 @@ func ExtFileType(path string) string {
 		return models.FileTypePNG
 	case ".webp":
 		return models.FileTypeWEBP
+	case ".avif":
+		return models.FileTypeAVIF
+	case ".jxl":
+		return models.FileTypeJXL
 	case ".gif":
 		return models.FileTypeGIF
 	case ".mp4":
@@ -238,8 +200,8 @@ func ExtFileType(path string) string {
 	return ""
 }
 
-// detectMagicType reads the file's leading bytes and returns the type
-// their signature declares, or ErrUnsupportedType when they match none.
+func MagicFileType(path string) (string, error) { return detectMagicType(path) }
+
 func detectMagicType(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -261,40 +223,39 @@ func detectMagic(buf []byte) (string, error) {
 		return "", ErrUnsupportedType
 	}
 
-	// JPEG: FF D8 FF
 	if buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF {
 		return models.FileTypeJPEG, nil
 	}
-	// PNG: 89 50 4E 47 0D 0A 1A 0A
 	if len(buf) >= 8 &&
 		buf[0] == 0x89 && buf[1] == 0x50 && buf[2] == 0x4E && buf[3] == 0x47 &&
 		buf[4] == 0x0D && buf[5] == 0x0A && buf[6] == 0x1A && buf[7] == 0x0A {
 		return models.FileTypePNG, nil
 	}
-	// GIF: 47 49 46 38
 	if buf[0] == 0x47 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x38 {
 		return models.FileTypeGIF, nil
 	}
-	// WEBP: 52 49 46 46 .. .. .. .. 57 45 42 50
 	if len(buf) >= 12 &&
 		buf[0] == 0x52 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x46 &&
 		buf[8] == 0x57 && buf[9] == 0x45 && buf[10] == 0x42 && buf[11] == 0x50 {
 		return models.FileTypeWEBP, nil
 	}
-	// MP4: ftyp box at offset 4 (66 74 79 70). Its brands disambiguate
-	// ISO base-media containers; without the brand check `.mov`,
-	// `.heic`, and old `.3gp` files would be accepted as MP4 and then
-	// fail to decode in the browser.
-	if len(buf) >= 12 && buf[4] == 0x66 && buf[5] == 0x74 && buf[6] == 0x79 && buf[7] == 0x70 &&
-		hasMP4Brand(buf) {
-		return models.FileTypeMP4, nil
+	if (buf[0] == 0xFF && buf[1] == 0x0A) || bytes.HasPrefix(buf, jxlContainer) {
+		return models.FileTypeJXL, nil
 	}
-	// WEBM: 1A 45 DF A3 (EBML header)
+	// Brands, not the bare ftyp box: .mov, .heic and .3gp would pass as
+	// MP4 and fail in the browser. AVIF is asked first, by its own
+	// brands: the mif1 it also lists is HEIC's too.
+	if len(buf) >= 12 && buf[4] == 0x66 && buf[5] == 0x74 && buf[6] == 0x79 && buf[7] == 0x70 {
+		if hasFtypBrand(buf, "avif", "avis") {
+			return models.FileTypeAVIF, nil
+		}
+		if hasFtypBrand(buf, "mp42", "mp41", "isom", "iso2", "avc1") {
+			return models.FileTypeMP4, nil
+		}
+	}
 	if buf[0] == 0x1A && buf[1] == 0x45 && buf[2] == 0xDF && buf[3] == 0xA3 {
 		return models.FileTypeWEBM, nil
 	}
-	// ZIP / CBZ: PK\x03\x04 (LFH) or PK\x05\x06 (empty zip EOCD).
-	// Both end up as FileTypeCBZ; an empty archive is rejected at ingest.
 	if buf[0] == 0x50 && buf[1] == 0x4B &&
 		(buf[2] == 0x03 && buf[3] == 0x04 || buf[2] == 0x05 && buf[3] == 0x06) {
 		return models.FileTypeCBZ, nil
@@ -303,18 +264,17 @@ func detectMagic(buf []byte) (string, error) {
 	return "", ErrUnsupportedType
 }
 
-// hasMP4Brand reports whether an ftyp box names a brand monbooru can
-// serve. The playable brand lands in compatible_brands as readily as in
-// major_brand: danbooru's mp4s are major iso5 and name mp41 only there.
-func hasMP4Brand(buf []byte) bool {
-	// Bounded by the declared box size so the scan stops at ftyp.
+var jxlContainer = []byte{0x00, 0x00, 0x00, 0x0C, 'J', 'X', 'L', ' ', 0x0D, 0x0A, 0x87, 0x0A}
+
+// Compatible brands count as much as the major one: danbooru's mp4s are
+// major iso5 and name mp41 only there.
+func hasFtypBrand(buf []byte, brands ...string) bool {
 	end := min(int(binary.BigEndian.Uint32(buf[:4])), len(buf))
 	for off := 8; off+4 <= end; off += 4 {
 		if off == 12 {
 			continue // minor_version
 		}
-		switch string(buf[off : off+4]) {
-		case "mp42", "mp41", "isom", "iso2", "avc1":
+		if slices.Contains(brands, string(buf[off:off+4])) {
 			return true
 		}
 	}
@@ -325,23 +285,24 @@ func IsVideoType(fileType string) bool {
 	return fileType == models.FileTypeMP4 || fileType == models.FileTypeWEBM
 }
 
-// extForFileType returns the extension a file of this type is named with,
-// or "" when unmapped. Only for files monbooru names itself; an
-// operator's own file keeps the name they gave it.
+// IsFFmpegStill reports the still types Go's image packages cannot decode.
+func IsFFmpegStill(fileType string) bool {
+	return fileType == models.FileTypeAVIF || fileType == models.FileTypeJXL
+}
+
+// Only for files monbooru names itself; an operator's file keeps its name.
 func extForFileType(fileType string) string { return fileTypeMeta[fileType].ext }
 
-// MIMEForFileType maps a stored file type to the media type to serve it
-// under, or "" when unmapped. Handlers set this explicitly because
-// http.ServeFile answers from the extension, which the bytes can
-// contradict.
+// MIMEForFileType exists because http.ServeFile goes by the extension,
+// which the bytes can contradict.
 func MIMEForFileType(fileType string) string { return fileTypeMeta[fileType].mime }
 
-// fileTypeMeta names each stored file type on disk and on the wire. An
-// unmapped type reads as the zero value, which both accessors report as "".
 var fileTypeMeta = map[string]struct{ ext, mime string }{
 	models.FileTypeJPEG: {".jpg", "image/jpeg"},
 	models.FileTypePNG:  {".png", "image/png"},
 	models.FileTypeWEBP: {".webp", "image/webp"},
+	models.FileTypeAVIF: {".avif", "image/avif"},
+	models.FileTypeJXL:  {".jxl", "image/jxl"},
 	models.FileTypeGIF:  {".gif", "image/gif"},
 	models.FileTypeMP4:  {".mp4", "video/mp4"},
 	models.FileTypeWEBM: {".webm", "video/webm"},
@@ -349,10 +310,9 @@ var fileTypeMeta = map[string]struct{ ext, mime string }{
 	models.FileTypeCBZ: {".cbz", "application/zip"},
 }
 
-// ContentDispositionFor names a download after the file on disk. The byte
-// routes end in an extensionless segment, so a browser left to itself names
-// the download from the Content-Type, which cannot tell a .cbz from a .zip;
-// inline keeps the same URL usable as an <img>/<video> src.
+// ContentDispositionFor names the download: the byte routes have no
+// extension, and the Content-Type cannot tell .cbz from .zip. Inline keeps
+// the URL usable as an <img> or <video> src.
 func ContentDispositionFor(canonPath string) string {
 	return mime.FormatMediaType("inline", map[string]string{"filename": filepath.Base(canonPath)})
 }

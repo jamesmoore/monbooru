@@ -7,31 +7,17 @@ import (
 	"path/filepath"
 )
 
-// WalkTree walks root the way filepath.WalkDir does, except that a symlink
-// is reported as whatever it points at and one leading to a directory is
-// descended into. Entries beneath it keep the link's own path prefix, so
-// folder_path, the containment checks and the watcher's registrations all
-// work on the names the operator sees rather than on where the bytes live.
-//
-// A link whose target will not stat is skipped: it is neither a file nor a
-// folder, and there is nothing under it to report. A directory link is
-// skipped too when its target resolves inside root, when it contains root,
-// or when an earlier link already led into it - the walk reaches those
-// another way, two names for one directory would ingest its files twice,
-// and a link to an ancestor would walk the whole gallery a second time
-// under the link's own name.
-func WalkTree(root string, fn fs.WalkDirFunc) error {
-	return WalkTreeUnder(root, root, fn)
+// WalkTree reports a link as its target, under the link's own name, and walks
+// no file under two names: it skips a directory link into the root, above it,
+// into a walked or fenced folder, and a real folder an earlier link walked.
+func WalkTree(b *Boundary, fn fs.WalkDirFunc) error {
+	return WalkTreeUnder(b.Root(), b, fn)
 }
 
-// WalkTreeUnder is WalkTree with the link tests taken against boundary
-// rather than against root. A caller walking a directory that appeared
-// inside the gallery needs the two to differ: the walk starts at the new
-// directory, and the tree its links must not escape is still the gallery.
-func WalkTreeUnder(root, boundary string, fn fs.WalkDirFunc) error {
-	bound, err := filepath.EvalSymlinks(boundary)
+func WalkTreeUnder(root string, b *Boundary, fn fs.WalkDirFunc) error {
+	bound, err := filepath.EvalSymlinks(b.Root())
 	if err != nil {
-		bound = filepath.Clean(boundary)
+		bound = filepath.Clean(b.Root())
 	}
 	rootReal, err := filepath.EvalSymlinks(root)
 	if err != nil {
@@ -41,6 +27,7 @@ func WalkTreeUnder(root, boundary string, fn fs.WalkDirFunc) error {
 		rootReal: bound,
 		followed: map[string]struct{}{bound: {}, rootReal: {}},
 		fn:       fn,
+		bound:    b,
 	}
 	info, err := os.Stat(root)
 	if err != nil {
@@ -58,11 +45,11 @@ type treeWalker struct {
 	rootReal string
 	followed map[string]struct{}
 	fn       fs.WalkDirFunc
+	bound    *Boundary
 }
 
-// walk reports d, then the entries of dir beneath path. dir is where the
-// bytes live and path is the name they are reported under; the two part
-// company once the walk has stepped through a link.
+// dir is where the bytes live and path the name they are reported under;
+// they differ past a link.
 func (w *treeWalker) walk(dir, path string, d fs.DirEntry) error {
 	if err := w.fn(path, d, nil); err != nil {
 		if errors.Is(err, fs.SkipDir) {
@@ -72,9 +59,8 @@ func (w *treeWalker) walk(dir, path string, d fs.DirEntry) error {
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		// SkipDir off the error-report call means this directory, which
-		// is already as far as the walk gets; returning it verbatim would
-		// unwind to WalkTree and truncate the whole walk silently.
+		// SkipDir here means this directory; returned as is, it would end
+		// the whole walk silently.
 		if err := w.fn(path, d, err); err != nil && !errors.Is(err, fs.SkipDir) {
 			return err
 		}
@@ -82,6 +68,9 @@ func (w *treeWalker) walk(dir, path string, d fs.DirEntry) error {
 	}
 	for _, e := range entries {
 		sub, subPath := filepath.Join(dir, e.Name()), filepath.Join(path, e.Name())
+		if w.bound.skips(subPath, sub) {
+			continue
+		}
 		descend, entry, ok := w.follow(sub, e)
 		if !ok {
 			continue
@@ -103,13 +92,12 @@ func (w *treeWalker) walk(dir, path string, d fs.DirEntry) error {
 	return nil
 }
 
-// follow answers what one entry is: the directory to descend into (empty
-// when there is none), the entry to report it under, and whether the walk
-// covers it at all. A link is answered as its target and recorded, so a
-// second link to the same directory is left alone rather than walked twice.
 func (w *treeWalker) follow(p string, e fs.DirEntry) (dir string, entry fs.DirEntry, ok bool) {
 	if e.Type()&fs.ModeSymlink == 0 {
 		if e.IsDir() {
+			if _, linked := w.followed[p]; linked {
+				return "", nil, false
+			}
 			return p, e, true
 		}
 		return "", e, true
@@ -126,9 +114,19 @@ func (w *treeWalker) follow(p string, e fs.DirEntry) (dir string, entry fs.DirEn
 	if err != nil {
 		return "", nil, false
 	}
-	if _, seen := w.followed[target]; seen || PathInside(w.rootReal, target) || PathInside(target, w.rootReal) {
+	if w.walkedBy(target) || PathInside(target, w.rootReal) || w.bound.leadsOut(target) {
 		return "", nil, false
 	}
 	w.followed[target] = struct{}{}
 	return target, e, true
+}
+
+// followed holds the root, so a target inside the root is walked by it.
+func (w *treeWalker) walkedBy(target string) bool {
+	for f := range w.followed {
+		if PathInside(f, target) {
+			return true
+		}
+	}
+	return false
 }

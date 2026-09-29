@@ -1,8 +1,6 @@
-# GPU variant: the monbooru binary on an NVIDIA CUDA 12 + cuDNN 9 runtime
-# base so the tagger can load the CUDA execution provider. The same binary runs
-# on CPU when tagger.use_cuda=false, so this image works for both.
+# The CUDA + cuDNN runtime base lets the tagger load the CUDA execution
+# provider; the binary still runs on CPU.
 
-# Stage 1: build the binary. 
 FROM golang:1.26.7-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -13,23 +11,19 @@ RUN . ./packaging/release-env.sh && \
     -ldflags="-s -w $LDFLAGS -X '$MOD.Package=docker' -X '$MOD.Variant=cuda'" \
     -o /monbooru ./cmd/monbooru
 
-# Stage 2: runtime -- NVIDIA CUDA 12.6 + cuDNN 9 runtime (x86_64 only).
 FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu22.04
 
-# Take the base's pending updates, drop the CUDA forward-compat libs
-# (the host driver is used via the NVIDIA container runtime) and the apt
-# cache.
+# Drops the CUDA forward-compat libs: the host driver comes in through the
+# NVIDIA container runtime.
 RUN apt-get update && apt-get upgrade -y && \
     apt-get remove -y --purge 'cuda-compat-*' && \
     rm -rf /usr/local/cuda/compat /var/lib/apt/lists/*
 
-# Single layer: install build-only fetch tools, pull the CUDA-enabled ORT and a
-# static ffmpeg/ffprobe.
 ARG ORT_VERSION=1.21.0
 ARG ORT_SHA256_X64_GPU=ef37a33ba75e457aebfd0d7b342ab20424aa6126bc5f565d247f1201b66996cf
-ARG FFMPEG_BUILD=v8.1.2-mb2
-ARG FFMPEG_NAME=ffmpeg-8.1.2-mb2
-ARG FFMPEG_SHA256_LINUX64=256131407bd62df7ff2d870073d9f7cc14e6cc0123cebd3616497805bc45f168
+ARG FFMPEG_BUILD=v8.1.2-mb4
+ARG FFMPEG_NAME=ffmpeg-8.1.2-mb4
+ARG FFMPEG_SHA256_LINUX64=66f8f4627e1cc9ad26caa9fcd9799e88db84711ef03c1565c923694804c11000
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils && \
     curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz" \

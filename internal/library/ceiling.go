@@ -9,15 +9,7 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// Ceiling carries the resolved rating-ceiling state for one request.
-// Construct via NewCeiling so callers share the per-request cache of
-// excluded tag ids.
-//
-// A Ceiling is safe to share across goroutines for one request. The
-// sidebar handlers fan out worker goroutines that all consult the same
-// *Ceiling; the mutex below guards the lazy cache against the resulting
-// concurrent first-access. The hot path (cache hit) reads the cached
-// slice directly under a single sync.Mutex acquire.
+// Ceiling is shared by one request's goroutines; mu guards the lazy cache.
 type Ceiling struct {
 	level string
 	cx    *Gallery
@@ -27,9 +19,8 @@ type Ceiling struct {
 	excludedLoaded bool
 }
 
-// Level returns the raw cookie value. Empty string and "explicit" both
-// mean "no ceiling"; callers that care about that distinction should use
-// IsActive instead.
+// Level is the raw cookie value; "explicit" means no ceiling too, so gate
+// on IsActive.
 func (c *Ceiling) Level() string {
 	if c == nil {
 		return ""
@@ -37,10 +28,6 @@ func (c *Ceiling) Level() string {
 	return c.level
 }
 
-// IsActive reports whether a ceiling will actually filter anything. The
-// no-cookie state and explicit-cookie state are both inactive: an
-// explicit cookie is a no-op in the same way the empty cookie is, since
-// the rating vocabulary tops out at explicit.
 func (c *Ceiling) IsActive() bool {
 	if c == nil {
 		return false
@@ -48,10 +35,8 @@ func (c *Ceiling) IsActive() bool {
 	return c.level != "" && c.level != "explicit"
 }
 
-// Apply AND-chains a NotExpr per rating level above the ceiling onto
-// userExpr. The emitted AST shape is the contract fastCountCeiling
-// recognises - keep this function as the sole producer. An empty or
-// "explicit" ceiling returns userExpr unchanged.
+// The executor turns this chain back into one rating_rank comparison, so it
+// must keep excluding every level above the ceiling.
 func (c *Ceiling) Apply(userExpr search.Expr) search.Expr {
 	if c == nil || !c.IsActive() {
 		return userExpr
@@ -75,10 +60,6 @@ func (c *Ceiling) Apply(userExpr search.Expr) search.Expr {
 	return search.AndExpr{Left: userExpr, Right: ce}
 }
 
-// ExcludedTagIDs returns the tag ids whose rating rank is strictly above
-// the ceiling. Memoised per Ceiling so multiple call sites in one
-// request pay the SELECT once. Returns nil when the ceiling is inactive
-// or the active gallery isn't available.
 func (c *Ceiling) ExcludedTagIDs() []int64 {
 	if c == nil {
 		return nil
@@ -99,15 +80,11 @@ func (c *Ceiling) ExcludedTagIDs() []int64 {
 	return c.excludedIDs
 }
 
-// notExistsRatingPredicate gates col on the absence of any over-ceiling rating
-// tag; in is the pre-built placeholder list for the excluded ids.
 func notExistsRatingPredicate(col, in string) string {
 	return `NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = ` + col + ` AND it.tag_id IN (` + in + `))`
 }
 
-// WhereOne returns a NOT EXISTS predicate gating col on the absence of
-// any rating tag above the ceiling. Returns ("", nil) when the ceiling
-// is inactive so the caller can omit the WHERE entirely and keep the
+// Empty when inactive, so the caller can omit the WHERE and keep the
 // covering scan.
 func (c *Ceiling) WhereOne(col string) (string, []any) {
 	ids := c.ExcludedTagIDs()
@@ -118,9 +95,6 @@ func (c *Ceiling) WhereOne(col string) (string, []any) {
 	return notExistsRatingPredicate(col, in), args
 }
 
-// WhereTwo returns a pair of NOT EXISTS predicates ANDed together that
-// gate each side of a paired query on the absence of any rating tag
-// above the ceiling. Returns ("", nil) when the ceiling is inactive.
 func (c *Ceiling) WhereTwo(leftCol, rightCol string) (string, []any) {
 	ids := c.ExcludedTagIDs()
 	if len(ids) == 0 {
@@ -131,15 +105,6 @@ func (c *Ceiling) WhereTwo(leftCol, rightCol string) (string, []any) {
 	return notExistsRatingPredicate(leftCol, in) + " AND " + notExistsRatingPredicate(rightCol, in), args
 }
 
-// WhereGroupClean returns a NOT EXISTS predicate that drops a group
-// row when any of its members carries a rating above the ceiling. The
-// predicate is meant to be ANDed onto a `... FROM <groups_table> g`
-// scan: callers wire `groupCol` to the group-id column (e.g.
-// `dup_groups.id`) and `membersTable` to the per-member join table
-// (`dup_group_members`).
-//
-// Returns ("", nil) when the ceiling is inactive so the caller can
-// skip the predicate entirely and keep the covering scan.
 func (c *Ceiling) WhereGroupClean(membersTable, groupCol string) (string, []any) {
 	ids := c.ExcludedTagIDs()
 	if len(ids) == 0 {
@@ -153,10 +118,7 @@ func (c *Ceiling) WhereGroupClean(membersTable, groupCol string) (string, []any)
 	)`, args
 }
 
-// RankCeiling returns the numeric images.rating_rank ceiling for
-// queries that read a stored rank column, and whether a ceiling is
-// active at all. Rows pass with `rank_col <= rank`; the -1 unrated
-// sentinel passes every level.
+// Rows pass with rank_col <= rank, so the unrated -1 passes every level.
 func (c *Ceiling) RankCeiling() (int, bool) {
 	if c == nil || !c.IsActive() {
 		return 0, false
@@ -164,13 +126,8 @@ func (c *Ceiling) RankCeiling() (int, bool) {
 	return tags.RatingRank(c.level), true
 }
 
-// AnyTainted reports whether any id in ids carries a rating above the
-// ceiling. One bounded EXISTS over the stored rating_rank per call -
-// relation chains and trees hold a handful of members, so probing the
-// ids at hand beats preloading every over-ceiling image in the
-// library. An inactive ceiling is a no-op so call sites can treat the
-// helper as policy-aware without an extra IsActive guard; a read
-// error keeps the row visible rather than failing the page.
+// Probing the few ids at hand beats preloading every over-ceiling image.
+// A read error keeps the row visible rather than failing the page.
 func (c *Ceiling) AnyTainted(ids []int64) bool {
 	rank, active := c.RankCeiling()
 	if !active || len(ids) == 0 || c.cx == nil || c.cx.DB == nil {
@@ -199,10 +156,8 @@ func (c *Ceiling) AnyTainted(ids []int64) bool {
 	return false
 }
 
-// NewCeiling binds a resolved level to a gallery. g may be nil - no
-// active gallery - and the resolver still answers for the AST shapes that
-// need no tag-id resolution: ExcludedTagIDs returns nil and AnyTainted
-// reports false.
+// g may be nil: Apply still works, ExcludedTagIDs returns nil and
+// AnyTainted false.
 func NewCeiling(level string, g *Gallery) *Ceiling {
 	return &Ceiling{level: level, cx: g}
 }

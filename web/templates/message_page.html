@@ -14,12 +14,9 @@
   </div>
   {{if .Poll}}
   <script>
-    // Come back when the listener does, rather than on a fixed timer that
-    // lands on a refused connection whenever the new process takes longer to
-    // bind. Seeing it refuse once is the reliable signal; a restart can also
-    // be quick enough that no probe catches the gap, so after a few seconds
-    // a server that answers is taken to be the new one. The meta refresh
-    // above is the no-script fallback, past this poll's own cap.
+    // Reload once the new process answers: after a refused probe, or
+    // after 8 probes in case the restart was too quick to see. The meta
+    // refresh is the no-script fallback.
     (function () {
       var down = false, tries = 0;
       var probe = function () {

@@ -15,17 +15,11 @@ import (
 	"github.com/monbooru/monbooru/internal/monloader"
 )
 
-// peerHTTPClient probes a peer's /health while pairing - a monloader whose
-// address is being approved, or a plugin's. The outbound monloader API calls
-// go through internal/monloader instead; this one only ever issues the
-// unauthed probe, so it keeps a short timeout of its own.
+// Only ever issues the unauthed /health probe, hence its own short timeout.
 var peerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// enqueueMonloader posts one enqueue payload and maps the reply: any
-// non-2xx is a per-request refusal the caller can skip a row over.
-// onConflict, when set, names what a 409 means for that endpoint. The
-// returned job id is what lets a caller resolve an attempt whose callback
-// never arrives; it is zero against a monloader that reports none.
+// monbooru only enqueues, keeping its single-egress model: every fetch
+// runs on monloader.
 func (s *Server) enqueueMonloader(ctx context.Context, path string, payload map[string]any, onConflict error) (int64, error) {
 	resp, err := s.monloader().Post(ctx, path, payload)
 	if err != nil {
@@ -48,64 +42,41 @@ func (s *Server) enqueueMonloader(ctx context.Context, path string, payload map[
 	return out.JobID, nil
 }
 
-// enqueueMetadataFetch asks monloader to re-read the post at url (metadata
-// only, no download) and enrich monbooru image imageID in gallery. All the
-// work - gallery-dl, mapping, the enrich call back into monbooru - runs on
-// monloader; monbooru only enqueues, keeping its single-egress model intact.
 func (s *Server) enqueueMetadataFetch(ctx context.Context, imageID int64, gallery, url string) error {
 	_, err := s.enqueueMonloader(ctx, "/api/v1/metadata",
 		map[string]any{"image_id": imageID, "gallery": gallery, "url": url}, nil)
 	return err
 }
 
-// enqueueReplace asks monloader to download the file the post at url serves
-// and push it back over monbooru image imageID's bytes. Like a metadata
-// fetch, only the enqueue happens here; the download, the hash verify, and
-// the push back into the replace endpoint all run on monloader.
 func (s *Server) enqueueReplace(ctx context.Context, imageID int64, gallery, url string) error {
 	_, err := s.enqueueMonloader(ctx, "/api/v1/replace",
 		map[string]any{"image_id": imageID, "gallery": gallery, "url": url}, nil)
 	return err
 }
 
-// errPTRUnavailable marks a lookup monloader refused because its PTR backend
-// is off - a stale capability read, not a connectivity failure.
+// A 409 on a PTR call: the cached capability was stale; the link itself
+// is fine.
 var errPTRUnavailable = errors.New("the PTR lookup is unavailable on monloader")
 
-// errLookupBudgetSpent marks a budgeted lookup monloader refused for the day.
-// Only the scheduled phase sends one, and it stops the phase rather than
-// walking the rest of the gallery into the same answer.
+// It ends the phase: every later row would get the same answer.
 var errLookupBudgetSpent = errors.New("monloader's daily lookup budget is spent")
 
-// errPTRBatchUnsupported marks a monloader too old for the batch PTR
-// endpoint. The phase reports it once and does nothing else: falling back to
-// one queued job per image is the exact thing the batch endpoint exists to
-// stop.
+// No per-image fallback: one queued job per image is what the batch
+// endpoint exists to stop.
 var errPTRBatchUnsupported = errors.New("monloader is too old for batch PTR lookup")
 
-// peerStatusError is a non-2xx reply to one request (a bad url, a malformed
-// hash, an endpoint the peer does not implement) - the request was refused,
-// not a sign the peer is down, so a batch can skip the row instead of
-// aborting. It names the peer: monbooru talks to monloader and to every
-// third-party plugin, and a message about a plugin that says "monloader"
-// sends the operator looking in the wrong place.
+// A refused request, not a sign the peer is down, so a batch skips the
+// row. It carries the peer's name: a plugin's refusal must not read as
+// monloader's.
 type peerStatusError struct{ peer, status string }
 
 func (e peerStatusError) Error() string { return e.peer + " returned " + e.status }
 
-// isPeerStatusErr reports whether err is a per-request status refusal.
 func isPeerStatusErr(err error) bool {
 	var se peerStatusError
 	return errors.As(err, &se)
 }
 
-// enqueueHashLookup asks monloader to find tags for image imageID by file
-// hash - backend "booru" walks the opted-in sites' md5 search, backend "ptr"
-// queries monloader's local PTR index by sha256 - and enrich the image back
-// through the same callbacks a source refetch uses. background puts the job
-// behind anything a person is watching; budgeted also spends a slot of
-// monloader's daily allowance and can be refused. Returns monloader's job id
-// so the attempt can be reconciled if its callback goes missing.
 func (s *Server) enqueueHashLookup(ctx context.Context, imageID int64, gallery, backend, md5, sha256 string, background, budgeted bool) (int64, error) {
 	return s.enqueueMonloader(ctx, "/api/v1/lookup", map[string]any{
 		"image_id": imageID, "gallery": gallery, "backend": backend, "md5": md5, "sha256": sha256,
@@ -113,19 +84,28 @@ func (s *Server) enqueueHashLookup(ctx context.Context, imageID int64, gallery, 
 	}, errPTRUnavailable)
 }
 
-// ptrLookupImage is one image in a batch PTR lookup: the hash to look up and
-// the id monloader names it by on the history row it files.
+func (s *Server) monloaderGalleryRenamed(ctx context.Context, oldName, newName string) error {
+	if !s.pairedWith(monloaderApp) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := s.monloader().Post(ctx, "/api/v1/galleries/rename", map[string]any{"from": oldName, "to": newName})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return peerStatusError{monloaderApp, resp.Status}
+	}
+	return nil
+}
+
 type ptrLookupImage struct {
 	ImageID int64  `json:"image_id"`
 	SHA256  string `json:"sha256"`
 }
 
-// ptrBatchLookup asks monloader for the PTR tags of a batch of images. The
-// answer is the outcome - no enqueue, no callback to lose - which is why a
-// whole-library pass goes through here rather than one queued job per image;
-// monloader files the batch as one history row, in the same scheduled / bulk
-// lane a queued lookup would take. Returns the tags per matched hash (misses
-// are absent) and its index cursor at answer time.
 func (s *Server) ptrBatchLookup(ctx context.Context, gallery string, scheduled bool, images []ptrLookupImage) (map[string][]string, uint64, error) {
 	resp, err := s.monloader().Post(ctx, "/api/v1/ptr/lookup", map[string]any{
 		"images": images, "gallery": gallery, "scheduled": scheduled,
@@ -153,21 +133,16 @@ func (s *Server) ptrBatchLookup(ctx context.Context, gallery string, scheduled b
 	return out.Results, out.Index, nil
 }
 
-// ptrTagInfo is one tag's answer from monloader's PTR graph query, in
-// monbooru-form names (bare or category:name).
+// Names are in monbooru form (bare or category:name).
 type ptrTagInfo struct {
 	Known        bool     `json:"known"`
 	Ideal        string   `json:"ideal"`
 	Aliases      []string `json:"aliases"`
 	Implications []string `json:"implications"`
-	// ImpliedBy arrives only from monloaders that serve the reverse
-	// implication edge; older ones leave it empty and the dialog simply
-	// offers no implied-by petitions.
-	ImpliedBy []string `json:"implied_by"`
+	ImpliedBy    []string `json:"implied_by"`
 }
 
-// ptrTagLookup asks monloader's PTR index for the alias / implication graph
-// of the given monbooru-form tag names (at most ptrLookupBatch per call).
+// At most ptrLookupBatch names per call: monloader's request limit.
 func (s *Server) ptrTagLookup(ctx context.Context, names []string) (map[string]ptrTagInfo, error) {
 	out, err := monloaderPostJSON[struct {
 		Results map[string]ptrTagInfo `json:"results"`
@@ -178,8 +153,6 @@ func (s *Server) ptrTagLookup(ctx context.Context, names []string) (map[string]p
 	return out.Results, nil
 }
 
-// ptrCluster is one sibling cluster monloader's spelling search answered with,
-// in monbooru-form names.
 type ptrCluster struct {
 	Ideal        string   `json:"ideal"`
 	Matched      []string `json:"matched"`
@@ -188,17 +161,12 @@ type ptrCluster struct {
 	ImpliedBy    int      `json:"implied_by"`
 }
 
-// errPTRNoSearch marks a monloader too old to answer the spelling search, so
-// the dialog drops back to its plain input rather than reading as broken.
+// A 404 from a monloader too old to search; the dialog falls back to its
+// plain input.
 var errPTRNoSearch = errors.New("monloader does not serve the spelling search")
 
-// errPTRSearchUnbounded is the refusal for a substring query with no namespace
-// to scope it to.
 var errPTRSearchUnbounded = errors.New("a substring search needs a category")
 
-// ptrSpellingSearch asks monloader which spellings the PTR holds near a
-// monbooru-form prefix. mode is empty for the prefix seek or "contains" for
-// the namespace walk.
 func (s *Server) ptrSpellingSearch(ctx context.Context, q, mode string, limit int) (clusters []ptrCluster, truncated bool, err error) {
 	v := url.Values{"q": {q}, "limit": {strconv.Itoa(limit)}}
 	if mode != "" {
@@ -230,11 +198,7 @@ func (s *Server) ptrSpellingSearch(ctx context.Context, q, mode string, limit in
 	return out.Clusters, out.Truncated, nil
 }
 
-// monloaderAPIBase is the address monbooru calls monloader at: the operator's
-// configured override when set, otherwise the address discovered during pairing
-// (the source the request came from, stored on the paired token). A paused
-// pairing reports no base, so every outbound call short-circuits as if
-// unconfigured while the credentials stay on disk.
+// A paused link answers "", so every outbound call fails before any I/O.
 func (s *Server) monloaderAPIBase() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
@@ -250,10 +214,8 @@ func (s *Server) monloaderAPIBase() string {
 	return ""
 }
 
-// monloaderUsable reports whether the link is actually up, so the
-// monloader-backed surfaces and the scheduled phases can skip when it is
-// paused, unreachable, or rejecting. A cold cache ("") stays optimistic so a
-// fresh boot does not blank the buttons before the first probe lands.
+// A cold cache ("") counts as up so a fresh boot does not blank the
+// buttons before the first probe.
 func (s *Server) monloaderUsable() bool {
 	conn := s.mlStatus.Seed().Conn
 	if s.monloaderPaused() {
@@ -262,19 +224,13 @@ func (s *Server) monloaderUsable() bool {
 	return s.pairedWith(monloaderApp) && conn != "down" && conn != "rejected"
 }
 
-// monloaderPaused reports whether the operator has suspended the monloader
-// link from the footer light. Read directly from config so the light can tell
-// a paused pairing apart from an unconfigured or unreachable one.
 func (s *Server) monloaderPaused() bool {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return s.cfg.Monloader.Paused
 }
 
-// checkMonloader probes the configured monloader for the footer light: /health
-// for up/down + version, then one authed read to surface a revoked token. The
-// PTR capability rides the same probe: the lookup buttons only need a
-// fresh-ish answer, and monloader 409s a lookup sent on a stale "enabled".
+// The authed queue read is there to surface a revoked token.
 func (s *Server) checkMonloader(ctx context.Context) monloader.Status {
 	base := strings.TrimRight(s.monloaderAPIBase(), "/")
 	if base == "" {
@@ -311,19 +267,15 @@ func (s *Server) checkMonloader(ctx context.Context) monloader.Status {
 			_ = json.NewDecoder(presp.Body).Decode(&p)
 			_ = presp.Body.Close()
 			on := presp.StatusCode == http.StatusOK && p.Enabled
-			// The `lookup:due` filter reads the cursor to skip images whose
-			// PTR miss predates no index movement, and this probe is the one
-			// thing that runs on a box nobody has a page open on.
+			// The lookup:due filter reads the cursor to skip images whose
+			// PTR miss the index has not moved past.
 			if p.Progress.UpdateIndex > 0 {
 				lookup.PTRCursor.Store(p.Progress.UpdateIndex)
 			}
-			// monloader refuses every PTR read until its index is caught
-			// up, so an index that is merely enabled is not usable yet.
+			// monloader refuses every PTR read until its index is caught up.
 			st.PTR = on && p.State == "ready"
 			st.PTRSyncing = on && !st.PTR
-			// An absent contrib field (older monloader) leaves this
-			// false, so contribution UI stays off against it. Gated on a
-			// fully-synced index so nothing is contributed against a
+			// Gated on a synced index so nothing is contributed against a
 			// stale copy.
 			st.Contrib = st.PTR && p.Contrib != nil && p.Contrib.Account && !p.Contrib.Banned
 			st.ContribBanned = on && p.Contrib != nil && p.Contrib.Banned
@@ -335,9 +287,6 @@ func (s *Server) checkMonloader(ctx context.Context) monloader.Status {
 	return st
 }
 
-// monloaderReachable reports whether monloader answers a health probe at base.
-// Approving a pairing monbooru can't reach would leave a dead pairing (no light,
-// no refetch), so the operator is blocked until the api url responds.
 func (s *Server) monloaderReachable(ctx context.Context, base string) bool {
 	if strings.TrimRight(base, "/") == "" {
 		return false
@@ -346,16 +295,11 @@ func (s *Server) monloaderReachable(ctx context.Context, base string) bool {
 	return up
 }
 
-// monloaderStatusTTL bounds how often the footer light re-probes monloader, so
-// a burst of navigations (each firing the light's load poll) reuses one probe
-// instead of fanning out into a probe per page. Kept under the 15s poll cadence
-// so a page left open still refreshes on schedule.
+// Under the light's 15s poll cadence, so a page left open still refreshes
+// on schedule.
 const monloaderStatusTTL = 10 * time.Second
 
-// monloaderStatusCached probes monloader at most once per monloaderStatusTTL and
-// serves the cached result otherwise, so the light's per-navigation poll does
-// not re-probe on every page load. The probe runs without the lock held so a
-// slow monloader never serializes concurrent page renders.
+// The probe runs unlocked so a slow monloader never serializes page renders.
 func (s *Server) monloaderStatusCached(ctx context.Context) (status, version string) {
 	if st, ok := s.mlStatus.Fresh(monloaderStatusTTL); ok {
 		return st.Conn, st.Version
@@ -372,8 +316,6 @@ func (s *Server) monloaderStatusHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if s.monloaderPaused() {
-		// Paused: keep the light and its poll alive so the operator can
-		// resume, but never probe.
 		s.renderMonloaderLight(w, r, "paused", "")
 		return
 	}
@@ -381,9 +323,8 @@ func (s *Server) monloaderStatusHandler(w http.ResponseWriter, r *http.Request) 
 	defer cancel()
 	before := s.mlStatus.Seed()
 	status, version := s.monloaderStatusCached(ctx)
-	// A flag flip re-mounts the surfaces that seeded from the stale
-	// value - a fresh session's contribution panels render empty until
-	// this first poll lands, and they listen for the change.
+	// Panels seeded from stale flags, empty on a fresh session, re-mount
+	// on this event.
 	after := s.mlStatus.Seed()
 	if before.PTR != after.PTR || before.PTRSyncing != after.PTRSyncing ||
 		before.Contrib != after.Contrib || before.ContribFailed != after.ContribFailed {
@@ -397,10 +338,6 @@ func (s *Server) monloaderStatusHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// monloader is the outbound client, rebuilt per call from the live config so
-// a re-pair, a pause or an address change lands without a restart. Base
-// answers "" while the link is paused or unset, which is what makes an
-// unconfigured call fail before any I/O.
 func (s *Server) monloader() *monloader.Client {
 	return &monloader.Client{
 		Base: s.monloaderAPIBase,

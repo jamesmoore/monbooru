@@ -9,12 +9,8 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// exifMagic is the JPEG-style EXIF header WebP encoders may or may not
-// prepend to the RIFF EXIF chunk; we strip it on read and re-prepend a
-// known-good copy before handing the payload to exif.Decode.
 var exifMagic = []byte("Exif\x00\x00")
 
-// extractSDFromWebP reads A1111 metadata from a WebP's EXIF chunk.
 func extractSDFromWebP(path string) *models.SDMetadata {
 	x, err := decodeWebPEXIF(path)
 	if err != nil || x == nil {
@@ -23,8 +19,6 @@ func extractSDFromWebP(path string) *models.SDMetadata {
 	return sdFromEXIF(x)
 }
 
-// decodeWebPEXIF walks the WebP RIFF container for its EXIF chunk and
-// decodes it. Returns nil for non-WebP or no EXIF chunk.
 func decodeWebPEXIF(path string) (*exifData, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -39,8 +33,6 @@ func decodeWebPEXIF(path string) (*exifData, error) {
 	return decodeEXIF(exifData)
 }
 
-// readWebPEXIF returns the raw EXIF chunk bytes from a WebP RIFF
-// stream, or nil for non-WebP or no EXIF chunk.
 func readWebPEXIF(r io.Reader) ([]byte, error) {
 	header := make([]byte, 12)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -57,8 +49,6 @@ func readWebPEXIF(r io.Reader) ([]byte, error) {
 		chunkType := string(chunk[0:4])
 		size := binary.LittleEndian.Uint32(chunk[4:8])
 		if size > maxChunkBytes {
-			// Skip oversize chunks wholesale, advancing past payload +
-			// padding so subsequent chunks still line up.
 			toSkip := int64(size)
 			if size%2 == 1 {
 				toSkip++
@@ -78,15 +68,14 @@ func readWebPEXIF(r io.Reader) ([]byte, error) {
 			_, _ = io.ReadFull(r, pad)
 		}
 		if chunkType == "EXIF" {
-			// Some encoders prepend the JPEG-style EXIF magic; strip it so
-			// the caller can re-prepend a known-good copy.
+			// Some encoders prepend the JPEG APP1 header; decodeEXIF
+			// wants the bare TIFF payload.
 			data = bytes.TrimPrefix(data, exifMagic)
 			return data, nil
 		}
 	}
 }
 
-// genericFromWebP returns EXIF tags from a WebP file (UserComment excluded).
 func genericFromWebP(path string) []models.SDParam {
 	x, err := decodeWebPEXIF(path)
 	if err != nil || x == nil {

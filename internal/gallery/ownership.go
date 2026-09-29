@@ -7,19 +7,9 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// claimOwnership chowns path to the current process UID/GID so later
-// rename/delete operations don't hit EACCES on files originally written
-// by a different user (rsynced from another machine, rootless Podman
-// where the container's UID 0 doesn't match the bind mount's owner).
-//
-// A file the walk reached through a symlinked folder is left alone. It
-// lives in a tree the operator keeps elsewhere and shares with whatever
-// else reads it, and rewriting its owner is the one thing here that a
-// scan cannot undo and nobody asked for. The resolve costs a handful of
-// lstats at a call site that has just read the whole file to hash it.
-//
-// Best-effort: failures log at debug and never abort the caller. ENOENT
-// is silenced because callers race deletions and watcher events.
+// Files another user wrote (an rsync, rootless Podman's UID mapping)
+// otherwise hit EACCES on a later rename or delete. A file behind a linked
+// folder keeps its owner: a chown is the one thing a scan cannot undo.
 func claimOwnership(galleryPath, path string) {
 	if !storedInside(galleryPath, path) {
 		logx.Debugf("chown %q: outside the gallery folder, left as it is", path)
@@ -30,10 +20,6 @@ func claimOwnership(galleryPath, path string) {
 	}
 }
 
-// storedInside reports whether path's bytes physically sit under root,
-// resolving every link on both sides. NamedInside answers the name, which
-// is the right question for the serve gate; this one asks where the file
-// actually is, and an unanswerable question counts as outside.
 func storedInside(root, path string) bool {
 	rootReal, err := filepath.EvalSymlinks(root)
 	if err != nil {

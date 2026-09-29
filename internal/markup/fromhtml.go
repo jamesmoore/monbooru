@@ -6,32 +6,32 @@ import (
 	"strings"
 )
 
-// maxTagRefLen mirrors the tag-name cap: a longer "tags" query is a search, not
-// a reference, and stays an ordinary link.
+// The tag-name cap: a longer "tags" query is a search and stays a link.
 const maxTagRefLen = 200
 
-// FromHTML converts a booru's HTML body into the vocabulary Parse reads. The
-// constructs below survive; every other element is dropped and its text kept,
-// so nothing a source sends can reach the renderer as markup it did not write.
-// base resolves the site-relative hrefs a booru's own links use; with no base
-// those links become plain text.
+// FromHTML turns tag-search links on base's host into tag references;
+// with a nil base, site-relative links keep only their text.
 func FromHTML(src string, base *url.URL) string {
-	c := converter{base: base}
+	c := converter{base: base, marks: map[string]int{}}
 	c.run(src)
 	return strings.TrimSpace(c.out.String())
 }
 
-// frame is one construct still to close. A dropped link keeps a frame with no
-// closing text so the matching </a> still pops it.
+// A dropped link still pushes a frame, with no closing text, so its </a>
+// pops it.
 type frame struct {
 	closing string
 	link    bool
 }
 
+// links and marks count the stack's frames, so an unmatched close skips
+// the walk.
 type converter struct {
 	base  *url.URL
 	out   strings.Builder
 	stack []frame
+	links int
+	marks map[string]int
 }
 
 func (c *converter) run(src string) {
@@ -65,9 +65,6 @@ func (c *converter) run(src string) {
 	}
 }
 
-// htmlMarks maps the HTML a booru serves onto the mark vocabulary
-// markup.go defines. Several tags fold onto one mark: a source's <strong>
-// and <b> say the same thing here.
 var htmlMarks = map[string]string{
 	"b": "b", "strong": "b",
 	"i": "i", "em": "i",
@@ -106,10 +103,13 @@ func (c *converter) tag(name string, closing bool, attrs string) {
 func (c *converter) mark(name string, closing bool) {
 	if !closing {
 		c.out.WriteString("[" + name + "]")
-		c.stack = append(c.stack, frame{closing: "[/" + name + "]"})
+		c.push(frame{closing: "[/" + name + "]"})
 		return
 	}
 	want := "[/" + name + "]"
+	if c.marks[want] == 0 {
+		return
+	}
 	for i := len(c.stack) - 1; i >= 0; i-- {
 		if c.stack[i].closing == want && !c.stack[i].link {
 			for len(c.stack) > i {
@@ -126,14 +126,17 @@ func (c *converter) openLink(attrs string) {
 		kind, value = c.linkTarget(html.UnescapeString(attrValue(attrs, "href")))
 	}
 	if kind == "" {
-		c.stack = append(c.stack, frame{link: true})
+		c.push(frame{link: true})
 		return
 	}
 	c.out.WriteString("[" + kind + "=" + value + "]")
-	c.stack = append(c.stack, frame{closing: "[/" + kind + "]", link: true})
+	c.push(frame{closing: "[/" + kind + "]", link: true})
 }
 
 func (c *converter) closeLink() {
+	if c.links == 0 {
+		return
+	}
 	for i := len(c.stack) - 1; i >= 0; i-- {
 		if c.stack[i].link {
 			for len(c.stack) > i {
@@ -144,9 +147,6 @@ func (c *converter) closeLink() {
 	}
 }
 
-// linkTarget classifies an href: a search on the origin's own site becomes a
-// tag reference, an absolute http(s) link stays a link, anything else is
-// dropped so only its label survives.
 func (c *converter) linkTarget(href string) (kind, value string) {
 	href = strings.TrimSpace(href)
 	if href == "" {
@@ -179,19 +179,27 @@ func isTagRef(s string) bool {
 		!strings.ContainsAny(s, " \t\r\n[]")
 }
 
-func (c *converter) inLink() bool {
-	for _, f := range c.stack {
-		if f.link {
-			return true
-		}
+func (c *converter) inLink() bool { return c.links > 0 }
+
+func (c *converter) push(f frame) {
+	c.stack = append(c.stack, f)
+	if f.link {
+		c.links++
+	} else {
+		c.marks[f.closing]++
 	}
-	return false
 }
 
 func (c *converter) pop() {
 	last := len(c.stack) - 1
-	c.out.WriteString(c.stack[last].closing)
+	f := c.stack[last]
+	c.out.WriteString(f.closing)
 	c.stack = c.stack[:last]
+	if f.link {
+		c.links--
+	} else {
+		c.marks[f.closing]--
+	}
 }
 
 func (c *converter) text(s string) {
@@ -209,8 +217,6 @@ func (c *converter) newline() {
 	}
 }
 
-// scanTag reads one element at the head of s, which starts with '<'. A zero
-// width means s opens no element and the '<' is text.
 func scanTag(s string) (name string, closing bool, attrs string, width int) {
 	i := 1
 	if i < len(s) && s[i] == '/' {
@@ -239,15 +245,14 @@ func scanTag(s string) (name string, closing bool, attrs string, width int) {
 			return name, closing, s[attrStart:i], i + 1
 		}
 	}
-	return "", false, "", 0
+	// Unterminated: dropped as a browser does, not rescanned from each '<'.
+	return "", false, "", len(s)
 }
 
 func isNameByte(b byte) bool {
 	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
 }
 
-// attrValue pulls one attribute out of an element's attribute text. Bare
-// values end at the first space; quoted ones at their quote.
 func attrValue(attrs, name string) string {
 	for i := 0; i < len(attrs); {
 		for i < len(attrs) && isSpace(attrs[i]) {
@@ -296,7 +301,6 @@ func attrValue(attrs, name string) string {
 
 func isSpace(b byte) bool { return b == ' ' || b == '\t' || b == '\r' || b == '\n' }
 
-// skipDecl consumes a comment or a doctype, which carry no text worth keeping.
 func skipDecl(s string) int {
 	if strings.HasPrefix(s, "<!--") {
 		if end := strings.Index(s[4:], "-->"); end >= 0 {
@@ -313,15 +317,18 @@ func skipDecl(s string) int {
 	return 0
 }
 
-// skipElement drops the contents of an element whose text is not prose.
 func skipElement(s, name string) int {
-	closing := "</" + name
-	i := strings.Index(strings.ToLower(s), closing)
-	if i < 0 {
-		return len(s)
+	for i := 0; ; {
+		j := strings.Index(s[i:], "</")
+		if j < 0 {
+			return len(s)
+		}
+		i += j + 2
+		if len(s)-i >= len(name) && strings.EqualFold(s[i:i+len(name)], name) {
+			if end := strings.IndexByte(s[i:], '>'); end >= 0 {
+				return i + end + 1
+			}
+			return len(s)
+		}
 	}
-	if end := strings.IndexByte(s[i:], '>'); end >= 0 {
-		return i + end + 1
-	}
-	return len(s)
 }

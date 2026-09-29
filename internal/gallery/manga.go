@@ -13,19 +13,11 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// MangaPageCacheTTL is the per-page idle reclaim window. Pages whose
-// mtime is older than this are unlinked by the per-gallery reclaim
-// goroutine; the cover thumbnail is exempt.
 const MangaPageCacheTTL = 5 * time.Minute
 
-// mangaReclaimInterval is the reclaim ticker's period. Constant rather
-// than configurable: shorter than the TTL so a freshly idle page evicts
-// within a window's slack of the deadline.
+// Shorter than the TTL, so an idle page goes within one tick of its deadline.
 const mangaReclaimInterval = 60 * time.Second
 
-// MangaCacheDir derives the per-gallery manga cache directory from the
-// gallery's thumbnails directory. Manga cache lives at
-// `<data_path>/<gallery>/manga/`, sibling to thumbnails.
 func MangaCacheDir(thumbnailsPath string) string {
 	if thumbnailsPath == "" {
 		return ""
@@ -33,31 +25,24 @@ func MangaCacheDir(thumbnailsPath string) string {
 	return filepath.Join(filepath.Dir(thumbnailsPath), "manga")
 }
 
-// mangaImageDir returns the per-image cache subdirectory under the
-// gallery's manga cache. Created on demand by the page-extract path.
 func mangaImageDir(thumbnailsPath string, imageID int64) string {
 	return filepath.Join(MangaCacheDir(thumbnailsPath), fmt.Sprintf("%d", imageID))
 }
 
-// mangaPagePath returns the on-disk path for the n-th cached page (1-
-// based) with the supplied original-extension tail. Zero-padded to
-// four digits so a directory listing sorts in display order.
 func mangaPagePath(imageDir string, n int, ext string) string {
 	ext = cmp.Or(ext, ".bin")
 	return filepath.Join(imageDir, fmt.Sprintf("page_%04d%s", n, ext))
 }
 
-// mangaPageThumbPath is the per-page thumbnail companion to
-// mangaPagePath. JPEG by construction.
 func mangaPageThumbPath(imageDir string, n int) string {
 	return filepath.Join(imageDir, fmt.Sprintf("page_%04d_thumb.jpg", n))
 }
 
-// extractedPageInDir returns the existing on-disk file for the n-th
-// page, regardless of which extension it was extracted as. Empty when
-// no file matches. The cache stores at most one extension per (id, n)
-// because extractPage uses the archive entry's extension and a comic
-// can't carry the same page twice under different names.
+func mangaPageViewPath(imageDir string, n int) string {
+	return filepath.Join(imageDir, fmt.Sprintf("page_%04d_view.jpg", n))
+}
+
+// The first match wins: a page is only ever extracted under one extension.
 func extractedPageInDir(imageDir string, n int) string {
 	prefix := fmt.Sprintf("page_%04d", n)
 	entries, err := os.ReadDir(imageDir)
@@ -72,12 +57,10 @@ func extractedPageInDir(imageDir string, n int) string {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
-		// Skip the thumbnail companion when looking for raw bytes.
 		if strings.HasSuffix(name, "_thumb.jpg") {
 			continue
 		}
-		// Reject names with extra digits after the prefix
-		// (page_00010 vs page_0001).
+		// Extra digits mean another page: page_1000 is a prefix of page_10000.
 		rest := name[len(prefix):]
 		if rest == "" || rest[0] != '.' {
 			continue
@@ -87,10 +70,6 @@ func extractedPageInDir(imageDir string, n int) string {
 	return ""
 }
 
-// touchCacheFile bumps the mtime/atime of path to now. Used on every
-// cache hit so the per-gallery reclaim goroutine sees recently-served
-// pages as live. Best-effort: a chtimes failure logs at debug and the
-// cache hit still proceeds.
 func touchCacheFile(path string) {
 	now := time.Now()
 	if err := os.Chtimes(path, now, now); err != nil {
@@ -98,19 +77,11 @@ func touchCacheFile(path string) {
 	}
 }
 
-// EnsureMangaPage returns the on-disk path for the n-th page of the
-// archive at canonPath, extracting it into the per-image cache on
-// miss. n is 1-based. The returned path is suitable for
-// http.ServeFile; mtime is bumped on hit so the reclaim goroutine
-// counts the access.
+// EnsureMangaPage extracts page n, 1-based, into the cache on a miss.
 func EnsureMangaPage(thumbnailsPath, canonPath string, imageID int64, n int) (string, error) {
 	return ensureMangaPageInDir(mangaImageDir(thumbnailsPath, imageID), canonPath, n)
 }
 
-// EnsureMangaPageInCache extracts to <cacheRoot>/<imageID>/page_NNNN
-// directly. Used by the auto-tagger which threads the per-gallery
-// manga cache directory through RunWithTaggers without owning the
-// full thumbnails-path derivation.
 func EnsureMangaPageInCache(cacheRoot, canonPath string, imageID int64, n int) (string, error) {
 	return ensureMangaPageInDir(filepath.Join(cacheRoot, fmt.Sprintf("%d", imageID)), canonPath, n)
 }
@@ -139,9 +110,6 @@ func ensureMangaPageInDir(imageDir, canonPath string, n int) (string, error) {
 	return dst, nil
 }
 
-// EnsureMangaPageThumb returns the on-disk path of the n-th page's
-// thumbnail (300px-longest-side JPEG Q85). Generated on miss from the
-// raw page bytes (which may themselves be extracted on demand).
 func EnsureMangaPageThumb(thumbnailsPath, canonPath string, imageID int64, n int) (string, error) {
 	imageDir := mangaImageDir(thumbnailsPath, imageID)
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
@@ -162,37 +130,45 @@ func EnsureMangaPageThumb(thumbnailsPath, canonPath string, imageID int64, n int
 	return thumb, nil
 }
 
-// generateImageThumbFromAny decodes any of the supported page formats
-// and writes a 300-px-longest-side JPEG thumbnail. Adds the per-image
-// cache dir generateImageThumb's own callers already hold.
+// EnsureMangaPageView is a full-size JPEG copy of page n for a browser
+// without AVIF or JPEG XL; the idle reclaim evicts it with the page.
+func EnsureMangaPageView(thumbnailsPath, canonPath string, imageID int64, n int) (string, error) {
+	view := mangaPageViewPath(mangaImageDir(thumbnailsPath, imageID), n)
+	if _, err := os.Stat(view); err == nil {
+		touchCacheFile(view)
+		return view, nil
+	}
+	pagePath, err := EnsureMangaPage(thumbnailsPath, canonPath, imageID, n)
+	if err != nil {
+		return "", err
+	}
+	if err := renderStill(pagePath, view, 0); err != nil {
+		return "", err
+	}
+	return view, nil
+}
+
 func generateImageThumbFromAny(srcPath, dstPath string) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return fmt.Errorf("create thumb dir: %w", err)
 	}
+	if IsFFmpegStill(ExtFileType(srcPath)) {
+		return renderStill(srcPath, dstPath, thumbMaxDim)
+	}
 	return generateImageThumb(srcPath, dstPath)
 }
 
-// removeMangaCache removes the per-image cache directory. Called from
-// the per-image delete path so a deleted manga's pages and cover
-// disappear with the row, and from sync's in-place-edit branch so a cbz
-// whose bytes changed drops its stale page cache before the thumbnails
-// are regenerated.
+// An empty path would put the dir relative to the working directory.
 func removeMangaCache(thumbnailsPath string, imageID int64) {
-	dir := mangaImageDir(thumbnailsPath, imageID)
-	if dir == "" {
+	if thumbnailsPath == "" {
 		return
 	}
+	dir := mangaImageDir(thumbnailsPath, imageID)
 	if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
 		logx.Warnf("manga cache: remove %q: %v", dir, err)
 	}
 }
 
-// MangaCacheReclaimer ticks every minute and unlinks `page_NNNN.<ext>`
-// raw-bytes files older than the TTL. cover.jpg and `page_NNNN_thumb.jpg`
-// are exempt: the cover backs the gallery thumbnail and the page thumbs
-// are pre-generated at ingest, so the reclaim is scoped to the lazy
-// reader-bytes cache that grows during reading sessions. Run alongside
-// the gallery's watcher; stops on ctx cancel.
 type MangaCacheReclaimer struct {
 	dir string
 	ttl time.Duration
@@ -203,15 +179,11 @@ type MangaCacheReclaimer struct {
 	done     chan struct{}
 }
 
-// NewMangaCacheReclaimer constructs a reclaimer for the given gallery
-// manga cache directory. dir must be the per-gallery `<data_path>/
-// <gallery>/manga` path.
+// NewMangaCacheReclaimer's dir must be the gallery's MangaCacheDir.
 func NewMangaCacheReclaimer(dir string) *MangaCacheReclaimer {
 	return &MangaCacheReclaimer{dir: dir, ttl: MangaPageCacheTTL, done: make(chan struct{})}
 }
 
-// Start spawns the reclaim goroutine. Idempotent against repeated
-// calls on the same instance; subsequent Start calls are no-ops.
 func (r *MangaCacheReclaimer) Start(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -223,7 +195,6 @@ func (r *MangaCacheReclaimer) Start(ctx context.Context) {
 	go r.run(cctx)
 }
 
-// Stop cancels the goroutine and waits for it to exit. Idempotent.
 func (r *MangaCacheReclaimer) Stop() {
 	r.mu.Lock()
 	cancel := r.cancel
@@ -250,9 +221,6 @@ func (r *MangaCacheReclaimer) run(ctx context.Context) {
 	}
 }
 
-// sweepOnce walks every <id>/ subdirectory and unlinks page_* files
-// past the TTL. Cover.jpg files are exempt because they back the
-// gallery thumbnail surface for the comic's lifetime.
 func (r *MangaCacheReclaimer) sweepOnce() {
 	if r.dir == "" {
 		return
@@ -279,10 +247,8 @@ func (r *MangaCacheReclaimer) sweepOnce() {
 			if !strings.HasPrefix(name, "page_") {
 				continue
 			}
-			// Page thumbnails are pre-generated at ingest and never
-			// regenerated during steady-state reading; reclaiming them
-			// would force the next /pages render back onto the slow
-			// lazy-extract path, defeating the precompute.
+			// Page thumbnails are pregenerated at ingest; reclaiming one
+			// sends the next page list back to lazy extraction.
 			if strings.HasSuffix(name, "_thumb.jpg") {
 				continue
 			}

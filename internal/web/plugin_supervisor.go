@@ -4,11 +4,9 @@ import (
 	"net"
 )
 
-// pluginCallbackURL is the address a managed plugin calls monbooru on. It is
-// the listener, not server.base_url: base_url is the browser-facing address,
-// which behind a reverse proxy or an ingress answers as something else (or not
-// at all) from inside the container the child runs in. The listener always
-// resolves, because the child shares its host.
+// The listener, not server.base_url: behind a proxy base_url may not
+// answer from inside the child's container, and the child shares the
+// listener's host.
 func (s *Server) pluginCallbackURL() string {
 	s.cfgMu.RLock()
 	addr, base := s.cfg.Server.BindAddress, s.cfg.Server.BaseURL
@@ -25,16 +23,14 @@ func (s *Server) pluginCallbackURL() string {
 	return "http://" + net.JoinHostPort(host, port)
 }
 
-// startManagedPlugins launches every dropped plugin the operator enabled.
 func (s *Server) startManagedPlugins() {
 	for _, p := range s.effectivePlugins() {
 		if !p.Installed {
 			continue
 		}
 		if !p.Enabled {
-			// Nothing is listening on the other end, and a cold probe cache
-			// reads optimistic - without this the buttons of a plugin the
-			// operator disabled come back on every restart.
+			// A cold probe cache reads as up, so without this a disabled
+			// plugin's buttons return on every restart.
 			s.peers.MarkDown(p.Name)
 			continue
 		}

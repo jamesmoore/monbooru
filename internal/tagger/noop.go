@@ -12,7 +12,6 @@ import (
 	"github.com/monbooru/monbooru/internal/jobs"
 )
 
-// CheckProviderAvailable always errors here; inference is compiled out.
 func CheckProviderAvailable(_ string) error {
 	return errors.New("auto-tagger disabled (built without -tags tagger)")
 }
@@ -25,8 +24,6 @@ func UnavailableReason(_ *config.Config) string {
 	return "inference disabled (built without -tags tagger)"
 }
 
-// AvailableTaggers lists every configured tagger as unavailable because
-// inference is disabled at build time.
 func AvailableTaggers(cfg *config.Config) []TaggerStatus {
 	list := DiscoverTaggers(cfg)
 	for i := range list {
@@ -36,17 +33,12 @@ func AvailableTaggers(cfg *config.Config) []TaggerStatus {
 	return list
 }
 
-// RunWithTaggers is the no-op stub matching the tagger build signature.
 func RunWithTaggers(_ context.Context, _ *db.DB, _ *config.Config, _ []int64, _ []TaggerStatus, _ *jobs.Manager, _ string, _ string) (int, error) {
 	return 0, nil
 }
 
-// ReleaseIdle is a no-op stub on the non-tagger build; nothing is
-// cached when inference is compiled out.
 func ReleaseIdle(_ time.Duration) bool { return false }
 
-// ReleaseAll is a no-op stub on the non-tagger build.
 func ReleaseAll() {}
 
-// Status reports "not loaded" since the non-tagger build never caches.
 func Status() CacheStatus { return CacheStatus{} }

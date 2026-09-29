@@ -13,13 +13,6 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// Tag-similarity candidates: the second detector feeding the pair
-// queue. pHash finds near-identical pixels; this finds recolours,
-// redraws and "based on" work, which share tags but no pixels.
-
-// Queue sources. A pair both detectors nominate carries `both`, which
-// is the strongest prior the queue can offer; `review` marks a pair the
-// operator asked to see again rather than one a detector found.
 const (
 	SourcePhash  = "phash"
 	SourceTags   = "tags"
@@ -27,54 +20,36 @@ const (
 	SourceReview = "review"
 )
 
-// Tag scores map into the distance column so one ordering key serves
-// both detectors. The base sits above the phash budget's ceiling (12)
-// so the bands never overlap: smallest-distance-first drains every
-// pixel match, then walks tag matches strongest first. Distance 0 stays
-// reserved for an operator requeue, the only row that should jump the
-// whole queue.
+// The tag band starts above the phash cap of 12, so the smallest-distance
+// order drains pixel matches before tag matches.
 const (
 	tagPairDistanceBase = 16
 	tagPairDistanceSpan = 48
 )
 
-// tagPairTopK caps how many matches one image contributes. Tag
-// similarity is cluster-shaped - two hundred same-character images
-// pairwise-match - and without the cap one cluster buries everything
-// else in the queue.
+// Without a cap one cluster of same-character images buries the rest of
+// the queue.
 const tagPairTopK = 3
 
-// tagPairMinShared is how many counted tags two images must have in
-// common before the queue will offer the pair, whatever they score.
-// Measured against a booru library's own declared duplicates: pairs
-// under this floor are almost never related, because a handful of rare
-// tags can carry a high score between two images that share nothing
-// else. A search can afford that noise since the operator is looking;
-// a work queue cannot.
+// Measured on a booru library's declared duplicates: under this floor, a
+// few rare tags can score high between unrelated images.
 const tagPairMinShared = 10
 
-// TagPairDistance maps a score into the queue's ordering key.
 func TagPairDistance(score float64) int {
 	score = min(max(score, 0), 1)
 	return tagPairDistanceBase + int(math.Round((1-score)*tagPairDistanceSpan))
 }
 
-// tagPairCandidate is one admitted match for a seed image.
 type tagPairCandidate struct {
 	imageID int64
 	score   float64
 }
 
-// findTagPairs scores every eligible pair over an in-memory tag index
-// and queues each image's best matches. Scoring per seed through SQL
-// would visit each tag's posting once per image carrying it - a cost
-// quadratic in tag usage - so the pass bulk-loads the index once and
-// lets it die with the run. Cancellable like the phash walk; the pass
-// is idempotent, so a re-walk only re-confirms what is already there.
+// Scoring per seed in SQL is quadratic in tag usage, so the index is
+// loaded once and dies with the run.
 func findTagPairs(ctx context.Context, database *db.DB, threshold float64, progress FindPairsProgress) (int, error) {
-	// A pair needs tagPairMinShared counted tags in common, and counted
-	// tags never outnumber the raw column, so anything under that floor
-	// cannot form an admissible pair and stays out of the index.
+	// Counted tags never outnumber raw ones, so images under the floor
+	// are skipped at load.
 	corpus, err := tags.LoadSimilarityCorpus(database, tagPairMinShared)
 	if err != nil {
 		return 0, fmt.Errorf("load tag-pair corpus: %w", err)
@@ -92,9 +67,8 @@ func findTagPairs(ctx context.Context, database *db.DB, threshold float64, progr
 		scorePairsFrom(corpus, postings, i, threshold, matches, scan)
 	}
 	added := 0
-	// Chunked commits, like the phash walk's flush: one WAL write per
-	// admitted candidate turns a big library's queue fill into thousands
-	// of tiny transactions.
+	// One transaction per candidate would make a big fill thousands of
+	// tiny WAL writes.
 	const txChunk = 500
 	var pending []tagPairInsert
 	flush := func() error {
@@ -151,10 +125,8 @@ func findTagPairs(ctx context.Context, database *db.DB, threshold float64, progr
 	return added, nil
 }
 
-// tagPostings is the corpus inverted by tag in one flat array: entries
-// holds every carrier index back to back, offsets says where each tag's
-// run starts. A map of per-tag slices costs one allocation per tag and
-// scatters the walk across the heap; the runs here are contiguous.
+// Flat arrays, not a map of per-tag slices: that costs an allocation per
+// tag and scatters the walk across the heap.
 type tagPostings struct {
 	offsets []int32
 	entries []int32
@@ -167,11 +139,8 @@ func (p *tagPostings) carriers(tagID int32) []int32 {
 	return p.entries[p.offsets[tagID]:p.offsets[tagID+1]]
 }
 
-// scorable reports whether an image can take part in an admissible
-// pair at all: the shared-tag floor counts what sharedWeight counts, so
-// an image carrying fewer than that can never clear it, whichever side
-// it is on. Keeping those out of the index removes them as candidates
-// too.
+// scorable counts what sharedWeight counts: an image under the floor can
+// never pair, on either side.
 func scorable(img *tags.SimilarityCorpusImage) bool {
 	n := 0
 	for _, t := range img.Tags {
@@ -232,9 +201,8 @@ func buildPostings(corpus []tags.SimilarityCorpusImage) *tagPostings {
 	return p
 }
 
-// pairScan is the per-image scratch the walk reuses. stamp marks which
-// candidates the current seed has already seen, so dedup costs one
-// compare instead of sorting the gathered list.
+// stamp marks the candidates the current seed has seen, so dedup is one
+// compare.
 type pairScan struct {
 	seen    []int32
 	partial []float64
@@ -247,13 +215,7 @@ func newPairScan(n int) *pairScan {
 	return &pairScan{seen: make([]int32, n), partial: make([]float64, n)}
 }
 
-// scorePairsFrom scores image i against every higher-indexed image it
-// could form an admissible pair with, feeding both sides' top-K
-// lists. Each unordered pair is handled exactly once, from its
-// lower-indexed member: the score is symmetric, so one computation
-// serves both sides. The type partition keeps a manga match out of a
-// still image's results and vice versa, matching the Similar-entries
-// panel.
+// Each pair is scored once, from its lower index, for both sides' top-K lists.
 func scorePairsFrom(corpus []tags.SimilarityCorpusImage, postings *tagPostings, i int, threshold float64, matches [][]tagPairCandidate, scan *pairScan) {
 	img := &corpus[i]
 	if !scorable(img) {
@@ -264,12 +226,8 @@ func scorePairsFrom(corpus []tags.SimilarityCorpusImage, postings *tagPostings, 
 	if len(prefix) == 0 {
 		return
 	}
-	// Shared weight cannot exceed either side's norm, so clearing the
-	// threshold puts the candidate's norm inside a band around this
-	// one's: below it the pair is capped by the candidate's own mass,
-	// above it by this image's. The carrier row is already in cache from
-	// the type check, which makes the band the cheapest rejection
-	// available - and most of the library sits outside it.
+	// Shared weight is at most either norm, so only a candidate with a
+	// norm in this band can clear the threshold.
 	loNorm := threshold * threshold * img.Norm
 	hiNorm := img.Norm / (threshold * threshold)
 	scan.stamp++
@@ -292,11 +250,8 @@ func scorePairsFrom(corpus []tags.SimilarityCorpusImage, postings *tagPostings, 
 	}
 	for _, j := range scan.cand {
 		other := &corpus[j]
-		// The prefix already contributed everything it can; the tags it
-		// left behind can add at most their own mass. Measured against
-		// what this candidate actually has to reach - not the band's
-		// floor, which every carrier of a heavy prefix tag clears - that
-		// settles most candidates without touching either tag list.
+		// The tags outside the prefix add at most their own mass, which
+		// settles most candidates without a merge.
 		if scan.partial[j]+outside < threshold*math.Sqrt(img.Norm*other.Norm) {
 			continue
 		}
@@ -313,21 +268,15 @@ func scorePairsFrom(corpus []tags.SimilarityCorpusImage, postings *tagPostings, 
 	}
 }
 
-// sharedFloor is the least shared weight any admissible pair seeded at
-// img can carry. The other side's norm is at least the shared weight
-// itself - a shared tag is counted on both sides - so clearing the
-// threshold forces shared >= threshold^2 * norm.
+// The other norm is at least the shared weight, so clearing the threshold
+// forces shared >= threshold^2 * norm.
 func sharedFloor(img *tags.SimilarityCorpusImage, threshold float64) float64 {
 	return threshold * threshold * img.Norm
 }
 
-// prefixTags returns the heaviest seeding tags whose removal would
-// leave less than floor of weight, plus the mass left outside them.
-// Every admissible pair shares at least one prefix tag, so only their
-// postings need walking for candidates - and the tags this cuts are
-// exactly the popular, low-weight ones whose postings dominate the
-// scan. Tags too popular to seed keep their mass in the running total:
-// they can still be shared, so the walk has to assume they are.
+// Every admissible pair shares a prefix tag, so only prefix postings are
+// walked. Non-seeding tags stay in the remaining mass: they can still be
+// shared.
 func prefixTags(img *tags.SimilarityCorpusImage, floor float64, scan *pairScan) (prefix []tags.SimilarityTag, outside float64) {
 	scan.ordered = append(scan.ordered[:0], img.Tags...)
 	ordered := scan.ordered
@@ -347,14 +296,9 @@ func prefixTags(img *tags.SimilarityCorpusImage, floor float64, scan *pairScan) 
 	return prefix, remaining
 }
 
-// sharedWeight sums the weights of the tags both id-sorted lists carry,
-// and reports how many of them say something about the subject. A tag
-// too popular to seed a scan is too popular to count as evidence
-// either - both images being tagged "1girl" is not something the pair
-// has in common - so it adds weight but not count. An implied row is
-// the same story: one parent tag with thirty implications would
-// otherwise clear a floor meant to ask for thirty separate agreements,
-// and it has to be a decision on both sides to be one.
+// Both lists must be sorted by tag id. Popular and implied tags add
+// weight but not count, or one parent with thirty implications passes for
+// thirty agreements.
 func sharedWeight(a, b []tags.SimilarityTag) (float64, int) {
 	var sum float64
 	n := 0
@@ -376,8 +320,6 @@ func sharedWeight(a, b []tags.SimilarityTag) (float64, int) {
 	return sum, n
 }
 
-// insertTopK keeps the best tagPairTopK candidates ordered by score
-// descending, image id ascending.
 func insertTopK(list []tagPairCandidate, c tagPairCandidate) []tagPairCandidate {
 	pos := len(list)
 	for pos > 0 {
@@ -397,16 +339,11 @@ func insertTopK(list []tagPairCandidate, c tagPairCandidate) []tagPairCandidate 
 	return list
 }
 
-// tagPairInsert is one admitted pair, canonicalised and ready to file.
 type tagPairInsert struct {
 	lo, hi int64
 	score  float64
 }
 
-// admitTagPair runs the two read probes that gate the queue: a pair
-// already carrying a declared relation or a not-related mark stays out,
-// and so does one whose images share a collection that opted out of
-// relation finding.
 func admitTagPair(ctx context.Context, database *db.DB, seedID int64, c tagPairCandidate) (tagPairInsert, bool, error) {
 	lo, hi := canonicalPair(seedID, c.imageID)
 	related, err := pairHasDeclaredRelation(ctx, database, lo, hi)
@@ -420,10 +357,7 @@ func admitTagPair(ctx context.Context, database *db.DB, seedID int64, c tagPairC
 	return tagPairInsert{lo: lo, hi: hi, score: c.score}, true, nil
 }
 
-// storeTagPairTx files one admitted pair. A pair already queued by the
-// phash walk is upgraded in place to record that both detectors agree,
-// which is a stronger prior than either alone. Reports whether a new row
-// landed.
+// Reports only a new row, not an upgrade or a raised score.
 func storeTagPairTx(tx *sql.Tx, p tagPairInsert) (bool, error) {
 	res, err := tx.Exec(
 		`UPDATE potential_relation_pairs SET source = ?, score = ?
@@ -446,11 +380,8 @@ func storeTagPairTx(tx *sql.Tx, p tagPairInsert) (bool, error) {
 	if n, _ := res.RowsAffected(); n > 0 {
 		return true, nil
 	}
-	// A re-walk after tag edits can find a stronger score for an
-	// already-queued pair. The row is the pair's best evidence, so
-	// raise it rather than keeping the older value. Scoped to
-	// tag-seeded rows: a `both` row's distance is the phash walk's
-	// real hamming distance, not derived from the score.
+	// Raise only tag rows: a both row's distance is a real Hamming
+	// distance, not the score's.
 	_, err = tx.Exec(
 		`UPDATE potential_relation_pairs SET score = ?, distance = ?
 		  WHERE a_image_id = ? AND b_image_id = ? AND source = ? AND score < ?`,
@@ -458,16 +389,10 @@ func storeTagPairTx(tx *sql.Tx, p tagPairInsert) (bool, error) {
 	return false, err
 }
 
-// pairSharesPrivateCollection reports whether both images sit in a
-// collection that has not opted into relation finding. The session
-// hides such pairs when it walks the queue; dropping them here keeps
-// the table from filling with rows no session will ever show, which
-// tag similarity would otherwise do constantly - the pages of one
-// collection share nearly every tag.
+// Dropped at admission, not just hidden: a collection's pages share
+// nearly every tag and would flood the table.
 func pairSharesPrivateCollection(ctx context.Context, database *db.DB, a, b int64) (bool, error) {
 	var excluded int
-	// The clause names the b-side first, so the binds follow that order
-	// rather than the pair's.
 	err := database.Read.QueryRowContext(ctx,
 		`SELECT `+collectionPairExclusion("?", "?"), b, a).Scan(&excluded)
 	if err != nil {
@@ -476,12 +401,8 @@ func pairSharesPrivateCollection(ctx context.Context, database *db.DB, a, b int6
 	return excluded == 0, nil
 }
 
-// collectionPairExclusion returns the clause that hides a pair whose
-// two images share a collection which has not opted into relation
-// finding - membership already relates them. Queue rows carry the same
-// verdict as the stored collection_hidden flag (db.Bootstrap's
-// pairHiddenProbe triggers); this clause serves the admission probe,
-// which runs before a row exists to stamp.
+// Must match the collection_hidden triggers' verdict; this one runs at
+// admission, before a row exists.
 func collectionPairExclusion(aCol, bCol string) string {
 	return `NOT EXISTS (
 		SELECT 1 FROM image_collections ca
@@ -490,11 +411,7 @@ func collectionPairExclusion(aCol, bCol string) string {
 		  AND NOT EXISTS (SELECT 1 FROM collection_find_relations f WHERE f.name = ca.name))`
 }
 
-// pairHasDeclaredRelation reports whether the pair already carries a
-// relation, a not-related mark, or a place on one chain or tree path.
-// Unlike pairAlreadyKnown it ignores the queue, so a caller can tell
-// "already decided" from "already queued" and upgrade the latter
-// instead of skipping it.
+// Leaves the queue out, so a pair the phash walk queued can still be upgraded.
 func pairHasDeclaredRelation(ctx context.Context, database *db.DB, a, b int64) (bool, error) {
 	tx, err := database.Read.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {

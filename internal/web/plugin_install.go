@@ -9,11 +9,7 @@ import (
 	"github.com/monbooru/monbooru/internal/plugins"
 )
 
-// effectivePlugin is a config block joined with the folder that supplies its
-// launch line, when one does. Installed marks the folder form, whose run
-// state the operator toggles from the web and which therefore persists as
-// Enabled on the block. The launch line stays off PluginConfig: it comes
-// from the folder's manifest and is never written to monbooru.toml, so a
+// The launch line stays off PluginConfig and out of monbooru.toml, so a
 // web-writable exec line cannot exist.
 type effectivePlugin struct {
 	config.PluginConfig
@@ -21,16 +17,10 @@ type effectivePlugin struct {
 	Installed bool
 }
 
-// pluginsDir is where dropped plugin folders live, next to monbooru.toml.
-// Absolute, because a folder-relative command becomes the launched process's
-// path while its folder becomes that process's working directory: a relative
-// path would then resolve against the folder instead of monbooru's cwd.
 func (s *Server) pluginsDir() string { return s.configSubdir("plugins") }
 
-// configSubdir is one of the folders monbooru keeps next to monbooru.toml,
-// as an absolute path. The settings hints print these, and a `-config` given
-// as a relative path would otherwise print one only the process's own working
-// directory can resolve.
+// Absolute: a plugin runs with its folder as cwd, where a relative path
+// would resolve against the folder.
 func (s *Server) configSubdir(name string) string {
 	if s.configPath == "" {
 		return ""
@@ -43,9 +33,7 @@ func (s *Server) configSubdir(name string) string {
 	return abs
 }
 
-// ensurePluginsDir creates the plugins folder at boot so there is somewhere
-// obvious to drop one. Unlike themes it seeds nothing: an example here would
-// be executable code.
+// Seeds nothing: an example here would be executable code.
 func (s *Server) ensurePluginsDir() {
 	dir := s.pluginsDir()
 	if dir == "" {
@@ -56,9 +44,6 @@ func (s *Server) ensurePluginsDir() {
 	}
 }
 
-// reservePluginName refuses the folder names monbooru cannot launch: the
-// companion keeps its own config section and surfaces, and a block name has
-// to survive the config round trip.
 func reservePluginName(name string) (string, bool) {
 	if name == monloaderApp {
 		return "the name belongs to the companion", true
@@ -69,9 +54,6 @@ func reservePluginName(name string) (string, bool) {
 	return "", false
 }
 
-// effectivePlugins merges the configured blocks with the discovered folders
-// by name: the block carries the pairing halves and the operator's flags, the
-// manifest the launch line.
 func (s *Server) effectivePlugins() []effectivePlugin {
 	blocks := s.plugins()
 	out := make([]effectivePlugin, 0, len(blocks))
@@ -95,7 +77,6 @@ func (s *Server) effectivePlugins() []effectivePlugin {
 	return out
 }
 
-// effective returns the merged view of one plugin, or false.
 func (s *Server) effective(name string) (effectivePlugin, bool) {
 	for _, p := range s.effectivePlugins() {
 		if p.Name == name {

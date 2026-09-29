@@ -11,11 +11,6 @@ import (
 	"github.com/monbooru/monbooru/internal/relations"
 )
 
-// findRelationPairsPost queues the find-pairs background job against
-// the active gallery's BK-tree. Form-encoded knobs:
-//   - distance (int, 0..12, default 4) - Hamming distance cap.
-//   - replace ("true" / unset) - wipe potential_relation_pairs before
-//     re-scanning.
 func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -39,9 +34,8 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	replace := r.FormValue("replace") == "true"
-	// replace=true wipes potential_relation_pairs; gate it behind an
-	// explicit confirm so a non-HTMX caller (curl, bookmarked URL, broken
-	// script) can't drop the queue with a single missing flag.
+	// A typed confirm, so a bare replace=true from curl or a bookmark
+	// cannot wipe the queue.
 	if replace && r.FormValue("confirm") != "REBUILD" {
 		flashStatus(w, http.StatusBadRequest, "replace=true requires confirm=REBUILD.")
 		return
@@ -72,9 +66,6 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 	writeInlineFlash(w, "ok", "Find-pairs started.")
 }
 
-// resetSkippedPost clears skipped_at on every potential_relation_pairs
-// row so previously-skipped pairs surface again at the front of the
-// queue on the next session render.
 func (s *Server) resetSkippedPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return

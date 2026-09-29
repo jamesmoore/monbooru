@@ -8,7 +8,6 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// TagRefTarget is a markup tag reference resolved against the catalog.
 type TagRefTarget struct {
 	Color string
 	Found bool
@@ -21,11 +20,8 @@ type tagRefRow struct {
 	usage    int
 }
 
-// ResolveTagRefs looks up the tag references a page's markup carries, in one
-// pass over the whole page. A reference may carry the `category:name`
-// qualifier the search bar takes; an unqualified name that lives in several
-// categories takes the most used one, and an alias takes its canonical row's
-// colour so the swatch matches where the link lands.
+// ResolveTagRefs gives an alias its canonical row's colour, so the swatch
+// matches where the link lands.
 func ResolveTagRefs(database *db.DB, refs []string) map[string]TagRefTarget {
 	out := make(map[string]TagRefTarget, len(refs))
 	var names []string
@@ -66,8 +62,6 @@ func ResolveTagRefs(database *db.DB, refs []string) map[string]TagRefTarget {
 	return out
 }
 
-// pickTagRef takes the most used row carrying name, restricted to one category
-// when the reference named one.
 func pickTagRef(rows []tagRefRow, name, category string) (TagRefTarget, bool) {
 	best, found := tagRefRow{usage: -1}, false
 	for _, r := range rows {
@@ -81,8 +75,6 @@ func pickTagRef(rows []tagRefRow, name, category string) (TagRefTarget, bool) {
 	return TagRefTarget{Color: best.color, Found: found}, found
 }
 
-// ExistingImageIDs reports which of ids the gallery still holds, so a markup
-// reference to a deleted image renders as text instead of a dead link.
 func ExistingImageIDs(database *db.DB, ids []int64) map[int64]bool {
 	out := map[int64]bool{}
 	placeholders, args := db.InPlaceholders(ids)
@@ -99,9 +91,6 @@ func ExistingImageIDs(database *db.DB, ids []int64) map[int64]bool {
 	return out
 }
 
-// ImageIDsBySourceURL is the batch form of ImageIDBySourceURL: it turns the
-// off-site links a page's markup carries into the local images whose origins
-// serve them, so a note linking a booru post links this gallery's copy.
 func ImageIDsBySourceURL(database *db.DB, urls []string) map[string]int64 {
 	out := map[string]int64{}
 	placeholders, args := db.InPlaceholders(urls)

@@ -1,18 +1,10 @@
-// Package searchkw declares the search query language's filter-keyword
-// vocabulary as a leaf data package. The parser and executor in
-// internal/search read it to dispatch `key:value` filters; the gallery
-// search bar's `system:` cheat-sheet iterates Keywords for its dropdown
-// rows; the tag service in internal/tags borrows the same list as the
-// reserved category-name set. Putting the source of truth here breaks
-// the cycle that would otherwise form via internal/gallery's tag-service
-// usage and internal/search's gallery-using test fixtures.
+// Package searchkw is the search filter-keyword vocabulary; it imports
+// nothing of ours.
 package searchkw
 
 import "strings"
 
-// Keywords lists every search-filter keyword in the order the
-// `system:` cheat-sheet dropdown surfaces them. Adding a future filter
-// is one edit here.
+// Keywords is in the order the system: cheat sheet lists them.
 var Keywords = []string{
 	"fav",
 	"inbox",
@@ -42,6 +34,7 @@ var Keywords = []string{
 	"hash",
 	"md5",
 	"prompt",
+	"comfyui",
 	"model",
 	"sampler",
 	"seed",
@@ -55,11 +48,8 @@ var Keywords = []string{
 	"upgrade",
 }
 
-// keywordSet is the membership-test view of Keywords. Built once at
-// init so IsKeyword is a single map lookup. `system` joins it here
-// rather than in Keywords: it is the cheat-sheet's own namespace, not a
-// filter the dropdown lists, but a query carrying it must not be read
-// as a category-qualified tag and probed for a category first.
+// system is no filter, but a system: query must not be probed as a
+// category-qualified tag.
 var keywordSet = func() map[string]struct{} {
 	m := make(map[string]struct{}, len(Keywords)+1)
 	m["system"] = struct{}{}
@@ -69,19 +59,13 @@ var keywordSet = func() map[string]struct{} {
 	return m
 }()
 
-// IsKeyword reports whether s is one of the recognised search-filter
-// keywords. Returns false for tag-name colons like "nier:automata".
 func IsKeyword(s string) bool {
 	_, ok := keywordSet[s]
 	return ok
 }
 
-// Expansions lists the second-level autocomplete rows for the
-// `system:<key>:` cheat-sheet drill-in: comparison operators for ordinal
-// filters and closed-vocabulary values otherwise. `cat:` is data-driven
-// from `tag_categories` and intentionally absent here; `folder:`,
-// `folderonly:`, and `generated:` accept open input and have no static
-// expansion.
+// For a key outside rangeKeys, its row is also the full set of accepted
+// values. cat: has no row because its values come from tag_categories.
 var Expansions = map[string][]string{
 	"fav":        {"true", "false"},
 	"inbox":      {"true", "false"},
@@ -101,30 +85,22 @@ var Expansions = map[string][]string{
 	"ratio":      {">=", "<=", ">", "<", "=", ".."},
 	"tagcount":   {">=", "<=", ">", "<", "=", ".."},
 	"duration":   {">=", "<=", ">", "<", "=", ".."},
-	"mime":       {"jpeg", "png", "webp", "gif", "mp4", "webm", "cbz"},
-	"via":        {"ingest", "upload"},
+	"mime":       {"jpeg", "png", "webp", "avif", "jxl", "gif", "mp4", "webm", "cbz"},
+	"via":        {"ingest", "upload", "extract", "generate"},
 	"relation":   {"duplicate", "original", "alternate", "version", "derivative", "source", "collection", "any", "none"},
 	"lookup":     {"never", "due", "missed", "exhausted", "off"},
 	"upgrade":    {"any", "bigger", "none", "unknown", "sample", "kept"},
 }
 
-// rangeKeys are excluded from closed-vocabulary validation: their Expansions
-// rows are hints (comparison operators for the numeric filters, the any/none
-// shortcuts for stale and source) rather than the full set of accepted
-// values. stale: also takes an open tag name, source: and upgrade: an open
-// site label, tagged: and autotagged: an open source label, so their values
-// are never flagged as unrecognised.
+// rangeKeys have Expansions rows that are only hints: operators, or
+// shortcuts beside an open tag, site, source or origin label.
 var rangeKeys = map[string]bool{
 	"width": true, "height": true, "date": true, "size": true,
 	"ratio": true, "tagcount": true, "duration": true, "pages": true,
 	"stale": true, "source": true, "upgrade": true,
-	"tagged": true, "autotagged": true,
+	"tagged": true, "autotagged": true, "via": true,
 }
 
-// closedVocab is the membership-test view of Expansions for the keys
-// whose values are a fixed set (type, mime, the bool filters, ...).
-// Range keys and open-input keys (folder, source, name, ...) are absent,
-// so ValueKnown treats them as accepting anything.
 var closedVocab = func() map[string]map[string]struct{} {
 	m := make(map[string]map[string]struct{}, len(Expansions))
 	for key, vals := range Expansions {
@@ -140,10 +116,6 @@ var closedVocab = func() map[string]map[string]struct{} {
 	return m
 }()
 
-// ValueKnown reports whether val is a recognised value for a
-// closed-vocabulary key. Open-input and range keys always return true.
-// Comma-separated unions (type:, mime:) hold only when every element is
-// recognised, matching how the executor unions the buckets.
 func ValueKnown(key, val string) bool {
 	set, ok := closedVocab[key]
 	if !ok {
@@ -161,10 +133,6 @@ func ValueKnown(key, val string) bool {
 	return true
 }
 
-// Descriptions maps each filter keyword to a short English label the
-// cheat-sheet dropdown shows just left of the "system" column. Tag
-// categories surface in the level-1 list with a generic "category"
-// label applied at render time.
 var Descriptions = map[string]string{
 	"fav":        "favorite images",
 	"inbox":      "in inbox",
@@ -194,6 +162,7 @@ var Descriptions = map[string]string{
 	"hash":       "sha256 or md5 digest",
 	"md5":        "md5 digest",
 	"prompt":     "SD / ComfyUI prompt",
+	"comfyui":    "ComfyUI workflow node or input",
 	"model":      "SD / ComfyUI model",
 	"sampler":    "SD / ComfyUI sampler",
 	"seed":       "SD / ComfyUI seed",
@@ -207,11 +176,7 @@ var Descriptions = map[string]string{
 	"upgrade":    "source serves a different file",
 }
 
-// numericComparisons is the operator vocabulary every plain numeric range
-// filter shares. size:, ratio: and duration: word theirs after the unit
-// they carry, which is what makes these four a real duplicate rather than
-// a coincidence. Read-only: ExpansionDescriptions is only ever read (by
-// the system: cheat sheet), so the four keys sharing one map is safe.
+// Shared by four keys, so nothing may write to it.
 var numericComparisons = map[string]string{
 	">=": "at least",
 	"<=": "at most",
@@ -221,10 +186,6 @@ var numericComparisons = map[string]string{
 	"..": "range",
 }
 
-// ExpansionDescriptions maps level-2 rows to a short English label.
-// Boolean expansions (true / false) and rating values are intentionally
-// absent - they're self-explanatory in their bare form. Operators and
-// `source:` values benefit from disambiguation.
 var ExpansionDescriptions = map[string]map[string]string{
 	"date": {
 		">":  "after",
@@ -245,7 +206,7 @@ var ExpansionDescriptions = map[string]map[string]string{
 	},
 	"pages": numericComparisons,
 	"type": {
-		"image":    "regular images (jpeg / png / webp)",
+		"image":    "regular images (jpeg / png / webp / avif / jxl)",
 		"archive":  "cbz / zip archives",
 		"animated": "gif / mp4 / webm",
 	},
@@ -275,8 +236,10 @@ var ExpansionDescriptions = map[string]map[string]string{
 		"..": "range",
 	},
 	"via": {
-		"ingest": "watcher or sync",
-		"upload": "web upload form",
+		"ingest":   "watcher or sync",
+		"upload":   "web upload form",
+		"extract":  "page extracted in the reader",
+		"generate": "archive built from a collection",
 	},
 	"source": {
 		"none": "no source at all",

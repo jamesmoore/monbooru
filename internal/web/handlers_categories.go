@@ -12,8 +12,7 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// categoriesData is the /categories page. Galleries shadows the layout's
-// own list with the config rows this page's picker renders.
+// Galleries shadows the layout's list with the config rows the picker renders.
 type categoriesData struct {
 	baseData
 	Galleries  []config.Gallery
@@ -34,10 +33,6 @@ func (s *Server) categoriesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// categoryColors returns a name → color map for every row in
-// tag_categories on the active gallery. Used by the tagger config
-// dialog so each category label renders in its own colour. Database
-// errors yield an empty map so the dialog still renders without colour.
 func (s *Server) categoryColors() map[string]string {
 	cx := s.active()
 	if cx == nil {
@@ -107,10 +102,7 @@ func (s *Server) updateCategoryPatch(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/categories", http.StatusSeeOther)
 		return
 	}
-	// The row is the answer: it carries the new colour, the two inputs
-	// that just disagreed, and whether a reset is still on offer. A
-	// refused colour rides the flash channel and the row swaps back to
-	// what storage holds.
+	// A refused colour still gets the stored row, so the inputs swap back.
 	if err != nil {
 		setFlashHeader(w, err.Error(), "err", nil)
 	}
@@ -127,7 +119,7 @@ func (s *Server) deleteCategoryDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	action := r.FormValue("action") // "move" | "delete_all"
+	action := r.FormValue("action")
 	action = cmp.Or(action, "move")
 	var targetID int64
 	if ts := r.FormValue("target_id"); ts != "" {
@@ -137,9 +129,7 @@ func (s *Server) deleteCategoryDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// Surface on /tags (the redirect target), not /categories - the
-	// flash rides the shared monbooru:flash channel which lands in
-	// whichever flash slot the destination page exposes.
+	s.active().InvalidateCaches()
 	hxDone(w, r, "Category deleted.", "/tags", "/tags")
 }
 
@@ -156,5 +146,6 @@ func (s *Server) renameCategoryPost(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.active().InvalidateCaches()
 	hxDone(w, r, "Category renamed to "+newName+".", "/categories", "/categories")
 }

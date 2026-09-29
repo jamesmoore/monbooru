@@ -8,38 +8,12 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// Tag suggestion and the related-images panel.
-
-// relatedMaxTagUsage drops seed tags whose global usage_count exceeds
-// the cap. A tag carried by more than this many images doesn't add
-// discriminative signal - the candidate set it brings in is mostly
-// noise - and on a 1M-image library it's the difference between a 2 s
-// GROUP BY and a sub-second one. Seed images whose every tag is
-// over-cap render an empty related panel rather than a slow one.
+// A tag on more images than this adds noise, and pulling in its carriers
+// makes the candidate GROUP BY slow on a large library.
 const relatedMaxTagUsage = 10000
 
-// RelatedImages returns up to limit images that share the most tags
-// with imageID, ranked by shared tag count. The source image, missing
-// images, and meta-only matches are excluded.
-//
-// Staged so the images join only runs against the top-N candidates:
-// my_tags resolves once (general capped to the K rarest, popular tags
-// dropped via relatedMaxTagUsage so the candidate scan stays bounded);
-// candidates aggregate from image_tags alone with an inner LIMIT; the
-// images row is joined last so is_missing filtering costs O(buffer).
-// The SELECT carries id + file_type + page_count so the related-images
-// partial can render the manga-pill ("N pages") on cbz candidates the
-// same way the gallery grid does.
-//
-// Type partition: a manga source (file_type='cbz') only surfaces
-// other manga; non-manga sources only surface non-manga (regular
-// images and animated). The split keeps "Similar entries" coherent -
-// the user navigating in a manga shouldn't get bounced into a regular
-// image grid and vice versa.
-//
-// ratingCeiling, when non-empty, drops candidates carrying any rating
-// tag above the ceiling level (highest-wins). Pass "" or "explicit" to
-// disable the filter.
+// Candidates are ranked from image_tags alone under an inner LIMIT;
+// images is joined last, so the is_missing filter only sees that buffer.
 func (s *Service) RelatedImages(imageID int64, limit int, ratingCeiling string) ([]models.Image, error) {
 	excluded := s.RatingTagIDsAbove(ratingCeiling)
 
@@ -114,24 +88,15 @@ func (s *Service) RelatedImages(imageID int64, limit int, ratingCeiling string) 
 	return out, rows.Err()
 }
 
-// SuggestTags returns tags matching prefix, sorted by usage_count DESC.
-// Two-pass shape: prefix matches first, then substring matches.
 func (s *Service) SuggestTags(prefix string, limit int) ([]models.Tag, error) {
 	return SuggestUsageRanked(s.db, prefix, "", false, limit)
 }
 
-// SuggestUsageRanked is the shared two-pass prefix→substring helper:
-// prefix matches first (sorted by usage_count DESC), then substring
-// matches that aren't already in the prefix set, until limit is hit.
-// categoryName, when non-empty, scopes both passes to that category;
-// requireUsage adds `usage_count > 0`.
 func SuggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsage bool, limit int) ([]models.Tag, error) {
 	prefix = db.EscapeLike(NormalizeTagName(prefix))
-	// The ranked pick runs against tags alone so it can ride
-	// idx_tags_active_usage and stop at the limit. With the category
-	// join in the same SELECT the planner drives from tag_categories
-	// instead, fetches every tag row through idx_tags_category and
-	// temp-sorts the lot to hand back ten.
+	// Ranked on tags alone so idx_tags_active_usage can stop at the
+	// limit; with the category join the planner drives from
+	// tag_categories and temp-sorts every tag.
 	baseSQL := `SELECT t.id, t.name, tc.name, tc.color, t.usage_count
 	            FROM (SELECT id, name, category_id, usage_count
 	                  FROM tags
@@ -195,8 +160,6 @@ func SuggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsa
 	return out, nil
 }
 
-// SuggestTagsInCategory returns tags matching prefix in the named
-// category, sorted by usage_count DESC.
 func (s *Service) SuggestTagsInCategory(prefix, categoryName string, limit int) ([]models.Tag, error) {
 	return db.QueryAll(s.db.Read, ScanTag,
 		`SELECT t.id, t.name, tc.name, tc.color, t.usage_count
@@ -211,8 +174,6 @@ func (s *Service) SuggestTagsInCategory(prefix, categoryName string, limit int) 
 		categoryName, db.EscapeLike(NormalizeTagName(prefix))+"%", limit)
 }
 
-// ScanTag reads one row of the five-column tag projection (id, name,
-// category name, color, usage_count) that every tag listing selects.
 func ScanTag(rows *sql.Rows) (models.Tag, error) {
 	var t models.Tag
 	err := rows.Scan(&t.ID, &t.Name, &t.CategoryName, &t.CategoryColor, &t.UsageCount)

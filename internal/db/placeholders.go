@@ -6,11 +6,7 @@ import (
 	"strings"
 )
 
-// Chunked walks xs in fixed-size slices, calling fn on each. The
-// callback receives a backing-array view, so any retained reference
-// (e.g. via append) must be copied. Used by query loops that batch IN
-// clauses below SQLite's parameter cap; the per-chunk progress / job
-// cancellation hook is jobs.Chunked.
+// fn gets a view of xs's backing array; copy anything it keeps.
 func Chunked[T any](xs []T, chunkSize int, fn func(chunk []T) error) error {
 	for start := 0; start < len(xs); start += chunkSize {
 		if err := fn(xs[start:min(start+chunkSize, len(xs))]); err != nil {
@@ -20,9 +16,7 @@ func Chunked[T any](xs []T, chunkSize int, fn func(chunk []T) error) error {
 	return nil
 }
 
-// ScanIDs walks rows and collects an []int64 column. Rows is closed by
-// the caller; this helper does not close it so the caller can compose
-// scans against the same rows iterator if needed.
+// ScanIDs leaves closing rows to the caller.
 func ScanIDs(rows *sql.Rows) ([]int64, error) {
 	var out []int64
 	for rows.Next() {
@@ -35,9 +29,8 @@ func ScanIDs(rows *sql.Rows) ([]int64, error) {
 	return out, rows.Err()
 }
 
-// ScanAll walks rows through scan and collects what it returns. Rows is
-// closed by the caller. A scan error drops the partial result: a caller
-// that acted on half a set would be acting on a lie.
+// ScanAll leaves closing rows to the caller, and on a scan error returns
+// nothing rather than a partial set.
 func ScanAll[T any](rows *sql.Rows, scan func(*sql.Rows) (T, error)) ([]T, error) {
 	var out []T
 	for rows.Next() {
@@ -50,8 +43,6 @@ func ScanAll[T any](rows *sql.Rows, scan func(*sql.Rows) (T, error)) ([]T, error
 	return out, rows.Err()
 }
 
-// QueryAll runs the query and collects its rows through scan, owning the
-// Close on every path.
 func QueryAll[T any](q Querier, scan func(*sql.Rows) (T, error), query string, args ...any) ([]T, error) {
 	rows, err := q.Query(query, args...)
 	if err != nil {
@@ -61,7 +52,6 @@ func QueryAll[T any](q Querier, scan func(*sql.Rows) (T, error), query string, a
 	return ScanAll(rows, scan)
 }
 
-// QueryAllContext is QueryAll on a cancellable read.
 func QueryAllContext[T any](ctx context.Context, q CtxQuerier, scan func(*sql.Rows) (T, error), query string, args ...any) ([]T, error) {
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -71,7 +61,6 @@ func QueryAllContext[T any](ctx context.Context, q CtxQuerier, scan func(*sql.Ro
 	return ScanAll(rows, scan)
 }
 
-// QueryStrings is QueryAll over a single text column.
 func QueryStrings(q Querier, query string, args ...any) ([]string, error) {
 	return QueryAll(q, func(rows *sql.Rows) (string, error) {
 		var v string
@@ -80,9 +69,6 @@ func QueryStrings(q Querier, query string, args ...any) ([]string, error) {
 	}, query, args...)
 }
 
-// InWriteTx runs work inside a write transaction, committing on success
-// and rolling back via defer on any error path. work's first error
-// short-circuits the commit.
 func InWriteTx(w *sql.DB, work func(*sql.Tx) error) error {
 	tx, err := w.Begin()
 	if err != nil {
@@ -95,31 +81,22 @@ func InWriteTx(w *sql.DB, work func(*sql.Tx) error) error {
 	return tx.Commit()
 }
 
-// Querier is the read surface both *sql.DB and *sql.Tx satisfy, so a
-// helper can run against a pooled connection or an open transaction.
 type Querier interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 }
 
-// Execer is Querier's write surface: a helper takes one so the caller
-// decides whether the writes land on the pool or inside its transaction.
 type Execer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// RowQuerier is the single-row read surface both *sql.DB and *sql.Tx
-// satisfy.
 type RowQuerier interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// CtxQuerier is Querier's context-carrying twin.
 type CtxQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// QueryIDs runs query and collects its single int64 column, folding the
-// Query + error-guard + Close dance every id-list read repeats.
 func QueryIDs(q Querier, query string, args ...any) ([]int64, error) {
 	rows, err := q.Query(query, args...)
 	if err != nil {
@@ -129,10 +106,7 @@ func QueryIDs(q Querier, query string, args ...any) ([]int64, error) {
 	return ScanIDs(rows)
 }
 
-// QueryIDsFunc runs query and hands each int64 to visit, stopping as soon
-// as visit reports false. For a listing whose answer sits early in an
-// ordered scan, this is the difference between fetching two rows and
-// materialising the whole result.
+// QueryIDsFunc stops the scan as soon as visit returns false.
 func QueryIDsFunc(q Querier, visit func(int64) bool, query string, args ...any) error {
 	rows, err := q.Query(query, args...)
 	if err != nil {
@@ -151,7 +125,6 @@ func QueryIDsFunc(q Querier, visit func(int64) bool, query string, args ...any) 
 	return rows.Err()
 }
 
-// QueryIDsContext is QueryIDs on a cancellable read.
 func QueryIDsContext(ctx context.Context, q CtxQuerier, query string, args ...any) ([]int64, error) {
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -161,10 +134,8 @@ func QueryIDsContext(ctx context.Context, q CtxQuerier, query string, args ...an
 	return ScanIDs(rows)
 }
 
-// InPlaceholders builds the `?,?,?` body for a SQL `IN (...)` clause and
-// the matching []any argument slice in one pass. Returns ("", nil) on
-// an empty input; callers should guard their IN clause against that
-// since SQLite rejects `IN ()`.
+// InPlaceholders returns "" for no input, and SQLite rejects IN (), so
+// the caller must handle that case.
 func InPlaceholders[T any](xs []T) (string, []any) {
 	if len(xs) == 0 {
 		return "", nil
@@ -176,10 +147,7 @@ func InPlaceholders[T any](xs []T) (string, []any) {
 	return strings.Repeat("?,", len(xs)-1) + "?", args
 }
 
-// EscapeLike escapes the SQLite LIKE metacharacters (`_`, `%`) and the
-// escape character (`\`) so operator-supplied input matches literally
-// when concatenated with `%`/`_` wildcards. Callers must pair it with
-// `ESCAPE '\'` on the LIKE clause.
+// EscapeLike's output needs ESCAPE '\' on the LIKE.
 func EscapeLike(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`)
 	return r.Replace(s)

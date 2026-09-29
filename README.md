@@ -36,7 +36,7 @@ Designed for organizing your local media collection, including AI-generated imag
 - **Inbox workflow** : new images land in the inbox for review
 - **Multiple galleries** in one instance, each with its own filesystem and database; per-gallery export/import; import data from supported booru applications
 - **REST API** for third-party integrations, with scoped bearer tokens, an OpenAPI spec, and built-in docs
-- **Plugins and themes support**: drop it in the plugins (or themes) folder and monbooru launches and supervises it for you
+- **Plugins and themes support**: drop one in the plugins (or themes) folder and switch it on in Settings; monbooru then launches and supervises a plugin for you
 - **Monloader integration (optional)** ([monloader](https://github.com/monbooru/monloader)) pulls images and tags from supported boorus and galleries, and reverse-looks up your own images against boorus, similarity services (IQDB, SauceNAO), and the Hydrus Public Tag Repository to backfill tags and sources; when a matched post serves a better file than your local copy, one click replaces it in place; the PTR connection can also pull tag aliases and implications into your catalog
 - **Optional password login**
 
@@ -46,7 +46,7 @@ Designed for organizing your local media collection, including AI-generated imag
 
 Monbooru compiles to a single self-contained binary (~21 MB, web assets embedded) with seven Go dependencies. Storage is one SQLite file per gallery: no database server, no cache layer, nothing else to run. Your collection stays ordinary files and folders on disk, the database and thumbnails live in a separate data directory, so removing monbooru leaves your images exactly where they were. The UI is server-rendered with no JS framework and no frontend build step.
 
-The heavy features stay out of the core process: ONNX auto-tagging ships without a model and runs in a separate worker that unloads itself when idle, and everything online (downloading, reverse lookup) lives in the optional monloader companion, so monbooru itself never touches the internet. ffmpeg is an optional dependency for video and animated previews.
+The heavy features stay out of the core process: ONNX auto-tagging ships without a model and runs in a separate worker that unloads itself when idle, and everything online (downloading, reverse lookup) lives in the optional monloader companion, so monbooru itself never touches the internet. ffmpeg is an optional dependency for video, animated previews, and AVIF and JPEG XL images.
 
 ---
 
@@ -129,7 +129,7 @@ This project is built on the work of others:
 - [htmx](https://htmx.org/) powers the server-rendered UI.
 - [SQLite](https://sqlite.org/), through the pure-Go [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) driver, stores each gallery.
 - [ONNX Runtime](https://onnxruntime.ai/), through [onnxruntime_go](https://github.com/yalue/onnxruntime_go), runs the auto-tagger. The models in the bundled catalog are the work of [SmilingWolf](https://huggingface.co/SmilingWolf) (WD SwinV2 v3), [animetimm](https://huggingface.co/animetimm) (EVA02), [fancyfeast](https://huggingface.co/fancyfeast) (JoyTag), and [Camais03](https://huggingface.co/Camais03) (Camie Tagger v2).
-- [ffmpeg](https://ffmpeg.org/) decodes video for thumbnails and hover previews; the bundled downloads carry a trimmed build of it from [ffmpeg-builds](https://github.com/monbooru/ffmpeg-builds), statically linked with [libwebp](https://chromium.googlesource.com/webm/libwebp) and [dav1d](https://code.videolan.org/videolan/dav1d).
+- [ffmpeg](https://ffmpeg.org/) decodes video, AVIF and JPEG XL for thumbnails and hover previews; the bundled downloads carry a trimmed build of it from [ffmpeg-builds](https://github.com/monbooru/ffmpeg-builds), statically linked with [libwebp](https://chromium.googlesource.com/webm/libwebp), [dav1d](https://code.videolan.org/videolan/dav1d) and [libjxl](https://github.com/libjxl/libjxl).
 - monloader is mostly a wrapper for [gallery-dl](https://github.com/mikf/gallery-dl), which does the actual scraping. Reverse lookups by image similarity are answered by [IQDB](https://iqdb.org/) and [SauceNAO](https://saucenao.com/); md5 lookups by the boorus themselves. The PTR tag lookup syncs against the [Hydrus Public Tag Repository](https://hydrusnetwork.github.io/hydrus/PTR.html) (PTR) via [Hydrus Network](https://github.com/hydrusnetwork/hydrus)'s repository protocol; the tags, aliases, and implications it serves are the work of the hydrus community.
 - monsender's in-page image detection uses code from [ushiro](https://github.com/gary-host-laptop/ushiro) by gary-host-laptop and [behind!](https://github.com/kubuzetto/behind) by kubuzetto, originally under MPL-2.0.
 - The mondocs site is built with [Hugo](https://gohugo.io/).

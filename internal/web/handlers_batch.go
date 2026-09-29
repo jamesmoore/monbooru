@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/api"
 	"github.com/monbooru/monbooru/internal/db"
@@ -22,34 +23,25 @@ import (
 	"github.com/monbooru/monbooru/internal/search"
 )
 
-// resolveBatchScope returns the image-id slice the caller's batch
-// operates on, materialised from either the "selection" (checked ids)
-// or "search" (everything matching the current query) form scope.
-// viewOrder walks a search scope in the gallery's own display order,
-// for the jobs that number their scope by position.
-// Writes an error fragment and returns ok=false on bad input.
 func (s *Server) resolveBatchScope(w http.ResponseWriter, r *http.Request, errLabel string, viewOrder bool) ([]int64, bool) {
 	scope := strings.TrimSpace(r.FormValue("scope"))
 	switch scope {
 	case "selection":
 		return parseIDList(r.Form["ids"]), true
 	case "search":
-		expr, parseErr := search.Parse(r.FormValue("q"))
-		if parseErr != nil {
-			flashStatus(w, http.StatusBadRequest, "Could not parse search: "+parseErr.Error())
-			return nil, false
-		}
+		expr := search.Parse(r.FormValue("q"))
 		seed, _ := strconv.ParseInt(r.FormValue("seed"), 10, 64)
-		// "act on current search" must mirror what the operator sees in
-		// the gallery - including the cookie ceiling. Without this wrap
-		// a SFW-ceiling-on operator clicking "delete all current search"
-		// would wipe explicit rows they can't even see.
+		// The ceiling applies, or deleting the search would take rows the
+		// operator cannot see.
 		sc := search.Scope{
 			Expr:       resolveCeiling(r, s.active()).Apply(expr),
 			ViewOrder:  viewOrder,
 			Sort:       r.FormValue("sort"),
 			Order:      r.FormValue("order"),
 			RandomSeed: seed,
+		}
+		if sc.Sort == "order" {
+			sc.OrderCollection = search.PinnedCollectionName(expr)
 		}
 		ids, err := sc.IDs(s.db())
 		if err != nil {
@@ -73,10 +65,8 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 		s.startBulkDelete(w, nil)
 		return
 	}
-	// One IN query per 500 ids: a row at a time would pay 1000 reads for a
-	// 1000-checkbox selection, and one list of them all runs out of SQLite
-	// parameters at 32766. The order the SELECT returns is undefined
-	// without an ORDER BY, so re-emit in the caller's input order via a map.
+	// Chunked IN lists: a query per row costs a read per checkbox, and
+	// one list overruns SQLite's parameter limit.
 	var loaded []search.DeleteTarget
 	err := db.Chunked(ids, 500, func(chunk []int64) error {
 		placeholders, args := db.InPlaceholders(chunk)
@@ -91,8 +81,6 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 	if err != nil {
-		// startBulkDelete(nil) would 202 with nothing queued, which the
-		// client reads as success - so surface the failure instead.
 		logx.Warnf("batch delete: load targets: %v", err)
 		flashStatus(w, http.StatusInternalServerError, "Could not load the selected images.")
 		return
@@ -116,17 +104,11 @@ func (s *Server) deleteSearchPost(w http.ResponseWriter, r *http.Request) {
 	}
 	queryStr := r.FormValue("q")
 
-	expr, parseErr := search.Parse(queryStr)
-	if parseErr != nil {
-		logx.Warnf("delete-search parse: %v", parseErr)
-		flashStatus(w, http.StatusBadRequest, "Could not parse search: "+parseErr.Error())
-		return
-	}
+	expr := search.Parse(queryStr)
 	expr = resolveCeiling(r, s.active()).Apply(expr)
 
-	// Stream the matching targets off the cursor so very large result sets
-	// don't allocate a second intermediate copy on top of whatever the
-	// bulk-delete worker holds.
+	// Straight off the cursor: an id list first would hold a second copy
+	// of a large result.
 	var targets []search.DeleteTarget
 	err := search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
 		targets = append(targets, t)
@@ -141,9 +123,6 @@ func (s *Server) deleteSearchPost(w http.ResponseWriter, r *http.Request) {
 	s.startBulkDelete(w, targets)
 }
 
-// startBulkDelete kicks off a background delete job for the given targets and
-// writes the response. The job reports progress via jobs.Manager; the client
-// sees the running state in the top-right status bar.
 func (s *Server) startBulkDelete(w http.ResponseWriter, targets []search.DeleteTarget) {
 	if len(targets) == 0 {
 		w.WriteHeader(http.StatusAccepted)
@@ -156,8 +135,6 @@ func (s *Server) startBulkDelete(w http.ResponseWriter, targets []search.DeleteT
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// recalcAffectedTags reconciles usage counts for the tags a batch touched,
-// reporting the step on the job bar. logCtx names the caller in the warning.
 func (s *Server) recalcAffectedTags(affected []int64, processed, total int, logCtx string) {
 	if len(affected) == 0 {
 		return
@@ -168,15 +145,8 @@ func (s *Server) recalcAffectedTags(affected []int64, processed, total int, logC
 	}
 }
 
-// runBulkDelete processes targets in chunks with one transaction per chunk.
-// The images schema cascades image_tags / image_paths / sd_metadata /
-// comfyui_metadata on image delete, so a single DELETE FROM images clears the
-// dependent rows. dup_groups.original_image_id has no CASCADE, so the
-// relations hook runs first to promote or dissolve, exactly as the
-// single-image delete does. Tag usage counts are reconciled at the end by a
-// targeted recalc scoped to the tag IDs actually touched by the cascade
-// (collected from image_tags before the DELETE), avoiding a full-table Recalc
-// that would walk every tag in the library.
+// The relations hook runs before the DELETE: dup_groups.original_image_id
+// has no ON DELETE.
 func (s *Server) runBulkDelete(targets []search.DeleteTarget) {
 	ctx := s.jobs.Context()
 	total := len(targets)
@@ -190,8 +160,8 @@ func (s *Server) runBulkDelete(targets []search.DeleteTarget) {
 	s.jobs.Update(0, total, "deleting…")
 	done := 0
 	onDelete := s.onImagesDeleteCallback()
-	// image_paths cascades with the rows, so the chunk's other copies on
-	// disk are read inside the same transaction that removes them.
+	// image_paths cascades with the rows, so the alias copies are read
+	// before the DELETE.
 	var chunkAliases map[int64][]gallery.AliasCopy
 	affectedTags, processed, cancelled, err := s.tagSvc().ChunkedDeleteWithTagRecalc(
 		ctx, ids, "", nil,
@@ -214,11 +184,13 @@ func (s *Server) runBulkDelete(targets []search.DeleteTarget) {
 				t := byID[id]
 				gallery.RemoveImageArtifacts(s.thumbnailsPath(), id, "")
 				if !t.IsMissing {
-					gallery.UnlinkImageFile(s.galleryPath(), t.CanonicalPath, id)
+					gallery.UnlinkImageFile(s.boundary(), t.CanonicalPath, id)
 				}
-				gallery.UnlinkAliasFiles(s.galleryPath(), id, chunkAliases[id])
+				gallery.UnlinkAliasFiles(s.boundary(), id, chunkAliases[id])
 			}
 			done += len(chunk)
+			// Before the tick, so the refresh it prompts counts what is left.
+			s.active().InvalidateCaches()
 			s.jobs.Update(done, total, "deleting…")
 		},
 	)
@@ -235,16 +207,6 @@ func (s *Server) runBulkDelete(targets []search.DeleteTarget) {
 	s.finishJob(nil, cancelled, fmt.Sprintf("delete cancelled (%d/%d deleted)", processed, total), fmt.Sprintf("Deleted %d image(s).", processed))
 }
 
-// batchPlace kicks off a background `move` job that files the selected image
-// IDs: the posted folder, the posted name, or both. A folder the form does
-// not carry leaves the folder alone, and a blank name leaves each name alone,
-// so one dialog covers a move, a rename, and both at once. Collisions
-// auto-suffix inside PlaceImage. The watcher suppresses its events while the
-// job runs so the Rename pairs don't flap the images as missing in transit.
-//
-// scope=search materialises ids by streaming the search result through
-// search.Scope.Stream (same idiom as batchTag and deleteSearchPost);
-// scope=selection (or empty) reads ids[] from the form.
 func (s *Server) batchPlace(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -252,15 +214,13 @@ func (s *Server) batchPlace(w http.ResponseWriter, r *http.Request) {
 	targetFolder := strings.TrimSpace(r.FormValue("folder"))
 	wantFolder := r.Form.Has("folder")
 
-	// Validate both halves once up-front so the user sees the error inline
-	// rather than as a per-image log entry once the job starts.
 	folderTmpl, err := gallery.ParseNameTemplate(targetFolder, gallery.ScopeMoveBatch)
 	if err != nil {
 		flashStatus(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if wantFolder && !folderTmpl.HasTokens() {
-		if _, err := gallery.ResolveSubdir(s.galleryPath(), targetFolder); err != nil {
+		if _, err := s.boundary().ResolveSubdir(targetFolder); err != nil {
 			flashStatus(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -279,12 +239,9 @@ func (s *Server) batchPlace(w http.ResponseWriter, r *http.Request) {
 	if !wantFolder {
 		folder = nil
 	}
-	// The check writes nothing, so it takes its own job type: the watcher
-	// has no rename to suppress, and the gallery has nothing to refresh -
-	// which is what leaves the operator's selection intact behind the
-	// dialog they are still standing in. It resolves the scope in the same
-	// display order the run does, so the {n} it reads on is the one the run
-	// would hand out.
+	// The check takes its own job type so its end does not refresh the
+	// grid and drop the selection behind the open dialog. It walks the
+	// run's display order, so {n} matches.
 	if r.FormValue("check") == "1" {
 		s.startScopedJob(w, r, "batch-place-check", models.JobTypeCheck, true, func(ids []int64) {
 			s.runBatchPlaceCheck(ids, folder, folderTmpl, nameTmpl)
@@ -296,10 +253,6 @@ func (s *Server) batchPlace(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// perImageLoop walks ids with per-image error isolation, reporting
-// progress every 25th and on the last. The callers own the completion
-// summary: they differ in which caches to invalidate and what to name
-// the result.
 func (s *Server) perImageLoop(ids []int64, verb, gerund string, op func(i int, id int64) error) (done, failed int, cancelled bool) {
 	ctx := s.jobs.Context()
 	total := len(ids)
@@ -321,11 +274,6 @@ func (s *Server) perImageLoop(ids []int64, verb, gerund string, op func(i int, i
 	return done, failed, false
 }
 
-// runBatchPlace files every target where the two halves say: one folder for
-// the whole scope, or the folder its own row renders when the destination
-// carries tokens, and the same for the name. A nil half is left alone. Each
-// PlaceImage has its own small write txn + Rename, and a per-image failure
-// is counted rather than stranding the rest of the scope.
 func (s *Server) runBatchPlace(ids []int64, targetFolder *string, folderTmpl, nameTmpl *gallery.NameTemplate) {
 	total := len(ids)
 	var moved, renamed, suffixed int
@@ -336,7 +284,7 @@ func (s *Server) runBatchPlace(ids []int64, targetFolder *string, folderTmpl, na
 		if err != nil {
 			return err
 		}
-		res, err := gallery.PlaceImage(s.db(), s.galleryPath(), id, folder, name)
+		res, err := gallery.PlaceImage(s.db(), s.boundary(), id, folder, name)
 		if err != nil {
 			return err
 		}
@@ -358,8 +306,8 @@ func (s *Server) runBatchPlace(ids []int64, targetFolder *string, folderTmpl, na
 	if done > 0 {
 		s.active().InvalidateCaches()
 	}
-	// The summary names what the run did, not which fields were filled: the
-	// batch folder opens on {folder}, so most renames move nothing at all.
+	// Named from what the run did: the folder field opens on {folder}, so
+	// most renames move nothing.
 	_, _, past := placeVerbs(moved > 0, renamed > 0)
 	if cancelled {
 		s.jobs.Complete(fmt.Sprintf("%s cancelled (%d/%d %s)", verb, done, total, past))
@@ -369,23 +317,15 @@ func (s *Server) runBatchPlace(ids []int64, targetFolder *string, folderTmpl, na
 	if failed > 0 {
 		summary = fmt.Sprintf("%s %d image(s), %d failed.", titleCase(past), done, failed)
 	}
-	// A template that names many files the same numbers them apart, which is
-	// the one thing a run could do quietly. Say how many.
 	if suffixed > 0 {
 		summary += fmt.Sprintf(" %d had a taken name and were numbered.", suffixed)
 	}
-	// A move leaves its source folders behind and the Folders sidebar, built
-	// from folder_path, stops showing them the moment nothing points at them.
-	// Say so here or the operator finds out in a file manager.
 	if n := countEmptiedDirs(sources); n > 0 {
 		summary += fmt.Sprintf(" %d folder(s) are now empty.", n)
 	}
 	s.jobs.Complete(summary)
 }
 
-// countEmptiedDirs reports how many of the directories a move left behind
-// hold nothing now. Bounded by the number of distinct sources, not by the
-// scope.
 func countEmptiedDirs(dirs map[string]struct{}) int {
 	n := 0
 	for dir := range dirs {
@@ -396,12 +336,6 @@ func countEmptiedDirs(dirs map[string]struct{}) int {
 	return n
 }
 
-// runBatchPlaceCheck walks the scope the way the run would but writes
-// nothing, counting the rows whose destination is already claimed - by
-// another row in the same scope, or by a file already on disk. Those are
-// exactly the rows the run would auto-suffix, and a sampled preview cannot
-// show them: a template that names 300 files the same numbers them without
-// ever saying so.
 func (s *Server) runBatchPlaceCheck(ids []int64, targetFolder *string, folderTmpl, nameTmpl *gallery.NameTemplate) {
 	total := len(ids)
 	claimed := make(map[string]struct{}, total)
@@ -411,7 +345,7 @@ func (s *Server) runBatchPlaceCheck(ids []int64, targetFolder *string, folderTmp
 		if err != nil {
 			return err
 		}
-		dest, numbered, err := gallery.PlannedPath(s.db(), s.galleryPath(), id, folder, name, claimed)
+		dest, numbered, err := gallery.PlannedPath(s.db(), s.boundary(), id, folder, name, claimed)
 		if err != nil {
 			return err
 		}
@@ -436,8 +370,6 @@ func (s *Server) runBatchPlaceCheck(ids []int64, targetFolder *string, folderTmp
 	s.jobs.Complete(summary)
 }
 
-// batchDestination resolves the two halves one row in a scoped job gets. A
-// half the operator left out stays nil, which is what leaves it alone.
 func (s *Server) batchDestination(targetFolder *string, folderTmpl, nameTmpl *gallery.NameTemplate, i, total int, id int64) (folder, name *string, err error) {
 	if targetFolder != nil {
 		rendered, renderErr := s.batchName(folderTmpl, *targetFolder, i, total, id)
@@ -456,9 +388,6 @@ func (s *Server) batchDestination(targetFolder *string, folderTmpl, nameTmpl *ga
 	return folder, name, nil
 }
 
-// batchName resolves the destination one image in a scoped job gets: the
-// literal the operator typed when it carries no tokens, otherwise the
-// row's own render with its position in the run.
 func (s *Server) batchName(tmpl *gallery.NameTemplate, literal string, i, total int, id int64) (string, error) {
 	if !tmpl.HasTokens() {
 		return literal, nil
@@ -471,13 +400,6 @@ func (s *Server) batchName(tmpl *gallery.NameTemplate, literal string, i, total 
 	return tmpl.Render(facts)
 }
 
-// batchTag kicks off a background `tag` job that adds (op=add) or removes
-// (op=remove) a tag set across either every image in the current search
-// (scope=search) or just the checked ids (scope=selection). The dialogs in
-// gallery.html post the tags string verbatim (parsed server-side so
-// category:name and quoted spans behave identically to the detail-page
-// tag input). The op=remove path is the "specific tags by name" branch of
-// #batch-strip-dialog; the bulk user/auto/all branches go through batchStrip.
 func (s *Server) batchTag(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -507,10 +429,6 @@ func (s *Server) batchTag(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// anyTagHasImplications reports whether any of the supplied tag ids
-// appears as a parent in tag_implications. Used by runBatchTag to pick
-// a smaller chunk size when the fan-out closure would otherwise pin
-// the writer for tens of seconds per 500-row chunk.
 func (s *Server) anyTagHasImplications(tagIDs []int64) bool {
 	if len(tagIDs) == 0 {
 		return false
@@ -526,19 +444,12 @@ func (s *Server) anyTagHasImplications(tagIDs []int64) bool {
 	return n == 1
 }
 
-// runBatchTag resolves each (catID, name) token to a tag id once up front
-// (creating new tags on add, looking up only existing ones on remove) and
-// applies the resolved set to every image in turn. Cancellable via the
-// shared job context, identical to runBulkDelete's pattern.
 func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note string) {
 	type resolvedTag struct {
 		id   int64
 		name string
 	}
 	var resolved []resolvedTag
-	// A token the tag charset refuses has to be named: the operator uses the
-	// batch bar precisely so they do not open every image to check, and a
-	// typo carrying * or " would otherwise land as plain success.
 	var refused skipReasons
 	var unmatched []string
 	if op == "add" {
@@ -558,10 +469,6 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 				`SELECT id FROM tags WHERE name = ? AND category_id = ?`, ct.name, ct.catID,
 			).Scan(&id)
 			if err != nil {
-				// A token that named no tag has to be said out loud: the
-				// wrong category qualifier is the natural mistake with this
-				// syntax, and a partly-ineffective removal otherwise reads
-				// exactly like a complete one.
 				unmatched = append(unmatched, s.tagTokenLabel(ct))
 				continue
 			}
@@ -593,11 +500,8 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 		tagIDs = append(tagIDs, t.id)
 	}
 
-	// Chunk size compresses to 100 when any resolved tag carries
-	// implications so the per-row fan-out cost in addTagToImageTxReportingDup
-	// doesn't hold the writer for tens of seconds on a 500-row chunk.
-	// The 500-row default still applies to bare-add jobs where the
-	// per-row work is just an INSERT OR IGNORE + usage_count bump.
+	// Implications fan out per row: a 500-row chunk of those holds the
+	// writer for tens of seconds.
 	chunkSize := 500
 	if op == "add" && s.anyTagHasImplications(tagIDs) {
 		chunkSize = 100
@@ -654,12 +558,6 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 	s.finishJob(nil, cancelled, fmt.Sprintf("%s cancelled (%d/%d processed)", label, processed, total), done)
 }
 
-// batchStrip kicks off a background `tag` job that strips tags by category
-// (mode=user|auto|all) across either every image in the current search
-// (scope=search) or the checked ids (scope=selection). Mirrors batchTag's
-// scope dispatch; the per-mode predicate decides which image_tags rows the
-// chunked DELETE in runBatchStrip touches. When mode=auto and tagger_name is
-// set, the strip is further scoped to that tagger's output rows.
 func (s *Server) batchStrip(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -671,8 +569,6 @@ func (s *Server) batchStrip(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusBadRequest, "mode must be user, auto, all, source, source-all, or stale")
 		return
 	}
-	// filterName narrows mode=auto to one tagger's output and mode=source to
-	// one site's tags; the bulk modes carry no name.
 	var filterName string
 	switch mode {
 	case "auto":
@@ -689,17 +585,6 @@ func (s *Server) batchStrip(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// runBatchStrip processes targets in chunks of 500 with one transaction per
-// chunk. The per-chunk pattern collects the distinct touched tag_ids before
-// the DELETE so the post-pass RecalcIDs is scoped to the tags that
-// actually changed (mirrors runBulkDelete). modePredicate narrows the strip:
-//
-//	user       → AND is_auto = 0 AND is_implied = 0 AND (tagger_name IS NULL OR '')
-//	auto       → AND is_auto = 1              (+ AND tagger_name = ? when scoped)
-//	source     → AND is_auto = 0 AND tagger_name = ?
-//	source-all → AND is_auto = 0 AND tagger_name <> '' AND tagger_name IS NOT NULL
-//	stale      → AND stale = 1
-//	all        → (no extra predicate)
 func (s *Server) runBatchStrip(ids []int64, mode, filterName string) {
 	var modePredicate, label, summary string
 	var extraArgs []any
@@ -760,8 +645,7 @@ func (s *Server) runBatchStrip(ids []int64, mode, filterName string) {
 		return
 	}
 
-	// The predicate DELETE only touches the rows it matches, so implied rows
-	// whose last parent it just took have to be swept after it.
+	// Implied rows whose last parent the DELETE took are swept after it.
 	if !cancelled {
 		orphanTags, orphans, err := s.tagSvc().PruneOrphanedImplied(ctx, ids)
 		if err != nil {
@@ -778,35 +662,19 @@ func (s *Server) runBatchStrip(ids []int64, mode, filterName string) {
 		fmt.Sprintf("%s %d image(s) (%d row change(s)).", summary, processed, removed))
 }
 
-// batchInbox kicks off a background `tag` job that flips is_inbox across
-// every image in the current search (scope=search) or the checked ids
-// (scope=selection). The op is always a per-row toggle: inbox rows
-// become archived, archived become inbox. Mirrors batchTag's scope
-// dispatch and runBulkDelete's chunked-tx shape.
-// The job processes ids in chunks of 500 with one transaction per
-// chunk. SQLite's `1 - is_inbox` does the per-row toggle in a single
-// UPDATE so a mixed selection (some inbox, some archived) ends up
-// cleanly inverted.
 func (s *Server) batchInbox(w http.ResponseWriter, r *http.Request) {
 	s.startScopedJob(w, r, "batch-inbox", models.JobTypeTag, false, func(ids []int64) {
 		s.runBulkToggle(ids, "is_inbox", "inbox state", "inbox toggle", "Toggled inbox state")
 	})
 }
 
-// batchFavorite mirrors batchInbox for the is_favorited column: a
-// per-row toggle that flips favorited rows to unfavorited and vice
-// versa across the resolved scope.
 func (s *Server) batchFavorite(w http.ResponseWriter, r *http.Request) {
 	s.startScopedJob(w, r, "batch-favorite", models.JobTypeTag, false, func(ids []int64) {
 		s.runBulkToggle(ids, "is_favorited", "favorite state", "favorite toggle", "Toggled favorite state")
 	})
 }
 
-// startScopedJob is the HTTP shell shared by every batch handler: parse
-// form, resolve scope, claim the jobs lane, spawn, 202. Callers validate
-// their own fields first (ParseForm is idempotent). viewOrder is for the
-// jobs that number their scope by position.
-func (s *Server) startScopedJob(w http.ResponseWriter, r *http.Request, scopeLabel, jobType string, viewOrder bool, run func([]int64)) {
+func (s *Server) startScopedJob(w http.ResponseWriter, r *http.Request, scopeLabel, jobType string, viewOrder bool, run func([]int64), others ...string) {
 	if !parseFormOK(w, r) {
 		return
 	}
@@ -818,17 +686,13 @@ func (s *Server) startScopedJob(w http.ResponseWriter, r *http.Request, scopeLab
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	if !s.startJob(w, jobType) {
+	if !s.startJob(w, jobType, others...) {
 		return
 	}
 	go run(ids)
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// runBulkToggle flips the named INTEGER column on every id via
-// SQLite's `1 - col` toggle, chunked at 500 ids per write tx.
-// progress/cancel/successNoun fill the per-chunk and completion
-// summaries.
 func (s *Server) runBulkToggle(ids []int64, column, progressNoun, cancelNoun, successNoun string) {
 	ctx := s.jobs.Context()
 	const chunkSize = 500
@@ -858,11 +722,6 @@ func (s *Server) runBulkToggle(ids []int64, column, progressNoun, cancelNoun, su
 	s.finishJob(nil, cancelled, fmt.Sprintf("%s cancelled (%d/%d toggled)", cancelNoun, processed, total), fmt.Sprintf("%s for %d image(s).", successNoun, processed))
 }
 
-// batchCollection adds or removes a collection label across every image
-// in `scope=search` (q + sort + order) or every checked id in
-// `scope=selection`. `mode=add` (default) files each image under the
-// label, keeping any other memberships; `mode=remove` drops the label.
-// One indexed write per 500-row chunk.
 func (s *Server) batchCollection(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -871,7 +730,7 @@ func (s *Server) batchCollection(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if len(collectionVal) > maxExternalSourceLen {
+	if utf8.RuneCountInString(collectionVal) > maxExternalSourceLen {
 		flashStatus(w, http.StatusBadRequest, "Collection label too long.")
 		return
 	}
@@ -885,10 +744,6 @@ func (s *Server) batchCollection(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// runBatchCollection adds or removes the label across the supplied id
-// list in chunks. Add keeps existing memberships (a row with no home
-// adopts the label); remove drops the membership and promotes another to
-// home (or clears the mirror) for rows whose home was the removed label.
 func (s *Server) runBatchCollection(ids []int64, label, mode string) {
 	ctx := s.jobs.Context()
 	const chunkSize = 500
@@ -923,12 +778,6 @@ func (s *Server) runBatchCollection(ids []int64, label, mode string) {
 	s.jobs.Complete(fmt.Sprintf("Added %d image(s) to collection.", processed))
 }
 
-// batchLookup fans one of three unrelated operations across `scope=search`
-// or `scope=selection`: mode=refresh re-fetches every declared source,
-// mode=hash discovers new ones by file hash (ptr / booru pick the backends,
-// unsourced narrows the scope to the images that could gain a source), and
-// mode=schedule sets the per-image opt-in the nightly run reads. The action
-// is hidden unless monloader is paired.
 func (s *Server) batchLookup(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -956,7 +805,6 @@ func (s *Server) batchLookup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// batchLookupOpts is one dialog submission.
 type batchLookupOpts struct {
 	mode       string
 	ptr, booru bool
@@ -964,10 +812,6 @@ type batchLookupOpts struct {
 	on         bool
 }
 
-// batchLookupCount answers the dialog's scope split so its live summary can
-// price each operation. The refresh branch is only worth firing for the
-// images that already carry a source, and the hash branch only for the ones
-// that do not; without the split the dialog would have to guess.
 func (s *Server) batchLookupCount(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -976,11 +820,8 @@ func (s *Server) batchLookupCount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// The dialog opens on the whole visible library often enough that a
-	// chunked EXISTS probe means thousands of round trips before the
-	// operator has committed to anything. Read the sourced ids once
-	// instead - the set is bounded by how many images carry a source,
-	// not by the scope - and intersect in memory.
+	// One read of every sourced id, intersected in memory: a chunked EXISTS
+	// probe over a whole-library scope is thousands of round trips.
 	withURL, err := db.QueryIDs(s.db().Read,
 		`SELECT DISTINCT image_id FROM image_sources WHERE url <> ''`)
 	if err != nil {
@@ -997,28 +838,17 @@ func (s *Server) batchLookupCount(w http.ResponseWriter, r *http.Request) {
 	api.WriteJSON(w, http.StatusOK, map[string]int{"total": len(ids), "sourced": sourced, "unsourced": len(ids) - sourced})
 }
 
-// runBatchLookup applies one dialog submission across the scope, stopping
-// early if monloader becomes unreachable (each enqueue is a bounded LAN call,
-// so this stays a foreground-light background job). Images without the needed
-// key - a source url, a readable file to md5 - are skipped and counted.
-//
-// A hash lookup here takes the background lane but is never budgeted: bulk
-// work whoever started it, so it belongs behind anything a person is waiting
-// on, but it is also a deliberate operator action, so the nightly budget must
-// not refuse it. The PTR half rides the batch endpoint like the scheduled
-// phase and enqueues nothing at all.
+// Hash lookups take the background lane, being bulk work, but no budget: the
+// operator asked for them, so the nightly budget must not refuse them.
 func (s *Server) runBatchLookup(opts batchLookupOpts, ids []int64) {
 	ctx := s.jobs.Context()
-	// Snapshot the gallery once so every row read and enqueue in this job
-	// stays consistent even if a switch is attempted concurrently.
 	cx := s.active()
 	if cx == nil {
 		s.jobs.Fail("no active gallery")
 		return
 	}
-	// The PTR pass writes image_tags before the booru loop starts, so a
-	// failure or a cancel below still owes the caches a drop. Deferred
-	// rather than repeated at each return; over-invalidating costs nothing.
+	// Deferred: the PTR pass writes image_tags, so every return owes the
+	// caches a drop.
 	defer cx.InvalidateCaches()
 	if opts.mode == "schedule" {
 		s.runBatchSchedule(ctx, cx, opts.on, ids)
@@ -1039,14 +869,9 @@ func (s *Server) runBatchLookup(opts batchLookupOpts, ids []int64) {
 				s.jobs.Fail("monloader unreachable: " + err.Error())
 				return
 			}
-			// monloader is the authority on whether it has an index to ask;
-			// the images were not skipped, the backend was simply not there.
 			ptrRefused = true
 		}
 	}
-	// A PTR-only hash lookup was finished by the batch call above, so the
-	// per-image walk - one row read each - would have nothing to do with what
-	// it read.
 	if opts.booru || opts.mode == "refresh" {
 		for i, id := range ids {
 			if ctx.Err() != nil {
@@ -1092,8 +917,6 @@ func (s *Server) runBatchLookup(opts batchLookupOpts, ids []int64) {
 				}
 			}
 			if err != nil {
-				// A per-request refusal (a bad hash) skips the row; only a
-				// transport failure means monloader is truly unreachable.
 				if isPeerStatusErr(err) {
 					skipped++
 					continue
@@ -1124,8 +947,6 @@ func (s *Server) runBatchLookup(opts batchLookupOpts, ids []int64) {
 	s.jobs.Complete(fmt.Sprintf("Looked up %d image(s): %s.", total, strings.Join(parts, ", ")))
 }
 
-// unsourcedOnly narrows a scope to the images that could still gain a
-// source, which is what makes "Find tags" over a big search affordable.
 func (s *Server) unsourcedOnly(cx *galleryCtx, ids []int64) []int64 {
 	var out []int64
 	for start := 0; start < len(ids); start += 500 {
@@ -1144,9 +965,6 @@ func (s *Server) unsourcedOnly(cx *galleryCtx, ids []int64) []int64 {
 	return out
 }
 
-// batchPTRLookup runs the scope through monloader's batch PTR endpoint in
-// chunks and applies every hit, recording each hash's outcome. Returns how
-// many matched.
 func (s *Server) batchPTRLookup(ctx context.Context, cx *galleryCtx, ids []int64) (int, error) {
 	matched := 0
 	for start := 0; start < len(ids) && ctx.Err() == nil; start += ptrLookupChunk {
@@ -1173,19 +991,13 @@ func (s *Server) batchPTRLookup(ctx context.Context, cx *galleryCtx, ids []int64
 		if err != nil {
 			return matched, err
 		}
-		// A record failure is logged inside and does not abort the batch: the
-		// scope is bounded and the operator asked for all of it.
+		// A record failure is logged inside and must not abort the batch.
 		hits, _, _ := applyPTRResults(cx, byHash, results, cursor)
 		matched += hits
 	}
 	return matched, nil
 }
 
-// runBatchSchedule sets the per-image scheduled-lookup opt-in across the
-// scope. Turning it on resets the ladder too, so this is the bulk equivalent
-// of the detail page's [look again] over a `lookup:exhausted` search. Both
-// backends move together: the per-backend choice belongs to the one image an
-// operator is looking at, not to a scope they picked in bulk.
 func (s *Server) runBatchSchedule(ctx context.Context, cx *galleryCtx, on bool, ids []int64) {
 	flag := 0
 	if on {
@@ -1216,15 +1028,10 @@ func (s *Server) runBatchSchedule(ctx context.Context, cx *galleryCtx, on bool, 
 	}
 }
 
-// enqueueSourceFetches queues one metadata refetch per declared origin url of
-// the image, plus a PTR hash lookup for a url-less "ptr" origin. Duplicate
-// urls collapse to one fetch; a PTR-unavailable answer skips that origin
-// rather than failing the batch. Returns how many jobs were queued.
 func (s *Server) enqueueSourceFetches(ctx context.Context, cx *galleryCtx, id int64, sha string) (int, error) {
 	galleryName := cx.Name
 	type origin struct{ site, url string }
-	// Fetching the origins a partial read did reach would queue less work than
-	// the summary claims, with nothing saying so.
+	// All or nothing: queueing what a partial read reached would go unreported.
 	origins, err := db.QueryAll(cx.DB.Read, func(rows *sql.Rows) (origin, error) {
 		var o origin
 		err := rows.Scan(&o.site, &o.url)

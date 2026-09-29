@@ -18,11 +18,6 @@ import (
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// suggestItem is the uniform row shape of the shared suggest dropdown
-// (partials/suggest_list.html). Name is both the visible label and the
-// dataset value the click handler reads. Tag rows carry their category
-// color and a usage count; `system:` cheat-sheet rows set Description
-// instead and suppress the count; folder / label rows are name-only.
 type suggestItem struct {
 	Name        string
 	Color       string
@@ -31,11 +26,7 @@ type suggestItem struct {
 	ShowCount   bool
 }
 
-// renderSuggestList renders the shared suggest_list.html partial. attr
-// names the data attribute carrying each row's value; onclick is the
-// full click-handler attribute. Both are compile-time constants chosen
-// per suggest surface (never user input), which is what makes the
-// HTMLAttr trust markers safe; per-row Name stays with the autoescaper.
+// attr and onclick become HTMLAttr unescaped: only ever pass constants.
 func (s *Server) renderSuggestList(w http.ResponseWriter, attr, onclick string, items []suggestItem) {
 	s.renderTemplate(w, "partials/suggest_list.html", map[string]any{
 		"Attr":    template.HTMLAttr(attr),
@@ -44,16 +35,10 @@ func (s *Server) renderSuggestList(w http.ResponseWriter, attr, onclick string, 
 	})
 }
 
-// renderSearchSuggest renders search-bar dropdown rows; shared by the
-// tag, filter-keyword, and system: cheat-sheet paths of searchSuggest.
 func (s *Server) renderSearchSuggest(w http.ResponseWriter, rows []suggestItem) {
 	s.renderSuggestList(w, `data-tag-name`, `onclick="applySearchSuggest(this.dataset.tagName)"`, rows)
 }
 
-// suggestLabels runs a single-text-column suggest query and collects its
-// non-blank values, owning the cursor. A row that will not scan is skipped
-// rather than dropping the whole list: an autocomplete showing most of its
-// matches beats one showing none. logLabel names the surface in the log.
 func (s *Server) suggestLabels(q db.Querier, logLabel, query string, args ...any) []string {
 	rows, err := q.Query(query, args...)
 	if err != nil {
@@ -78,21 +63,8 @@ func (s *Server) suggestLabels(q db.Querier, logLabel, query string, args ...any
 	return out
 }
 
-// foldersSuggest returns up to 10 existing folder paths whose name or leading
-// segments match the typed prefix. Drives the autocomplete dropdown on the
-// move dialogs. Root (empty folder_path) is excluded from suggestions because
-// it maps to an empty input anyway.
-//
-// The half-open range form `folder_path >= prefix AND folder_path < prefix||X`
-// (where X is one codepoint past the prefix's last char) lets SQLite seek to
-// the first match and stop at the boundary - a `LIKE ?||'%'` form forces a
-// full index scan because the default case-insensitive collation can't bound
-// it. The empty-prefix branch keeps the simpler shape so the seek skips the
-// tail-bound machinery; the planner already short-circuits via DISTINCT once
-// 10 unique folder paths have surfaced. NOCASE on both bounds + the matching
-// partial index keeps the suggest in step with the case-insensitive
-// `folder:` search filter so capitalised paths surface from a lowercase
-// prefix and vice versa.
+// The NOCASE range seeks the index where LIKE 'prefix%' would walk all of
+// it, and folds case the way the folder: filter does.
 func (s *Server) foldersSuggest(w http.ResponseWriter, r *http.Request) {
 	prefix := strings.TrimSpace(r.URL.Query().Get("prefix"))
 	var folders []string
@@ -122,30 +94,14 @@ func (s *Server) foldersSuggest(w http.ResponseWriter, r *http.Request) {
 	s.renderSuggestList(w, `data-folder-path`, `onclick="applyLabelSuggest(this, 'folderPath')"`, items)
 }
 
-// collectionSuggest returns up to 10 distinct existing collection
-// labels whose prefix matches what the user has typed. Drives the
-// autocomplete dropdown on the detail-page collection-edit dialog and
-// the batch-collection dialog. Empty prefix lists the alphabetically
-// first labels so the dropdown has something to show on focus. The
-// underlying column is still named `series` (kept for schema
-// stability); only the user-facing vocabulary moved.
 func (s *Server) collectionSuggest(w http.ResponseWriter, r *http.Request) {
 	s.renderLabelSuggest(w, r, s.queryCollectionLabels)
 }
 
-// sourceSuggest mirrors collectionSuggest for the detail-page source
-// edit dialog. Shares renderLabelSuggest because the rendered shape
-// (one flat list of free-text labels) is identical; applyLabelSuggest
-// in main.js is generic on the dropdown's nearest text input, so the
-// same client handler covers both dialogs.
 func (s *Server) sourceSuggest(w http.ResponseWriter, r *http.Request) {
 	s.renderLabelSuggest(w, r, s.querySourceLabels)
 }
 
-// renderLabelSuggest reads the typed prefix, runs query for up to 10
-// rows, and renders the shared suggest_list.html partial (204 on no
-// matches). The data-series attribute name predates the collection
-// rename and is kept for client-side stability.
 func (s *Server) renderLabelSuggest(w http.ResponseWriter, r *http.Request, query func(string, int) []string) {
 	labels := query(strings.TrimSpace(r.URL.Query().Get("prefix")), 10)
 	if len(labels) == 0 {
@@ -159,10 +115,7 @@ func (s *Server) renderLabelSuggest(w http.ResponseWriter, r *http.Request, quer
 	s.renderSuggestList(w, `data-series`, `onclick="applyLabelSuggest(this, 'series')"`, items)
 }
 
-// queryDistinctLabels returns distinct non-empty values of a NOCASE label
-// column, optionally bounded to a case-insensitive prefix, so the suggest
-// stays in step with the matching case-insensitive filter. Reading the
-// membership table (not the scalar mirror) surfaces secondary entries too.
+// col must be declared NOCASE: the lowered range bounds rely on it.
 func (s *Server) queryDistinctLabels(table, col, prefix string, limit int, logLabel string) []string {
 	if prefix == "" {
 		return s.suggestLabels(s.db().Read, logLabel,
@@ -176,11 +129,8 @@ func (s *Server) queryDistinctLabels(table, col, prefix string, limit int, logLa
 		 ORDER BY `+col+` LIMIT ?`, lo, hi, limit)
 }
 
-// queryTaggerLabels drives the `tagged:` / `autotagged:` autocomplete off
-// the provenance ledger's label set, which stays a handful of rows at any
-// library size - so the prefix match and the case fold run here rather
-// than as a per-keystroke scan of image_tag_sources. auto narrows to
-// labels an auto-tagger stamped on image_tags.
+// The ledger holds a handful of labels at any size; matching them here
+// spares a per-keystroke scan of image_tag_sources.
 func (s *Server) queryTaggerLabels(prefix string, limit int, auto bool) []string {
 	svc := s.tagSvc()
 	if svc == nil {
@@ -205,9 +155,7 @@ func (s *Server) queryTaggerLabels(prefix string, limit int, auto bool) []string
 	return matchLabelPrefix(labels, prefix, limit)
 }
 
-// matchLabelPrefix keeps the labels a case-insensitive prefix selects,
-// one per spelling: the filters match NOCASE, so a ledger carrying both
-// `PTR` and `ptr` would otherwise offer two rows for one result set.
+// Deduped case-blind: the filters match NOCASE, so PTR and ptr are one row.
 func matchLabelPrefix(labels []string, prefix string, limit int) []string {
 	low := strings.ToLower(prefix)
 	seen := make(map[string]struct{}, len(labels))
@@ -229,28 +177,16 @@ func matchLabelPrefix(labels []string, prefix string, limit int) []string {
 	return out
 }
 
-// querySourceLabels drives the `source:` autocomplete in the search-bar
-// `system:` level-2 dropdown and the detail / batch source dialogs.
 func (s *Server) querySourceLabels(prefix string, limit int) []string {
 	return s.queryDistinctLabels("image_sources", "site", prefix, limit, "source")
 }
 
-// queryCollectionLabels drives the detail / batch dialogs and the
-// search-bar `collection:` autocomplete.
 func (s *Server) queryCollectionLabels(prefix string, limit int) []string {
 	return s.queryDistinctLabels("image_collections", "name", prefix, limit, "collection")
 }
 
-// queryNameBasenames returns up to limit distinct lowercased file
-// basenames whose name starts with prefix, sampled from non-missing
-// images. Rides the basename_lower partial index via a half-open
-// range seek so the underlying scan is bounded by the prefix's
-// matching slice instead of the full library.
-//
-// The autocomplete is prefix-only on purpose: most operators type
-// the start of a filename and pick from the alphabetical list. The
-// name: filter itself still does substring matches; the
-// autocomplete is just a way to surface candidate values fast.
+// Prefix-only, unlike the name: filter, so it seeks the basename_lower
+// index instead of scanning the library.
 func (s *Server) queryNameBasenames(prefix string, limit int) []string {
 	d := s.db()
 	if d == nil || prefix == "" {
@@ -265,12 +201,32 @@ func (s *Server) queryNameBasenames(prefix string, limit int) []string {
 		low, nextPrefix(low), limit)
 }
 
-// querySDStringField returns up to limit distinct values from the
-// matching SD / ComfyUI metadata columns whose value matches prefix.
-// substring=true switches to a `LIKE %prefix%` scan (used by `prompt:`
-// where values are sentences); false uses a prefix-range scan that
-// pins the underlying index. Empty prefix returns alphabetically first
-// values so the dropdown has something to show on focus.
+// A bare value names a node class, so it seeks the node= slice. Two
+// characters minimum: a DISTINCT over the whole node= half takes seconds.
+func (s *Server) queryComfyTerms(prefix string, limit int) []string {
+	d := s.db()
+	if d == nil || len(prefix) < 2 {
+		return nil
+	}
+	bare := !strings.ContainsAny(prefix, "=<>")
+	seek := prefix
+	if bare {
+		seek = "node=" + prefix
+	}
+	lo, hi := search.ComfyTermRange(seek)
+	terms := s.suggestLabels(d.Read, "comfyui",
+		`SELECT DISTINCT term FROM comfyui_terms
+		 WHERE term >= ? COLLATE NOCASE AND term < ? COLLATE NOCASE
+		 ORDER BY term LIMIT ?`,
+		lo, hi, limit)
+	if bare {
+		for i, t := range terms {
+			terms[i] = strings.TrimPrefix(t, "node=")
+		}
+	}
+	return terms
+}
+
 func (s *Server) querySDStringField(sdField, comfyField, prefix string, limit int, substring bool) []string {
 	d := s.db()
 	if d == nil {
@@ -317,16 +273,36 @@ func (s *Server) querySDStringField(sdField, comfyField, prefix string, limit in
 	return out
 }
 
+func (s *Server) ambiguousGeneralNames(suggestions []models.Tag) map[string]bool {
+	var names []string
+	for _, t := range suggestions {
+		if t.CategoryName == "general" {
+			names = append(names, t.Name)
+		}
+	}
+	out := map[string]bool{}
+	if len(names) == 0 {
+		return out
+	}
+	placeholders, args := db.InPlaceholders(names)
+	shared, err := db.QueryStrings(s.db().Read,
+		`SELECT name FROM tags WHERE name IN (`+placeholders+`)
+		 GROUP BY name HAVING COUNT(DISTINCT COALESCE(canonical_tag_id, id)) > 1`, args...)
+	if err != nil {
+		logx.Warnf("tag suggest: %v", err)
+	}
+	for _, name := range shared {
+		out[name] = true
+	}
+	return out
+}
+
 func (s *Server) tagSuggest(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	// Accept the input's value however it arrives: q=, tag=, canonical_id=,
-	// or target= (the batch-imply input submits its value under its name).
+	// Inputs submit under their own names; the batch-imply one uses target.
 	prefix := cmp.Or(q.Get("q"), q.Get("tag"), q.Get("canonical_id"), q.Get("target"))
 
-	// If the prefix contains "category:name" and the prefix is a real
-	// category, filter by category. Otherwise suggest literal tags whose
-	// full name matches the raw input (so tags like "nier:automata" still
-	// surface while the user types).
+	// Only a real category splits: "nier:automata" is one tag name.
 	var catName, tagPrefix string
 	if idx := strings.Index(prefix, ":"); idx > 0 && s.categoryExists(prefix[:idx]) {
 		catName = prefix[:idx]
@@ -342,16 +318,21 @@ func (s *Server) tagSuggest(w http.ResponseWriter, r *http.Request) {
 		suggestions, _ = s.tagSvc().SuggestTags(tagPrefix, 10)
 	}
 
-	// Attribute each suggestion with its category so selecting a non-general
-	// tag adds it in the right category on submit.
 	if catName != "" {
 		for i := range suggestions {
 			suggestions[i].Name = catName + ":" + suggestions[i].Name
 		}
 	} else {
+		// A canonical input reads a bare name in every category, so a general
+		// name that another tag shares is written out in full.
+		var ambiguous map[string]bool
+		if q.Has("canonical_id") || q.Has("target") {
+			ambiguous = s.ambiguousGeneralNames(suggestions)
+		}
 		for i := range suggestions {
-			if suggestions[i].CategoryName != "" && suggestions[i].CategoryName != "general" {
-				suggestions[i].Name = suggestions[i].CategoryName + ":" + suggestions[i].Name
+			cat := suggestions[i].CategoryName
+			if cat != "" && (cat != "general" || ambiguous[suggestions[i].Name]) {
+				suggestions[i].Name = cat + ":" + suggestions[i].Name
 			}
 		}
 	}
@@ -368,31 +349,16 @@ func (s *Server) tagSuggest(w http.ResponseWriter, r *http.Request) {
 	s.renderSuggestList(w, `data-tag-name`, `onclick="applyTagSuggest(this)"`, items)
 }
 
-// searchIDsCap bounds what one [Select all] can hand back. The walk runs in
-// the foreground over the whole match set, and past this the answer is a list
-// no batch POST could usefully carry: a million-image library's popular tag
-// is three megabytes of ids.
+// Beyond this the id list outgrows what a batch POST can usefully carry.
 var searchIDsCap = 5000
 
-// errSearchIDsFull stops the walk at the cap instead of reading the rest.
 var errSearchIDsFull = errors.New("search ids: cap reached")
 
-// searchIDs answers the ids one search matches, in the gallery's own order.
-// The inbox cluster's [Select all] is the caller: a batch that spilled past
-// the page edge has no rows on screen to tick, and the selection is a list of
-// ids rather than a query, so the list has to come from here. Capped, with
-// the answer saying so, since the handler takes any query.
 func (s *Server) searchIDs(w http.ResponseWriter, r *http.Request) {
-	expr, err := search.Parse(r.URL.Query().Get("q"))
-	if err != nil {
-		http.Error(w, "Could not parse search: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	// The ceiling the operator is browsing under, so this can never hand back
-	// a row the grid would not have shown them.
+	expr := search.Parse(r.URL.Query().Get("q"))
 	expr = resolveCeiling(r, s.active()).Apply(expr)
 	ids := []int64{}
-	err = search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
+	err := search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
 		ids = append(ids, t.ID)
 		if len(ids) >= searchIDsCap {
 			return errSearchIDsFull
@@ -413,33 +379,20 @@ func (s *Server) searchIDs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
-	// Pin the swap target server-side. When an auto-refresh fires concurrently
-	// with the debounced input request, htmx has been observed to resolve the
-	// input's hx-target to the form-inherited #gallery-grid, which lands the
-	// dropdown inside the grid with no way to dismiss it. HX-Retarget forces
-	// the response back onto #search-suggest regardless of what the client
-	// computed at request time.
+	// htmx can resolve the input's target to the form's #gallery-grid when a
+	// grid refresh races the request; pin the dropdown's target here.
 	w.Header().Set("HX-Retarget", "#search-suggest")
 	w.Header().Set("HX-Reswap", "innerHTML")
 
 	input := r.URL.Query().Get("q")
-	// Split the input: everything except the last word is the "context"
-	// that must also match, and the last word is the prefix being typed.
-	// The last word has its leading "-" stripped so the suggestion list works
-	// while the user is still typing the negated tag.
 	words := strings.Fields(input)
 	prefix := ""
-	var catFilter string // category name if user typed "catname:prefix"
+	var catFilter string
 	var contextTokens []string
 	if len(words) > 0 {
 		last := words[len(words)-1]
 		contextTokens = words[:len(words)-1]
 		last = strings.TrimPrefix(last, "-")
-		// system: hijacks the suggest endpoint to surface the query
-		// language itself - the keywords, operators, and closed-vocabulary
-		// values - without the user leaving the search bar. "system" is
-		// reserved at the category layer, so the categoryExists branch
-		// below cannot reach this name.
 		if rest, ok := strings.CutPrefix(last, "system:"); ok {
 			s.renderSystemSuggest(w, rest)
 			return
@@ -447,29 +400,14 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 		if colonIdx := strings.IndexByte(last, ':'); colonIdx >= 0 {
 			key := strings.ToLower(last[:colonIdx])
 			val := last[colonIdx+1:]
-			// Filter keyword: surface the level-2 hint - operators for
-			// date/width/height, closed-vocabulary values for
-			// fav/source/rating/etc., live category names for cat: - so
-			// the dropdown helps the user the same way `system:<key>:`
-			// would. Avoids forcing the user to remember the cheat-sheet
-			// trigger after they've already committed to the filter.
 			if searchkw.IsKeyword(key) {
-				// Most filter keys carry closed-vocabulary values that are
-				// case-insensitive matches against a static enum (fav:true,
-				// ai:comfyui, ...). The free-text keys are the exceptions:
-				// labels are operator-entered free text whose case must
-				// survive the prefix-range SQL, so pass them through
-				// unchanged. They all accept the quoted form
-				// (`source:"foo bar"`); strip a leading `"` so the dropdown
-				// keeps matching while the user is mid-quote.
+				// Free-text values keep their case for the range scans.
 				vp := strings.ToLower(val)
 				switch key {
-				case "collection", "source", "name", "prompt", "model", "sampler":
+				case "collection", "source", "name", "prompt", "model", "sampler", "comfyui":
 					vp = strings.TrimPrefix(val, `"`)
 				case "tagged", "autotagged":
-					// Quoted like the keys above, but expansionRows
-					// matches the booleans that share the level
-					// case-sensitively, so the fold has to survive.
+					// expansionRows compares case-sensitively; keep the fold.
 					vp = strings.TrimPrefix(vp, `"`)
 				}
 				rows := s.systemSuggestLevel2(key, vp)
@@ -480,9 +418,6 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 				s.renderSearchSuggest(w, rows)
 				return
 			}
-			// Category-qualified only when the prefix actually names a
-			// category; otherwise suggest literal tags that match the
-			// whole "key:val" string (e.g. "nier:aut..." → "nier:automata").
 			if colonIdx > 0 && s.categoryExists(key) {
 				catFilter = key
 				prefix = val
@@ -498,14 +433,10 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the preceding tokens as a query. Empty context → expr is nil and
-	// the combination filter degrades to a plain global-usage suggestion.
-	contextExpr, _ := search.Parse(strings.Join(contextTokens, " "))
+	contextExpr := search.Parse(strings.Join(contextTokens, " "))
 
 	suggestions, _ := search.SuggestTagsWithFilter(s.db(), contextExpr, prefix, catFilter, 10)
 
-	// Prefix non-general tags (or category-qualified searches) so clicking a
-	// suggestion appends the correct token to the search bar.
 	for i := range suggestions {
 		if catFilter != "" {
 			suggestions[i].Name = catFilter + ":" + suggestions[i].Name
@@ -514,9 +445,6 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Drop suggestions whose formatted name is already present in the search
-	// bar - otherwise typing a partial tag that overlaps an existing one would
-	// re-suggest what the user already picked.
 	if alreadyTyped := alreadyTypedTags(contextTokens); len(alreadyTyped) > 0 {
 		out := suggestions[:0]
 		for _, sug := range suggestions {
@@ -540,12 +468,6 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 	s.renderSearchSuggest(w, rows)
 }
 
-// renderSystemSuggest emits cheat-sheet rows for the search-bar's
-// `system:` namespace. rest is what follows "system:" in the user's
-// last word. Without an inner colon the level-1 list surfaces every
-// real prefix (filter keywords plus existing tag categories); with an
-// inner colon the per-keyword level-2 list takes over (static operators
-// or values for filter keywords, live tags for category prefixes).
 func (s *Server) renderSystemSuggest(w http.ResponseWriter, rest string) {
 	var rows []suggestItem
 	if colonIdx := strings.IndexByte(rest, ':'); colonIdx >= 0 {
@@ -562,12 +484,6 @@ func (s *Server) renderSystemSuggest(w http.ResponseWriter, rest string) {
 	s.renderSearchSuggest(w, rows)
 }
 
-// systemSuggestLevel1 lists every prefix the user can type to start a
-// `key:value` search token: the search-filter keywords plus every
-// existing tag category. A category whose name doubles as a filter
-// keyword (rating: is both) is folded into the keyword row to avoid
-// duplicate dropdown entries. Category rows carry their own colour so
-// the dropdown reads at a glance like the rest of the tag UI.
 func (s *Server) systemSuggestLevel1(prefix string) []suggestItem {
 	var rows []suggestItem
 	for _, kw := range searchkw.Keywords {
@@ -595,8 +511,6 @@ func (s *Server) systemSuggestLevel1(prefix string) []suggestItem {
 	return rows
 }
 
-// expansionRows renders the static level-2 vocabulary a keyword declares
-// in searchkw.Expansions, filtered by what the user has typed so far.
 func expansionRows(key, valPrefix string) []suggestItem {
 	descs := searchkw.ExpansionDescriptions[key]
 	var rows []suggestItem
@@ -612,8 +526,7 @@ func expansionRows(key, valPrefix string) []suggestItem {
 	return rows
 }
 
-// quotedSDLabelRows wraps each label as `<key>:"<label>"` so multi-
-// word model / sampler / prompt values stay one parser token.
+// Quoted so a multi-word label stays one parser token.
 func quotedSDLabelRows(key string, labels []string) []suggestItem {
 	rows := make([]suggestItem, 0, len(labels))
 	for _, lbl := range labels {
@@ -641,23 +554,14 @@ func (s *Server) systemSuggestLevel2(key, valPrefix string) []suggestItem {
 		}
 		return rows
 	}
-	// collection labels may contain spaces; wrap each suggestion in
-	// double quotes so the parser still treats it as a single token.
 	if key == "collection" {
 		return quotedSDLabelRows("collection", s.queryCollectionLabels(valPrefix, 10))
 	}
-	// Source labels are operator-edited free text that frequently contains
-	// spaces; quote each suggestion so the parser still treats it as one
-	// token. Mirrors the collection: branch above. The none / any
-	// membership shortcuts lead, since no real label can reach them.
 	if key == "source" {
 		return append(expansionRows(key, valPrefix),
 			quotedSDLabelRows("source", s.querySourceLabels(valPrefix, 10))...)
 	}
-	// tagged: / autotagged: take the booleans or a label from the
-	// provenance ledger. Ledger labels are quoted like the source:
-	// branch above; a label that repeats an expansion value (the
-	// reserved `user`) keeps the expansion row and its description.
+	// A label repeating an expansion (user) keeps only the expansion row.
 	if key == "tagged" || key == "autotagged" {
 		labels := s.queryTaggerLabels(valPrefix, 10, key == "autotagged")
 		labels = slices.DeleteFunc(labels, func(l string) bool {
@@ -665,35 +569,22 @@ func (s *Server) systemSuggestLevel2(key, valPrefix string) []suggestItem {
 		})
 		return append(expansionRows(key, valPrefix), quotedSDLabelRows(key, labels)...)
 	}
-	// name: surfaces distinct file basenames whose substring matches
-	// the prefix, mirroring the executor's `canonical_path LIKE '%/<val>%'`
-	// shape. Empty prefix returns nothing - on a million-image library a
-	// blank scan would walk the whole table and overflow the suggest budget.
-	// Filenames frequently contain spaces; wrap each suggestion in quotes
-	// so the parser keeps the value as a single token, matching the
-	// source: / collection: branches.
 	if key == "name" {
 		if valPrefix == "" {
 			return nil
 		}
 		return quotedSDLabelRows("name", s.queryNameBasenames(valPrefix, 10))
 	}
-	// model: / sampler: are typically short low-cardinality identifiers
-	// (e.g. `sdxl_v1.0`, `Euler a`). Surface distinct values from both
-	// metadata tables that prefix-match the typed text. Quote the value
-	// so multi-word sampler names like `Euler a` survive the parser.
 	if key == "model" {
 		return quotedSDLabelRows("model", s.querySDStringField("model", "model_checkpoint", valPrefix, 10, false))
+	}
+	if key == "comfyui" {
+		return quotedSDLabelRows("comfyui", s.queryComfyTerms(valPrefix, 10))
 	}
 	if key == "sampler" {
 		return quotedSDLabelRows("sampler", s.querySDStringField("sampler", "sampler", valPrefix, 10, false))
 	}
-	// prompt: stores free-text sentences, so substring-match the prefix
-	// against existing prompts. Empty prefix returns nothing - listing
-	// the alphabetically first prompts isn't useful, and a full-table
-	// distinct on a sentence column is expensive. Prompts always contain
-	// spaces; the quoted form is the only one the parser can ingest as
-	// a single token.
+	// Empty prefix lists nothing: a DISTINCT over prompts scans every row.
 	if key == "prompt" {
 		if valPrefix == "" {
 			return nil
@@ -703,15 +594,9 @@ func (s *Server) systemSuggestLevel2(key, valPrefix string) []suggestItem {
 	if _, ok := searchkw.Expansions[key]; ok {
 		return expansionRows(key, valPrefix)
 	}
-	// Filter keyword without a static expansion (folder, folderonly,
-	// generated): no level-2 hint - the user types the value freeform.
 	if searchkw.IsKeyword(key) {
 		return nil
 	}
-	// Real category at level 2: list tags in that category, mirroring
-	// the existing `<category>:<prefix>` autocomplete path. These rows
-	// wear the category color and a usage count, not the dim "system"
-	// label, since they're real data, not a static hint.
 	if s.categoryExists(key) {
 		suggestions, _ := search.SuggestTagsWithFilter(s.db(), nil, valPrefix, key, 10)
 		rows := make([]suggestItem, 0, len(suggestions))
@@ -728,19 +613,12 @@ func (s *Server) systemSuggestLevel2(key, valPrefix string) []suggestItem {
 	return nil
 }
 
-// systemCategoryRow pairs a tag-category name with its colour so the
-// system: dropdown can render each row in the category's accent.
 type systemCategoryRow struct {
 	Name  string
 	Color string
 }
 
-// systemCategoryRows pulls the live category list once per request.
-// tag_categories is small (~9 builtin plus a handful of user rows) so
-// it's cheaper to read all and filter in Go than to run a LIKE per
-// keystroke and worry about escaping underscored names. Color is the
-// hex value from the categories table; unknown values fall back to
-// the neutral default via tags.SafeCategoryColor.
+// A small table: filtering in Go spares a LIKE and escaping its underscores.
 func (s *Server) systemCategoryRows() []systemCategoryRow {
 	d := s.db()
 	if d == nil {
@@ -757,11 +635,6 @@ func (s *Server) systemCategoryRows() []systemCategoryRow {
 	return out
 }
 
-// alreadyTypedTags normalizes the preceding search-bar tokens into the same
-// shape as formatted suggestion names (plain "tag" or "category:tag") so the
-// suggest filter can drop tags the user has already committed. Filter keywords
-// (fav:true, folder:..., etc.) are skipped because they aren't tag names and
-// would never match a suggestion anyway.
 func alreadyTypedTags(contextTokens []string) map[string]struct{} {
 	set := make(map[string]struct{}, len(contextTokens))
 	for _, tok := range contextTokens {
@@ -769,8 +642,6 @@ func alreadyTypedTags(contextTokens []string) map[string]struct{} {
 		if t == "" {
 			continue
 		}
-		// Skip filter keywords; only tag tokens belong in the de-dup set.
-		// Shares searchkw.IsKeyword with searchSuggest's value-only check.
 		if colonIdx := strings.IndexByte(t, ':'); colonIdx > 0 {
 			if searchkw.IsKeyword(strings.ToLower(t[:colonIdx])) {
 				continue

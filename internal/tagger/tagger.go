@@ -1,16 +1,7 @@
 //go:build tagger
 
 // Package tagger runs ONNX models over images and turns what they emit
-// into tags. It owns the model catalog, the per-tagger thresholds and
-// category mapping, the preprocessing, the inference, and the aggregation
-// across several taggers - everything between "here is an image" and "here
-// are the labels to apply".
-//
-// It does not apply them: the write goes through internal/tags so a
-// machine-made tag lands under the same fan-out and usage accounting a
-// hand-typed one does. The whole package is behind the `tagger` build tag,
-// and the default backend runs the model in a subprocess so the parent
-// never loads the runtime.
+// into tags.
 package tagger
 
 import (
@@ -18,6 +9,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -34,15 +26,10 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
-// IsAvailable reports whether at least one enabled tagger has its files.
 func IsAvailable(cfg *config.Config) bool { return len(EnabledTaggers(cfg)) > 0 }
 
-// buildSupportsInference is true in the tagger build, false in the noop
-// build.
 func buildSupportsInference() bool { return true }
 
-// UnavailableReason explains why auto-tagging can't run, mirroring the
-// reason shown in Settings → Auto-Tagger. Returns "" when IsAvailable.
 func UnavailableReason(cfg *config.Config) string {
 	if IsAvailable(cfg) {
 		return ""
@@ -59,10 +46,6 @@ func UnavailableReason(cfg *config.Config) string {
 	return "no enabled tagger"
 }
 
-// CheckProviderAvailable probes whether the ONNX Runtime library can
-// initialize the requested execution provider. The settings handler calls
-// it before persisting a non-CPU provider so the operator sees a library
-// or device issue immediately rather than at tagger-job time.
 func CheckProviderAvailable(provider string) error {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if provider == "" || provider == "cpu" {
@@ -102,11 +85,8 @@ func CheckProviderAvailable(provider string) error {
 	return nil
 }
 
-// AvailableTaggers returns every known tagger with availability set.
 func AvailableTaggers(cfg *config.Config) []TaggerStatus { return DiscoverTaggers(cfg) }
 
-// Status snapshots the registered backend's cache state for the
-// operator UI.
 func Status() CacheStatus {
 	if b := activeBackend(); b != nil {
 		return b.Status()
@@ -114,8 +94,6 @@ func Status() CacheStatus {
 	return CacheStatus{}
 }
 
-// ReleaseIdle tears down the cached session set when it has been idle
-// for at least `after`.
 func ReleaseIdle(after time.Duration) bool {
 	if b := activeBackend(); b != nil {
 		return b.ReleaseIdle(after)
@@ -123,26 +101,19 @@ func ReleaseIdle(after time.Duration) bool {
 	return false
 }
 
-// ReleaseAll unconditionally tears down the cached session set.
 func ReleaseAll() {
 	if b := activeBackend(); b != nil {
 		b.ReleaseAll()
 	}
 }
 
-// autotagChunkSize bounds one backend round trip: a whole-library scope
-// would otherwise extract every video's frames, and hold them on disk,
-// before the first tag lands.
+// A whole-library scope would otherwise extract every video's frames to
+// disk before the first tag lands.
 const autotagChunkSize = 200
 
-// RunWithTaggers tags ids through the supplied taggers, merging
-// results so each image ends up with one row per unique tag. Callers
-// must pass only enabled+available taggers. provider overrides
-// cfg.Tagger.ExecutionProvider so per-request callers can keep single-image
-// runs on the CPU. mangaCacheDir is the per-gallery <data_path>/
-// <gallery>/manga directory used to extract and cache cbz pages on
-// demand; pass "" to fall back to a per-image temp directory.
-// Returns the count of submitted ids left without auto_tagged_at.
+// RunWithTaggers takes only enabled, available taggers and returns how
+// many ids were left untagged. provider overrides the configured one; an
+// empty mangaCacheDir extracts pages under the system temp directory.
 func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, ids []int64, taggers []TaggerStatus, mgr *jobs.Manager, provider string, mangaCacheDir string) (int, error) {
 	if len(taggers) == 0 {
 		return 0, fmt.Errorf("no tagger is enabled or available")
@@ -152,9 +123,6 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 		return 0, fmt.Errorf("auto-tagger disabled (no backend registered)")
 	}
 
-	// Loaded ahead of the backend so a fresh session set picks up the
-	// current tag_categories rows when LoadDispatch resolves rule
-	// targets. Reused below for the rating / wd14 / inferred chains.
 	type catRow struct {
 		id   int64
 		name string
@@ -173,13 +141,9 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 	}
 	generalCatID := catIDs["general"]
 
-	// Inference map for taggers whose category scheme can't tell apart
-	// general from categorised counterparts (joytag's single_general,
-	// camie when its category is "general"). Maps tag name → catID for
-	// an existing non-general non-meta categorised tag. Ambiguous names
-	// (multiple categorised variants) are dropped and fall back to
-	// general. Lets joytag's `hakurei_reimu` attach to a pre-existing
-	// `character:hakurei_reimu` instead of going under general.
+	// single_general taggers can't tell a character from a general tag,
+	// so a name found in exactly one other category (bar general and
+	// meta) is filed there.
 	inferredCats := map[string]int64{}
 	hasSingleGeneral := false
 	for _, t := range taggers {
@@ -190,8 +154,7 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 		}
 	}
 	if hasSingleGeneral && generalCatID != 0 {
-		// Skip names whose general counterpart already carries a manual
-		// image_tag - that's an explicit user choice.
+		// A name the user has tagged as general by hand stays general.
 		inferred, err := db.QueryAllContext(ctx, database.Read, func(rows *sql.Rows) (catRow, error) {
 			var c catRow
 			err := rows.Scan(&c.name, &c.id)
@@ -228,20 +191,13 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 
 	parallel := min(max(1, cfg.Tagger.Parallel), len(ids))
 
-	// jobs.Manager carries a single status string; parallel workers
-	// writing into it would each clobber the others' progress, making
-	// the displayed message hop between mangas. Per-worker slots plus
-	// a serialising mutex turn every emission into a single combined
-	// snapshot - workers see and write the same view of all peers, so
-	// the displayed message is always consistent regardless of which
-	// goroutine fired the update.
+	// The job has one status line, so each worker writes its own slot and
+	// every update joins them all.
 	total := len(ids)
 	var completed atomic.Int64
 	var statusMu sync.Mutex
 	workerStatus := make([]string, parallel)
-	// Cap the number of per-worker entries the status bar shows; at
-	// parallel=8 with every worker on a long cbz the joined string
-	// otherwise overflows the flash slot.
+	// More than three workers' pages overflow the status slot.
 	const maxVisibleWorkers = 3
 	emitStatus := func(workerIdx int, msg string) {
 		statusMu.Lock()
@@ -267,10 +223,6 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 		taggerNames = append(taggerNames, t.Name)
 	}
 
-	// Build one chunk's payload: look up each id's canonical path and
-	// file type, extract frames (videos, cbz pages), and ship the
-	// resolved paths to the backend. Frame cleanup runs once the
-	// backend has answered for the chunk.
 	var skipped atomic.Int64
 	prepared := 0
 	runChunk := func(chunk []int64) error {
@@ -285,8 +237,8 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 			if ctx.Err() != nil {
 				break
 			}
-			// Extraction is minutes of ffmpeg on a video-heavy scope;
-			// without this the bar sits on the caller's starting line.
+			// Extraction can take minutes on a video-heavy scope, so it
+			// reports progress too.
 			prepared++
 			mgr.Update(int(completed.Load()), total, fmt.Sprintf("preparing %d/%d", prepared, total))
 			var canonPath, fileType string
@@ -323,11 +275,6 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 			Parallel:       parallel,
 			Images:         requests,
 			OnProgress: func(workerIdx int, msg string) {
-				// The backend's per-image-done convention is OnProgress
-				// with an empty msg; non-empty msg is per-page cbz
-				// status. Use the empty-msg event to drive the live
-				// counter so the flash shows N/total during the run
-				// instead of jumping from 0 to total at completion.
 				if msg == "" {
 					completed.Add(1)
 				}
@@ -364,24 +311,10 @@ func RunWithTaggers(ctx context.Context, database *db.DB, cfg *config.Config, id
 		}
 	}
 
-	// Final status update so the progress bar reaches total when the
-	// last image is the cancelled / skipped tail.
 	mgr.Update(int(completed.Load()), total, "tagging images")
 	return int(skipped.Load()), ctx.Err()
 }
 
-// framesForTagging returns the file paths to feed the tagger plus a
-// cleanup func. Branches by file type:
-//   - static images: [canonPath], no-op cleanup.
-//   - videos: up to five frames sampled via ffmpeg, removed by cleanup.
-//   - cbz manga: every page extracted into the per-gallery manga cache
-//     (or a temp directory when mangaCacheDir is empty); the cache
-//     entries are deliberately left on disk so idle reclaim handles
-//     eviction five minutes after the last use, mirroring the
-//     reader's serve path.
-//
-// With ffmpeg missing or failing, videos yield no frames and the
-// caller skips the asset; an unreadable archive does the same.
 func framesForTagging(canonPath, fileType, mangaCacheDir string, imageID int64) ([]string, func()) {
 	switch fileType {
 	case "mp4", "webm":
@@ -393,6 +326,12 @@ func framesForTagging(canonPath, fileType, mangaCacheDir string, imageID int64) 
 			}
 		}
 		return frames, cleanup
+	case "avif", "jxl":
+		frame, err := gallery.RenderStillFrame(canonPath, os.TempDir())
+		if err != nil {
+			return nil, func() {}
+		}
+		return []string{frame}, func() { _ = os.Remove(frame) }
 	case "cbz":
 		archive, err := gallery.OpenManga(canonPath)
 		if err != nil {
@@ -401,40 +340,39 @@ func framesForTagging(canonPath, fileType, mangaCacheDir string, imageID int64) 
 		}
 		pageCount := len(archive.Pages)
 		_ = archive.Close()
-		cacheRoot := mangaCacheDir
-		var tempDir string
-		if cacheRoot == "" {
-			tempDir, err = os.MkdirTemp("", "manga-frames-*")
-			if err != nil {
-				logx.Warnf("tagger: temp dir for manga frames: %v", err)
-				return nil, func() {}
-			}
-			cacheRoot = tempDir
+		// Beside the reader's cache, not in it: its reclaimer unlinks pages
+		// idle past their TTL, which inference over a chunk can outlast.
+		root := ""
+		if mangaCacheDir != "" {
+			root = filepath.Dir(mangaCacheDir)
+		}
+		tempDir, err := os.MkdirTemp(root, "autotag-*")
+		if err != nil {
+			logx.Warnf("tagger: temp dir for manga frames: %v", err)
+			return nil, func() {}
 		}
 		paths := make([]string, 0, pageCount)
 		for i := 1; i <= pageCount; i++ {
-			path, err := gallery.EnsureMangaPageInCache(cacheRoot, canonPath, imageID, i)
+			path, err := gallery.EnsureMangaPageInCache(tempDir, canonPath, imageID, i)
 			if err != nil {
 				logx.Warnf("tagger: extract page %d of %q: %v", i, canonPath, err)
 				continue
 			}
+			if gallery.IsFFmpegStill(gallery.ExtFileType(path)) {
+				frame, err := gallery.RenderStillFrame(path, tempDir)
+				if err != nil {
+					logx.Warnf("tagger: render page %d of %q: %v", i, canonPath, err)
+					continue
+				}
+				path = frame
+			}
 			paths = append(paths, path)
 		}
-		cleanup := func() {
-			if tempDir != "" {
-				_ = os.RemoveAll(tempDir)
-			}
-		}
-		return paths, cleanup
+		return paths, func() { _ = os.RemoveAll(tempDir) }
 	}
 	return []string{canonPath}, func() {}
 }
 
-// storeResults commits the merged auto-tag set for one image and keeps
-// usage_count in sync. The replace step is scoped to taggerNames so
-// other taggers' rows survive. ratingCatID gates the highest-rank-wins
-// rating prune that fires when any of merged's tags is a rating-category
-// row; pass 0 to skip (pre-bootstrap DB).
 func storeResults(
 	ctx context.Context, database *db.DB,
 	imageID int64, merged map[TagKey]Scored, taggerNames []string, ratingCatID int64,
@@ -445,16 +383,21 @@ func storeResults(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Resolve each desired tag to a tag_id, creating new rows as
-	// needed. Alias rows redirect to their canonical so we never
-	// attach an alias to an image (matches GetOrCreateTag). Two labels
-	// that collapse onto the same canonical keep the higher score.
+	// Aliases resolve to their canonical: an alias never goes on an image.
 	type target struct {
 		score      float32
 		taggerName string
 	}
 	targets := make(map[int64]target, len(merged))
+	hasRating := false
 	for k, s := range merged {
+		if ratingCatID != 0 && k.CatID == ratingCatID {
+			// A mapping rule can name anything; only the four levels rate.
+			if !tags.IsCanonicalRating(k.Name) {
+				continue
+			}
+			hasRating = true
+		}
 		var tagID int64
 		var isAlias int
 		var canonicalID sql.NullInt64
@@ -554,15 +497,15 @@ func storeResults(
 		}
 	}
 
-	// Every emitted tag records the tagger in the source ledger - the
-	// fresh inserts below and the tags already on the image alike, since
-	// re-confirming an existing row is what the ledger captures.
+	// Existing rows are recorded too: the ledger captures a tagger
+	// re-confirming a tag.
 	for tid, t := range targets {
 		if err := tags.RecordTagSourceTx(tx, imageID, tid, t.taggerName); err != nil {
 			return fmt.Errorf("record tag source %d: %w", tid, err)
 		}
 	}
 
+	var inserted []int64
 	for tid, t := range toAdd {
 		var tname any
 		if t.taggerName != "" {
@@ -577,33 +520,25 @@ func storeResults(
 		if n, _ := res.RowsAffected(); n == 0 {
 			continue
 		}
-		// Through the tags helpers so the is_missing guard holds: a
-		// missing image is not in usage_count, and auto-tagging one
-		// must not inflate it.
+		// Through the tags helpers: a missing image is not counted in
+		// usage_count.
 		if err := tags.BumpTagUsageTx(tx, tid, imageID); err != nil {
 			return fmt.Errorf("increment usage for tag %d: %w", tid, err)
 		}
+		inserted = append(inserted, tid)
+	}
+	// After every insert: a parent fanned out first would leave its emitted child implied.
+	for _, tid := range inserted {
 		if err := tags.ApplyImpliedFanoutTx(tx, imageID, tid, ratingCatID, true); err != nil {
 			return fmt.Errorf("fan out implications for tag %d: %w", tid, err)
 		}
 	}
 
-	// WD14 emits every rating label that beats its threshold, so a
-	// single image can pick up `sensitive` and `questionable` in one
-	// pass. Sweep lower-rank rating rows so highest-rank wins matches
-	// what search resolves to anyway.
-	if ratingCatID != 0 {
-		hasRating := false
-		for k := range merged {
-			if k.CatID == ratingCatID {
-				hasRating = true
-				break
-			}
-		}
-		if hasRating {
-			if err := tags.PruneLowerRatingsTx(tx, ratingCatID, imageID); err != nil {
-				return fmt.Errorf("prune lower ratings: %w", err)
-			}
+	// A tagger can emit several ratings in one pass; keep the highest, as
+	// search resolves it.
+	if hasRating {
+		if err := tags.PruneLowerRatingsTx(tx, ratingCatID, imageID); err != nil {
+			return fmt.Errorf("prune lower ratings: %w", err)
 		}
 	}
 

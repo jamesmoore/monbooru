@@ -30,6 +30,8 @@
     </form>
   </div>
 
+  <div id="flash-relations"></div>
+
   {{if not .Pair}}
   <section class="session-empty">
     {{if gt .HiddenByCeiling 0}}
@@ -121,7 +123,7 @@
 
     <p class="session-prompt"><span id="session-prompt-text" data-default="Hover a decision below to preview what it commits.">Hover a decision below to preview what it commits.</span></p>
 
-    <form id="session-decision-form" hx-post="/relations/session/decide" hx-swap="none"
+    <form id="session-decision-form" hx-post="/relations/session/decide" hx-target="#flash-relations" hx-swap="innerHTML"
           hx-on::after-request="onSessionDecideResponse(event)">
       <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
       <input type="hidden" name="a" value="{{.Pair.A.ID}}">
@@ -207,9 +209,8 @@
   var pair = document.querySelector('.session-pair');
   var leftInput = document.getElementById('session-left');
 
-  // Browser form restoration on bfcache can leave a previous pair's id
-  // in session-left after the page rerenders for a new pair; fall back
-  // to A when the input doesn't match either side.
+  // Form restoration can leave a previous pair's id in the input, so
+  // anything but A or B falls back to A.
   function currentLeftID() {
     var v = leftInput ? leftInput.value : null;
     if (v === pair.dataset.a || v === pair.dataset.b) return v;
@@ -219,18 +220,12 @@
   function flipSides() {
     var cells = pair.querySelector('.session-cells');
     if (!cells) return;
-    // Children are [leftCell, bridge, rightCell]; swap left and right
-    // around the bridge so the final order reads [right, bridge, left].
-    // The per-cell heading and meta live inside each cell so they
-    // travel with the swap; the bridge stays put.
     var left = cells.children[0];
     var bridge = cells.children[1];
     var right = cells.children[2];
     if (!left || !bridge || !right) return;
     cells.insertBefore(right, left);
     cells.insertBefore(bridge, left);
-    // Update the in-cell Left / Right headings so they keep matching
-    // the side the operator now reads as left.
     var newLeftCell = cells.children[0];
     var newRightCell = cells.children[2];
     var lh = newLeftCell.querySelector('.session-role');
@@ -240,11 +235,6 @@
     var newLeftSide = newLeftCell.dataset.side;
     var aID = pair.dataset.a, bID = pair.dataset.b;
     leftInput.value = (newLeftSide === 'A') ? aID : bID;
-    // Keep the comparison table oriented to the on-screen sides: swap its
-    // two header ids and each row's value cells so the fixed Left / Right
-    // labels still describe the images now under them. cmp-win / cmp-match
-    // markers ride along inside the value cells, so the highlight stays
-    // attached to the right value.
     var table = pair.querySelector('.relations-compare-table');
     if (table) {
       var ids = table.querySelectorAll('thead .cmp-col-id');
@@ -262,11 +252,6 @@
   var swap = document.getElementById('session-swap');
   if (swap) swap.addEventListener('click', flipSides);
 
-  // Prompt preview: every decision button (including 5 Not related
-  // and 6 Skip) carries the full sentence shape via
-  // data-prompt-sentence; the {left} / {right} placeholders resolve
-  // against the operator's current left / right (so a Swap flip is
-  // reflected immediately).
   var prompt = document.getElementById('session-prompt-text');
   if (prompt) {
     var defaultPrompt = prompt.getAttribute('data-default') || prompt.textContent;
@@ -286,13 +271,6 @@
     });
   }
 
-  // Compare dialog: a before/after slider over the full-size media.
-  // The left slot is the base layer; the right slot sits on top clipped
-  // to a width set by the cursor's X within the stage. The slot owns
-  // either an <img> (image sides) or a muted/looping <video> (mp4 /
-  // webm sides) so video-vs-video and mixed pairs slide the same way
-  // image pairs do. Dragging (or moving without click on desktop)
-  // updates the split.
   var compareBtn = document.getElementById('session-compare');
   var compareDlg = document.getElementById('session-compare-dialog');
   var compareStage = document.getElementById('compare-stage');
@@ -322,7 +300,8 @@
     if (!slot) return;
     while (slot.firstChild) slot.removeChild(slot.firstChild);
     var isVideo = fileType === 'mp4' || fileType === 'webm';
-    var src = '/images/' + id + (isVideo ? '/file' : '/view');
+    // /view would hand an archive over as the zip itself.
+    var src = '/images/' + id + (isVideo ? '/file' : fileType === 'cbz' ? '/page/1' : '/view');
     var el = document.createElement(isVideo ? 'video' : 'img');
     if (isVideo) {
       el.autoplay = true;
@@ -341,8 +320,6 @@
     var aID = pair.dataset.a, bID = pair.dataset.b;
     var aType = pair.dataset.aType || '';
     var bType = pair.dataset.bType || '';
-    // session-left tracks the operator's current "left" so the slider
-    // mirrors what's on screen even after a swap.
     var leftID = currentLeftID();
     var rightID = (leftID === aID) ? bID : aID;
     var leftType = (leftID === aID) ? aType : bType;
@@ -361,9 +338,7 @@
   function clearCompareSlots() {
     [slotLeft, slotRight].forEach(function(slot) {
       if (!slot) return;
-      // Pause any playing <video> before tear-down so audio decoders
-      // and the video timer release immediately rather than running
-      // unseen behind the closed <dialog>.
+      // Pause and unload the video first so its decoder is released at once.
       var v = slot.querySelector('video');
       if (v) { try { v.pause(); } catch (_) {} v.removeAttribute('src'); v.load(); }
       while (slot.firstChild) slot.removeChild(slot.firstChild);
@@ -412,10 +387,6 @@
     }, {passive: false});
   }
 
-  // Post-decide modal hook. The decision form's hx-on::after-request
-  // calls onSessionDecideResponse: when the server flagged a duplicate
-  // decision via X-Relations-Post-Decision, open the delete dialog
-  // instead of advancing. Every other decision rides the auto-reload.
   var postdecideDlg = document.getElementById('session-postdecide-delete-dialog');
   var pdCsrf = form.querySelector('input[name="_csrf"]');
   var pdCSRFValue = pdCsrf ? pdCsrf.value : '';
@@ -446,12 +417,11 @@
       window.location.reload();
     }
   };
-  // URL-encoded bodies so the handlers' r.ParseForm() actually reads
-  // the fields; FormData lands as multipart and Go's ParseForm leaves
-  // r.Form empty for non-urlencoded posts.
+  // URL-encoded, not FormData: r.ParseForm does not read a multipart body.
   var pdHeaders = {
     'HX-Request': 'true',
     'X-CSRF-Token': pdCSRFValue,
+    'X-Monbooru-Gallery': document.body.dataset.gallery || '',
     'Content-Type': 'application/x-www-form-urlencoded',
   };
   function pdCopyTags() {
@@ -465,8 +435,8 @@
   }
   var pdKeep = document.getElementById('postdecide-keep');
   if (pdKeep) pdKeep.addEventListener('click', function() {
-    // Keeping the file honours the copy box too: the choice is about the
-    // tags, not about which button ends the dialog.
+    // Keep honours the copy box too: it is a choice about the tags, not
+    // the file.
     pdCopyTags().then(function() {
       if (postdecideDlg) postdecideDlg.close();
       window.location.reload();
@@ -486,18 +456,12 @@
       window.location.reload();
     });
   });
-  // Esc on the post-decide dialog must default to keeping the file (the
-  // safer path). It is a cancel, so it skips the tag copy the Keep
-  // button honours.
+  // Esc keeps the file but, as a cancel, skips the tag copy.
   if (postdecideDlg) postdecideDlg.addEventListener('cancel', function(e) {
     e.preventDefault();
     postdecideDlg.close();
     window.location.reload();
   });
-  // Dialog-scoped shortcuts: D commits the delete; Enter keeps the
-  // file (matches the autofocused Keep button). Both run only while
-  // the modal is open so they do not collide with the queue
-  // shortcuts wired below.
   if (postdecideDlg) postdecideDlg.addEventListener('keydown', function(e) {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     var tag = e.target.tagName;
@@ -511,21 +475,15 @@
     }
   });
 
-  // Keyboard shortcuts. 1-6 trigger the corresponding decision button;
-  // W flips sides; C opens Compare; Space behaves like Skip.
   document.addEventListener('keydown', function(e) {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.defaultPrevented) return;
-    // While the compare dialog is open, Esc closes it and the rest of
-    // the shortcuts pass through to dialog default behaviour.
+    // preventDefault tells the global Escape handler this Esc is used.
     if (compareDlg && compareDlg.open) {
       if (e.key === 'Escape') { e.preventDefault(); compareDlg.close(); }
       return;
     }
-    // Any other open dialog (gallery switch, shortcuts help) owns Esc
-    // so the operator doesn't lose unsaved input by jumping back to
-    // Relations.
     if (document.querySelector('dialog[open]')) return;
     var btnIndex = -1;
     if (e.key >= '1' && e.key <= '6') btnIndex = parseInt(e.key, 10) - 1;

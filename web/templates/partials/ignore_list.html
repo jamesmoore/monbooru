@@ -1,0 +1,5 @@
+{{define "partials/ignore_list.html"}}
+<div id="ignore-list" class="ignore-list"{{if .OOB}} hx-swap-oob="true"{{end}}>
+  {{range .Ignore}}<code>{{.}}</code>{{else}}<span class="status-dim">none</span>{{end}}
+</div>
+{{end}}

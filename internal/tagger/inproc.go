@@ -24,11 +24,8 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
-// loadedTagger pairs a cached ORT session with the per-call config the
-// inference loop reads, so threshold edits take effect without
-// rebuilding the session. Candidates carries the per-label routing
-// resolved once at the top of Run so the aggregator can index in
-// directly instead of recomputing per image.
+// loadedTagger joins a cached session with this run's config, so
+// threshold edits apply without a session rebuild.
 type loadedTagger struct {
 	cfg        config.TaggerInstance
 	session    *ort.DynamicAdvancedSession
@@ -39,10 +36,6 @@ type loadedTagger struct {
 	dispatch   *DispatchTable
 }
 
-// loadedSession is the cached half of loadedTagger: ORT state keyed
-// by tagger name. modelFile and tagsFile gate cache reuse - a TOML
-// edit that swaps either invalidates the entry; profileFP additionally
-// invalidates on a tagger.json sidecar edit.
 type loadedSession struct {
 	modelFile string
 	tagsFile  string
@@ -53,10 +46,6 @@ type loadedSession struct {
 	inputSize int
 }
 
-// inprocBackend is the in-process implementation of Backend. It owns
-// the long-lived ORT environment plus the per-tagger session cache;
-// idle release and warm-cache reuse mirror the previous package-level
-// cache exactly.
 type inprocBackend struct {
 	mu          sync.Mutex
 	inUse       bool
@@ -70,20 +59,12 @@ type inprocBackend struct {
 
 var defaultBackend = &inprocBackend{}
 
-// UseInprocBackend forces the in-process backend, replacing any
-// previously-registered Backend. The tagger-worker subcommand calls
-// this on entry so the child runs inference itself instead of trying
-// to spawn a grandchild.
+// UseInprocBackend is for the worker child, which must not spawn a grandchild.
 func UseInprocBackend() {
 	SetBackend(defaultBackend)
 }
 
 func init() {
-	// Default backend is the subprocess client: the parent never
-	// loads CUDA libraries or holds an ORT environment, so its RSS
-	// stays at the no-tagger baseline even after autotag jobs have
-	// run. MONBOORU_TAGGER_BACKEND=inproc is the rollback for
-	// operators who hit a subprocess regression.
 	if os.Getenv("MONBOORU_TAGGER_BACKEND") == "inproc" {
 		SetBackend(defaultBackend)
 		return
@@ -95,11 +76,7 @@ func init() {
 	SetBackend(defaultBackend)
 }
 
-// satisfies returns true when the cached set covers every requested
-// tagger with the same execution-provider mode, the same model / tags
-// filenames, and the same profile fingerprint. The profile check picks
-// up tagger.json sidecar edits without a manual reload. Caller must
-// hold b.mu.
+// Caller must hold b.mu.
 func (b *inprocBackend) satisfies(modelPath string, taggers []TaggerStatus, provider string) bool {
 	if !b.initialized || b.provider != provider {
 		return false
@@ -123,12 +100,9 @@ func (b *inprocBackend) satisfies(modelPath string, taggers []TaggerStatus, prov
 	return true
 }
 
-// ensure populates the cache for (taggers, provider). On signature
-// mismatch the existing cache is torn down first. Caller must hold
-// b.mu.
+// Caller must hold b.mu.
 func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provider string) error {
-	// Normalized before the signature check so an empty provider matches a
-	// warm "cpu" cache instead of tearing it down.
+	// Before the signature check, so "" matches a warm "cpu" cache.
 	provider = cmp.Or(provider, "cpu")
 	if b.satisfies(cfg.Paths.ModelPath, taggers, provider) {
 		logx.Infof("tagger: reusing warm cache (%d session(s))", len(b.sessions))
@@ -145,15 +119,9 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 	}
 	loadStart := time.Now()
 
-	// First-ever CUDA inference on a host with a recent GPU pays a
-	// JIT-compilation cost (cuDNN compiles PTX kernels for the live
-	// compute capability, tens of seconds on Blackwell). CUDA caches
-	// the JIT'd kernels under $HOME/.nv/ComputeCache by default;
-	// inside a container that path is in the writable overlay and
-	// disappears on restart. Point CUDA_CACHE_PATH at <data_path>/
-	// .nv-cache so the cache survives container recycles. Honour an
-	// operator-set CUDA_CACHE_PATH if one is already in the
-	// environment.
+	// CUDA caches JIT-compiled kernels under $HOME/.nv, which a container
+	// loses on restart; keep them under the data path unless
+	// CUDA_CACHE_PATH is already set.
 	if provider == "cuda" && os.Getenv("CUDA_CACHE_PATH") == "" {
 		cacheDir := filepath.Join(cfg.Paths.DataPath, ".nv-cache")
 		if err := os.MkdirAll(cacheDir, 0o755); err == nil {
@@ -174,16 +142,12 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 	}
 	b.sessionOpts = opts
 
-	// ORT defaults intra_op_num_threads to the host's physical core
-	// count. With cfg.Tagger.Parallel goroutines each calling Run, that
-	// oversubscribes the CPU; split the cores evenly across workers and
-	// pin inter-op to 1 so the per-Run scheduler doesn't fan out again.
-	// CUDA ignores these for kernel work but cuDNN still honours them
-	// for host-side helpers.
+	// ORT gives each session every core by default; with parallel workers
+	// that oversubscribes the CPU, so the cores are split between them
+	// and inter-op stays at 1.
 	parallel := max(1, cfg.Tagger.Parallel)
 	if provider == "directml" {
-		// Run serialises directml to one worker, so that session gets
-		// every core rather than the configured share.
+		// Run serialises directml, so its one worker gets every core.
 		parallel = 1
 	}
 	intra := max(1, runtime.NumCPU()/parallel)
@@ -196,8 +160,8 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 		return fmt.Errorf("set inter-op threads: %w", err)
 	}
 
-	// Like the CUDA JIT cache above, OpenVINO's compiled-model cache goes
-	// under <data_path> so it survives container recycles.
+	// Under the data path so the compiled-model cache survives a
+	// container restart.
 	epCacheDir := ""
 	if provider == "openvino" {
 		dir := filepath.Join(cfg.Paths.DataPath, ".openvino-cache")
@@ -272,8 +236,6 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 	return nil
 }
 
-// parseDirectMLDeviceID resolves a DirectML adapter id. Anything ORT
-// would reject falls back to adapter 0 rather than failing the load.
 func parseDirectMLDeviceID(v string) int {
 	if v == "" {
 		return 0
@@ -286,26 +248,19 @@ func parseDirectMLDeviceID(v string) int {
 	return id
 }
 
-// directmlDeviceID reads the operator's adapter selection. The tagger
-// child inherits the variable from the parent's environment.
 func directmlDeviceID() int {
 	return parseDirectMLDeviceID(os.Getenv("MONBOORU_TAGGER_DIRECTML_DEVICE_ID"))
 }
 
-// appendExecutionProvider attaches the requested ONNX Runtime execution
-// provider to the session options. cacheDir hosts provider-specific
-// compile caches (OpenVINO); pass "" to skip cache configuration, e.g.
-// for a plain availability probe. It returns a cleanup function that
-// must be called to release any provider-specific options that were
-// allocated; the cleanup is nil when nothing was allocated.
+// The caller must run a non-nil cleanup to free the provider options. An
+// empty cacheDir skips the compile cache.
 func appendExecutionProvider(opts *ort.SessionOptions, provider, cacheDir string) (cleanup func(), err error) {
 	switch provider {
 	case "cpu", "":
 		return nil, nil
 	case "cuda":
-		// Drop the CPU-side initializer copies once weights upload to
-		// the device; ORT otherwise keeps a duplicate in host memory
-		// for the lifetime of the session.
+		// Without this ORT keeps a host copy of the weights for the
+		// session's lifetime.
 		if err := opts.AddSessionConfigEntry("session.use_device_allocator_for_initializers", "1"); err != nil {
 			return nil, fmt.Errorf("ort session config: %w", err)
 		}
@@ -313,14 +268,9 @@ func appendExecutionProvider(opts *ort.SessionOptions, provider, cacheDir string
 		if err != nil {
 			return nil, fmt.Errorf("ort cuda options (ensure libonnxruntime was built with CUDA): %w", err)
 		}
-		// HEURISTIC trades the multi-second first-Run cuDNN search
-		// (EXHAUSTIVE default) for a fast algorithm pick that ORT's
-		// own docs put within a few percent of optimal on most CNNs.
-		// kSameAsRequested grows the GPU arena by the requested size
-		// instead of doubling; default is fine for training but
-		// inflates the arena on small-batch inference. Keeping copies
-		// on the default stream avoids the cross-stream sync that
-		// only pays off when the secondary stream is fully utilised.
+		// HEURISTIC skips cuDNN's multi-second exhaustive search,
+		// kSameAsRequested grows the arena by the request instead of
+		// doubling, and default-stream copies avoid a cross-stream sync.
 		if err := cudaOpts.Update(map[string]string{
 			"cudnn_conv_algo_search":    "HEURISTIC",
 			"arena_extend_strategy":     "kSameAsRequested",
@@ -335,11 +285,7 @@ func appendExecutionProvider(opts *ort.SessionOptions, provider, cacheDir string
 		}
 		return func() { _ = cudaOpts.Destroy() }, nil
 	case "directml":
-		// The DirectML EP requires memory pattern disabled and the
-		// sequential execution mode; the ORT docs reject sessions built
-		// with the defaults. Set both explicitly so the session never
-		// trips the requirement, and honour MONBOORU_TAGGER_DIRECTML_DEVICE_ID
-		// for multi-GPU hosts instead of hardcoding adapter 0.
+		// DirectML requires the memory pattern off and sequential execution.
 		if err := opts.SetMemPattern(false); err != nil {
 			return nil, fmt.Errorf("set directml mem pattern: %w", err)
 		}
@@ -401,11 +347,6 @@ func appendExecutionProvider(opts *ort.SessionOptions, provider, cacheDir string
 	}
 }
 
-// inferInputSize picks the spatial axis from an ONNX input's Dimensions
-// shape based on the profile's layout. Returns 0 when the shape is
-// degenerate (dynamic axis as -1, or unexpected rank). NHWC: shape is
-// [N,H,W,C]; NCHW: shape is [N,C,H,W]. We prefer H over W; the two are
-// equal for every square-input tagger we ship.
 func inferInputSize(dims ort.Shape, layout string) int {
 	if len(dims) != 4 {
 		return 0
@@ -425,8 +366,6 @@ func inferInputSize(dims ort.Shape, layout string) int {
 	return int(d)
 }
 
-// teardownLocked destroys every cached ORT object and asks glibc to
-// return the freed bytes to the kernel. Caller must hold b.mu.
 func (b *inprocBackend) teardownLocked() {
 	for _, s := range b.sessions {
 		_ = s.session.Destroy()
@@ -448,8 +387,6 @@ func (b *inprocBackend) teardownLocked() {
 	mallocTrim()
 }
 
-// ReleaseIdle tears down the cached session set when it has been idle
-// for at least `after` and no run is in flight.
 func (b *inprocBackend) ReleaseIdle(after time.Duration) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -463,18 +400,15 @@ func (b *inprocBackend) ReleaseIdle(after time.Duration) bool {
 	return true
 }
 
-// ReleaseAll unconditionally tears down the cached session set.
+// A run holds no lock while it infers, so its sessions stay until it ends.
 func (b *inprocBackend) ReleaseAll() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.initialized {
+	if b.initialized && !b.inUse {
 		b.teardownLocked()
 	}
 }
 
-// Status copies the cache state under the lock so the caller never
-// touches backend internals. Returns Loaded=false when no model set
-// is currently warm.
 func (b *inprocBackend) Status() CacheStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -495,10 +429,6 @@ func (b *inprocBackend) Status() CacheStatus {
 	return out
 }
 
-// Run executes inference for a batch of pre-prepared images and
-// returns one result per image in submission order. Per-image errors
-// land on Result.Err; whole-batch failures (no taggers, ORT init
-// failure) come back as the error return.
 func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
 	if len(req.Taggers) == 0 {
 		return RunResponse{}, fmt.Errorf("no tagger is enabled or available")
@@ -528,20 +458,12 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 		b.mu.Lock()
 		b.inUse = false
 		b.lastUsed = time.Now()
-		// idle_release_after_minutes <= 0 disables caching: tear
-		// down right after the run so RSS drops back to baseline.
 		if req.Cfg.Tagger.IdleReleaseAfterMinutes <= 0 {
 			b.teardownLocked()
 		}
 		b.mu.Unlock()
 	}()
 
-	// Resolve every label's routing once per loaded tagger. Inputs
-	// (profile, catIDs, dispatch, inferredCats) are invariant across
-	// images; doing this per-image burns 10k+ map lookups and
-	// function calls on each pass. The id->name view is built once for
-	// the same reason: a linear scan per label is ~200k comparisons on
-	// a 10k-label vocabulary.
 	catNames := make(map[int64]string, len(req.CatIDs))
 	for name, cid := range req.CatIDs {
 		catNames[cid] = name
@@ -593,11 +515,8 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 		results[i].ID = im.ID
 	}
 
-	// Periodic mallocTrim during long runs: every trimInterval images
-	// the worker that crosses the threshold hands glibc's freed pages
-	// back to the kernel. Without it a many-thousand-image run inflates
-	// the arena monotonically; the existing teardown-time trim only
-	// fires at idle release.
+	// Without a periodic trim a long run grows glibc's arena until the
+	// next idle release.
 	const trimInterval = 256
 	var sinceTrim atomic.Int64
 
@@ -653,9 +572,8 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 				}
 			}
 		}
-		// Every frame failed to decode or infer. Report an error rather
-		// than an empty map: the store loop reconciles an empty result by
-		// deleting the image's existing auto-tags.
+		// An error, not an empty map: storing an empty result deletes the
+		// image's auto-tags.
 		if !anyInferred {
 			results[idx].Err = "all frames failed"
 			return
@@ -697,11 +615,6 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 	return RunResponse{Results: results}, ctx.Err()
 }
 
-// inferImage loads, preprocesses, and runs inference on a single image
-// against the tagger's resolved profile. The profile drives every
-// preprocessing axis (pad, layout, channel order, normalisation) and
-// the output transform (raw logits get sigmoid'd; sigmoid_in_model
-// outputs pass through).
 func inferImage(lt loadedTagger, path string) ([]float32, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -727,11 +640,7 @@ func inferImage(lt loadedTagger, path string) ([]float32, error) {
 		return nil, err
 	}
 
-	// ort.NewTensor aliases the float32 slice, so the buffer must
-	// outlive the Run call. Destroy releases ORT's reference; only
-	// then can we hand the slice back to the pool. Explicit order
-	// instead of defer so the Put happens after Destroy on success
-	// and after Destroy on error too.
+	// The pool gets the buffer back only after Destroy: the tensor aliases it.
 	outputs := []ort.Value{nil}
 	runErr := lt.session.Run([]ort.Value{inputTensor}, outputs)
 	_ = inputTensor.Destroy()
@@ -745,10 +654,8 @@ func inferImage(lt loadedTagger, path string) ([]float32, error) {
 	if !ok {
 		return nil, fmt.Errorf("unexpected output type: %T", outputs[0])
 	}
-	// GetData returns ORT-owned memory backing the output ortValue;
-	// the deferred Destroy releases that memory. Always copy into a
-	// Go-owned slice before returning so the caller never holds a
-	// dangling pointer.
+	// GetData is ORT-owned memory that the deferred Destroy frees, so it
+	// is copied out.
 	data := outTensor.GetData()
 	out := make([]float32, len(data))
 	if lt.profile.Activation == "logits" {

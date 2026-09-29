@@ -10,10 +10,6 @@ import (
 	"github.com/monbooru/monbooru/internal/fsx"
 )
 
-// MergedDispatchRules returns the embedded defaults with the overlay
-// applied - same-source entries replaced, new sources appended -
-// source-sorted. This is the effective table the export view shows and
-// the file shape a dispatch_default PR replaces.
 func MergedDispatchRules(modelPath, taggerName string) []DispatchEntry {
 	merged := map[string]DispatchEntry{}
 	for _, e := range EmbeddedDispatchRules(taggerName) {
@@ -30,23 +26,14 @@ func MergedDispatchRules(modelPath, taggerName string) []DispatchEntry {
 	return out
 }
 
-// MarshalDispatchDoc renders rules as a complete dispatch.json
-// document, the same shape both the embedded defaults and the overlay
-// use.
 func MarshalDispatchDoc(rules []DispatchEntry) ([]byte, error) {
 	return json.MarshalIndent(dispatchDoc{Version: dispatchSchemaVersion, Rules: rules}, "", "  ")
 }
 
-// overlayMu serialises the read-modify-write cycle in
-// UpdateDispatchOverlay. SaveDispatchOverlay is atomic per write, but
-// two edits that both start from the same on-disk snapshot still lose
-// one of them without this.
+// Atomic writes alone would still lose one of two edits made from the
+// same snapshot.
 var overlayMu sync.Mutex
 
-// UpdateDispatchOverlay folds one edit into the tagger's overlay and
-// rewrites it, holding the lock across the whole cycle. mutate sees the
-// current rules keyed by source; a non-nil error aborts before any
-// write.
 func UpdateDispatchOverlay(modelPath, taggerName string, mutate func(map[string]DispatchEntry) error) error {
 	overlayMu.Lock()
 	defer overlayMu.Unlock()
@@ -64,13 +51,8 @@ func UpdateDispatchOverlay(modelPath, taggerName string, mutate func(map[string]
 	return SaveDispatchOverlay(modelPath, taggerName, rules)
 }
 
-// SaveDispatchOverlay rewrites <modelPath>/<taggerName>/dispatch.json
-// with the given rules, source-sorted. A rule identical to the
-// embedded default for its source is dropped so the overlay stays a
-// pure delta against stock, and an overlay left empty is deleted
-// instead of written - "differs from stock" needs no bookkeeping
-// beyond the file's existence. The write is atomic (temp + rename) so
-// a crash can't leave a half-written table for the next Run to skip.
+// The overlay stays a pure delta against stock, and an empty one is
+// deleted: the file existing is what "differs from stock" means.
 func SaveDispatchOverlay(modelPath, taggerName string, rules []DispatchEntry) error {
 	embedded := map[string]DispatchEntry{}
 	for _, e := range EmbeddedDispatchRules(taggerName) {

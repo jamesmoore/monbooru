@@ -263,7 +263,7 @@
   </div>
 
   {{$page := .Page}}
-  {{$tagsBase := printf "/tags?q=%s&sort=%s&order=%s&cat=%s&origin=%s&used_by=%s&type=%s&created_after=%s&conflicts=%s&stale=%s&folded=%s&show_zero=%s&page=" .Prefix .Sort .Order .CategoryID .Origin .UsedBy .Type .CreatedAfter $conflicts $stale $folded $zero}}
+  {{$tagsBase := printf "/tags?q=%s&sort=%s&order=%s&cat=%s&origin=%s&used_by=%s&type=%s&created_after=%s&conflicts=%s&stale=%s&folded=%s&show_zero=%s&page=" (urlQ .Prefix) (urlQ .Sort) (urlQ .Order) (urlQ .CategoryID) (urlQ .Origin) (urlQ .UsedBy) (urlQ .Type) (urlQ .CreatedAfter) $conflicts $stale $folded $zero}}
   <div hx-boost="true" hx-target="#tags-page" hx-select="#tags-page" hx-swap="outerHTML" hx-select-oob="#sidebar-inner" hx-push-url="true">
   {{template "partials/pagination.html" (dict "Base" $tagsBase "Page" $page "Total" .TotalPages)}}
   </div>
@@ -400,9 +400,8 @@
 {{end}}
 
 <script>
-// htmx swaps #tags-page in place on filter clicks, live search, and
-// header sorts, so everything inside it binds through delegated
-// document-level listeners that resolve their element at event time.
+// Delegated: htmx swaps #tags-page in place on filters, live search and
+// header sorts.
 
 function openRenameDialog(btn) {
   var id = btn.dataset.id;
@@ -411,8 +410,8 @@ function openRenameDialog(btn) {
   clearSlots('rename-error');
   var input = document.getElementById('rename-new-name');
   input.value = name;
-  // An alias can't leave its old name behind (the leftover would
-  // point at an alias), so the checkbox only offers on plain rows.
+  // An alias cannot keep its old name as an alias: that would point an
+  // alias at an alias.
   var keep = document.getElementById('rename-keep-alias');
   keep.checked = false;
   document.getElementById('rename-keep-alias-row').hidden = btn.dataset.isAlias === '1';
@@ -425,11 +424,6 @@ function confirmDeleteTag(btn) {
   deleteTagFlow(btn, btn.dataset.id, function() { window.location.reload(); });
 }
 
-// --- Selection / batch bar ---
-// The selection is the scope of every batch action. Ticking the header
-// checkbox selects the page and offers the whole-search escalation;
-// escalated scope is resolved server-side from the sidebar filter
-// fields, the same way delete-search always has been.
 var tagSelectAllMatching = false;
 var _lastTagCheckbox = null;
 
@@ -472,8 +466,8 @@ function handleTagSelectClick(box, e) {
     var pageBox = document.getElementById('tag-select-page');
     if (pageBox) pageBox.checked = false;
   }
-  // Focus off the box so the keydown router's input guard doesn't swallow
-  // the page's shortcuts on the next press.
+  // Blurred so the keydown router, which ignores keys while an input has
+  // focus, still sees the next shortcut.
   box.blur();
   updateTagBatchBar();
 }
@@ -487,8 +481,7 @@ function clearTagSelection() {
   updateTagBatchBar();
 }
 
-// The page's click router. Declaration order is match order, so the class
-// entries stay ahead of the id ones.
+// First match wins, so the class entries stay ahead of the id ones.
 var tagClickRoutes = [
   ['.btn-rename-trigger', function(el) { openRenameDialog(el); }],
   ['.btn-delete-tag', function(el) { confirmDeleteTag(el); }],
@@ -559,44 +552,45 @@ var tagClickRoutes = [
   }]
 ];
 
-document.addEventListener('click', function(e) {
-  if (!e.target.closest) return;
-  for (var i = 0; i < tagClickRoutes.length; i++) {
-    var el = e.target.closest(tagClickRoutes[i][0]);
-    if (el) { tagClickRoutes[i][1](el, e); return; }
-  }
-  // While a selection is active, a plain click on a row's background
-  // toggles it, like the gallery's batch-mode thumbnails. Shift keeps
-  // the checkbox's range semantics; other modifiers keep their default.
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
-  var bar = document.getElementById('tag-batch-bar');
-  if (!bar || bar.hidden) return;
-  if (e.target.closest('a, button, select, input, label')) return;
-  var row = e.target.closest('.tag-row');
-  if (!row) return;
-  var cb = row.querySelector('.tag-select');
-  if (!cb) return;
-  cb.checked = !cb.checked;
-  handleTagSelectClick(cb, e);
-});
+// A Back re-runs this script; stacked listeners would toggle a row twice.
+if (!window.tagsPageWired) {
+  window.tagsPageWired = true;
+  document.addEventListener('click', function(e) {
+    if (!e.target.closest) return;
+    for (var i = 0; i < tagClickRoutes.length; i++) {
+      var el = e.target.closest(tagClickRoutes[i][0]);
+      if (el) { tagClickRoutes[i][1](el, e); return; }
+    }
+    // Shift passes: the toggle below extends a range like a shift-click on
+    // the box.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    var bar = document.getElementById('tag-batch-bar');
+    if (!bar || bar.hidden) return;
+    if (e.target.closest('a, button, select, input, label')) return;
+    var row = e.target.closest('.tag-row');
+    if (!row) return;
+    var cb = row.querySelector('.tag-select');
+    if (!cb) return;
+    cb.checked = !cb.checked;
+    handleTagSelectClick(cb, e);
+  });
 
-document.addEventListener('change', function(e) {
-  if (e.target && e.target.id === 'tag-select-page') {
-    tagSelectAllMatching = false;
-    document.querySelectorAll('.tag-select').forEach(function(b) { b.checked = e.target.checked; });
-    e.target.blur();
-    updateTagBatchBar();
-  }
-});
+  document.addEventListener('change', function(e) {
+    if (e.target && e.target.id === 'tag-select-page') {
+      tagSelectAllMatching = false;
+      document.querySelectorAll('.tag-select').forEach(function(b) { b.checked = e.target.checked; });
+      e.target.blur();
+      updateTagBatchBar();
+    }
+  });
 
-// A swapped-in table arrives with fresh, unchecked boxes; drop the
-// stale selection state so the bar doesn't lie about the scope.
-document.body.addEventListener('htmx:afterSwap', function(e) {
-  if (e.detail && e.detail.target && e.detail.target.id === 'tags-page') {
-    tagSelectAllMatching = false;
-    _lastTagCheckbox = null;
-  }
-});
+  document.body.addEventListener('htmx:afterSwap', function(e) {
+    if (e.detail && e.detail.target && e.detail.target.id === 'tags-page') {
+      tagSelectAllMatching = false;
+      _lastTagCheckbox = null;
+    }
+  });
+}
 
 function tagScopeParams() {
   if (tagSelectAllMatching) {
@@ -615,10 +609,8 @@ function tagScopeLabel() {
   return n + ' selected tag' + (n === 1 ? '' : 's');
 }
 
-// The shared 202-response follow-up: latch the reload and let the job
-// status poller refresh once the background batch reports done. The
-// selection rides across that reload like the gallery's does, except under
-// the whole-search escalation, whose scope is a filter and not a row set.
+// The escalated scope is a filter, not rows, so it is not stashed across
+// the reload.
 function tagBatchDone() {
   if (!tagSelectAllMatching) stashSelection(selectedTagIds());
   _pendingGalleryReload = true;
@@ -639,8 +631,6 @@ function confirmBatchCategory() {
   });
 }
 
-// Merge needs the individual rows to offer the canonical choice, so
-// the whole-search escalation can't drive it.
 function openBatchMerge() {
   var flash = document.getElementById('tag-flash');
   if (tagSelectAllMatching) {
@@ -678,7 +668,7 @@ function confirmBatchMerge() {
   var canon = document.querySelector('#batch-merge-choices input[name=merge_canon]:checked');
   if (!canon) return;
   var params = tagScopeParams();
-  params.set('canonical_id', canon.value);
+  params.set('canonical_id', '#' + canon.value);
   postForm('/tags/batch-alias', params, {
     dialogId: 'batch-merge-dialog',
     flashId: 'batch-merge-flash',
@@ -716,16 +706,10 @@ function confirmBatchImply() {
   });
 }
 
-// The tag-create / alias-create dialogs need no after-request hook: the
-// success path answers 204 + HX-Redirect (htmx navigates, the shared
-// monbooru:flash listener seeds the destination's flash slot; a reload
-// here would race and clobber the redirect), and errors land in the
-// dialog's flash-err target for correction.
+// The create dialogs need no after-request hook: success is an
+// HX-Redirect, which a reload would race.
 
-// markPTRReviewStart records when a PTR sweep was submitted so the
-// post-job reload can offer a review link scoped to what the sweep
-// created (origin=ptr + created_after=<start>). Seconds precision to
-// match the stored created_at shape.
+// Seconds precision, the shape created_at is stored in.
 function markPTRReviewStart() {
   try {
     sessionStorage.setItem('monbooru_ptr_review_from',
@@ -743,8 +727,8 @@ function markPTRReviewStart() {
   var el = document.getElementById('tag-flash');
   if (!el) return;
   var link = document.createElement('a');
-  // Explicit type=: the sweep also creates aliases, which the page's
-  // tags-only default would hide from the review.
+  // An explicit empty type=: the page's tags-only default would hide the
+  // aliases the sweep made.
   link.href = '/tags?origin=ptr&created_after=' + encodeURIComponent(from) + '&type=';
   link.textContent = 'review what it created';
   var div = document.createElement('div');
@@ -762,8 +746,6 @@ function confirmPTRLookupSearch() {
     failMsg: 'PTR lookup failed.',
     catchMsg: 'PTR lookup request failed.',
     onOK: function() {
-      // Reload once the background sweep reports done so the table shows
-      // the new aliases and implications, same latch as the bulk delete.
       markPTRReviewStart();
       tagBatchDone();
     }
@@ -786,16 +768,15 @@ function updateTagColor(sel) {
   var color = opt ? opt.dataset.color : '';
   var row = sel.closest('tr');
   if (!row || !color) return;
-  // Alias rows render the alias-side as a span (the canonical link keeps
-  // its own colour); canonical rows render the name as a link.
+  // On an alias row the alias is the span; the link is the canonical's,
+  // which keeps its own colour.
   var target = row.querySelector('.tag-name-cell > span') || row.querySelector('.tag-name-cell a');
   if (target) target.style.color = color;
 }
 
-// The PATCH answers 200 with a flash-err carrying the merge offer on a
-// category collision; nothing moved, so undo the onchange repaint and
-// put the select back. The stored selection lives in the options'
-// selected attribute, which the user's picking never touches.
+// A collision answers 200 with a flash-err, and nothing moved. The saved
+// value lives in the options' selected attribute, which picking never
+// changes.
 function onTagCategoryPatch(event, sel) {
   var collided = event.detail.successful &&
     event.detail.xhr.responseText.indexOf('flash-err') !== -1;

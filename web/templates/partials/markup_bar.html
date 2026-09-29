@@ -12,7 +12,7 @@
   <button type="button" class="btn-link-accent" data-wrap="image" title="Link an image in this gallery">[image]</button>
   <span class="markup-bar-sep">|</span>
   <button type="button" class="btn-link-accent"
-          hx-post="/images/{{.ImageID}}/markup/preview"
+          hx-post="{{.PreviewURL}}"
           hx-include="closest form"
           hx-vals='js:{body: document.getElementById("{{.Target}}").value}'
           hx-target="#{{.Target}}-preview"

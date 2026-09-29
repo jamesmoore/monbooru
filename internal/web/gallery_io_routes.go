@@ -1,10 +1,5 @@
 package web
 
-// The gallery import / export and transfer routes. The IO itself lives in
-// internal/galleryio; what stays here is what needs the server: resolving a
-// gallery, holding the job lane, swapping a context under ctxMu, and the
-// HTTP shape of each route.
-
 import (
 	"cmp"
 	"fmt"
@@ -22,51 +17,38 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// importGallery replaces the target gallery's database (and optionally its
-// source files) with the contents of the uploaded archive/file. Destructive;
-// the caller's UI is responsible for confirming intent.
-//
-// format is one of "db", "json", "zip". For "zip" the inner format is detected
-// from the archive. importOver is rejected when the target is the active or
-// default gallery (mirrors removeGallery's guard).
-func (s *Server) importGallery(name, format string, upload io.Reader) error {
-	newCx, err := s.replaceGalleryFromUpload(name, format, upload)
+func (s *Server) importGallery(name, format string, upload io.Reader) (int, error) {
+	newCx, leftOut, err := s.replaceGalleryFromUpload(name, format, upload)
 	if err != nil {
-		return err
+		return leftOut, err
 	}
 	logx.Infof("gallery: imported %q (format=%s)", name, format)
 
-	// Make the imported gallery active before queuing the rebuild-thumbs job.
-	// Otherwise the job-manager lock the rebuild takes would keep switchGallery
-	// blocked for the duration of the rebuild, leaving the user pinned to
-	// whatever gallery they had active at Import time. Failures here are
-	// non-fatal: the import already succeeded and a failed switch just leaves
-	// the previous gallery active.
+	// Before the rebuild starts: switchGallery refuses while a job runs.
 	if err := s.switchGallery(name); err != nil {
 		logx.Infof("gallery %q: post-import switch skipped: %v", name, err)
 	}
 
-	// Import wiped the thumbnails directory as part of the swap, so the newly
-	// installed DB now references images that have no thumbnail on disk.
-	// Queue a rebuild so the user doesn't have to reach for Maintenance →
-	// Rebuild thumbnails manually. Non-fatal: import already succeeded; a
-	// concurrent job or empty gallery just skips the kickoff.
+	// The import wiped the thumbnails directory.
 	if err := s.startRebuildThumbsJob(newCx); err != nil {
 		logx.Infof("gallery %q: skipped post-import rebuild: %v", name, err)
 	}
-	return nil
+	return leftOut, nil
 }
 
-// replaceGalleryFromUpload buffers the upload, swaps the gallery's files
-// for it and reopens the context, returning the reopened one. It holds the
-// job lane rather than ctxMu for the length of that: buffering a multi-GB
-// archive and replacing a library are minutes of work, and a request that
-// cannot take the read lock is a frozen UI. Every gallery mutation and
-// every job already refuses while the lane is held, so the exclusion the
-// long write lock was providing is unchanged.
-func (s *Server) replaceGalleryFromUpload(name, format string, upload io.Reader) (*galleryCtx, error) {
+func leftOutNote(leftOut int) string {
+	if leftOut == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" %d file(s) in the archive sit in folders this gallery leaves out and were not extracted.", leftOut)
+}
+
+// Holds the job lane, not ctxMu, for these minutes of work: a held ctxMu
+// freezes every request, and every mutation and job already refuses while
+// the lane is held.
+func (s *Server) replaceGalleryFromUpload(name, format string, upload io.Reader) (*galleryCtx, int, error) {
 	if err := s.jobs.BeginSchedule(); err != nil {
-		return nil, errJobRunning
+		return nil, 0, errJobRunning
 	}
 	defer s.jobs.EndSchedule()
 
@@ -75,72 +57,73 @@ func (s *Server) replaceGalleryFromUpload(name, format string, upload io.Reader)
 	cx, ok := st.contexts[name]
 	if !ok {
 		s.ctxMu.Unlock()
-		return nil, fmt.Errorf("unknown gallery %q", name)
+		return nil, 0, fmt.Errorf("unknown gallery %q", name)
 	}
 	if name == st.active {
 		s.ctxMu.Unlock()
-		return nil, fmt.Errorf("cannot import over the active gallery; switch to another first")
+		return nil, 0, fmt.Errorf("cannot import over the active gallery; switch to another first")
 	}
 	s.cfgMu.RLock()
 	isDefault := name == s.cfg.DefaultGallery
 	s.cfgMu.RUnlock()
 	if isDefault {
 		s.ctxMu.Unlock()
-		return nil, fmt.Errorf("cannot import over the default gallery; set another as default first")
+		return nil, 0, fmt.Errorf("cannot import over the default gallery; set another as default first")
 	}
 	galleryPath := cx.GalleryPath
+	bound := cx.Boundary()
 	dbPath := cx.DBPath
 	thumbsPath := cx.ThumbnailsPath
 	dataDir := filepath.Dir(dbPath)
 	s.ctxMu.Unlock()
 
-	// Buffer the upload to a temp file on the same filesystem as the data
-	// directory so the later rename is atomic. The upload may be a multi-GB
-	// zip; we cannot keep it in RAM. Before the close below, so an upload
-	// that fails leaves the gallery open and untouched.
+	// Next to the database so the rename into place stays on one filesystem,
+	// and before the close so a failed upload leaves the gallery open.
 	tmp, err := os.CreateTemp(dataDir, "import-*.upload")
 	if err != nil {
-		return nil, fmt.Errorf("create temp: %w", err)
+		return nil, 0, fmt.Errorf("create temp: %w", err)
 	}
 	tmpPath := tmp.Name()
 	defer func() { _ = os.Remove(tmpPath) }()
 	if _, err := io.Copy(tmp, upload); err != nil {
 		_ = tmp.Close()
-		return nil, fmt.Errorf("buffer upload: %w", err)
+		return nil, 0, fmt.Errorf("buffer upload: %w", err)
 	}
 	_ = tmp.Close()
 
-	// Close the target DB and stop its watcher before touching on-disk state.
 	s.ctxMu.Lock()
+	if err := exportRunning(cx); err != nil {
+		s.ctxMu.Unlock()
+		return nil, 0, err
+	}
 	cx.Close()
 	s.ctxMu.Unlock()
 
-	applyErr := galleryio.ApplyImport(format, tmpPath, dbPath, thumbsPath, galleryPath, s.maxFileSizeMB())
+	leftOut, applyErr := galleryio.ApplyImport(format, tmpPath, dbPath, thumbsPath, bound, s.maxFileSizeMB())
 
-	// Reopen regardless so we leave the gallery usable even after a failed import.
+	// Reopened even after a failed import, so the gallery stays usable.
 	newCx, openErr := library.Open(config.Gallery{
 		Name: name, GalleryPath: galleryPath, DBPath: dbPath, ThumbnailsPath: thumbsPath,
 	})
 	if openErr != nil {
 		if applyErr != nil {
-			return nil, fmt.Errorf("import failed: %w (reopen also failed: %v)", applyErr, openErr)
+			return nil, leftOut, fmt.Errorf("import failed: %w (reopen also failed: %v)", applyErr, openErr)
 		}
-		return nil, fmt.Errorf("reopen gallery: %w", openErr)
+		return nil, leftOut, fmt.Errorf("reopen gallery: %w", openErr)
 	}
 	s.ctxMu.Lock()
 	next := s.galleryState().clone()
 	next.contexts[name] = newCx
 	s.galState.Store(next)
+	s.rebuildBoundaries()
 	watch, maxMB := s.watcherSettings()
 	newCx.StartBackground(watch, maxMB, s.ingestNaming(newCx.Name), s.jobs)
 	s.ctxMu.Unlock()
 
 	go newCx.WarmCaches()
-	return newCx, applyErr
+	return newCx, leftOut, applyErr
 }
 
-// settingsGalleryExport serves GET /settings/galleries/{name}/export?format=&with_images=.
-// Plain GET so the browser saves the response as a file without HTMX wiring.
 func (s *Server) settingsGalleryExport(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -176,6 +159,9 @@ func (s *Server) settingsGalleryExport(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		logx.Warnf("gallery export %q: %v", name, err)
+		// The headers are out: a clean end would pass a truncated file
+		// off as whole.
+		panic(http.ErrAbortHandler)
 	}
 }
 
@@ -198,18 +184,37 @@ func exportFilename(name, format string, withImages bool) (string, string) {
 	return name, "application/octet-stream"
 }
 
-// settingsGalleryImport serves POST /settings/galleries/{name}/import.
-// Expects a multipart form with `mode`, `confirm_name` (replace only),
-// and `file`. The handler reads parts in order with MultipartReader so
-// the type-to-confirm gate runs before the (possibly multi-GB) file
-// part is consumed; this requires the dialog template to put mode and
-// confirm_name fields ahead of the file input. CSRF is validated by
-// the middleware off the X-CSRF-Token header so it never triggers
-// implicit form parsing on this route.
+// The file part comes back unread, so an upload streams instead of spooling
+// to a temp file.
+func readFieldsToFile(mr *multipart.Reader) (map[string]string, *multipart.Part, error) {
+	const maxFieldBytes = 1 << 20
+	fields := map[string]string{}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			return fields, nil, nil
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if part.FileName() != "" {
+			return fields, part, nil
+		}
+		body, err := io.ReadAll(io.LimitReader(part, maxFieldBytes))
+		_ = part.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+		fields[part.FormName()] = strings.TrimSpace(string(body))
+	}
+}
+
+// Parts are read in order so the name check runs before the file is
+// consumed: the form must put mode and confirm_name ahead of the file.
 func (s *Server) settingsGalleryImport(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 
-	const maxImport = 16 << 30 // 16 GiB cap; protects against runaway uploads on a LAN setup.
+	const maxImport = 16 << 30
 	r.Body = http.MaxBytesReader(w, r.Body, maxImport)
 
 	mr, err := r.MultipartReader()
@@ -217,39 +222,17 @@ func (s *Server) settingsGalleryImport(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "expected multipart/form-data")
 		return
 	}
-
-	const maxFieldBytes = 1 << 20 // 1 MiB per form field; values are short
-	fields := map[string]string{}
-	var filePart *multipart.Part
-	var fileFilename string
-	for {
-		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			writeInlineFlash(w, "err", "malformed upload")
-			return
-		}
-		if part.FileName() == "" {
-			body, readErr := io.ReadAll(io.LimitReader(part, maxFieldBytes))
-			_ = part.Close()
-			if readErr != nil {
-				writeInlineFlash(w, "err", "malformed upload")
-				return
-			}
-			fields[part.FormName()] = strings.TrimSpace(string(body))
-			continue
-		}
-		filePart = part
-		fileFilename = part.FileName()
-		break
+	fields, filePart, err := readFieldsToFile(mr)
+	if err != nil {
+		writeInlineFlash(w, "err", "malformed upload")
+		return
 	}
 	if filePart == nil {
 		writeInlineFlash(w, "err", "missing file")
 		return
 	}
 	defer func() { _ = filePart.Close() }()
+	fileFilename := filePart.FileName()
 
 	mode := fields["mode"]
 	mode = cmp.Or(mode, "replace")
@@ -275,32 +258,20 @@ func (s *Server) settingsGalleryImport(w http.ResponseWriter, r *http.Request) {
 			writeInlineFlash(w, "err", err.Error())
 			return
 		}
-		// Mirror the replace path (importGallery → switchGallery): a merge
-		// brings new images into the target gallery, so the user expects to
-		// land on it. No-op if the target is already active.
 		if err := s.switchGallery(name); err != nil {
 			logx.Infof("gallery %q: post-merge switch skipped: %v", name, err)
 		}
 		writeInlineFlash(w, "ok", "Gallery "+name+" merged: "+res.Summary()+".")
 		return
 	}
-	if err := s.importGallery(name, format, filePart); err != nil {
+	leftOut, err := s.importGallery(name, format, filePart)
+	if err != nil {
 		writeInlineFlash(w, "err", err.Error())
 		return
 	}
-	// Write the success flash into #flash-galleries; the dialog's
-	// after-request hook detects the flash-ok, closes the modal, and
-	// triggers a reload so the newly-active gallery badge shows.
-	writeInlineFlash(w, "ok", "Gallery "+name+" imported. Rebuilding thumbnails in the background.")
+	writeInlineFlash(w, "ok", "Gallery "+name+" imported. Rebuilding thumbnails in the background."+leftOutNote(leftOut))
 }
 
-// batchTransfer copies every image in the resolved scope into another gallery:
-// each file is re-ingested there (fresh thumbnail + metadata + phash, SHA-
-// deduped into any existing target row) and its tags, sources, commentary,
-// annotations, note and favorite ride along. Relations and collections do not.
-// With remove_after set, each confirmed copy deletes the source image. Runs as
-// a transfer job so the global jobs lane serializes it and the target gallery's
-// watcher stays suppressed against the file copy.
 func (s *Server) batchTransfer(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
@@ -311,13 +282,9 @@ func (s *Server) batchTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 	s.startScopedJob(w, r, "batch-transfer", models.JobTypeTransfer, false, func(ids []int64) {
 		s.runBatchTransfer(ids, dstCx, removeAfter)
-	})
+	}, dstCx.Name)
 }
 
-// transferImage copies the one image at {id} into the target gallery, mirroring
-// placeImage's single-image job shape so the watcher-suppression pattern is
-// reused. Without remove_after the operator stays on the source image; with it
-// the source is gone, so the redirect returns to the gallery.
 func (s *Server) transferImage(w http.ResponseWriter, r *http.Request) {
 	id, ok := idAndForm(w, r)
 	if !ok {
@@ -327,7 +294,7 @@ func (s *Server) transferImage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.startJob(w, models.JobTypeTransfer) {
+	if !s.startJob(w, models.JobTypeTransfer, dstCx.Name) {
 		return
 	}
 	srcCx := s.active()
@@ -356,9 +323,6 @@ func (s *Server) transferImage(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, dest, http.StatusSeeOther)
 }
 
-// transferTarget parses and validates the target gallery + remove_after fields
-// shared by the batch and single-image handlers. The target must be a different,
-// live gallery.
 func (s *Server) transferTarget(w http.ResponseWriter, r *http.Request) (*galleryCtx, bool, bool) {
 	target := strings.TrimSpace(r.FormValue("target"))
 	msg := ""
@@ -381,9 +345,6 @@ func (s *Server) transferTarget(w http.ResponseWriter, r *http.Request) (*galler
 	return nil, false, false
 }
 
-// runBatchTransfer processes targets one image at a time with per-image error
-// isolation, mirroring runBatchPlace: a single unreadable file can't strand the
-// rest.
 func (s *Server) runBatchTransfer(ids []int64, dstCx *galleryCtx, removeAfter bool) {
 	srcCx := s.active()
 	total := len(ids)
@@ -408,10 +369,6 @@ func (s *Server) runBatchTransfer(ids []int64, dstCx *galleryCtx, removeAfter bo
 	s.jobs.Complete(summary)
 }
 
-// The export entry points address a gallery by name - what the route and the
-// tests both have - and hand the resolved handle to internal/galleryio, which
-// never needs to know the server exists.
-
 func (s *Server) exportGalleryDB(name string, w io.Writer) error {
 	return s.exportGallery(name, func(cx *galleryCtx) error { return galleryio.ExportGalleryDB(cx.Handle, w) })
 }
@@ -432,21 +389,26 @@ func (s *Server) exportGalleryLightManifest(name string, w io.Writer) error {
 	return s.exportGallery(name, func(cx *galleryCtx) error { return galleryio.ExportGalleryLightManifest(cx.Handle, w) })
 }
 
+// Streams without ctxMu, which would stall a queued switch and every
+// request behind it; the pin is taken under the lock so nothing closes
+// the gallery first.
 func (s *Server) exportGallery(name string, write func(*galleryCtx) error) error {
+	s.ctxMu.RLock()
 	cx := s.get(name)
+	if cx != nil {
+		cx.BeginExport()
+	}
+	s.ctxMu.RUnlock()
 	if cx == nil {
 		return fmt.Errorf("unknown gallery %q", name)
 	}
+	defer cx.EndExport()
 	return write(cx)
 }
 
-// mergeGallery additively brings the upload's tags - and its images, when it
-// carries their files - into the named gallery. Unlike importGallery it wipes
-// nothing and is permitted on the active and default galleries.
 func (s *Server) mergeGallery(name, format string, upload io.Reader) (galleryio.MergeResult, error) {
-	// Held, not merely checked: a merge is minutes of writes through one
-	// gallery's handle, and rename / repoint / remove would otherwise close
-	// and move that database halfway through.
+	// Held, not just checked: rename, repoint or remove would close the
+	// database mid-merge.
 	if err := s.jobs.BeginSchedule(); err != nil {
 		return galleryio.MergeResult{}, errJobRunning
 	}
@@ -463,9 +425,6 @@ func (s *Server) mergeGallery(name, format string, upload io.Reader) (galleryio.
 	return res, err
 }
 
-// transferOneImage resolves the server-side pieces internal/galleryio takes
-// by parameter - the size cap and the relations cleanup - so a caller with
-// two gallery contexts names only what it is transferring.
 func (s *Server) transferOneImage(srcCx, dstCx *galleryCtx, id int64, removeAfter bool) error {
 	return galleryio.TransferOneImage(srcCx.Handle, dstCx.Handle, id, removeAfter,
 		s.maxFileSizeMB(), s.onImageDeleteCallback())

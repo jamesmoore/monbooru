@@ -230,8 +230,6 @@
   function refresh() {
     var n = selectedCheckboxes().length;
     toolbarCount.textContent = n;
-    // Merge needs two groups to consolidate; Remove takes any non-empty
-    // selection because each row dissolves independently.
     if (mergeBtn) mergeBtn.disabled = n < 2;
     removeBtn.disabled = n < 1;
   }
@@ -249,8 +247,6 @@
     refresh();
   });
   refresh();
-  // While a selection is active, a plain click on a card's background
-  // toggles it, like the gallery's batch-mode thumbnails.
   document.addEventListener('click', function(e) {
     if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
     if (!e.target.closest) return;
@@ -263,10 +259,6 @@
     cb.checked = !cb.checked;
     refresh();
   });
-  // Remove-selected: per-kind confirmation copy, then a single POST to
-  // the bulk dissolve endpoint. Each kind names its id field after the
-  // existing per-row dissolve form (group_id for dup/alt, root_id for
-  // version/derivative, pair="a:b" for not_related).
   removeBtn.addEventListener('click', function() {
     var sel = selectedCheckboxes();
     if (!sel.length) return;
@@ -287,6 +279,15 @@
       submitDissolve(kind, sel.map(function(cb) { return cb.value; }));
     }, '', 'Remove');
   });
+  // A refusal answers 200 with its message instead of a redirect.
+  function onBrowseGroupsResponse(resp) {
+    var redirect = resp.headers.get('HX-Redirect');
+    if (redirect) {
+      window.location.href = redirect;
+      return;
+    }
+    resp.text().then(function(t) { document.getElementById('flash-relations').innerHTML = t; });
+  }
   function submitDissolve(kind, values) {
     var field = 'group_id';
     if (kind === 'version' || kind === 'derivative') field = 'root_id';
@@ -297,14 +298,10 @@
       hx: true,
       flashId: 'flash-relations',
       catchMsg: null,
-      onOK: function(resp) {
-        var redirect = resp.headers.get('HX-Redirect');
-        window.location.href = redirect || ('/relations/browse?kind=' + kind);
-      },
+      onOK: onBrowseGroupsResponse,
     });
   }
-  // Merge-selected: only present on dup/alt tabs. Dup needs the
-  // operator to pick which group's original survives; alt just merges.
+  // Only the dup and alt tabs render the merge button.
   if (!mergeBtn) return;
   var mergeKind = (kind === 'duplicate') ? 'dup' : 'alt';
   mergeBtn.addEventListener('click', function() {
@@ -362,9 +359,6 @@
     });
   }
   function submitMerge(ids, url, keepOriginalFrom) {
-    // URL-encoded body so the handler's r.ParseForm() actually sees
-    // the group_id fields; a FormData body lands as multipart and
-    // Go's ParseForm leaves r.Form empty for non-urlencoded posts.
     var params = new URLSearchParams();
     ids.forEach(function(id) { params.append('group_id', id); });
     if (keepOriginalFrom !== null && keepOriginalFrom !== '') {
@@ -374,10 +368,7 @@
       hx: true,
       flashId: 'flash-relations',
       catchMsg: null,
-      onOK: function(resp) {
-        var redirect = resp.headers.get('HX-Redirect');
-        window.location.href = redirect || ('/relations/browse?kind=' + (url.indexOf('kind=dup') > -1 ? 'duplicate' : 'alternate'));
-      },
+      onOK: onBrowseGroupsResponse,
     });
   }
 })();

@@ -1,5 +1,3 @@
-; Inno Setup script for the Windows installer. 
-
 #define MyAppName "Monbooru"
 #define MyAppExeName "monbooru.exe"
 #define MyAppPublisher "monbooru"

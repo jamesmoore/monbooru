@@ -12,18 +12,8 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// PhashStored keeps the in-memory tree in lockstep with a phash the
-// caller just wrote, and, when IncrementalProbeEnabled is set, probes it
-// for near-duplicates of that row and records them in
-// potential_relation_pairs - one probe at the configured distance, with
-// no full rescan behind it.
-//
-// Called by whoever stored the hash rather than fired from a package
-// global the gallery published and this package filled from init(): that
-// made the two behaviourally mutually dependent with nothing in the
-// import graph to show it, and one wiring for the whole process. A
-// database with no tree registered is a no-op, which is what every build
-// running no relations index sees.
+// PhashStored must follow every phash write so a built tree stays in step
+// with the column.
 func PhashStored(database *db.DB, id, phash int64) {
 	tree := DefaultRegistry.Lookup(database)
 	if tree == nil || !tree.Built() {
@@ -39,17 +29,22 @@ func PhashStored(database *db.DB, id, phash int64) {
 	}
 }
 
-// PhashSink is PhashStored bound to one database, the shape the gallery's
-// ingest and sync paths take so they can publish without importing this
-// package.
-func PhashSink(database *db.DB) gallery.PhashSink {
-	return func(id, phash int64) { PhashStored(database, id, phash) }
+func PhashCleared(database *db.DB, id int64) {
+	if tree := DefaultRegistry.Lookup(database); tree != nil && tree.Built() {
+		tree.Remove(id)
+	}
 }
 
-// EnsureBuilt builds the tree against database when it isn't already
-// populated. Idempotent; safe to call from multiple goroutines (one
-// loses the race and rebuilds redundantly, but the final state is the
-// same).
+func PhashSink(database *db.DB) gallery.PhashSink {
+	return func(id int64, phash *int64) {
+		if phash == nil {
+			PhashCleared(database, id)
+			return
+		}
+		PhashStored(database, id, *phash)
+	}
+}
+
 func (t *BKTree) EnsureBuilt(database *db.DB) error {
 	if t.Built() {
 		return nil
@@ -57,28 +52,18 @@ func (t *BKTree) EnsureBuilt(database *db.DB) error {
 	return t.BuildFromDB(database)
 }
 
-// BKTree is a 64-bit Hamming-distance metric tree over image phashes.
-// Used by find-pairs and the `phash:<hex>~d` search keyword to answer
-// "every image within distance d of this phash" without scanning every
-// row. Concurrent-safe: Insert / Remove serialise, Search runs under a
-// read lock so per-request queries don't contend with the watcher's
-// incremental Inserts.
 type BKTree struct {
-	mu      sync.RWMutex
-	root    *bkNode
-	idIndex map[int64]int64 // id -> phash, drives Remove
-	built   atomic.Bool
-	// lastUsed stamps the last search so the reclaim loop can drop a
-	// tree nobody is browsing against.
+	mu       sync.RWMutex
+	root     *bkNode
+	idIndex  map[int64]int64 // id -> phash
+	built    atomic.Bool
 	lastUsed atomic.Int64
 }
 
 type bkNode struct {
 	phash int64
 	ids   []int64
-	// Edges keyed by distance, as a slice rather than a map: fanout is
-	// at most 65 and in practice a handful, where a map costs an order
-	// of magnitude more per node than the linear scan saves.
+	// A slice, not a map: fanout is at most 65 and usually a handful.
 	children []bkEdge
 }
 
@@ -87,7 +72,6 @@ type bkEdge struct {
 	node *bkNode
 }
 
-// child returns the edge at distance dist, or nil.
 func (n *bkNode) child(dist int) *bkNode {
 	for i := range n.children {
 		if n.children[i].dist == dist {
@@ -97,29 +81,16 @@ func (n *bkNode) child(dist int) *bkNode {
 	return nil
 }
 
-// NewBKTree returns an empty tree. Use BuildFromDB to populate from
-// SQLite, or call Insert directly when feeding individual rows.
 func NewBKTree() *BKTree { return &BKTree{idIndex: make(map[int64]int64)} }
 
-// Built reports whether BuildFromDB has been called at least once on
-// this tree. Useful for "is this gallery ready for relations queries"
-// gating in handlers that want to avoid showing a partial result while
-// the lazy build is in flight.
 func (t *BKTree) Built() bool { return t.built.Load() }
 
-// Reset clears every entry. Used after a full backfill so the next
-// query rebuilds against the new DB contents instead of paying the
-// per-row incremental insert.
 func (t *BKTree) Reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.resetLocked()
 }
 
-// ReleaseIdle drops a built tree nobody has searched for at least
-// `after`, returning whether it did. The next query rebuilds it from
-// the phash column; on a large library the index is tens of megabytes
-// that only a relations or phash: browse needs.
 func (t *BKTree) ReleaseIdle(after time.Duration) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -136,10 +107,6 @@ func (t *BKTree) resetLocked() {
 	t.built.Store(false)
 }
 
-// BuildFromDB rebuilds the tree from every (id, phash) row in images
-// where phash IS NOT NULL. Idempotent: calling twice is safe. Clears
-// the tree first so a partial earlier build doesn't leave stale
-// entries.
 func (t *BKTree) BuildFromDB(database *db.DB) error {
 	rows, err := database.Read.Query(`SELECT id, phash FROM images WHERE phash IS NOT NULL`)
 	if err != nil {
@@ -166,8 +133,6 @@ func (t *BKTree) BuildFromDB(database *db.DB) error {
 	return nil
 }
 
-// Insert adds (id, phash) to the tree. If id already exists, its
-// previous entry is removed first so the index stays single-valued.
 func (t *BKTree) Insert(id, phash int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -177,7 +142,6 @@ func (t *BKTree) Insert(id, phash int64) {
 	t.insertLocked(id, phash)
 }
 
-// Remove deletes id from the tree. Idempotent.
 func (t *BKTree) Remove(id int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -188,12 +152,9 @@ func (t *BKTree) Remove(id int64) {
 	t.removeIDLocked(id, phash)
 }
 
-// SearchWithinDistance returns every image id whose stored phash is
-// within Hamming distance `d` of `query`. Self-matches at distance 0
-// are included. Result order is unspecified. The second return reports
-// whether a built tree answered: a caller that gets false has to fall
-// back rather than read the empty result as "no matches", since the
-// tree can be dropped between its EnsureBuilt and this call.
+// SearchWithinDistance reports false when no built tree answered: the
+// tree can be dropped after EnsureBuilt, so the caller must fall back
+// rather than read "no matches".
 func (t *BKTree) SearchWithinDistance(query int64, d int) ([]int64, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -229,10 +190,8 @@ func (t *BKTree) insertLocked(id, phash int64) {
 
 func (t *BKTree) removeIDLocked(id, phash int64) {
 	delete(t.idIndex, id)
-	// Walk to the node holding this phash and drop the id from its ids
-	// list. Empty leaves are left in place rather than rewriting the
-	// tree on every delete; Reset is the cheap path when fragmentation
-	// matters (after a bulk backfill).
+	// An emptied node stays in place rather than rewriting the tree on
+	// every delete.
 	cur := t.root
 	for cur != nil {
 		if cur.phash == phash {
@@ -260,44 +219,27 @@ func (t *BKTree) searchLocked(node *bkNode, query int64, d int, out *[]int64) {
 	}
 }
 
-// hammingDistance returns the number of differing bits between the
-// unsigned interpretations of a and b.
 func hammingDistance(a, b int64) int { return bits.OnesCount64(uint64(a) ^ uint64(b)) }
 
-// Registry maps a SQLite handle to its in-memory BKTree. Per-gallery
-// galleryCtx registers its handle at startup and deregisters when the
-// gallery is closed, so the tree's lifetime tracks the DB. Lookup
-// returns nil when the gallery doesn't have a tree wired - hooks that
-// fire from a test harness or a half-constructed gallery state then
-// no-op cleanly.
 type Registry struct {
 	mu    sync.RWMutex
 	trees map[*db.DB]*BKTree
 }
 
-// DefaultRegistry is the process-wide registry PhashStored and
-// Service.OnImageDeleteTx route through.
 var DefaultRegistry = &Registry{trees: map[*db.DB]*BKTree{}}
 
-// Register attaches tree to database. A subsequent ingest's
-// post-store hook then knows where to deposit the new (id, phash).
-// Replaces any prior registration for the same database.
 func (r *Registry) Register(database *db.DB, tree *BKTree) {
 	r.mu.Lock()
 	r.trees[database] = tree
 	r.mu.Unlock()
 }
 
-// Unregister drops the database's registration. Called when the
-// gallery context is destroyed (gallery removal, server shutdown).
 func (r *Registry) Unregister(database *db.DB) {
 	r.mu.Lock()
 	delete(r.trees, database)
 	r.mu.Unlock()
 }
 
-// Lookup returns the registered tree for database, or nil when no
-// tree is wired.
 func (r *Registry) Lookup(database *db.DB) *BKTree {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

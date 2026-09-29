@@ -19,6 +19,7 @@
           {{$q := printf "%s:%s" .CategoryName .Name}}
           {{$active := or (index $.ActiveTagTerms $q) (index $.ActiveTagTerms .Name)}}
           <li class="tag-entry" data-name="{{.Name}}">
+            <a href="/tags/{{.ID}}" class="tag-wiki" title="Tag details">?</a>
             <a href="/?q={{$q}}" class="tag-link" data-tag="{{$q}}" style="color:{{catColor .CategoryColor}}">{{.Name}}</a>
             {{if $active}}
             <button class="tag-add-btn btn-tag-add active" data-tag="{{$q}}" title="Remove from current search">-</button>

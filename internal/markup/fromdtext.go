@@ -2,13 +2,8 @@ package markup
 
 import "strings"
 
-// FromDText converts a booru's DText body into the vocabulary Parse reads.
-// Danbooru and e621 publish artist commentary as DText rather than HTML, so
-// this is the commentary's FromHTML: the inline marks the two spellings
-// already share pass through untouched, the wrappers this side has no mark for
-// keep their text and lose their brackets, and DText's link and wiki forms
-// become the link constructs. Anything else stays the characters it is, the
-// way Parse itself degrades.
+// FromDText converts DText, the markup Danbooru and e621 commentary is
+// written in.
 func FromDText(src string) string {
 	d := &dtext{}
 	d.run(src)
@@ -17,14 +12,11 @@ func FromDText(src string) string {
 
 type dtext struct {
 	out strings.Builder
-	// inLink suppresses a second link inside one, which Parse refuses; the
-	// label survives on its own.
+	// Parse refuses a link inside a link, so a nested one keeps only its label.
 	inLink bool
 	depth  int
 }
 
-// dtextWrappers are the block constructs with no mark on this side. Their text
-// is what the reader wants and the brackets are furniture.
 var dtextWrappers = map[string]bool{
 	"quote": true, "expand": true, "section": true, "spoiler": true,
 	"color": true, "nodtext": true,
@@ -56,8 +48,6 @@ func (d *dtext) run(src string) {
 	}
 }
 
-// construct reads one DText form at the head of s. A zero width means s opens
-// none and its first byte is ordinary text.
 func (d *dtext) construct(s string) int {
 	switch {
 	case strings.HasPrefix(s, "[["):
@@ -74,9 +64,6 @@ func (d *dtext) construct(s string) int {
 	return d.bareURL(s)
 }
 
-// bracketTag handles the [name] forms: a mark both vocabularies spell the same
-// way survives verbatim, [br] is a newline, a wrapper loses its brackets, and
-// anything else is left as the characters it is.
 func (d *dtext) bracketTag(s string) int {
 	end := strings.IndexByte(s, ']')
 	if end < 0 {
@@ -102,8 +89,7 @@ func (d *dtext) bracketTag(s string) int {
 	return end + 1
 }
 
-// wikiLink converts [[page]] and [[page|label]]. A danbooru wiki page is a
-// tag, written with the spaces a tag name carries as underscores.
+// A wiki page names a tag, with spaces where the tag has underscores.
 func (d *dtext) wikiLink(s string) int {
 	end := strings.Index(s, "]]")
 	if end < 0 {
@@ -114,8 +100,6 @@ func (d *dtext) wikiLink(s string) int {
 	return end + 2
 }
 
-// tagSearch converts {{tag}}. A search of several terms names no one tag, so
-// it keeps its text.
 func (d *dtext) tagSearch(s string) int {
 	end := strings.Index(s, "}}")
 	if end < 0 {
@@ -126,9 +110,6 @@ func (d *dtext) tagSearch(s string) int {
 	return end + 2
 }
 
-// quotedLink converts "label":url and "label":[url]. The colon has to be
-// followed by something link-shaped or an ordinary quoted phrase before one
-// would become a link.
 func (d *dtext) quotedLink(s string) int {
 	q := strings.IndexByte(s[1:], '"')
 	if q < 0 {
@@ -160,8 +141,6 @@ func (d *dtext) quotedLink(s string) int {
 	return q + 3 + w
 }
 
-// angleURL converts <https://...>, which is how DText links a URL carrying
-// punctuation a bare one would stop at.
 func (d *dtext) angleURL(s string) int {
 	end := strings.IndexByte(s, '>')
 	if end < 0 || !validURL(strings.TrimSpace(s[1:end])) {
@@ -171,8 +150,6 @@ func (d *dtext) angleURL(s string) int {
 	return end + 1
 }
 
-// bareURL links a URL written on its own, which is how most commentary carries
-// one. It has to start a word, or a URL glued to the end of one would link.
 func (d *dtext) bareURL(s string) int {
 	if !validURL(s) || !d.atWordStart() {
 		return 0
@@ -185,8 +162,6 @@ func (d *dtext) bareURL(s string) int {
 	return n
 }
 
-// tagRef emits a tag reference, or the label alone when the name is not one
-// tag this side could resolve.
 func (d *dtext) tagRef(name, label string) {
 	if d.inLink || !isTagRef(name) {
 		d.label(label)
@@ -199,8 +174,8 @@ func (d *dtext) tagRef(name, label string) {
 	d.out.WriteString("[/tag]")
 }
 
-// urlRef emits a link, or the label alone for a target Parse could not render
-// as one - a site-relative href with no host to resolve it against, above all.
+// A site-relative href has no host to resolve against, so it keeps only
+// its label.
 func (d *dtext) urlRef(href, label string) {
 	href = strings.TrimSpace(href)
 	if d.inLink || !validURL(href) || strings.ContainsAny(href, " \t\r\n[]") {
@@ -214,9 +189,6 @@ func (d *dtext) urlRef(href, label string) {
 	d.out.WriteString("[/url]")
 }
 
-// label converts a reference's visible text, which carries marks of its own.
-// Past the nesting cap it is written as it stands, like any other run the
-// converter does not take apart.
 func (d *dtext) label(s string) {
 	if d.depth >= maxDepth {
 		d.out.WriteString(s)
@@ -241,8 +213,6 @@ func (d *dtext) atWordStart() bool {
 	return isSpace(b) || strings.IndexByte("([{<\"'", b) >= 0
 }
 
-// splitRef cuts a wiki or search reference into its target and the label it is
-// written with, which is the target itself when none is given.
 func splitRef(s string) (target, label string) {
 	if i := strings.IndexByte(s, '|'); i >= 0 {
 		return s[:i], s[i+1:]
@@ -250,9 +220,6 @@ func splitRef(s string) (target, label string) {
 	return s, s
 }
 
-// urlRunLen measures the URL at the head of s. It ends at whitespace or a
-// character DText writes around a link, and the sentence punctuation a URL is
-// followed by is not part of it.
 func urlRunLen(s string) int {
 	i := 0
 	for i < len(s) && !isSpace(s[i]) && strings.IndexByte(`<>"[]`, s[i]) < 0 {
@@ -264,13 +231,11 @@ func urlRunLen(s string) int {
 	return i
 }
 
-// headerWidth measures an hN. header prefix, which carries no text of its own.
 func headerWidth(s string) int {
 	if len(s) < 3 || s[0] != 'h' || s[1] < '1' || s[1] > '6' {
 		return 0
 	}
 	i := 2
-	// h4#anchor. names a link target the body has no use for.
 	if s[i] == '#' {
 		for i < len(s) && s[i] != '.' && !isSpace(s[i]) {
 			i++

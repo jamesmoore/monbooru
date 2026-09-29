@@ -14,20 +14,11 @@ import (
 	"github.com/monbooru/monbooru/internal/lookup"
 )
 
-// ApplyReplacedFile swaps an image's bytes for the staged file, keeping the
-// row's identity (tags, sources, collections, relations, notes) while every
-// content-derived column and artifact is re-derived: sha, size, dimensions,
-// file/source type, side-table metadata, thumbnail, phash. Annotation boxes
-// are scaled to the new dimensions - the old file is a resize of the same
-// picture, so linear scaling holds.
-//
-// Ordering: the old file moves to a backup beside the staged one (both
-// outside the watched tree), the DB commits pointing at the new state, then
-// the staged file renames into the canonical path. The watcher event that
-// fires sees a path whose sha the DB already carries and dedups to a no-op;
-// either crash window is one rename wide and surfaces as the standard
-// missing-file banner, with the backup restorable by hand.
-func ApplyReplacedFile(database *db.DB, galleryPath, thumbnailsPath string, imageID int64, stagedPath, newSHA, newMD5, newType string) (*int64, error) {
+// ApplyReplacedFile commits the row before the staged file renames into
+// place, so the watcher finds a sha the DB already carries. stagedPath,
+// and the backup beside it, must lie outside the watched tree.
+func ApplyReplacedFile(database *db.DB, b *Boundary, thumbnailsPath string, imageID int64, stagedPath, newSHA, newMD5, newType string) (*int64, error) {
+	galleryPath := b.Root()
 	var stored *int64
 	var oldPath string
 	var oldW, oldH *int
@@ -39,21 +30,21 @@ func ApplyReplacedFile(database *db.DB, galleryPath, thumbnailsPath string, imag
 	if !NamedInside(galleryPath, oldPath) {
 		return nil, fmt.Errorf("refusing to replace %q outside gallery root %q", oldPath, galleryPath)
 	}
+	if err := b.Check(oldPath); err != nil {
+		return nil, fmt.Errorf("refusing to replace image %d: %w", imageID, err)
+	}
 
 	fi, err := os.Stat(stagedPath)
 	if err != nil {
 		return nil, fmt.Errorf("stat staged file: %w", err)
 	}
-	// newType came from the pushed filename, which the client chose. The
-	// bytes decide what the row records and what the file is renamed to.
+	// newType comes from the client's filename; the bytes decide.
 	if actual, magicErr := detectMagicType(stagedPath); magicErr == nil {
 		newType = actual
 	}
-	newW, newH := decodeImageDimensions(stagedPath)
+	newW, newH := stillDimensions(stagedPath, newType)
 	sdMeta, comfyMeta, sourceType := extractGenerationMeta(stagedPath, newType)
 
-	// monbooru names this file, so it names it after the type it holds; an
-	// extension that already claims that type is left as the operator spelled it.
 	newPath := oldPath
 	if newExt := extForFileType(newType); newExt != "" && ExtFileType(oldPath) != newType {
 		stem := filepath.Base(oldPath)
@@ -72,19 +63,20 @@ func ApplyReplacedFile(database *db.DB, galleryPath, thumbnailsPath string, imag
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
+		// phash goes with the old bytes: the backfill revisits a NULL
+		// phash, never a stale one.
 		if _, err := tx.Exec(
 			`UPDATE images SET sha256 = ?, md5 = ?, canonical_path = ?, file_type = ?, file_size = ?,
-			        width = ?, height = ?, source_type = ?, is_missing = 0 WHERE id = ?`,
+			        width = ?, height = ?, source_type = ?, is_missing = 0, phash = NULL WHERE id = ?`,
 			newSHA, newMD5, newPath, newType, fi.Size(), toNullInt(newW), toNullInt(newH), sourceType, imageID,
 		); err != nil {
 			return fmt.Errorf("update images row: %w", err)
 		}
-		// Alias paths hold copies of the old bytes; the canonical row follows
-		// the swap, the aliases no longer describe this row's content.
+		// The alias paths still hold the old bytes.
 		if _, err := tx.Exec(`DELETE FROM image_paths WHERE image_id = ? AND is_canonical = 0`, imageID); err != nil {
 			return fmt.Errorf("drop stale aliases: %w", err)
 		}
-		// The recorded lookup misses are about bytes this row no longer has.
+		// The recorded lookup misses are about the old bytes.
 		if err := lookup.DeleteForImage(tx, imageID); err != nil {
 			return fmt.Errorf("drop lookup history: %w", err)
 		}
@@ -113,23 +105,19 @@ func ApplyReplacedFile(database *db.DB, galleryPath, thumbnailsPath string, imag
 		return tx.Commit()
 	}
 	if err := commit(); err != nil {
-		// The DB still describes the old bytes; put the old file back so
-		// nothing changed at all.
 		if rbErr := moveIntoPlace(backupPath, oldPath); rbErr != nil {
 			logx.Warnf("replace: restore of %q failed after aborted swap: %v", oldPath, rbErr)
 		}
 		return nil, err
 	}
 
-	// The staged file came from os.CreateTemp at 0600 and the rename
-	// carries that through onto the gallery path, where every other
-	// write path lands at what os.Create gives under the usual umask.
+	// The staged file is a 0600 os.CreateTemp, and the rename would carry
+	// that mode into the gallery.
 	if err := os.Chmod(stagedPath, 0o644); err != nil {
 		logx.Warnf("replace: chmod staged file %q: %v", stagedPath, err)
 	}
 	if err := moveIntoPlace(stagedPath, newPath); err != nil {
-		// The row already points at the new sha; keep the backup for hand
-		// recovery and surface the standard missing-file state.
+		putOldFileBack(database, galleryPath, imageID, oldPath, newPath, backupPath)
 		return nil, fmt.Errorf("place replaced file: %w", err)
 	}
 	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
@@ -138,37 +126,42 @@ func ApplyReplacedFile(database *db.DB, galleryPath, thumbnailsPath string, imag
 
 	if err := Generate(newPath, thumbnailsPath, imageID, newType); err != nil {
 		logx.Warnf("replace: thumbnail regen for %q: %v", newPath, err)
-		// The phash is computed off the thumbnail, so there is nothing to
-		// rehash. Clearing it beats leaving the old bytes' value behind:
-		// the backfill job picks up NULL phashes, a stale one it never
-		// revisits.
-		if _, err := database.Write.Exec(`UPDATE images SET phash = NULL WHERE id = ?`, imageID); err != nil {
-			logx.Warnf("replace: clearing stale phash for %q: %v", newPath, err)
-		}
 	} else if h, err := RecomputeAndStorePhash(context.Background(), database, imageID, thumbnailsPath); err != nil {
 		logx.Warnf("replace: phash recompute for %q: %v", newPath, err)
 	} else {
 		stored = &h
 	}
+	if err := ApplyMetaTags(database, thumbnailsPath, imageID); err != nil {
+		logx.Warnf("replace: meta tags for %q: %v", newPath, err)
+	}
 	logx.Infof("replace: image id=%d now %q (sha %s)", imageID, newPath, newSHA)
 	return stored, nil
 }
 
-// moveIntoPlace renames src onto dst, falling back to copy-and-remove when
-// the two sit on different filesystems: the data and gallery mounts need
-// not share a device, and neither need two folders of one gallery once a
-// symlinked one is part of the tree. A src that survives the copy leaves
-// the file in two places, so the copy is undone and the caller hears the
-// failure rather than being told a move happened that only half did.
+// The committed row names bytes that never landed. With the old file back
+// where the row points, the watcher or the next sync re-derives the row
+// from it, tags kept, rather than both versions being lost.
+func putOldFileBack(database *db.DB, galleryPath string, imageID int64, oldPath, newPath, backupPath string) {
+	if newPath != oldPath {
+		if err := repointCanonical(database.Write, imageID, oldPath, FolderPath(galleryPath, oldPath), newPath); err != nil {
+			logx.Warnf("replace: pointing image %d back at %q: %v", imageID, oldPath, err)
+		}
+	}
+	if err := moveIntoPlace(backupPath, oldPath); err != nil {
+		logx.Warnf("replace: putting %q back after a failed placement: %v", oldPath, err)
+	}
+}
+
+// moveIntoPlace copies across devices (the data and gallery mounts, a
+// linked folder). A source that cannot go undoes the copy: a file in two
+// places is worse than one not moved.
 func moveIntoPlace(src, dst string) error {
 	err := os.Rename(src, dst)
 	if err == nil {
 		return nil
 	}
-	// Only the cross-device refusal. Every other rename failure - a
-	// directory the process may read but not write, a destination held
-	// open - is a real one, and a copy that silently succeeds where the
-	// rename could not turns an atomic move into a copy plus an unlink.
+	// Only EXDEV: a copy that succeeds where the rename failed turns an
+	// atomic move into a copy plus an unlink.
 	if !errors.Is(err, syscall.EXDEV) {
 		return err
 	}
@@ -182,10 +175,6 @@ func moveIntoPlace(src, dst string) error {
 	return nil
 }
 
-// CopyFileContents streams src to a new file at dst, unlinking a partial
-// dst on failure. A copy rather than a rename, for the callers whose two
-// paths can sit on different filesystems: the cross-device replace above
-// and the transfer between gallery roots.
 func CopyFileContents(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {

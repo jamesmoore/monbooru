@@ -25,9 +25,6 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-// ipcMethod identifies the IPC call's intent so a single
-// request/response struct covers Run, Status, ReleaseIdle, ReleaseAll
-// without separate wire types per method.
 type ipcMethod uint8
 
 const (
@@ -38,36 +35,23 @@ const (
 	ipcMethodShutdown
 )
 
-// ipcRequest is the parent → child envelope. Only one of the
-// method-specific fields is populated per call.
 type ipcRequest struct {
 	Method    ipcMethod
 	Run       *RunRequest
 	IdleAfter time.Duration
 }
 
-// ipcTokenEnv names the environment variable carrying the per-spawn
-// handshake secret. The environment rather than argv: /proc/<pid>/environ
-// is owner-only where /proc/<pid>/cmdline is world-readable, and the
-// first frame the parent sends after the handshake is the whole config.
+// The environment, not argv: /proc/<pid>/environ is owner-only while
+// cmdline is world-readable.
 const ipcTokenEnv = "MONBOORU_TAGGER_IPC_TOKEN"
 
-// ipcHandshakeTimeout bounds how long a connector may sit on the
-// accepted socket before greeting, so a peer that never speaks cannot
-// hold the listener.
 const ipcHandshakeTimeout = 5 * time.Second
 
-// ipcHello is the child's first frame. The listener is a loopback TCP
-// port any local process can reach, so the parent drops every
-// connection that cannot echo the secret it spawned the child with
-// rather than handing the winner of a race the config.
+// Any local process can reach the loopback listener, so a connection that
+// cannot echo the spawn secret is dropped before it sees the config.
 type ipcHello struct{ Token string }
 
-// ipcResponse is the child → parent envelope. Errors travel as a
-// non-empty Err string so the response decode never fails on a normal
-// failure. Stream=true marks a non-terminal progress frame that
-// carries WorkerIdx + Msg; the receiver keeps reading until a frame
-// with Stream=false arrives.
+// A Stream frame is progress; the first frame without Stream is the reply.
 type ipcResponse struct {
 	Stream    bool
 	WorkerIdx int
@@ -78,11 +62,6 @@ type ipcResponse struct {
 	Err       string
 }
 
-// writeFrame encodes payload as gob, prefixes a uint32 length, and
-// writes both atomically. Returns the count of bytes the caller has
-// successfully placed on the wire so partial-write errors can
-// distinguish "the peer never saw this" from "the peer saw a partial
-// payload".
 func writeFrame(w io.Writer, payload any) error {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(payload); err != nil {
@@ -101,16 +80,10 @@ func writeFrame(w io.Writer, payload any) error {
 	return err
 }
 
-// maxFrameBytes caps the body length readFrame is willing to allocate
-// in one go. The largest realistic payload is a batch response carrying
-// merged tag maps, well under a megabyte; 64 MiB leaves headroom for
-// future protocol additions while bounding the blast of a corrupted
-// header that decodes as a multi-GB length.
+// Real frames stay well under a megabyte; the cap bounds what a corrupt
+// length header can make readFrame allocate.
 const maxFrameBytes uint32 = 64 << 20
 
-// readFrame reads a uint32 length followed by that many bytes of gob,
-// decoding into dst. Returns io.EOF when the peer closed cleanly
-// before sending another frame.
 func readFrame(r io.Reader, dst any) error {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -127,44 +100,24 @@ func readFrame(r io.Reader, dst any) error {
 	return gob.NewDecoder(bytes.NewReader(body)).Decode(dst)
 }
 
-// ipcBackend is the parent-side Backend that talks to a child
-// monbooru process over a TCP loopback socket. It supervises the
-// child: spawn on demand, terminate on ReleaseAll / ReleaseIdle, log
-// abnormal exits, restart on the next Run.
-//
-// The child runs the same monbooru binary with the
-// `tagger-worker --addr=<host:port>` argv tail; on exit (graceful
-// shutdown or crash) the kernel reclaims its CUDA libraries and
-// primary context, which is the whole point of the subprocess split.
+// ipcBackend runs inference in a child monbooru process: only the child's
+// exit gives back the CUDA libraries and primary context it loaded.
 type ipcBackend struct {
-	mu   sync.Mutex
-	cmd  *exec.Cmd
-	conn net.Conn
-	// inFlight gates Run vs supervisor teardown so a shutdown never
-	// races a request in progress.
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	conn     net.Conn
 	inFlight atomic.Int32
-	// childPID mirrors b.cmd.Process.Pid for callers that can't take
-	// b.mu (Stats panel hits WorkerPID mid-batch; the IPC streaming
-	// loop holds the mutex for the whole run).
+	// Readable without b.mu, which Run holds for the whole batch.
 	childPID atomic.Int32
-	// runProvider records the in-flight Run's Provider so a Status
-	// call mid-batch reports the right mode even when the cached
-	// snapshot is stale (e.g. just after an execution_provider toggle
-	// where the previous snapshot is from the CPU session).
+	// Overrides the cached snapshot's provider mid-batch: the snapshot
+	// may predate a provider switch.
 	runProvider atomic.Value
-	// lastStatus caches the most recent Status response so a Status
-	// call during an in-flight Run can serve from cache instead of
-	// queueing behind the long-running IPC frame loop.
-	lastStatus atomic.Pointer[CacheStatus]
+	lastStatus  atomic.Pointer[CacheStatus]
 }
 
-// newIPCBackend constructs the parent-side IPC backend. The child is
-// spawned lazily on the first Run; constructor errors are limited to
-// process-environment problems (cannot determine own path).
 func newIPCBackend() (*ipcBackend, error) { return &ipcBackend{}, nil }
 
-// ensureRunning starts the child if it isn't alive yet. Caller must
-// hold b.mu.
+// Caller must hold b.mu.
 func (b *ipcBackend) ensureRunning() error {
 	if b.cmd != nil && b.conn != nil {
 		return nil
@@ -193,9 +146,6 @@ func (b *ipcBackend) ensureRunning() error {
 	}
 	logx.Infof("tagger-worker: spawned pid=%d addr=%s", cmd.Process.Pid, addr)
 
-	// Accept the child's connection with a bounded wait so a child
-	// that crashes before connecting (e.g. missing libonnxruntime)
-	// surfaces a clear error instead of hanging the parent.
 	type acceptResult struct {
 		conn net.Conn
 		err  error
@@ -236,7 +186,6 @@ func (b *ipcBackend) ensureRunning() error {
 	}
 }
 
-// newIPCToken mints the per-spawn handshake secret.
 func newIPCToken() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -245,8 +194,6 @@ func newIPCToken() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// ipcHandshakeOK reads the greeting frame and reports whether it
-// carries the expected secret.
 func ipcHandshakeOK(c net.Conn, want string) bool {
 	_ = c.SetReadDeadline(time.Now().Add(ipcHandshakeTimeout))
 	var hello ipcHello
@@ -257,9 +204,7 @@ func ipcHandshakeOK(c net.Conn, want string) bool {
 	return subtle.ConstantTimeCompare([]byte(hello.Token), []byte(want)) == 1
 }
 
-// terminate forcibly stops the child for abnormal or crash paths. It
-// sends SIGTERM, waits 5s, then SIGKILL if necessary. Caller must hold
-// b.mu.
+// Caller must hold b.mu.
 func (b *ipcBackend) terminate() {
 	if b.cmd == nil {
 		return
@@ -270,11 +215,8 @@ func (b *ipcBackend) terminate() {
 	b.reapLocked(true, "terminated")
 }
 
-// reapLocked waits for the child to exit, killing it after 5s, then clears
-// the handles it left behind. dropConnFirst closes the socket before the
-// wait, which is what an unresponsive child needs; a graceful shutdown keeps
-// it open until the child has acknowledged and exited. verb names the outcome
-// in the log line. Caller must hold b.mu.
+// dropConnFirst is for an unresponsive child; a graceful shutdown keeps
+// the socket open until the child has exited.
 func (b *ipcBackend) reapLocked(dropConnFirst bool, verb string) {
 	if dropConnFirst && b.conn != nil {
 		_ = b.conn.Close()
@@ -309,16 +251,10 @@ func (b *ipcBackend) reapLocked(dropConnFirst bool, verb string) {
 	logx.Infof("tagger-worker: %s pid=%d", verb, pid)
 }
 
-// call sends a request and reads the terminal response. Caller must
-// hold b.mu. A watcher goroutine closes b.conn when ctx fires so a
-// wedged worker can't hang the parent indefinitely; the resulting
-// wire error runs terminate() which SIGTERMs the child. The caller
-// gets ctx.Err on cancellation rather than the wrapped read error.
-// Intermediate Stream=true frames are forwarded to onProgress (when
-// non-nil); the loop returns on the first Stream=false frame.
+// Caller must hold b.mu.
 func (b *ipcBackend) call(ctx context.Context, req ipcRequest, onProgress func(int, string)) (ipcResponse, error) {
-	// Capture the handle under the caller's lock so the watcher never reads
-	// b.conn while terminate() (also under b.mu) sets it to nil.
+	// The watcher gets its own copy: terminate, also under b.mu, sets
+	// b.conn to nil.
 	conn := b.conn
 	done := make(chan struct{})
 	defer close(done)
@@ -358,21 +294,13 @@ func (b *ipcBackend) call(ctx context.Context, req ipcRequest, onProgress func(i
 	}
 }
 
-// shortCallTimeout bounds Status / ReleaseIdle / ReleaseAll: long
-// enough that a healthy worker's response (microseconds for Status,
-// up to a few seconds for a teardown that includes mallocTrim) never
-// trips it, short enough that a wedged worker doesn't hang the
-// reclaim ticker or server shutdown.
+// Well above a teardown with mallocTrim (a few seconds), short enough
+// that a wedged worker can't stall the reclaim ticker or shutdown.
 const shortCallTimeout = 30 * time.Second
 
-// Run sends the batch to the child, forwards every Stream=true
-// progress frame it emits through req.OnProgress, and returns the
-// terminal response. ctx cancellation unwedges the IPC reader and
-// returns ctx.Err to the caller; the next Run respawns.
 func (b *ipcBackend) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
-	// gob can't encode the OnProgress func, so we strip it from the
-	// wire payload and forward progress over the response stream
-	// instead.
+	// gob cannot encode a func; progress comes back over the response
+	// stream instead.
 	wire := req
 	wire.OnProgress = nil
 	b.inFlight.Add(1)
@@ -398,11 +326,8 @@ func (b *ipcBackend) Run(ctx context.Context, req RunRequest) (RunResponse, erro
 	return *resp.Run, nil
 }
 
-// Status returns the child's cache state. While a Run is in flight,
-// b.mu is held by the streaming call loop and an IPC round-trip would
-// queue behind the whole batch. Short-circuit on inFlight > 0 with the
-// last cached snapshot, overlaying InUse=true, so the Stats panel
-// renders without waiting on the worker.
+// A Run holds b.mu for the whole batch, so while one is in flight Status
+// answers from the last snapshot instead of queueing behind it.
 func (b *ipcBackend) Status() CacheStatus {
 	if b.inFlight.Load() > 0 {
 		provider, _ := b.runProvider.Load().(string)
@@ -434,9 +359,6 @@ func (b *ipcBackend) Status() CacheStatus {
 	return snap
 }
 
-// ReleaseIdle asks the child to teardown if it has been idle long
-// enough. When the child reports it tore down, parent SIGTERMs to
-// reclaim the CUDA libraries it loaded; the next Run respawns it.
 func (b *ipcBackend) ReleaseIdle(after time.Duration) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -455,9 +377,6 @@ func (b *ipcBackend) ReleaseIdle(after time.Duration) bool {
 	return resp.Released
 }
 
-// ReleaseAll asks the child to shut down gracefully, waits up to 5s
-// for the process to exit, and kills it if it is still alive. The
-// next Run respawns.
 func (b *ipcBackend) ReleaseAll() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -469,7 +388,6 @@ func (b *ipcBackend) ReleaseAll() {
 	defer cancel()
 	resp, err := b.call(ctx, ipcRequest{Method: ipcMethodShutdown}, nil)
 	if err != nil {
-		// call already invoked terminate() on wire failure.
 		return
 	}
 	if resp.Err != "" {
@@ -477,15 +395,9 @@ func (b *ipcBackend) ReleaseAll() {
 		return
 	}
 
-	// The child keeps the socket until it has acknowledged the shutdown and
-	// exited, so the drop happens after the wait.
 	b.reapLocked(false, "released")
 }
 
-// WorkerPID returns the live child's PID, or (0, false) when no
-// worker is currently running. Reads childPID atomically so the Stats
-// panel can sample /proc/<pid>/smaps even while an autotag batch
-// holds b.mu in the streaming Run loop.
 func (b *ipcBackend) WorkerPID() (int, bool) {
 	pid := b.childPID.Load()
 	if pid == 0 {

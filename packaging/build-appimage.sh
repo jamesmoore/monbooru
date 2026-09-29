@@ -1,6 +1,4 @@
 #!/bin/sh
-# packaging/build-appimage.sh
-#
 # Builds the desktop bundled AppImage for $GOARCH into dist/.
 set -eu
 

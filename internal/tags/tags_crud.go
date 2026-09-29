@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,19 +16,12 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// Tag rows themselves: name validation, get-or-create, listing and
-// filtering, alias lookups, per-image reads, and deletion.
-
-// tagDecorationClass is the separator/decoration set. A name built only from
-// these is rejected as content-free ("---"); an emoticon like ">_<" passes
-// because it also carries runes outside the set.
+// A name made only of these is content-free; emoticons like ">_<" pass on
+// their other runes.
 const tagDecorationClass = "_()!@#$.~+:-"
 
-// buildTagName is the shared tag-name normalizer: lowercase, drop
-// control/format/private-use runes, trim surrounding whitespace, and fold each
-// internal whitespace run to a single `_`. Existing underscores are left alone.
-// When foldReserved is set the grammar-reserved `"` and `*` fold like
-// whitespace; the strict validator leaves them in place so it can reject them.
+// With foldReserved false, '"' and '*' survive so the validator can
+// reject them.
 func buildTagName(name string, foldReserved bool) string {
 	name = strings.ToLower(name)
 	var b strings.Builder
@@ -49,25 +43,14 @@ func buildTagName(name string, foldReserved bool) string {
 	return b.String()
 }
 
-// NormalizeTagName applies the shared normalization without folding the
-// reserved characters. The add path (via ValidateTagName), the search parser,
-// the filter-value resolvers, and the tag autocomplete all run input through it
-// so a typed query matches a stored name.
 func NormalizeTagName(name string) string { return buildTagName(name, false) }
 
-// HasTagContent reports whether name carries a rune outside the decoration
-// class, so pure separators are rejected while emoticons pass.
 func HasTagContent(name string) bool {
 	return strings.ContainsFunc(name, func(r rune) bool {
 		return !strings.ContainsRune(tagDecorationClass, r)
 	})
 }
 
-// ValidateTagName normalizes name and checks the tag-name rules: 1-200 runes,
-// none of them the reserved `"` or `*`, and at least one content rune. Returns
-// the normalized name or an ErrInvalidTagName-wrapped error. Exposed so non-UI
-// sources (the auto-tagger label loader, the JSON import path) apply the same
-// rules.
 func ValidateTagName(name string) (string, error) {
 	name = NormalizeTagName(name)
 
@@ -83,28 +66,20 @@ func ValidateTagName(name string) (string, error) {
 	return name, nil
 }
 
-// NormalizeName folds an externally-sourced tag name into the stored form:
-// normalized like ValidateTagName but the reserved `"` / `*` fold to `_` rather
-// than being rejected, and leftover end underscores are trimmed. Import tokens
-// pass through it so a hydrus tag like `hatsune miku` is stored as
-// `hatsune_miku` instead of being rejected. Returns "" when nothing usable
-// remains.
+// NormalizeName is for imported names: '"' and '*' fold to '_' instead of
+// failing, and it may return "".
 func NormalizeName(name string) string { return strings.Trim(buildTagName(name, true), "_") }
 
 func (s *Service) GetOrCreateTag(name string, categoryID int64) (*models.Tag, error) {
 	return s.GetOrCreateTagFrom(name, categoryID, "user")
 }
 
-// GetOrCreateTagFrom is GetOrCreateTag with an explicit creation origin
-// (a booru site, "ptr", an import label). The origin is stamped only on
-// the insert; an existing row keeps its creator.
+// GetOrCreateTagFrom stamps origin only on insert; an existing row keeps
+// its creator.
 func (s *Service) GetOrCreateTagFrom(name string, categoryID int64, origin string) (*models.Tag, error) {
-	normalized, err := ValidateTagName(name)
+	normalized, err := s.validateTagIn(name, categoryID)
 	if err != nil {
 		return nil, err
-	}
-	if s.ratingCatID != 0 && categoryID == s.ratingCatID && !IsCanonicalRating(normalized) {
-		return nil, ErrNonCanonicalRating
 	}
 
 	var tag *models.Tag
@@ -116,12 +91,43 @@ func (s *Service) GetOrCreateTagFrom(name string, categoryID int64, origin strin
 	return tag, err
 }
 
+func (s *Service) GetOrCreateTagsFrom(names []string, categoryID int64, origin string) ([]int64, error) {
+	ids := make([]int64, 0, len(names))
+	err := s.inWriteTx(func(tx *sql.Tx) error {
+		for _, name := range names {
+			normalized, err := s.validateTagIn(name, categoryID)
+			if err != nil {
+				return err
+			}
+			tag, err := getOrCreateTagTx(tx, normalized, categoryID, origin)
+			if err != nil {
+				return err
+			}
+			ids = append(ids, tag.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (s *Service) validateTagIn(name string, categoryID int64) (string, error) {
+	normalized, err := ValidateTagName(name)
+	if err != nil {
+		return "", err
+	}
+	if s.ratingCatID != 0 && categoryID == s.ratingCatID && !IsCanonicalRating(normalized) {
+		return "", ErrNonCanonicalRating
+	}
+	return normalized, nil
+}
+
 func getOrCreateTagTx(tx *sql.Tx, name string, categoryID int64, origin string) (*models.Tag, error) {
 	var tag models.Tag
 	var createdAt string
 	var canonicalID sql.NullInt64
-	// Look up by (name, category_id) so the same name can live in
-	// multiple categories.
 	err := tx.QueryRow(
 		`SELECT id, name, category_id, usage_count, is_alias, canonical_tag_id, created_at FROM tags WHERE name = ? AND category_id = ?`,
 		name, categoryID,
@@ -148,12 +154,9 @@ func getOrCreateTagTx(tx *sql.Tx, name string, categoryID int64, origin string) 
 		return nil, err
 	}
 
-	// If this row is an alias, redirect to its canonical. MergeTags
-	// refuses to point an alias at another alias, so one hop is enough.
-	// A failed lookup (notably a dangling canonical_tag_id) must not
-	// fall through to the alias row itself - callers would key
-	// image_tags onto an alias id, which the resolver treats
-	// inconsistently.
+	// One hop: write paths never leave an alias pointing at another
+	// alias. A dangling canonical is an error, not a fallback that keys
+	// image_tags on the alias.
 	if tag.IsAlias && canonicalID.Valid {
 		var canon models.Tag
 		var canonCreated string
@@ -171,8 +174,6 @@ func getOrCreateTagTx(tx *sql.Tx, name string, categoryID int64, origin string) 
 	return &tag, nil
 }
 
-// tagFilterWhere builds the WHERE clause and bound args shared by
-// ListTags and ListTagIDs so both views see exactly the same set.
 func tagFilterWhere(filter TagFilter) (string, []any) {
 	args := []any{}
 	where := "1=1"
@@ -194,8 +195,7 @@ func tagFilterWhere(filter TagFilter) (string, []any) {
 	switch filter.Origin {
 	case "":
 	case "alias":
-		// Legacy spelling kept for pre-Type URLs and API callers;
-		// alias-ness is structure, not provenance.
+		// A documented API value: origin=alias narrows to alias rows.
 		where += " AND t.is_alias = 1"
 	default:
 		where += " AND t.origin = ?"
@@ -218,21 +218,17 @@ func tagFilterWhere(filter TagFilter) (string, []any) {
 		args = append(args, filter.CreatedAfter)
 	}
 	if filter.ConflictsOnly {
-		// Same row-counting shape as ConflictsCount so badge and listing agree.
 		where += ` AND t.is_alias = 0 AND t.name IN (
 			SELECT name FROM tags WHERE is_alias = 0
 			GROUP BY name HAVING COUNT(*) >= 2)`
 	}
-	// The IN over the small stale slice bounds the scan to tags that have any
-	// stale row; the "full" count subquery then runs only for those. Implied
-	// rows never go stale, so a tag with live implied usage never reads as
-	// full - the conservative direction for a delete candidate.
+	// IN bounds the scan to tags with a stale row. Implied rows are never
+	// stale, so live implied usage keeps a tag out of "full".
 	switch filter.Stale {
 	case "has":
 		where += ` AND t.id IN (SELECT tag_id FROM image_tags WHERE stale = 1)`
 	case "full":
-		// usage_count is maintained over visible images only, so the stale
-		// count has to skip missing ones or the two sides never agree.
+		// usage_count counts visible images only, so the stale side must too.
 		where += ` AND t.usage_count > 0 AND t.id IN (SELECT tag_id FROM image_tags WHERE stale = 1)
 			AND (SELECT COUNT(*) FROM image_tags it JOIN images mi ON mi.id = it.image_id AND mi.is_missing = 0
 			     WHERE it.tag_id = t.id AND it.stale = 1) = t.usage_count`
@@ -242,21 +238,16 @@ func tagFilterWhere(filter TagFilter) (string, []any) {
 	}
 	switch {
 	case filter.ZeroOnly:
-		// Strictly zero-usage non-alias rows. Aliases are excluded because
-		// their usage_count is 0 by construction and would otherwise drown
-		// the actual triage targets.
+		// Alias rows always sit at usage 0, so both cases decide them by
+		// is_alias.
 		where += " AND t.usage_count = 0 AND t.is_alias = 0"
 	case !filter.ShowZero:
-		// Hide non-alias zero-usage rows. Aliases always pass because
-		// their usage_count is 0 by construction.
 		where += " AND (t.usage_count > 0 OR t.is_alias = 1)"
 	}
 	return where, args
 }
 
-// tagOrderBy builds the ORDER BY shared by ListTags and AdjacentTags.
-// The trailing id tiebreak keeps full ties deterministic so the detail
-// page's prev/next walk agrees with the rendered listing.
+// The id tiebreak keeps prev/next on the detail page in step with the listing.
 func tagOrderBy(filter TagFilter) string {
 	dir := "ASC"
 	if strings.EqualFold(filter.Order, "desc") {
@@ -265,12 +256,9 @@ func tagOrderBy(filter TagFilter) string {
 	orderBy := "t.name " + dir
 	switch {
 	case filter.ConflictsOnly:
-		// Colliding pairs must sit adjacent; the category tiebreak keeps
-		// each pair's order stable.
+		// Colliding rows must sit together whatever the requested order.
 		orderBy = "t.name ASC, t.category_id ASC"
 	case filter.Sort == "usage" || filter.Sort == "created" || filter.Sort == "last_used":
-		// These default to DESC when no order is set (most-used / newest /
-		// most recently applied first).
 		dir = "DESC"
 		if strings.EqualFold(filter.Order, "asc") {
 			dir = "ASC"
@@ -281,8 +269,6 @@ func tagOrderBy(filter TagFilter) string {
 		case "created":
 			return "t.created_at " + dir + ", t.id " + dir
 		case "last_used":
-			// SQLite sorts NULL smallest, so never-applied rows land last
-			// on the default DESC and first on ASC.
 			orderBy = "t.last_used_at " + dir + ", t.name ASC"
 		}
 	}
@@ -306,20 +292,14 @@ func (s *Service) ListTags(filter TagFilter) ([]models.Tag, int, error) {
 	}
 	offset := filter.PageIndex * limit
 
-	// The folded-into subquery only runs on the folded-duplicates view; every
-	// other listing selects a constant NULL so the hot path pays nothing.
 	foldedCol := "NULL"
 	if filter.FoldedOnly {
 		foldedCol = `(SELECT t2.name FROM folded_tag_pairs fp JOIN tags t2 ON t2.id = fp.new_id WHERE fp.old_id = t.id AND fp.ambiguous = 0 LIMIT 1)`
 	}
 
-	// The page is picked from tags alone so the sort index can serve it
-	// and stop at the limit; with the joins in the same SELECT the
-	// planner drives from tag_categories, reads every tag row through
-	// idx_tags_category and temp-sorts the catalog to return a hundred.
-	// LEFT JOIN pulls the canonical name/category when t.is_alias = 1
-	// so the caller can render "alias -> canonical" without a second
-	// round trip.
+	// The page is picked from tags alone so the sort index can stop at
+	// the limit; with the joins in the same SELECT the planner drives
+	// from tag_categories and temp-sorts the whole catalog.
 	query := fmt.Sprintf(
 		`SELECT t.id, t.name, t.category_id, tc.name, tc.color,
 		        t.usage_count, t.is_alias, t.canonical_tag_id, t.created_at,
@@ -380,39 +360,23 @@ func (s *Service) ListTags(filter TagFilter) ([]models.Tag, int, error) {
 	return tagList, total, nil
 }
 
-// ConflictsCount reports how many tag rows carry a name that occupies
-// more than one category, for the /tags Conflicts filter badge and the
-// Maintenance diagnostic. Rows rather than names: the badge is the entry
-// point to the listing its own link opens, and that listing renders one
-// row per (name, category) - four colliding names across two categories
-// each is a badge of 8 and a header of 8.
-//
-// UNIQUE(name, category_id) makes COUNT(*) per name equal to the count
-// of distinct categories, and the name-only form is what keeps both the
-// grouping scan and the membership test inside idx_tags_active_name:
-// reading category_id would send every row back to the table, which is an
-// order of magnitude slower on a large catalog.
+// COUNT(*) per name equals its category count under UNIQUE(name,
+// category_id), and reading only name keeps both scans inside
+// idx_tags_active_name.
 func (s *Service) ConflictsCount() (int, error) {
 	var n int
-	// Rows, not names: the badge is the entry point to the listing its own
-	// link opens, and that listing renders one row per (name, category).
 	err := s.db.Read.QueryRow(`SELECT COUNT(*) FROM tags WHERE is_alias = 0 AND name IN (
 		SELECT name FROM tags WHERE is_alias = 0
 		GROUP BY name HAVING COUNT(*) >= 2)`).Scan(&n)
 	return n, err
 }
 
-// StaleUsageCount reports how many tags carry at least one source-dropped
-// (stale) usage, for the /tags Stale filter badge.
 func (s *Service) StaleUsageCount() (int, error) {
 	var n int
 	err := s.db.Read.QueryRow(`SELECT COUNT(DISTINCT tag_id) FROM image_tags WHERE stale = 1`).Scan(&n)
 	return n, err
 }
 
-// FullyStaleCount reports how many tags have nothing but stale usage left,
-// for the /tags Stale filter's second badge. The predicate mirrors
-// tagFilterWhere's `full` branch so badge and listing can't disagree.
 func (s *Service) FullyStaleCount() (int, error) {
 	var n int
 	err := s.db.Read.QueryRow(`SELECT COUNT(*) FROM tags t
@@ -422,17 +386,13 @@ func (s *Service) FullyStaleCount() (int, error) {
 	return n, err
 }
 
-// OriginCount pairs a stored creation-origin label with how many tags
-// carry it.
 type OriginCount struct {
 	Label string
 	Count int
 }
 
-// OriginCounts returns the distinct non-empty creation origins in the
-// catalog, most-populated first, for the /tags sidebar filter. typeFilter
-// is the listing's active Type ("tag" / "alias" / ""), applied here too so
-// a badge counts the rows its own link will show.
+// typeFilter is the listing's Type, so a badge counts the rows its own
+// link shows.
 func (s *Service) OriginCounts(typeFilter string) ([]OriginCount, error) {
 	where := ""
 	switch typeFilter {
@@ -451,9 +411,6 @@ func (s *Service) OriginCounts(typeFilter string) ([]OriginCount, error) {
 	)
 }
 
-// AutoTaggerLabels reports which of labels appear as an auto-tagger
-// attribution (an is_auto = 1 tagger_name) so origin chips can color
-// machine creators apart from site creators.
 func (s *Service) AutoTaggerLabels(labels []string) (map[string]struct{}, error) {
 	set := make(map[string]struct{})
 	seen := make(map[string]struct{}, len(labels))
@@ -472,9 +429,8 @@ func (s *Service) AutoTaggerLabels(labels []string) (map[string]struct{}, error)
 		return set, nil
 	}
 	placeholders, args := db.InPlaceholders(wanted)
-	// The literal IS NOT NULL / != '' terms restate
-	// idx_image_tags_auto_tagger's partial predicate; without them the
-	// planner can't prove the index applies and scans image_tags.
+	// The IS NOT NULL and != '' terms restate idx_image_tags_auto_tagger's
+	// partial predicate, without which the planner scans image_tags.
 	labels, err := db.QueryStrings(s.db.Read,
 		`SELECT DISTINCT tagger_name FROM image_tags
 		 WHERE is_auto = 1 AND tagger_name IS NOT NULL AND tagger_name != ''
@@ -489,24 +445,15 @@ func (s *Service) AutoTaggerLabels(labels []string) (map[string]struct{}, error)
 	return set, nil
 }
 
-// ListTagIDs returns every tag id matching the filter, ignoring
-// PageIndex / Limit. Used by /tags' bulk delete-in-current-search so
-// the dialog count and the actual delete set agree.
 func (s *Service) ListTagIDs(filter TagFilter) ([]int64, error) {
 	where, args := tagFilterWhere(filter)
 	return db.QueryIDs(s.db.Read, `SELECT t.id FROM tags t WHERE `+where+` ORDER BY t.id`, args...)
 }
 
-// AdjacentTags returns the ids neighbouring id in the filter's listing
-// order, ignoring pagination, so the tag detail page can step through
-// the same sequence the /tags table shows. A nil side means no
-// neighbour there (or id absent from the filtered set).
 func (s *Service) AdjacentTags(filter TagFilter, id int64) (prev, next *int64, err error) {
 	where, args := tagFilterWhere(filter)
-	// The listing has no key to seek on, so the scan is ordered and
-	// unbounded; walking it and stopping at the row after the match is
-	// what keeps a tag near the front of a 100k-tag catalog from paying
-	// for the whole of it.
+	// No key to seek on, so the ordered scan streams and stops one row
+	// past the match.
 	var last int64
 	var seen, found bool
 	err = db.QueryIDsFunc(s.db.Read, func(cur int64) bool {
@@ -569,11 +516,6 @@ func (s *Service) GetTag(id int64) (*models.Tag, error) {
 	return &t, nil
 }
 
-// AliasesForTagIDs returns alias rows keyed by the canonical tag id
-// they point at, with display fields joined for chip rendering on the
-// detail page (where viewers benefit from seeing which alternate names
-// also surface this image in search). One query regardless of input
-// size, chunked at the SQLite parameter cap.
 func (s *Service) AliasesForTagIDs(canonicalIDs []int64) (map[int64][]models.Tag, error) {
 	out := make(map[int64][]models.Tag, len(canonicalIDs))
 	if len(canonicalIDs) == 0 {
@@ -619,16 +561,12 @@ func (s *Service) AliasesForTagIDs(canonicalIDs []int64) (map[int64][]models.Tag
 	return out, nil
 }
 
-// AliasKey identifies an alias row by category and name.
 type AliasKey struct {
 	CategoryID int64
 	Name       string
 }
 
-// SyncAliasStaleness reconciles the stale flag on a canonical tag's
-// origin-attributed alias rows against a refresh: rows absent from fresh are
-// flagged, rows listed again are cleared. The rows stay either way - the
-// operator decides what to remove. Returns how many rows were newly flagged.
+// SyncAliasStaleness only flags or clears: the operator decides what to remove.
 func (s *Service) SyncAliasStaleness(canonicalID int64, origin string, fresh map[AliasKey]bool) (int, error) {
 	flagged := 0
 	err := s.inWriteTx(func(tx *sql.Tx) error {
@@ -670,9 +608,7 @@ func setTagsStaleTx(tx *sql.Tx, ids []int64, stale int) error {
 	return setStaleTx(tx, "tags", "id", "", ids, stale)
 }
 
-// setStaleTx flags or clears the stale column on the rows keyCol
-// selects, narrowed further by extraWhere when the table needs a
-// second key (an implication is keyed by its parent too).
+// extraWhere is raw SQL ending in " AND ", for a table with a second key.
 func setStaleTx(tx *sql.Tx, table, keyCol, extraWhere string, ids []int64, stale int) error {
 	if len(ids) == 0 {
 		return nil
@@ -685,54 +621,50 @@ func setStaleTx(tx *sql.Tx, table, keyCol, extraWhere string, ids []int64, stale
 	return err
 }
 
-// AppliedByCount is one attribution group over a tag's image_tags rows:
-// which source applies the tag and on how many images.
 type AppliedByCount struct {
-	Label  string // tagger_name; "" = anonymous UI adds
-	IsAuto bool
-	Count  int
+	Label   string // tagger_name; "" = anonymous UI adds and every Implied row
+	IsAuto  bool
+	Implied bool
+	Count   int
 }
 
-// UsageMonth is one month of a tag's still-present applications, keyed
-// by the row's created_at. Removals leave the history and rows moved by
-// a merge keep their original dates.
 type UsageMonth struct {
 	Month string // YYYY-MM
 	Count int
 }
 
-// UsageBreakdown aggregates a tag's image_tags rows once and returns
-// both detail-page views: applied-by attribution groups and the monthly
-// histogram. One pass because the row fetch dominates on popular tags -
-// a monster tag's hundreds of thousands of rows are read once, not once
-// per panel.
+// One pass for both views: on a popular tag the row read dominates.
 func (s *Service) UsageBreakdown(tagID int64) ([]AppliedByCount, []UsageMonth, error) {
+	// An implied row has no tagger and the parent's is_auto: apart, or it reads as a manual add.
 	rows, err := s.db.Read.Query(
-		`SELECT COALESCE(tagger_name, ''), is_auto, strftime('%Y-%m', created_at), COUNT(*)
-		 FROM image_tags WHERE tag_id = ?
-		 GROUP BY COALESCE(tagger_name, ''), is_auto, strftime('%Y-%m', created_at)`,
+		`SELECT CASE WHEN it.is_implied = 1 THEN '' ELSE COALESCE(it.tagger_name, '') END AS label,
+		        CASE WHEN it.is_implied = 1 THEN 0 ELSE it.is_auto END AS auto,
+		        it.is_implied, strftime('%Y-%m', it.created_at) AS month, COUNT(*)
+		 FROM image_tags it JOIN images i ON i.id = it.image_id AND i.is_missing = 0
+		 WHERE it.tag_id = ?
+		 GROUP BY label, auto, it.is_implied, month`,
 		tagID,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	appliedIdx := make(map[[2]any]int)
+	appliedIdx := make(map[[3]any]int)
 	monthIdx := make(map[string]int)
 	var applied []AppliedByCount
 	var months []UsageMonth
 	for rows.Next() {
 		var label, month string
-		var isAuto, count int
-		if err := rows.Scan(&label, &isAuto, &month, &count); err != nil {
+		var isAuto, implied, count int
+		if err := rows.Scan(&label, &isAuto, &implied, &month, &count); err != nil {
 			return nil, nil, err
 		}
-		ak := [2]any{label, isAuto}
+		ak := [3]any{label, isAuto, implied}
 		if i, ok := appliedIdx[ak]; ok {
 			applied[i].Count += count
 		} else {
 			appliedIdx[ak] = len(applied)
-			applied = append(applied, AppliedByCount{Label: label, IsAuto: isAuto == 1, Count: count})
+			applied = append(applied, AppliedByCount{Label: label, IsAuto: isAuto == 1, Implied: implied == 1, Count: count})
 		}
 		if i, ok := monthIdx[month]; ok {
 			months[i].Count += count
@@ -744,8 +676,6 @@ func (s *Service) UsageBreakdown(tagID int64) ([]AppliedByCount, []UsageMonth, e
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
-	// Tie-break by label asc so two equivalent runs produce the same
-	// ordering, and the panel does not reshuffle between renders.
 	sort.Slice(applied, func(i, j int) bool {
 		if applied[i].Count != applied[j].Count {
 			return applied[i].Count > applied[j].Count
@@ -756,10 +686,8 @@ func (s *Service) UsageBreakdown(tagID int64) ([]AppliedByCount, []UsageMonth, e
 	return applied, months, nil
 }
 
-// GetImageTags returns the per-image tag list alongside the owning
-// image's folder_path. Both pieces are read in one round trip via a
-// LEFT JOIN over images so a freshly-uploaded image with no tags still
-// surfaces its folder. The folder is empty when the image id is unknown.
+// GetImageTags also returns the image's folder_path, empty for an unknown
+// image.
 func (s *Service) GetImageTags(imageID int64) (string, []models.ImageTag, error) {
 	rows, err := s.db.Read.Query(
 		`SELECT i.folder_path,
@@ -806,8 +734,6 @@ func (s *Service) GetImageTags(imageID int64) (string, []models.ImageTag, error)
 			folder = folderPath.String
 		}
 		if !imgID.Valid || !tagID.Valid {
-			// Untagged image - the LEFT JOIN emitted one row with NULL
-			// tag columns; skip it but keep the folder.
 			continue
 		}
 		it := models.ImageTag{
@@ -835,44 +761,18 @@ func (s *Service) GetImageTags(imageID int64) (string, []models.ImageTag, error)
 	return folder, result, rows.Err()
 }
 
-// deleteTagsTx strips ids from every image - including each id's transitive
-// implied closure - and removes their aliases, inside tx. It does not delete
-// the tag rows themselves: the single-tag and whole-category callers delete
-// those by different keys. The returned closure is the set of implied
-// descendants the caller must RecalcIDs after commit.
+// The FK cascade alone would strand implied rows, so the sweep runs here.
+// The caller deletes the tag rows and must RecalcIDs the returned tags
+// after commit.
 func deleteTagsTx(tx *sql.Tx, ids []int64) ([]int64, error) {
-	closure, err := TransitiveImpliedTx(tx, ids)
+	swept, err := stripTagsTx(tx, ids)
 	if err != nil {
-		return nil, fmt.Errorf("walk implied closure: %w", err)
+		return nil, err
 	}
 	for _, id := range ids {
-		if _, err := tx.Exec(`DELETE FROM image_tags WHERE tag_id = ?`, id); err != nil {
-			return nil, fmt.Errorf("strip parent image_tags: %w", err)
-		}
-	}
-	// Tier order: TransitiveImpliedTx returns BFS, so dropping rows in
-	// that order makes deeper tiers see the now-gone upstream rows when
-	// they re-check whether any remaining parent on the image still
-	// justifies them.
-	for _, impID := range closure {
-		if _, err := tx.Exec(
-			`DELETE FROM image_tags
-			 WHERE tag_id = ? AND is_implied = 1
-			   AND NOT EXISTS (
-			       SELECT 1 FROM tag_implications ti
-			       JOIN image_tags it_p ON it_p.tag_id = ti.parent_tag_id
-			       WHERE ti.implied_tag_id = ? AND it_p.image_id = image_tags.image_id
-			   )`,
-			impID, impID,
-		); err != nil {
-			return nil, fmt.Errorf("sweep implied %d: %w", impID, err)
-		}
-	}
-	for _, id := range ids {
-		// Imported or legacy rows can chain alias -> alias, even back through
-		// the deleted tag. Null the tag's own pointer so a cycle can't
-		// dangle-check the sweep, then drop the whole alias subtree in one
-		// statement so intra-chain references vanish together.
+		// Old rows can chain alias -> alias, even back through this tag.
+		// Clearing its own pointer first and dropping the chain in one
+		// statement keeps every FK check satisfied.
 		if _, err := tx.Exec(`UPDATE tags SET canonical_tag_id = NULL WHERE id = ?`, id); err != nil {
 			return nil, fmt.Errorf("unlink canonical: %w", err)
 		}
@@ -889,39 +789,40 @@ func deleteTagsTx(tx *sql.Tx, ids []int64) ([]int64, error) {
 			return nil, fmt.Errorf("delete aliases: %w", err)
 		}
 	}
-	return closure, nil
+	return swept, nil
 }
 
-// DeleteTag removes a tag from every image and drops the tag row. Alias
-// rows pointing at it are removed too (their canonical_tag_id would
-// otherwise dangle). image_tags rows cascade on the tags FK, but the
-// per-image removal runs first so the implied closure is swept - the
-// FK cascade alone would drop the parent row and leave its
-// is_implied=1 dependents on every carrier image with nothing on the
-// image to justify them.
-//
-// Implementation: one bulk DELETE for the parent's image_tags rows,
-// then a tier-by-tier sweep of the transitive implied closure where
-// each tier deletes is_implied=1 rows whose only justification was the
-// (now-gone) parent or an upstream implied. Same end-state as the
-// per-image walk but linear in the number of distinct implied tags
-// rather than the number of carrier images. Final RecalcIDs reconciles
-// usage_count for every tag the cascade touched.
-//
-// The four canonical rating tags are immutable in the catalog (their
-// names are part of the data model) so the row itself stays. Delete on
-// one of them strips its image_tags rows instead - the user-visible
-// "remove this rating from every image" the UI exposes. An imported
-// rating-category row under any other name is not vocabulary and
-// deletes outright.
+// Only the images that carried a stripped tag can have lost a parent.
+func stripTagsTx(tx *sql.Tx, ids []int64) ([]int64, error) {
+	var carriers []int64
+	for _, id := range ids {
+		got, err := db.QueryIDs(tx, `DELETE FROM image_tags WHERE tag_id = ? RETURNING image_id`, id)
+		if err != nil {
+			return nil, fmt.Errorf("strip parent image_tags: %w", err)
+		}
+		carriers = append(carriers, got...)
+	}
+	slices.Sort(carriers)
+	carriers = slices.Compact(carriers)
+	seen := map[int64]struct{}{}
+	if err := db.Chunked(carriers, 500, func(chunk []int64) error {
+		_, err := pruneOrphanedImpliedTx(tx, chunk, seen)
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("sweep implied: %w", err)
+	}
+	return tagIDsFromSet(seen), nil
+}
+
+// DeleteTag keeps a canonical rating row and only strips it from every image.
 func (s *Service) DeleteTag(id int64) error {
 	if s.isLockedRatingTag(id) {
 		return s.stripTagFromAllImages(id)
 	}
-	var closure []int64
+	var swept []int64
 	err := s.inWriteTx(func(tx *sql.Tx) error {
 		var err error
-		closure, err = deleteTagsTx(tx, []int64{id})
+		swept, err = deleteTagsTx(tx, []int64{id})
 		if err != nil {
 			return err
 		}
@@ -937,42 +838,37 @@ func (s *Service) DeleteTag(id int64) error {
 	if err != nil {
 		return err
 	}
-	// Recompute usage_count over the swept set so the cached value
-	// reflects the post-state without a full Recalc.
-	if len(closure) > 0 {
-		return s.RecalcIDs(closure)
+	if len(swept) > 0 {
+		return s.RecalcIDs(swept)
 	}
 	return nil
 }
 
-// stripTagFromAllImages clears every image_tags row for tagID and zeros
-// the tag's usage_count. Used by DeleteTag's rating-tag branch where
-// the catalog row must stay intact.
 func (s *Service) stripTagFromAllImages(tagID int64) error {
-	return s.inWriteTx(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM image_tags WHERE tag_id = ?`, tagID); err != nil {
-			return fmt.Errorf("strip image_tags: %w", err)
+	var swept []int64
+	err := s.inWriteTx(func(tx *sql.Tx) error {
+		var err error
+		if swept, err = stripTagsTx(tx, []int64{tagID}); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(`UPDATE tags SET usage_count = 0 WHERE id = ?`, tagID); err != nil {
 			return fmt.Errorf("zero usage: %w", err)
 		}
 		return nil
 	})
+	if err != nil || len(swept) == 0 {
+		return err
+	}
+	return s.RecalcIDs(swept)
 }
 
-// isRatingTag reports whether the tag with this id lives in the rating
-// category. Returns false on lookup error so a missing row falls through
-// to the existing ErrTagNotFound path in the caller.
 func (s *Service) isRatingTag(id int64) bool {
 	_, ok := s.ratingRowName(id)
 	return ok
 }
 
-// isLockedRatingTag reports whether the tag with this id is one of the
-// four canonical rating rows. Those are the rows the vocabulary is made
-// of; a rating-category row under any other name only reaches the
-// catalog through a raw import, which normalizes colours and the alias
-// graph but not rating names, and stays repairable.
+// Only the canonical four are locked: an import can leave other names in
+// the rating category, and those must stay repairable.
 func (s *Service) isLockedRatingTag(id int64) bool {
 	name, ok := s.ratingRowName(id)
 	return ok && IsCanonicalRating(name)
@@ -990,12 +886,8 @@ func (s *Service) ratingRowName(id int64) (string, bool) {
 	return name, catID == s.ratingCatID
 }
 
-// RenameTag renames a tag. The new name must pass validation and must
-// not collide with another tag in the same category.
 func (s *Service) RenameTag(id int64, newName string) error { return s.renameTag(id, newName, false) }
 
-// nameTaken returns the id of another tag holding (name, catID), or 0
-// when the slot is free. exceptID is the row being renamed or moved.
 func nameTaken(q db.RowQuerier, name string, catID, exceptID int64) (int64, error) {
 	var existing int64
 	switch err := q.QueryRow(
@@ -1009,19 +901,11 @@ func nameTaken(q db.RowQuerier, name string, catID, exceptID int64) (int64, erro
 	return existing, nil
 }
 
-// RenameTagKeepAlias renames the tag and installs its old name as an
-// alias of the renamed row in the same transaction, so searches and
-// adds of the old spelling keep resolving. Refused on alias rows - the
-// leftover alias would point at an alias, a chain the resolver doesn't
-// follow.
+// RenameTagKeepAlias leaves the old name behind as an alias of the renamed tag.
 func (s *Service) RenameTagKeepAlias(id int64, newName string) error {
 	return s.renameTag(id, newName, true)
 }
 
-// renameTag is the shared body: validate, load, refuse a locked rating
-// row, check the destination slot, rename. keepAlias also installs the
-// old spelling as an alias of the renamed row, which is why the whole
-// thing runs in one transaction either way.
 func (s *Service) renameTag(id int64, newName string, keepAlias bool) error {
 	normalized, err := ValidateTagName(newName)
 	if err != nil {
@@ -1032,17 +916,12 @@ func (s *Service) renameTag(id int64, newName string, keepAlias bool) error {
 		var oldName string
 		var isAlias int
 		if err := tx.QueryRow(`SELECT category_id, name, is_alias FROM tags WHERE id = ?`, id).Scan(&catID, &oldName, &isAlias); err != nil {
-			// Surface 404 for a missing id. The UPDATE below would
-			// otherwise no-op silently and the handler would report a
-			// successful rename for a tag that doesn't exist.
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrTagNotFound
 			}
 			return fmt.Errorf("look up tag %d: %w", id, err)
 		}
 		if keepAlias && isAlias == 1 {
-			// The leftover alias would point at an alias, a chain the
-			// resolver doesn't follow.
 			return fmt.Errorf("cannot keep the old name of an alias; rename it plainly")
 		}
 		if s.ratingCatID != 0 && catID == s.ratingCatID && IsCanonicalRating(oldName) {
@@ -1064,8 +943,6 @@ func (s *Service) renameTag(id int64, newName string, keepAlias bool) error {
 		if !keepAlias {
 			return nil
 		}
-		// The old (name, category) slot vacated inside this tx, so the
-		// alias insert cannot collide.
 		_, err = tx.Exec(
 			`INSERT INTO tags (name, category_id, is_alias, canonical_tag_id, usage_count, origin) VALUES (?, ?, 1, ?, 0, 'user')`,
 			oldName, catID, id,
@@ -1074,9 +951,6 @@ func (s *Service) renameTag(id int64, newName string, keepAlias bool) error {
 	})
 }
 
-// ErrCategoryCollision reports the (name, target category) collision a
-// category move runs into, carrying the surviving row's id so callers
-// can offer to merge into it instead.
 type ErrCategoryCollision struct {
 	Name       string
 	ExistingID int64
@@ -1086,10 +960,8 @@ func (e *ErrCategoryCollision) Error() string {
 	return fmt.Sprintf("a tag named %q already exists in the target category", e.Name)
 }
 
-// ChangeTagCategoryMerge is ChangeTagCategory that resolves a name
-// collision by merging the tag into the target category's existing row
-// (the moving tag becomes an alias of the survivor). The bool reports
-// whether a merge happened instead of a plain move.
+// ChangeTagCategoryMerge merges into the target's same-name tag on a
+// collision and reports whether it did.
 func (s *Service) ChangeTagCategoryMerge(tagID, newCategoryID int64) (bool, error) {
 	err := s.ChangeTagCategory(tagID, newCategoryID)
 	var coll *ErrCategoryCollision
@@ -1102,9 +974,6 @@ func (s *Service) ChangeTagCategoryMerge(tagID, newCategoryID int64) (bool, erro
 	return false, err
 }
 
-// ChangeTagCategory moves a tag to a different category. Returns
-// ErrTagNotFound, ErrCategoryNotFound, or ErrCategoryCollision when a
-// tag with the same name already lives in the target category.
 func (s *Service) ChangeTagCategory(tagID, newCategoryID int64) error {
 	var currentCatID int64
 	var name string
@@ -1116,8 +985,6 @@ func (s *Service) ChangeTagCategory(tagID, newCategoryID int64) error {
 	if currentCatID == newCategoryID {
 		return nil
 	}
-	// Moving in stays refused whatever the name: the category takes only
-	// its four canonical rows. Moving out is refused only for those rows.
 	if s.ratingCatID != 0 && newCategoryID == s.ratingCatID {
 		return ErrRatingCategoryClosed
 	}
@@ -1130,8 +997,6 @@ func (s *Service) ChangeTagCategory(tagID, newCategoryID int64) error {
 	).Scan(&catExists); err != nil || catExists == 0 {
 		return ErrCategoryNotFound
 	}
-	// Reject up front so the user gets a clean message rather than the
-	// raw UNIQUE(name, category_id) constraint error.
 	existing, err := nameTaken(s.db.Read, name, newCategoryID, tagID)
 	if err != nil {
 		return err

@@ -1,12 +1,6 @@
-// Package metadata reads what a file says about itself: Stable Diffusion
-// parameters from A1111 and Forge, ComfyUI workflows in both the API and
-// the workflow shape, EXIF, and ComicInfo out of an archive. Every input
-// is a file somebody else wrote, so nothing here trusts a length, an
-// offset or a type, and a malformed one is a miss rather than a failure.
-//
-// It is pure: it takes bytes and returns structs. Storing what it found is
-// internal/gallery's job, which is why this package has no database import
-// and no knowledge of an image id.
+// Package metadata reads generation parameters, EXIF and ComicInfo out of
+// files. Every input is untrusted: no length, offset or type is believed,
+// and a malformed file is a miss, not a failure.
 package metadata
 
 import (
@@ -16,9 +10,6 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-// Extract reads SD and/or ComfyUI metadata from a file. Either return
-// can be nil; parsing is best-effort and failures surface as nil rather
-// than errors.
 func Extract(path, fileType string) (*models.SDMetadata, *models.ComfyUIMetadata, error) {
 	switch fileType {
 	case "png":
@@ -34,9 +25,8 @@ func Extract(path, fileType string) (*models.SDMetadata, *models.ComfyUIMetadata
 	}
 }
 
-// ExtractGeneric returns key-value pairs the SD and ComfyUI parsers
-// don't consume (extra PNG text chunks, EXIF tags). Best-effort; file
-// errors return an empty slice.
+// ExtractGeneric returns the key-value pairs the SD and ComfyUI parsers
+// leave unread.
 func ExtractGeneric(path, fileType string) []models.SDParam {
 	switch fileType {
 	case "png":
@@ -84,8 +74,6 @@ func genericFromEXIF(path string) []models.SDParam {
 	return collectEXIFTags(x)
 }
 
-// collectEXIFTags walks every EXIF tag across all IFDs and returns them
-// as key/value pairs. UserComment is skipped because it's the SD source.
 func collectEXIFTags(x *exifData) []models.SDParam {
 	out := make([]models.SDParam, 0, len(x.tags))
 	x.walk(func(name string, tag *exifTag) {
@@ -96,4 +84,26 @@ func collectEXIFTags(x *exifData) []models.SDParam {
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
+}
+
+func EXIFOrientation(path, fileType string) (int, bool) {
+	var x *exifData
+	switch fileType {
+	case "jpeg":
+		x = decodeJPEGEXIF(path)
+	case "webp":
+		x, _ = decodeWebPEXIF(path)
+	}
+	if x == nil {
+		return 0, false
+	}
+	tag, ok := x.get("Orientation")
+	if !ok {
+		return 0, false
+	}
+	v, ok := tag.intAt(0)
+	if !ok {
+		return 0, false
+	}
+	return int(v), true
 }
