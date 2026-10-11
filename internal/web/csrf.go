@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"log"
 	"mime"
 	"net/http"
 	"strings"
@@ -14,9 +13,7 @@ import (
 
 func mustRandBytes(n int) []byte {
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		log.Fatalf("FATAL: failed to generate CSRF secret: %v", err)
-	}
+	_, _ = rand.Read(b)
 	return b
 }
 
@@ -115,13 +112,6 @@ func (s *Server) cSRFMiddleware(next http.Handler) http.Handler {
 }
 
 func isMultipart(r *http.Request) bool {
-	ct := r.Header.Get("Content-Type")
-	if ct == "" {
-		return false
-	}
-	mt, _, err := mime.ParseMediaType(ct)
-	if err != nil {
-		return false
-	}
-	return len(mt) > 10 && mt[:10] == "multipart/"
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && strings.HasPrefix(mt, "multipart/")
 }

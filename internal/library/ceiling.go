@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -35,29 +36,8 @@ func (c *Ceiling) IsActive() bool {
 	return c.level != "" && c.level != "explicit"
 }
 
-// The executor turns this chain back into one rating_rank comparison, so it
-// must keep excluding every level above the ceiling.
 func (c *Ceiling) Apply(userExpr search.Expr) search.Expr {
-	if c == nil || !c.IsActive() {
-		return userExpr
-	}
-	rank := tags.RatingRank(c.level)
-	if rank < 0 || rank >= len(tags.RatingLevels)-1 {
-		return userExpr
-	}
-	var ce search.Expr
-	for i := rank + 1; i < len(tags.RatingLevels); i++ {
-		not := search.NotExpr{Expr: search.FilterExpr{Key: "rating", Val: tags.RatingLevels[i]}}
-		if ce == nil {
-			ce = not
-		} else {
-			ce = search.AndExpr{Left: ce, Right: not}
-		}
-	}
-	if userExpr == nil {
-		return ce
-	}
-	return search.AndExpr{Left: userExpr, Right: ce}
+	return search.ApplyCeiling(userExpr, c.Level())
 }
 
 func (c *Ceiling) ExcludedTagIDs() []int64 {
@@ -126,38 +106,34 @@ func (c *Ceiling) RankCeiling() (int, bool) {
 	return tags.RatingRank(c.level), true
 }
 
-// Probing the few ids at hand beats preloading every over-ceiling image.
-// A read error keeps the row visible rather than failing the page.
-func (c *Ceiling) AnyTainted(ids []int64) bool {
+func (c *Ceiling) RankFilter() gallery.RankCeiling {
 	rank, active := c.RankCeiling()
-	if !active || len(ids) == 0 || c.cx == nil || c.cx.DB == nil {
-		return false
-	}
-	const chunk = 500
-	for start := 0; start < len(ids); start += chunk {
-		end := start + chunk
-		if end > len(ids) {
-			end = len(ids)
-		}
-		in, args := db.InPlaceholders(ids[start:end])
-		var tainted int
-		err := c.cx.DB.Read.QueryRow(
-			`SELECT EXISTS (SELECT 1 FROM images WHERE id IN (`+in+`) AND rating_rank > ?)`,
-			append(args, rank)...,
-		).Scan(&tainted)
-		if err != nil {
-			logx.Debugf("ceiling tainted probe: %v", err)
-			return false
-		}
-		if tainted != 0 {
-			return true
-		}
-	}
-	return false
+	return gallery.RankCeiling{Rank: rank, Active: active}
 }
 
-// g may be nil: Apply still works, ExcludedTagIDs returns nil and
-// AnyTainted false.
+// TaintedAmong reads, in one query, the over-ceiling ids among the
+// endpoints of table's colA and colB. A read error keeps every row visible
+// rather than failing the page.
+func (c *Ceiling) TaintedAmong(table, colA, colB string) map[int64]bool {
+	rank, active := c.RankCeiling()
+	if !active || c.cx == nil || c.cx.DB == nil {
+		return nil
+	}
+	tainted := map[int64]bool{}
+	err := db.QueryIDsFunc(c.cx.DB.Read, func(id int64) bool {
+		tainted[id] = true
+		return true
+	}, `SELECT id FROM images WHERE rating_rank > ? AND id IN (
+		SELECT `+colA+` FROM `+table+` UNION SELECT `+colB+` FROM `+table+`)`, rank)
+	if err != nil {
+		logx.Debugf("ceiling tainted read: %v", err)
+		return nil
+	}
+	return tainted
+}
+
+// g may be nil: Apply still works, ExcludedTagIDs and TaintedAmong
+// return nil.
 func NewCeiling(level string, g *Gallery) *Ceiling {
 	return &Ceiling{level: level, cx: g}
 }

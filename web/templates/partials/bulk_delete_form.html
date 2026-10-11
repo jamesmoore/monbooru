@@ -6,7 +6,6 @@
       {{if .ConfirmDanger}}data-confirm-danger="{{.ConfirmDanger}}"
       {{end}}data-confirm-ok="{{.ConfirmOK}}"
       style="display:inline">
-  <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
   {{if .All}}<input type="hidden" name="all" value="true">{{end}}
   <button type="submit" class="btn-danger btn-sm">{{.Label}}</button>
 </form>

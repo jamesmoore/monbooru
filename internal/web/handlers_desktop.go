@@ -1,6 +1,7 @@
 package web
 
 import (
+	"cmp"
 	"io/fs"
 	"net"
 	"net/http"
@@ -17,14 +18,17 @@ import (
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
-// The bind address is no condition: Restart must survive the wizard's
-// network choice. A forwarded hop is refused: behind a same-host proxy
-// every peer is loopback. Callers 404 so nothing is advertised.
+// The bind address is no condition: Restart must survive the wizard's network
+// choice. A forwarded hop is refused (behind a same-host proxy every peer is
+// loopback), as is a non-loopback Host (DNS rebinding). Callers 404 to hide it.
 func (s *Server) desktopLocal(r *http.Request) bool {
 	if !s.desktop {
 		return false
 	}
 	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("Forwarded") != "" {
+		return false
+	}
+	if !desktop.IsLoopbackAddr(r.Host) {
 		return false
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -72,13 +76,8 @@ func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
 		data.Roots = append(data.Roots, browseEntry{Name: root, Path: root})
 	}
 
-	path := strings.TrimSpace(r.URL.Query().Get("path"))
-	if path == "" {
-		path, _ = os.UserHomeDir()
-	}
-	if path == "" {
-		path = string(filepath.Separator)
-	}
+	home, _ := os.UserHomeDir()
+	path := cmp.Or(strings.TrimSpace(r.URL.Query().Get("path")), home, string(filepath.Separator))
 	data.Path = filepath.Clean(path)
 	if parent := filepath.Dir(data.Path); parent != data.Path {
 		data.Parent = parent
@@ -199,7 +198,7 @@ func (s *Server) DesktopHook() desktop.Hook { return s.desktopHook() }
 func (s *Server) desktopHook() desktop.Hook {
 	icon, _ := fs.ReadFile(s.staticFS, "appicon.png")
 	return desktop.Hook{
-		App:     "monbooru",
+		App:     s.desktopApp,
 		Name:    s.booruName(),
 		Comment: "Lightweight and fast private booru",
 		Icon:    icon,

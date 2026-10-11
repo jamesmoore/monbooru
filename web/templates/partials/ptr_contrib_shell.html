@@ -7,9 +7,7 @@
 <dialog id="ptr-contrib-dialog" class="ptr-contrib-dialog">
   <form id="ptr-contrib-form" data-verb="{{.Verb}}" data-noun="{{.Noun}}"
         hx-post="{{.PostURL}}"
-        hx-target="#ptr-contrib-flash" hx-swap="innerHTML"
-        hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'>
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+        hx-target="#ptr-contrib-flash" hx-swap="innerHTML">
     {{if .SHA256}}<input type="hidden" name="sha256" value="{{.SHA256}}">{{end}}
     <header class="ptr-contrib-dialog-head">
       <strong>contribute to the Public Tag Repository</strong>

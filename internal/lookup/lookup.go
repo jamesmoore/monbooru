@@ -12,6 +12,14 @@ const (
 	BackendBooru = "booru"
 )
 
+// Backends lists the history rows a lookup on monloader's backend covers.
+func Backends(name string) []string {
+	if name == "all" {
+		return []string{BackendPTR, BackendBooru}
+	}
+	return []string{name}
+}
+
 const (
 	ResultHit   = "hit"
 	ResultMiss  = "miss"

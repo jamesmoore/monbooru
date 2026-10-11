@@ -82,35 +82,27 @@ func (s *Service) GetOrCreateTagFrom(name string, categoryID int64, origin strin
 		return nil, err
 	}
 
-	var tag *models.Tag
-	err = s.inWriteTx(func(tx *sql.Tx) error {
-		var txErr error
-		tag, txErr = getOrCreateTagTx(tx, normalized, categoryID, origin)
-		return txErr
+	return writeTx(s, func(tx *sql.Tx) (*models.Tag, error) {
+		return getOrCreateTagTx(tx, normalized, categoryID, origin)
 	})
-	return tag, err
 }
 
 func (s *Service) GetOrCreateTagsFrom(names []string, categoryID int64, origin string) ([]int64, error) {
-	ids := make([]int64, 0, len(names))
-	err := s.inWriteTx(func(tx *sql.Tx) error {
+	return writeTx(s, func(tx *sql.Tx) ([]int64, error) {
+		ids := make([]int64, 0, len(names))
 		for _, name := range names {
 			normalized, err := s.validateTagIn(name, categoryID)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			tag, err := getOrCreateTagTx(tx, normalized, categoryID, origin)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			ids = append(ids, tag.ID)
 		}
-		return nil
+		return ids, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return ids, nil
 }
 
 func (s *Service) validateTagIn(name string, categoryID int64) (string, error) {
@@ -124,31 +116,48 @@ func (s *Service) validateTagIn(name string, categoryID int64) (string, error) {
 	return normalized, nil
 }
 
+// FindTag resolves a name as GetOrCreateTag does, normalised and an alias
+// followed to its canonical, but never creates one: a miss is ErrTagNotFound.
+func (s *Service) FindTag(name string, categoryID int64) (*models.Tag, error) {
+	tag, err := lookupTag(s.db.Read, NormalizeTagName(name), categoryID)
+	if err == nil && tag == nil {
+		return nil, ErrTagNotFound
+	}
+	return tag, err
+}
+
 func getOrCreateTagTx(tx *sql.Tx, name string, categoryID int64, origin string) (*models.Tag, error) {
+	tag, err := lookupTag(tx, name, categoryID)
+	if err != nil || tag != nil {
+		return tag, err
+	}
+	var id int64
+	if err := tx.QueryRow(
+		`INSERT INTO tags (name, category_id, origin) VALUES (?, ?, ?) RETURNING id`,
+		name, categoryID, origin,
+	).Scan(&id); err != nil {
+		return nil, fmt.Errorf("inserting tag: %w", err)
+	}
+	return &models.Tag{
+		ID:         id,
+		Name:       name,
+		CategoryID: categoryID,
+		Origin:     origin,
+		CreatedAt:  time.Now().UTC(),
+	}, nil
+}
+
+// lookupTag returns nil, nil when nothing holds the name.
+func lookupTag(q db.RowQuerier, name string, categoryID int64) (*models.Tag, error) {
 	var tag models.Tag
 	var createdAt string
 	var canonicalID sql.NullInt64
-	err := tx.QueryRow(
+	err := q.QueryRow(
 		`SELECT id, name, category_id, usage_count, is_alias, canonical_tag_id, created_at FROM tags WHERE name = ? AND category_id = ?`,
 		name, categoryID,
 	).Scan(&tag.ID, &tag.Name, &tag.CategoryID, &tag.UsageCount, &tag.IsAlias, &canonicalID, &createdAt)
-
-	if err == sql.ErrNoRows {
-		var id int64
-		if err := tx.QueryRow(
-			`INSERT INTO tags (name, category_id, origin) VALUES (?, ?, ?) RETURNING id`,
-			name, categoryID, origin,
-		).Scan(&id); err != nil {
-			return nil, fmt.Errorf("inserting tag: %w", err)
-		}
-		tag = models.Tag{
-			ID:         id,
-			Name:       name,
-			CategoryID: categoryID,
-			Origin:     origin,
-			CreatedAt:  time.Now().UTC(),
-		}
-		return &tag, nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
@@ -160,7 +169,7 @@ func getOrCreateTagTx(tx *sql.Tx, name string, categoryID int64, origin string) 
 	if tag.IsAlias && canonicalID.Valid {
 		var canon models.Tag
 		var canonCreated string
-		if err := tx.QueryRow(
+		if err := q.QueryRow(
 			`SELECT id, name, category_id, usage_count, is_alias, created_at FROM tags WHERE id = ?`,
 			canonicalID.Int64,
 		).Scan(&canon.ID, &canon.Name, &canon.CategoryID, &canon.UsageCount, &canon.IsAlias, &canonCreated); err != nil {
@@ -319,38 +328,22 @@ func (s *Service) ListTags(filter TagFilter) ([]models.Tag, int, error) {
 	tagList, err := db.QueryAll(s.db.Read, func(rows *sql.Rows) (models.Tag, error) {
 		var t models.Tag
 		var isAlias int
-		var canonicalID sql.NullInt64
 		var createdAt string
-		var lastUsed sql.NullString
-		var foldedInto sql.NullString
-		var canonName, canonCatName, canonCatColor sql.NullString
+		var lastUsed, foldedInto, canonName, canonCatName, canonCatColor sql.NullString
 		if err := rows.Scan(
 			&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
-			&t.UsageCount, &isAlias, &canonicalID, &createdAt,
+			&t.UsageCount, &isAlias, &t.CanonicalTagID, &createdAt,
 			&t.Origin, &lastUsed, &t.StaleUsage, &foldedInto,
 			&canonName, &canonCatName, &canonCatColor,
 		); err != nil {
 			return t, err
 		}
-		if foldedInto.Valid {
-			t.FoldedInto = foldedInto.String
-		}
-		if lastUsed.Valid {
-			t.LastUsedAt, _ = time.Parse(time.RFC3339, lastUsed.String)
-		}
+		t.FoldedInto = foldedInto.String
+		t.LastUsedAt, _ = time.Parse(time.RFC3339, lastUsed.String)
 		t.IsAlias = isAlias == 1
-		if canonicalID.Valid {
-			t.CanonicalTagID = &canonicalID.Int64
-		}
-		if canonName.Valid {
-			t.CanonicalName = canonName.String
-		}
-		if canonCatName.Valid {
-			t.CanonicalCategoryName = canonCatName.String
-		}
-		if canonCatColor.Valid {
-			t.CanonicalCategoryColor = canonCatColor.String
-		}
+		t.CanonicalName = canonName.String
+		t.CanonicalCategoryName = canonCatName.String
+		t.CanonicalCategoryColor = canonCatColor.String
 		t.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		return t, nil
 	}, query, args...)
@@ -401,11 +394,9 @@ func (s *Service) OriginCounts(typeFilter string) ([]OriginCount, error) {
 	case "tag":
 		where = " AND is_alias = 0"
 	}
-	return db.QueryAll(s.db.Read, func(rows *sql.Rows) (OriginCount, error) {
-		var oc OriginCount
-		err := rows.Scan(&oc.Label, &oc.Count)
-		return oc, err
-	},
+	return db.QueryAll(s.db.Read, db.ScanRow(func(oc *OriginCount) []any {
+		return []any{&oc.Label, &oc.Count}
+	}),
 		`SELECT origin, COUNT(*) FROM tags WHERE origin <> ''`+where+
 			` GROUP BY origin ORDER BY COUNT(*) DESC, origin ASC`,
 	)
@@ -413,18 +404,7 @@ func (s *Service) OriginCounts(typeFilter string) ([]OriginCount, error) {
 
 func (s *Service) AutoTaggerLabels(labels []string) (map[string]struct{}, error) {
 	set := make(map[string]struct{})
-	seen := make(map[string]struct{}, len(labels))
-	var wanted []string
-	for _, l := range labels {
-		if l == "" {
-			continue
-		}
-		if _, dup := seen[l]; dup {
-			continue
-		}
-		seen[l] = struct{}{}
-		wanted = append(wanted, l)
-	}
+	wanted := slices.DeleteFunc(slices.Compact(slices.Sorted(slices.Values(labels))), func(l string) bool { return l == "" })
 	if len(wanted) == 0 {
 		return set, nil
 	}
@@ -484,9 +464,7 @@ func (s *Service) AdjacentTags(filter TagFilter, id int64) (prev, next *int64, e
 func (s *Service) GetTag(id int64) (*models.Tag, error) {
 	var t models.Tag
 	var isAlias int
-	var canonicalID sql.NullInt64
 	var createdAt string
-
 	var lastUsed sql.NullString
 	err := s.db.Read.QueryRow(
 		`SELECT t.id, t.name, t.category_id, tc.name, tc.color, t.usage_count,
@@ -496,7 +474,7 @@ func (s *Service) GetTag(id int64) (*models.Tag, error) {
 		 WHERE t.id = ?`, id,
 	).Scan(
 		&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
-		&t.UsageCount, &isAlias, &canonicalID, &createdAt, &t.Origin, &lastUsed,
+		&t.UsageCount, &isAlias, &t.CanonicalTagID, &createdAt, &t.Origin, &lastUsed,
 	)
 	if err == sql.ErrNoRows {
 		return nil, ErrTagNotFound
@@ -506,13 +484,8 @@ func (s *Service) GetTag(id int64) (*models.Tag, error) {
 	}
 
 	t.IsAlias = isAlias == 1
-	if canonicalID.Valid {
-		t.CanonicalTagID = &canonicalID.Int64
-	}
 	t.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-	if lastUsed.Valid {
-		t.LastUsedAt, _ = time.Parse(time.RFC3339, lastUsed.String)
-	}
+	t.LastUsedAt, _ = time.Parse(time.RFC3339, lastUsed.String)
 	return &t, nil
 }
 
@@ -568,20 +541,17 @@ type AliasKey struct {
 
 // SyncAliasStaleness only flags or clears: the operator decides what to remove.
 func (s *Service) SyncAliasStaleness(canonicalID int64, origin string, fresh map[AliasKey]bool) (int, error) {
-	flagged := 0
-	err := s.inWriteTx(func(tx *sql.Tx) error {
+	return writeTx(s, func(tx *sql.Tx) (int, error) {
 		type aliasRow struct {
 			id, catID, stale int64
 			name             string
 		}
-		present, err := db.QueryAll(tx, func(rows *sql.Rows) (aliasRow, error) {
-			var a aliasRow
-			err := rows.Scan(&a.id, &a.catID, &a.name, &a.stale)
-			return a, err
-		}, `SELECT id, category_id, name, stale FROM tags
+		present, err := db.QueryAll(tx, db.ScanRow(func(a *aliasRow) []any {
+			return []any{&a.id, &a.catID, &a.name, &a.stale}
+		}), `SELECT id, category_id, name, stale FROM tags
 			 WHERE is_alias = 1 AND canonical_tag_id = ? AND origin = ?`, canonicalID, origin)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		var flag, clear []int64
 		for _, a := range present {
@@ -593,15 +563,13 @@ func (s *Service) SyncAliasStaleness(canonicalID int64, origin string, fresh map
 			}
 		}
 		if err := setTagsStaleTx(tx, flag, 1); err != nil {
-			return err
+			return 0, err
 		}
 		if err := setTagsStaleTx(tx, clear, 0); err != nil {
-			return err
+			return 0, err
 		}
-		flagged = len(flag)
-		return nil
+		return len(flag), nil
 	})
-	return flagged, err
 }
 
 func setTagsStaleTx(tx *sql.Tx, ids []int64, stale int) error {
@@ -718,7 +686,7 @@ func (s *Service) GetImageTags(imageID int64) (string, []models.ImageTag, error)
 			usage      sql.NullInt64
 			isAuto     sql.NullInt64
 			isImplied  sql.NullInt64
-			conf       sql.NullFloat64
+			conf       *float64
 			tagger     sql.NullString
 			stale      sql.NullInt64
 			createdAt  sql.NullString
@@ -730,9 +698,7 @@ func (s *Service) GetImageTags(imageID int64) (string, []models.ImageTag, error)
 		); err != nil {
 			return "", nil, err
 		}
-		if folderPath.Valid {
-			folder = folderPath.String
-		}
+		folder = folderPath.String
 		if !imgID.Valid || !tagID.Valid {
 			continue
 		}
@@ -746,35 +712,27 @@ func (s *Service) GetImageTags(imageID int64) (string, []models.ImageTag, error)
 			IsAuto:     isAuto.Int64 == 1,
 			IsImplied:  isImplied.Int64 == 1,
 			Stale:      stale.Int64 == 1,
+			Confidence: conf,
+			TaggerName: tagger.String,
 		}
-		if conf.Valid {
-			it.Confidence = &conf.Float64
-		}
-		if tagger.Valid {
-			it.TaggerName = tagger.String
-		}
-		if createdAt.Valid {
-			it.CreatedAt, _ = time.Parse(time.RFC3339, createdAt.String)
-		}
+		it.CreatedAt, _ = time.Parse(time.RFC3339, createdAt.String)
 		result = append(result, it)
 	}
 	return folder, result, rows.Err()
 }
 
 // The FK cascade alone would strand implied rows, so the sweep runs here.
-// The caller deletes the tag rows and must RecalcIDs the returned tags
-// after commit.
-func deleteTagsTx(tx *sql.Tx, ids []int64) ([]int64, error) {
-	swept, err := stripTagsTx(tx, ids)
-	if err != nil {
-		return nil, err
+// The caller deletes the tag rows.
+func deleteTagsTx(tx *sql.Tx, ids []int64) error {
+	if err := stripTagsTx(tx, ids); err != nil {
+		return err
 	}
 	for _, id := range ids {
 		// Old rows can chain alias -> alias, even back through this tag.
 		// Clearing its own pointer first and dropping the chain in one
 		// statement keeps every FK check satisfied.
 		if _, err := tx.Exec(`UPDATE tags SET canonical_tag_id = NULL WHERE id = ?`, id); err != nil {
-			return nil, fmt.Errorf("unlink canonical: %w", err)
+			return fmt.Errorf("unlink canonical: %w", err)
 		}
 		if _, err := tx.Exec(
 			`DELETE FROM tags WHERE id IN (
@@ -786,32 +744,31 @@ func deleteTagsTx(tx *sql.Tx, ids []int64) ([]int64, error) {
 			     SELECT id FROM sub
 			 )`, id,
 		); err != nil {
-			return nil, fmt.Errorf("delete aliases: %w", err)
+			return fmt.Errorf("delete aliases: %w", err)
 		}
 	}
-	return swept, nil
+	return nil
 }
 
 // Only the images that carried a stripped tag can have lost a parent.
-func stripTagsTx(tx *sql.Tx, ids []int64) ([]int64, error) {
+func stripTagsTx(tx *sql.Tx, ids []int64) error {
 	var carriers []int64
 	for _, id := range ids {
 		got, err := db.QueryIDs(tx, `DELETE FROM image_tags WHERE tag_id = ? RETURNING image_id`, id)
 		if err != nil {
-			return nil, fmt.Errorf("strip parent image_tags: %w", err)
+			return fmt.Errorf("strip parent image_tags: %w", err)
 		}
 		carriers = append(carriers, got...)
 	}
 	slices.Sort(carriers)
 	carriers = slices.Compact(carriers)
-	seen := map[int64]struct{}{}
 	if err := db.Chunked(carriers, 500, func(chunk []int64) error {
-		_, err := pruneOrphanedImpliedTx(tx, chunk, seen)
+		_, err := pruneOrphanedImpliedTx(tx, chunk)
 		return err
 	}); err != nil {
-		return nil, fmt.Errorf("sweep implied: %w", err)
+		return fmt.Errorf("sweep implied: %w", err)
 	}
-	return tagIDsFromSet(seen), nil
+	return nil
 }
 
 // DeleteTag keeps a canonical rating row and only strips it from every image.
@@ -819,11 +776,8 @@ func (s *Service) DeleteTag(id int64) error {
 	if s.isLockedRatingTag(id) {
 		return s.stripTagFromAllImages(id)
 	}
-	var swept []int64
-	err := s.inWriteTx(func(tx *sql.Tx) error {
-		var err error
-		swept, err = deleteTagsTx(tx, []int64{id})
-		if err != nil {
+	return s.inWriteTx(func(tx *sql.Tx) error {
+		if err := deleteTagsTx(tx, []int64{id}); err != nil {
 			return err
 		}
 		res, err := tx.Exec(`DELETE FROM tags WHERE id = ?`, id)
@@ -835,20 +789,11 @@ func (s *Service) DeleteTag(id int64) error {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	if len(swept) > 0 {
-		return s.RecalcIDs(swept)
-	}
-	return nil
 }
 
 func (s *Service) stripTagFromAllImages(tagID int64) error {
-	var swept []int64
-	err := s.inWriteTx(func(tx *sql.Tx) error {
-		var err error
-		if swept, err = stripTagsTx(tx, []int64{tagID}); err != nil {
+	return s.inWriteTx(func(tx *sql.Tx) error {
+		if err := stripTagsTx(tx, []int64{tagID}); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`UPDATE tags SET usage_count = 0 WHERE id = ?`, tagID); err != nil {
@@ -856,10 +801,6 @@ func (s *Service) stripTagFromAllImages(tagID int64) error {
 		}
 		return nil
 	})
-	if err != nil || len(swept) == 0 {
-		return err
-	}
-	return s.RecalcIDs(swept)
 }
 
 func (s *Service) isRatingTag(id int64) bool {
@@ -911,44 +852,61 @@ func (s *Service) renameTag(id int64, newName string, keepAlias bool) error {
 	if err != nil {
 		return err
 	}
-	return s.inWriteTx(func(tx *sql.Tx) error {
-		var catID int64
-		var oldName string
-		var isAlias int
-		if err := tx.QueryRow(`SELECT category_id, name, is_alias FROM tags WHERE id = ?`, id).Scan(&catID, &oldName, &isAlias); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrTagNotFound
-			}
-			return fmt.Errorf("look up tag %d: %w", id, err)
-		}
-		if keepAlias && isAlias == 1 {
-			return fmt.Errorf("cannot keep the old name of an alias; rename it plainly")
-		}
-		if s.ratingCatID != 0 && catID == s.ratingCatID && IsCanonicalRating(oldName) {
-			return ErrRatingTagImmutable
-		}
-		if oldName == normalized {
-			return nil
-		}
-		existing, err := nameTaken(tx, normalized, catID, id)
-		if err != nil {
-			return err
-		}
-		if existing != 0 {
-			return fmt.Errorf("a tag named %q already exists in this category", normalized)
-		}
-		if _, err := tx.Exec(`UPDATE tags SET name = ? WHERE id = ?`, normalized, id); err != nil {
-			return err
-		}
-		if !keepAlias {
-			return nil
-		}
-		_, err = tx.Exec(
-			`INSERT INTO tags (name, category_id, is_alias, canonical_tag_id, usage_count, origin) VALUES (?, ?, 1, ?, 0, 'user')`,
-			oldName, catID, id,
-		)
+	return s.inWriteTx(func(tx *sql.Tx) error { return s.renameTagTx(tx, id, normalized, keepAlias) })
+}
+
+// RenameAndMoveTag stores both or neither, so a refused move leaves the
+// old name.
+func (s *Service) RenameAndMoveTag(id int64, newName string, newCategoryID int64) error {
+	normalized, err := ValidateTagName(newName)
+	if err != nil {
 		return err
+	}
+	return s.inWriteTx(func(tx *sql.Tx) error {
+		if err := s.renameTagTx(tx, id, normalized, false); err != nil {
+			return err
+		}
+		return s.changeTagCategoryTx(tx, id, newCategoryID)
 	})
+}
+
+func (s *Service) renameTagTx(tx *sql.Tx, id int64, normalized string, keepAlias bool) error {
+	var catID int64
+	var oldName string
+	var isAlias int
+	if err := tx.QueryRow(`SELECT category_id, name, is_alias FROM tags WHERE id = ?`, id).Scan(&catID, &oldName, &isAlias); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrTagNotFound
+		}
+		return fmt.Errorf("look up tag %d: %w", id, err)
+	}
+	if keepAlias && isAlias == 1 {
+		return fmt.Errorf("cannot keep the old name of an alias; rename it plainly")
+	}
+	if s.ratingCatID != 0 && catID == s.ratingCatID && IsCanonicalRating(oldName) {
+		return ErrRatingTagImmutable
+	}
+	if oldName == normalized {
+		return nil
+	}
+	existing, err := nameTaken(tx, normalized, catID, id)
+	if err != nil {
+		return err
+	}
+	if existing != 0 {
+		return fmt.Errorf("a tag named %q %w", normalized, ErrTagNameTaken)
+	}
+	if _, err := tx.Exec(`UPDATE tags SET name = ? WHERE id = ?`, normalized, id); err != nil {
+		return err
+	}
+	if !keepAlias {
+		return nil
+	}
+	_, err = tx.Exec(
+		`INSERT INTO tags (name, category_id, is_alias, canonical_tag_id, usage_count, origin) VALUES (?, ?, 1, ?, 0, 'user')`,
+		oldName, catID, id,
+	)
+	return err
 }
 
 type ErrCategoryCollision struct {
@@ -975,9 +933,13 @@ func (s *Service) ChangeTagCategoryMerge(tagID, newCategoryID int64) (bool, erro
 }
 
 func (s *Service) ChangeTagCategory(tagID, newCategoryID int64) error {
+	return s.inWriteTx(func(tx *sql.Tx) error { return s.changeTagCategoryTx(tx, tagID, newCategoryID) })
+}
+
+func (s *Service) changeTagCategoryTx(tx *sql.Tx, tagID, newCategoryID int64) error {
 	var currentCatID int64
 	var name string
-	if err := s.db.Read.QueryRow(
+	if err := tx.QueryRow(
 		`SELECT category_id, name FROM tags WHERE id = ?`, tagID,
 	).Scan(&currentCatID, &name); err != nil {
 		return ErrTagNotFound
@@ -992,18 +954,18 @@ func (s *Service) ChangeTagCategory(tagID, newCategoryID int64) error {
 		return ErrRatingTagImmutable
 	}
 	var catExists int
-	if err := s.db.Read.QueryRow(
+	if err := tx.QueryRow(
 		`SELECT COUNT(*) FROM tag_categories WHERE id = ?`, newCategoryID,
 	).Scan(&catExists); err != nil || catExists == 0 {
 		return ErrCategoryNotFound
 	}
-	existing, err := nameTaken(s.db.Read, name, newCategoryID, tagID)
+	existing, err := nameTaken(tx, name, newCategoryID, tagID)
 	if err != nil {
 		return err
 	}
 	if existing != 0 {
 		return &ErrCategoryCollision{Name: name, ExistingID: existing}
 	}
-	_, err = s.db.Write.Exec(`UPDATE tags SET category_id = ? WHERE id = ?`, newCategoryID, tagID)
+	_, err = tx.Exec(`UPDATE tags SET category_id = ? WHERE id = ?`, newCategoryID, tagID)
 	return err
 }

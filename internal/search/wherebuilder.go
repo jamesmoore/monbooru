@@ -13,9 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/monbooru/monbooru/internal/counts"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/lookup"
+	"github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/relations"
 	"github.com/monbooru/monbooru/internal/searchkw"
 	"github.com/monbooru/monbooru/internal/tags"
 	"github.com/monbooru/monbooru/internal/upgrade"
@@ -118,10 +121,6 @@ func containsMissingFilter(expr Expr) bool {
 // where walking the sort index and testing each row beats the planner's
 // idx_images_missing walk plus a temp sort.
 func columnFilterIndexHint(expr Expr, sort string) string {
-	f, ok := expr.(FilterExpr)
-	if !ok || f.Val == "" {
-		return ""
-	}
 	sortHint := func() string {
 		switch sort {
 		case "filesize":
@@ -129,6 +128,17 @@ func columnFilterIndexHint(expr Expr, sort string) string {
 		default:
 			return " INDEXED BY idx_images_ingested_visible"
 		}
+	}
+	// A workflow term matches few rows, so its negation matches most.
+	if n, ok := expr.(NotExpr); ok {
+		if f, ok := n.Expr.(FilterExpr); ok && f.Key == "comfyui" && f.Val != "" {
+			return sortHint()
+		}
+		return ""
+	}
+	f, ok := expr.(FilterExpr)
+	if !ok || f.Val == "" {
+		return ""
 	}
 	switch f.Key {
 	case "fav":
@@ -211,16 +221,12 @@ func collectAndedTags(expr Expr) []TagExpr {
 // WalkAndedLeaves visits only what every match must satisfy: an Or or Not
 // node is handed to visit whole.
 func WalkAndedLeaves(expr Expr, visit func(Expr)) {
-	var walk func(Expr)
-	walk = func(e Expr) {
-		if v, ok := e.(AndExpr); ok {
-			walk(v.Left)
-			walk(v.Right)
-			return
-		}
-		visit(e)
+	if v, ok := expr.(AndExpr); ok {
+		WalkAndedLeaves(v.Left, visit)
+		WalkAndedLeaves(v.Right, visit)
+		return
 	}
-	walk(expr)
+	visit(expr)
 }
 
 // A wildcard's many canonicals or 3+ ANDed tags leave the cursor no seekable
@@ -268,13 +274,7 @@ func pickAndDriverTag(database *db.DB, expr Expr, allowSingleLiteral bool) ([]an
 	if len(tagLeaves)+len(filterLeaves) == 0 {
 		return nil, false
 	}
-	hasWildcard := false
-	for _, leaf := range tagLeaves {
-		if leaf.Wildcard != "" {
-			hasWildcard = true
-			break
-		}
-	}
+	hasWildcard := slices.ContainsFunc(tagLeaves, func(leaf TagExpr) bool { return leaf.Wildcard != "" })
 	// A lone literal is one EXISTS the planner handles well; a wildcard's
 	// LIST SUBQUERY scans every tag row, so even one pays to materialise.
 	if !hasWildcard && (len(tagLeaves)+len(filterLeaves)) < 2 && !allowSingleLiteral {
@@ -468,6 +468,8 @@ type whereBuilder struct {
 	args             []any
 	hasMissingFilter bool
 	db               *db.DB
+	tree             *relations.BKTree
+	tallies          *counts.Tallies
 	ratingIDs        map[string]int64
 	ratingUsage      map[string]int64
 	ratingResolved   bool
@@ -488,7 +490,11 @@ func (b *whereBuilder) similaritySeed(imageID int64) (tags.OverlapSeed, bool) {
 	if b.db == nil {
 		return tags.OverlapSeed{}, false
 	}
-	seed, err := tags.LoadOverlapSeed(b.db, imageID)
+	visible, ok := b.tallies.VisibleCount()
+	if !ok {
+		return tags.OverlapSeed{}, false
+	}
+	seed, err := tags.LoadOverlapSeed(b.db, imageID, visible)
 	if err != nil {
 		return tags.OverlapSeed{}, false
 	}
@@ -592,7 +598,7 @@ func (b *whereBuilder) imageTagsPredicate(where string, negate bool) string {
 
 // buildWhereDBDriverFull also reports whether a missing: filter was seen
 // and whether the ceiling became a rating_rank predicate.
-func buildWhereDBDriverFull(expr Expr, database *db.DB, legs []andDriverLeg) (string, []any, bool, bool) {
+func buildWhereDBDriverFull(expr Expr, src Source, legs []andDriverLeg) (string, []any, bool, bool) {
 	var leaves map[Expr]bool
 	if len(legs) > 0 {
 		leaves = make(map[Expr]bool, len(legs))
@@ -600,7 +606,7 @@ func buildWhereDBDriverFull(expr Expr, database *db.DB, legs []andDriverLeg) (st
 			leaves[l.leaf] = true
 		}
 	}
-	b := &whereBuilder{db: database, driverLeaves: leaves}
+	b := &whereBuilder{db: src.DB, tree: src.Tree, tallies: src.Tallies, driverLeaves: leaves}
 	expr = b.peelCeilingForColumnRewrite(expr)
 	if expr != nil {
 		part := b.buildExpr(expr)
@@ -608,8 +614,7 @@ func buildWhereDBDriverFull(expr Expr, database *db.DB, legs []andDriverLeg) (st
 			b.parts = append(b.parts, part)
 		}
 	}
-	where := strings.Join(b.parts, " AND ")
-	where = cmp.Or(where, "1=1")
+	where := cmp.Or(strings.Join(b.parts, " AND "), "1=1")
 	return where, b.args, b.hasMissingFilter, b.ceilingRewrote
 }
 
@@ -642,8 +647,8 @@ func (b *whereBuilder) categoryExists(name string) bool {
 	return true
 }
 
-func buildWhereDB(expr Expr, database *db.DB) (string, []any, bool) {
-	where, args, hasMissing, _ := buildWhereDBDriverFull(expr, database, nil)
+func buildWhereDB(expr Expr, src Source) (string, []any, bool) {
+	where, args, hasMissing, _ := buildWhereDBDriverFull(expr, src, nil)
 	return where, args, hasMissing
 }
 
@@ -700,11 +705,11 @@ func (b *whereBuilder) buildTagExpr(e TagExpr) string {
 
 // template must end in `%s ?`: the %s takes the operator, or
 // `BETWEEN ? AND` for a range.
-func (b *whereBuilder) buildCompFilter(template, val string, parseVal func(string) (any, bool), parseComp func(string) (string, any, bool)) string {
+func (b *whereBuilder) buildCompFilter(template, val string, parseVal func(string) (any, bool)) string {
 	if s, ok := b.tryRangeComp(template, val, parseVal, parseVal); ok {
 		return s
 	}
-	op, n, ok := parseComp(val)
+	op, n, ok := compOf(val, parseVal)
 	return b.scalarComp(template, op, n, ok)
 }
 
@@ -756,22 +761,22 @@ var filterBuilders = map[string]func(*whereBuilder, FilterExpr) string{
 	"ai":         (*whereBuilder).buildAIFilter,
 	"source":     (*whereBuilder).buildSourceFilter,
 	"cat":        (*whereBuilder).buildCatFilter,
-	"width":      comp("i.width %s ?", parseIntValue, parseIntComp),
-	"height":     comp("i.height %s ?", parseIntValue, parseIntComp),
+	"width":      comp("i.width %s ?", parseIntValue),
+	"height":     comp("i.height %s ?", parseIntValue),
 	"date":       func(b *whereBuilder, e FilterExpr) string { return b.buildDateFilter(e.Val) },
 	"missing":    (*whereBuilder).buildMissingFilter,
 	"type":       (*whereBuilder).buildTypeFilter,
 	"collection": (*whereBuilder).buildCollectionFilter,
 	// NULL page_count (not a manga) reads as 0, so pages:>=1 excludes images.
-	"pages":    comp("COALESCE(i.page_count, 0) %s ?", parseIntValue, parseIntComp),
+	"pages":    comp("COALESCE(i.page_count, 0) %s ?", parseIntValue),
 	"name":     (*whereBuilder).buildNameFilter,
-	"size":     comp("i.file_size %s ?", parseSizeValueAny, parseSizeComp),
+	"size":     comp("i.file_size %s ?", parseSizeValueAny),
 	"mime":     (*whereBuilder).buildMimeFilter,
-	"ratio":    comp("(CAST(i.width AS REAL) / NULLIF(i.height, 0)) %s ?", parseFloatValue, parseFloatComp),
-	"tagcount": comp("i.tag_count %s ?", parseIntValue, parseIntComp),
+	"ratio":    comp("(CAST(i.width AS REAL) / NULLIF(i.height, 0)) %s ?", parseFloatValue),
+	"tagcount": comp("i.tag_count %s ?", parseIntValue),
 	// Not COALESCE like pages:, or a non-video would match duration:<5 as
 	// a 0-second clip.
-	"duration":   comp("(i.duration_seconds IS NOT NULL AND i.duration_seconds %s ?)", parseFloatValue, parseFloatComp),
+	"duration":   comp("(i.duration_seconds IS NOT NULL AND i.duration_seconds %s ?)", parseFloatValue),
 	"hash":       (*whereBuilder).buildHashFilter,
 	"md5":        (*whereBuilder).buildMD5Filter,
 	"id":         (*whereBuilder).buildIDFilter,
@@ -796,9 +801,9 @@ var filterBuilders = map[string]func(*whereBuilder, FilterExpr) string{
 	"upgrade":    (*whereBuilder).buildUpgradeFilter,
 }
 
-func comp(sqlTemplate string, parseVal func(string) (any, bool), parseComp func(string) (string, any, bool)) func(*whereBuilder, FilterExpr) string {
+func comp(sqlTemplate string, parseVal func(string) (any, bool)) func(*whereBuilder, FilterExpr) string {
 	return func(b *whereBuilder, e FilterExpr) string {
-		return b.buildCompFilter(sqlTemplate, e.Val, parseVal, parseComp)
+		return b.buildCompFilter(sqlTemplate, e.Val, parseVal)
 	}
 }
 
@@ -818,7 +823,7 @@ func (b *whereBuilder) buildSystemFilter(_ FilterExpr) string { return "1=0" }
 
 // A value that isn't a boolean matches nothing rather than reading as false.
 func boolColumnFilter(col, val string) string {
-	b, ok := parseBoolVal(val)
+	b, ok := searchkw.ParseBool(val)
 	if !ok {
 		return "1=0"
 	}
@@ -871,7 +876,7 @@ func (b *whereBuilder) buildSourceFilter(e FilterExpr) string {
 }
 
 func (b *whereBuilder) buildCatFilter(e FilterExpr) string {
-	b.args = append(b.args, e.Val)
+	b.args = append(b.args, strings.ToLower(e.Val))
 	return b.imageIDExists("image_tags it JOIN tags t ON it.tag_id = t.id JOIN tag_categories tc ON tc.id = t.category_id", "it", "tc.name = ?", false)
 }
 
@@ -994,15 +999,7 @@ const (
 )
 
 func isHexDigest(s string, want int) bool {
-	if len(s) != want {
-		return false
-	}
-	for _, r := range s {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
-			return false
-		}
-	}
-	return true
+	return len(s) == want && !strings.ContainsFunc(s, func(r rune) bool { return (r < '0' || r > '9') && (r < 'a' || r > 'f') })
 }
 
 func (b *whereBuilder) buildIDFilter(e FilterExpr) string {
@@ -1039,8 +1036,8 @@ func (b *whereBuilder) buildSamplerFilter(e FilterExpr) string {
 // IN, not EXISTS: the IN seeks the seed indexes, where an EXISTS walks
 // images and probes each metadata table by image_id.
 func (b *whereBuilder) buildSeedFilter(e FilterExpr) string {
-	seed, err := strconv.ParseInt(strings.TrimSpace(e.Val), 10, 64)
-	if err != nil {
+	seed, ok := metadata.ParseSeed(strings.TrimSpace(e.Val))
+	if !ok {
 		return "1=0"
 	}
 	b.args = append(b.args, seed, seed)
@@ -1075,7 +1072,7 @@ func (b *whereBuilder) buildAutotaggedFilter(e FilterExpr) string {
 }
 
 func (b *whereBuilder) boolTagsPredicate(boolExtra, ledgerExtra, val string) string {
-	v, ok := parseBoolVal(val)
+	v, ok := searchkw.ParseBool(val)
 	if !ok {
 		b.args = append(b.args, val)
 		return b.sourceLedgerPredicate(ledgerExtra)
@@ -1351,28 +1348,10 @@ func parseCompOp(val string) (string, string) {
 	return "=", val
 }
 
-func parseIntComp(val string) (string, any, bool) {
-	return compOf(val, func(raw string) (any, bool) {
-		n, err := strconv.ParseInt(raw, 10, 64)
-		return n, err == nil
-	})
-}
-
-func parseFloatComp(val string) (string, any, bool) {
-	return compOf(val, func(raw string) (any, bool) {
-		n, err := strconv.ParseFloat(raw, 64)
-		return n, err == nil
-	})
-}
-
 func compOf(val string, parse func(string) (any, bool)) (string, any, bool) {
 	op, raw := parseCompOp(val)
 	v, ok := parse(strings.TrimSpace(raw))
 	return op, v, ok
-}
-
-func parseSizeComp(val string) (string, any, bool) {
-	return compOf(val, func(raw string) (any, bool) { return parseSizeValue(raw) })
 }
 
 // KB and KiB alike are 1024 bytes, the unit the UI displays.

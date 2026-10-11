@@ -2,7 +2,6 @@ package web
 
 import (
 	"cmp"
-	"database/sql"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -48,6 +47,7 @@ type tagsPageData struct {
 	ShowZero        bool
 	ZeroOnly        bool
 	BackQS          string
+	RowsOnly        bool
 }
 
 func (s *Server) originKinds(labels []string) map[string]string {
@@ -108,27 +108,27 @@ type tagsSidebarCounts struct {
 }
 
 // In parallel: in sequence the scans cost more than the listing they decorate.
-func (s *Server) tagsSidebarLoad(typeFilter string) tagsSidebarCounts {
+func (s *Server) tagsSidebarLoad(typeFilter string, full bool) tagsSidebarCounts {
 	var c tagsSidebarCounts
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	svc := s.tagSvc()
 	run := func(fn func() error) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := fn(); err != nil {
 				mu.Lock()
 				c.Err = cmp.Or(c.Err, err)
 				mu.Unlock()
 			}
-		}()
+		})
 	}
-	run(func() (err error) { c.Conflicts, err = svc.ConflictsCount(); return })
-	run(func() (err error) { c.Stale, err = svc.StaleUsageCount(); return })
-	run(func() (err error) { c.FullyStale, err = svc.FullyStaleCount(); return })
-	run(func() (err error) { c.Folded, err = svc.FoldedDuplicatesCount(); return })
-	run(func() (err error) { c.Origins, err = svc.OriginCounts(typeFilter); return })
+	if full {
+		run(func() (err error) { c.Conflicts, err = svc.ConflictsCount(); return })
+		run(func() (err error) { c.Stale, err = svc.StaleUsageCount(); return })
+		run(func() (err error) { c.FullyStale, err = svc.FullyStaleCount(); return })
+		run(func() (err error) { c.Folded, err = svc.FoldedDuplicatesCount(); return })
+		run(func() (err error) { c.Origins, err = svc.OriginCounts(typeFilter); return })
+	}
 	run(func() (err error) { c.UsedBy, err = svc.UsedByLabels(); return })
 	wg.Wait()
 	return c
@@ -185,7 +185,9 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	counts := s.tagsSidebarLoad(p.Type)
+	// The live search swaps the listing only: its input lives in the sidebar.
+	rowsOnly := isHTMXRequest(r) && r.Header.Get("HX-Trigger") == "tags-q-input"
+	counts := s.tagsSidebarLoad(p.Type, !rowsOnly)
 	if counts.Err != nil {
 		http.Error(w, counts.Err.Error(), http.StatusInternalServerError)
 		return
@@ -238,6 +240,7 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 		ShowZero:        p.ShowZero,
 		ZeroOnly:        p.ZeroOnly,
 		BackQS:          p.backQS(),
+		RowsOnly:        rowsOnly,
 	}
 	s.renderTemplate(w, "tags.html", data)
 }
@@ -290,47 +293,45 @@ func tagListingParamsFrom(q url.Values) tagListingParams {
 }
 
 func (s *Server) tagListingFilter(p tagListingParams) tags.TagFilter {
-	f := s.buildTagFilter(p.CatID, p.Prefix, p.Sort, p.Order, p.Origin, p.Type, p.CreatedAfter, p.ShowZero, p.ZeroOnly, p.Page, 100)
-	f.ConflictsOnly = p.Conflicts
-	f.Stale = p.Stale
-	f.FoldedOnly = p.Folded
-	f.UsedBy = p.UsedBy
+	f := tags.TagFilter{
+		Prefix:        p.Prefix,
+		Sort:          p.Sort,
+		Order:         p.Order,
+		PageIndex:     p.Page - 1,
+		Limit:         100,
+		Origin:        p.Origin,
+		Type:          p.Type,
+		CreatedAfter:  createdAfterCutoff(p.CreatedAfter),
+		ShowZero:      p.ShowZero,
+		ZeroOnly:      p.ZeroOnly,
+		ConflictsOnly: p.Conflicts,
+		Stale:         p.Stale,
+		FoldedOnly:    p.Folded,
+		UsedBy:        p.UsedBy,
+	}
+	if p.CatID != "" {
+		if id, err := strconv.ParseInt(p.CatID, 10, 64); err == nil {
+			f.CategoryID = &id
+		} else if id, ok := s.categoryIDByName(p.CatID); ok {
+			f.CategoryID = &id
+		}
+	}
 	return f
 }
 
 func (p tagListingParams) backQS() string {
-	v := url.Values{}
-	if p.Prefix != "" {
-		v.Set("q", p.Prefix)
-	}
+	v := setNonEmpty(url.Values{}, "q", p.Prefix, "cat", p.CatID, "origin", p.Origin, "used_by", p.UsedBy,
+		"created_after", p.CreatedAfter, "stale", p.Stale, "show_zero", p.ZeroParam)
 	v.Set("sort", p.Sort)
 	v.Set("order", p.Order)
 	if p.HasType || p.Type != "" {
 		v.Set("type", p.Type)
 	}
-	if p.CatID != "" {
-		v.Set("cat", p.CatID)
-	}
-	if p.Origin != "" {
-		v.Set("origin", p.Origin)
-	}
-	if p.UsedBy != "" {
-		v.Set("used_by", p.UsedBy)
-	}
-	if p.CreatedAfter != "" {
-		v.Set("created_after", p.CreatedAfter)
-	}
 	if p.Conflicts {
 		v.Set("conflicts", "1")
 	}
-	if p.Stale != "" {
-		v.Set("stale", p.Stale)
-	}
 	if p.Folded {
 		v.Set("folded", "1")
-	}
-	if p.ZeroParam != "" {
-		v.Set("show_zero", p.ZeroParam)
 	}
 	if p.Page > 1 {
 		v.Set("page", strconv.Itoa(p.Page))
@@ -338,36 +339,32 @@ func (p tagListingParams) backQS() string {
 	return v.Encode()
 }
 
-func (s *Server) buildTagFilter(catIDStr, prefix, sortStr, orderStr, originStr, typeStr, createdAfterRaw string, showZero, zeroOnly bool, page, limit int) tags.TagFilter {
-	f := tags.TagFilter{
-		Prefix:       prefix,
-		Sort:         sortStr,
-		Order:        orderStr,
-		PageIndex:    page - 1,
-		Limit:        limit,
-		Origin:       originStr,
-		Type:         typeStr,
-		CreatedAfter: createdAfterCutoff(createdAfterRaw),
-		ShowZero:     showZero,
-		ZeroOnly:     zeroOnly,
-	}
-	if catIDStr != "" {
-		if id, err := strconv.ParseInt(catIDStr, 10, 64); err == nil {
-			f.CategoryID = &id
-		} else if id, ok := s.categoryIDByName(catIDStr); ok {
-			f.CategoryID = &id
-		}
-	}
-	return f
+// canonicalRef is an existing tag (id), or a name and category to create
+// once the operation is sure to run.
+type canonicalRef struct {
+	id    int64
+	name  string
+	catID int64
 }
 
-// "#<id>" is a tag id and anything else a name: normalised, an alias
-// followed to its canonical, a bare one taken only when it names a single
-// tag across the categories.
-func (s *Server) resolveCanonicalTagInput(input string, create bool) (int64, string) {
+func (s *Server) canonicalID(ref canonicalRef) (int64, error) {
+	if ref.id != 0 {
+		return ref.id, nil
+	}
+	tag, err := s.tagSvc().GetOrCreateTag(ref.name, ref.catID)
+	if err != nil {
+		return 0, err
+	}
+	return tag.ID, nil
+}
+
+// "#<id>" is a tag id, anything else a name: normalised, an alias followed to
+// its canonical, a bare one taken only when one tag across the categories has
+// it. With create, an unknown name comes back to be created; nothing is written.
+func (s *Server) resolveCanonicalTagInput(input string, create bool) (canonicalRef, string) {
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return 0, "Tag name is required."
+		return canonicalRef{}, "Tag name is required."
 	}
 	if digits, ok := strings.CutPrefix(input, "#"); ok {
 		var exists int
@@ -376,71 +373,61 @@ func (s *Server) resolveCanonicalTagInput(input string, create bool) (int64, str
 			err = s.db().Read.QueryRow(`SELECT COUNT(*) FROM tags WHERE id = ?`, id).Scan(&exists)
 		}
 		if err != nil || exists == 0 {
-			return 0, "Tag not found: " + input
+			return canonicalRef{}, "Tag not found: " + input
 		}
-		return id, ""
+		return canonicalRef{id: id}, ""
 	}
-	catName, bare := "", input
-	if idx := strings.Index(input, ":"); idx > 0 && s.categoryExists(input[:idx]) {
-		catName, bare = input[:idx], strings.TrimSpace(input[idx+1:])
-		if bare == "" {
-			return 0, "Tag name is required after the category prefix."
-		}
+	f, err := tags.SplitForm(s.db(), input)
+	if err != nil {
+		return canonicalRef{}, "Tag lookup failed: " + err.Error()
+	}
+	catID, bare := f.CategoryID, strings.TrimSpace(f.Name)
+	if catID != 0 && bare == "" {
+		return canonicalRef{}, "Tag name is required after the category prefix."
 	}
 	name, err := tags.ValidateTagName(strings.Trim(bare, `"`))
 	if err != nil {
-		return 0, err.Error()
-	}
-	var catID int64
-	if catName != "" {
-		id, ok, err := tags.CategoryIDByName(s.db(), catName)
-		if !ok || err != nil {
-			return 0, "Category not found: " + catName
-		}
-		catID = id
+		return canonicalRef{}, err.Error()
 	}
 	type choice struct {
 		id    int64
 		label string
 	}
-	choices, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (choice, error) {
-		var c choice
-		err := rows.Scan(&c.id, &c.label)
-		return c, err
-	}, `SELECT DISTINCT ct.id, c.name || ':' || ct.name
+	choices, err := db.QueryAll(s.db().Read, db.ScanRow(func(c *choice) []any {
+		return []any{&c.id, &c.label}
+	}), `SELECT DISTINCT ct.id, c.name || ':' || ct.name
 	    FROM tags t
 	    JOIN tags ct ON ct.id = COALESCE(t.canonical_tag_id, t.id)
 	    JOIN tag_categories c ON c.id = ct.category_id
 	    WHERE t.name = ? AND (? = 0 OR t.category_id = ?)
 	    ORDER BY c.name`, name, catID, catID)
 	if err != nil {
-		return 0, "Tag lookup failed: " + err.Error()
+		return canonicalRef{}, "Tag lookup failed: " + err.Error()
 	}
 	switch len(choices) {
 	case 1:
-		return choices[0].id, ""
+		return canonicalRef{id: choices[0].id}, ""
 	case 0:
 		if !create {
-			return 0, "Tag not found: " + input
+			return canonicalRef{}, "Tag not found: " + input
 		}
 		if catID == 0 {
 			cx := s.active()
 			if cx == nil || cx.GeneralCategoryID == 0 {
-				return 0, "Could not resolve the general category."
+				return canonicalRef{}, "Could not resolve the general category."
 			}
 			catID = cx.GeneralCategoryID
 		}
-		tag, err := s.tagSvc().GetOrCreateTag(name, catID)
-		if err != nil {
-			return 0, err.Error()
+		if catID == s.tagSvc().RatingCategoryID() && !tags.IsCanonicalRating(name) {
+			return canonicalRef{}, tags.ErrNonCanonicalRating.Error()
 		}
-		return tag.ID, ""
+		return canonicalRef{name: name, catID: catID}, ""
 	}
 	labels := make([]string, len(choices))
 	for i, c := range choices {
 		labels[i] = c.label
 	}
-	return 0, "Tag name " + name + " exists in more than one category; use " + strings.Join(labels, " or ")
+	return canonicalRef{}, "Tag name " + name + " exists in more than one category; use " + strings.Join(labels, " or ")
 }
 
 func (s *Server) qualifiedTagName(id int64) string {
@@ -463,12 +450,19 @@ func (s *Server) createTagPost(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "Invalid category.", http.StatusBadRequest)
 		return
 	}
-	if _, err := s.tagSvc().GetOrCreateTag(name, catID); err != nil {
+	msg := ""
+	if existing, err := s.tagSvc().FindTag(name, catID); err == nil {
+		msg = "Tag " + existing.Name + " already exists."
+		if typed := tags.NormalizeTagName(name); typed != existing.Name || existing.CategoryID != catID {
+			msg = typed + " is an alias of " + s.qualifiedTagName(existing.ID) + "."
+		}
+	}
+	tag, err := s.tagSvc().GetOrCreateTag(name, catID)
+	if err != nil {
 		externalErr(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.active().InvalidateCaches()
-	hxDone(w, r, "Tag "+name+" created.", "/tags?q="+url.QueryEscape(name), "/tags")
+	hxDone(w, r, cmp.Or(msg, "Tag "+tag.Name+" created."), "/tags?q="+url.QueryEscape(tag.Name), "/tags")
 }
 
 func (s *Server) createAliasPost(w http.ResponseWriter, r *http.Request) {
@@ -484,19 +478,24 @@ func (s *Server) createAliasPost(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "Invalid category.", http.StatusBadRequest)
 		return
 	}
-	canonID, msg := s.resolveCanonicalTagInput(canonInput, true)
+	canon, msg := s.resolveCanonicalTagInput(canonInput, true)
 	if msg != "" {
 		externalErr(w, r, msg, http.StatusBadRequest)
 		return
 	}
 
-	if _, err := s.tagSvc().CreateAlias(name, catID, canonID); err != nil {
+	var alias *models.Tag
+	if canon.id != 0 {
+		alias, err = s.tagSvc().CreateAlias(name, catID, canon.id)
+	} else {
+		alias, err = s.tagSvc().CreateAliasToNewTag(name, catID, canon.name, canon.catID)
+	}
+	if err != nil {
 		externalErr(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.active().InvalidateCaches()
 
-	hxDone(w, r, "Alias "+name+" created, resolving to "+s.qualifiedTagName(canonID)+".", "/tags?type=alias&q="+url.QueryEscape(name), "/tags?type=alias")
+	hxDone(w, r, "Alias "+alias.Name+" created, resolving to "+s.qualifiedTagName(*alias.CanonicalTagID)+".", "/tags?type=alias&q="+url.QueryEscape(alias.Name), "/tags?type=alias")
 }
 
 func (s *Server) addTagAliasPost(w http.ResponseWriter, r *http.Request) {
@@ -523,9 +522,6 @@ func (s *Server) addTagAliasPost(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		added++
-	}
-	if added > 0 {
-		s.active().InvalidateCaches()
 	}
 	switch {
 	case len(failures) == 0:
@@ -567,9 +563,6 @@ func (s *Server) removeTagAliasesDelete(w http.ResponseWriter, r *http.Request) 
 		}
 		removed++
 	}
-	if removed > 0 {
-		s.active().InvalidateCaches()
-	}
 	noun := "alias"
 	if removed != 1 {
 		noun = "aliases"
@@ -589,7 +582,6 @@ func (s *Server) deleteTagHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.active().InvalidateCaches()
 	// tag-relations-changed makes the tag page's PTR panel refetch its diff.
 	if tag != nil && tag.IsAlias {
 		setFlashHeader(w, "Alias removed.", "ok", map[string]any{"tag-relations-changed": ""})
@@ -615,7 +607,6 @@ func (s *Server) runDeleteTagsByIDs(ids []int64) {
 		return true, nil
 	})
 
-	s.active().InvalidateCaches()
 	summary := skippedSuffix(fmt.Sprintf("deleted %d tag(s)", deleted), skipped)
 	s.finishTagScopeJob(deleted, reasons, cancelled, "delete tags", summary)
 }
@@ -639,8 +630,6 @@ func (s *Server) renameTagPost(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// Cached id lists for ?q=oldname would outlive the rename.
-	s.active().InvalidateCaches()
 	// HX-Refresh, not a redirect: the listing keeps its filters.
-	hxDone(w, r, "Renamed to "+newName+".", "", "/tags")
+	hxDone(w, r, "Renamed to "+tags.NormalizeTagName(newName)+".", "", "/tags")
 }

@@ -2,6 +2,7 @@ package web
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -34,25 +35,17 @@ func (s *Server) categoriesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) categoryColors() map[string]string {
-	cx := s.active()
-	if cx == nil {
+	svc := s.tagSvc()
+	if svc == nil {
 		return nil
 	}
-	rows, err := cx.DB.Read.Query(`SELECT name, color FROM tag_categories`)
+	cats, err := svc.ListCategories()
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
-	out := map[string]string{}
-	for rows.Next() {
-		var name, color string
-		if err := rows.Scan(&name, &color); err != nil {
-			return nil
-		}
-		out[name] = tags.SafeCategoryColor(color)
-	}
-	if rows.Err() != nil {
-		return nil
+	out := make(map[string]string, len(cats))
+	for _, c := range cats {
+		out[c.Name] = tags.SafeCategoryColor(c.Color)
 	}
 	return out
 }
@@ -62,13 +55,13 @@ func (s *Server) categoryCountHandler(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	count, err := s.tagSvc().GetCategoryTagCount(id)
+	c, err := s.tagSvc().CategoryDeleteCounts(id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), categoryStatus(err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = fmt.Fprintf(w, `{"count":%d}`, count)
+	_, _ = fmt.Fprintf(w, `{"count":%d,"aliases":%d,"linked_aliases":%d}`, c.Tags, c.Aliases, c.LinkedAliases)
 }
 
 func (s *Server) createCategoryPost(w http.ResponseWriter, r *http.Request) {
@@ -76,10 +69,9 @@ func (s *Server) createCategoryPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.FormValue("name")
-	color := r.FormValue("color")
-	color = cmp.Or(color, "#888888")
+	color := cmp.Or(r.FormValue("color"), "#888888")
 	if _, err := s.tagSvc().CreateCategory(name, color); err != nil {
-		externalErr(w, r, err.Error(), http.StatusBadRequest)
+		externalErr(w, r, err.Error(), categoryStatus(err))
 		return
 	}
 	hxDone(w, r, "Category "+name+" created.", "/categories", "/categories")
@@ -119,18 +111,36 @@ func (s *Server) deleteCategoryDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	action := r.FormValue("action")
-	action = cmp.Or(action, "move")
+	action := cmp.Or(r.FormValue("action"), "move")
 	var targetID int64
 	if ts := r.FormValue("target_id"); ts != "" {
-		targetID, _ = strconv.ParseInt(ts, 10, 64)
+		var err error
+		if targetID, err = strconv.ParseInt(ts, 10, 64); err != nil {
+			http.Error(w, "Invalid target category.", http.StatusBadRequest)
+			return
+		}
 	}
 	if err := s.tagSvc().DeleteCategoryMoveOrDelete(id, action, targetID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), categoryStatus(err))
 		return
 	}
-	s.active().InvalidateCaches()
 	hxDone(w, r, "Category deleted.", "/tags", "/tags")
+}
+
+func categoryStatus(err error) int {
+	var collision *tags.ErrCategoryMoveCollision
+	switch {
+	case errors.Is(err, tags.ErrCategoryNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, tags.ErrBuiltinCategory), errors.Is(err, tags.ErrInvalidMoveTarget),
+		errors.Is(err, tags.ErrRatingCategoryClosed), errors.Is(err, tags.ErrBuiltinCategoryName),
+		errors.Is(err, tags.ErrInvalidCategoryName), errors.Is(err, tags.ErrReservedCategoryName),
+		errors.Is(err, tags.ErrInvalidCategoryColor):
+		return http.StatusBadRequest
+	case errors.As(err, &collision), errors.Is(err, tags.ErrCategoryExists):
+		return http.StatusConflict
+	}
+	return http.StatusInternalServerError
 }
 
 func (s *Server) renameCategoryPost(w http.ResponseWriter, r *http.Request) {
@@ -143,9 +153,8 @@ func (s *Server) renameCategoryPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.tagSvc().RenameCategory(id, newName); err != nil {
-		externalErr(w, r, err.Error(), http.StatusBadRequest)
+		externalErr(w, r, err.Error(), categoryStatus(err))
 		return
 	}
-	s.active().InvalidateCaches()
 	hxDone(w, r, "Category renamed to "+newName+".", "/categories", "/categories")
 }

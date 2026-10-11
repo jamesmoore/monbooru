@@ -1,6 +1,5 @@
 {{define "partials/scheduled_lookup.html"}}
 {{$l := .Lookup}}
-{{$csrf := .CSRFToken}}
 {{$id := $l.ImageID}}
 <div id="scheduled-lookup" class="scheduled-lookup">
   {{range $l.Backends}}
@@ -9,16 +8,14 @@
   <span class="lookup-switch{{$off}}">
     {{if .Enabled}}<span class="tag-mode-current">[on]</span>
     {{else}}<form hx-post="/images/{{$id}}/scheduled-lookup" hx-target="#scheduled-lookup" hx-swap="outerHTML"
-          hx-headers='{"X-CSRF-Token":"{{$csrf}}"}' style="display:inline">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
+          style="display:inline">
       <input type="hidden" name="backend" value="{{.Backend}}">
       <input type="hidden" name="on" value="1">
       <button type="submit" class="tag-mode-toggle">on</button>
     </form>{{end}}
     <span class="tag-mode-sep">/</span>
     {{if .Enabled}}<form hx-post="/images/{{$id}}/scheduled-lookup" hx-target="#scheduled-lookup" hx-swap="outerHTML"
-          hx-headers='{"X-CSRF-Token":"{{$csrf}}"}' style="display:inline">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
+          style="display:inline">
       <input type="hidden" name="backend" value="{{.Backend}}">
       <input type="hidden" name="on" value="0">
       <button type="submit" class="tag-mode-toggle">off</button>

@@ -2,6 +2,7 @@ package gallery
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +18,8 @@ import (
 // ApplyReplacedFile commits the row before the staged file renames into
 // place, so the watcher finds a sha the DB already carries. stagedPath,
 // and the backup beside it, must lie outside the watched tree.
-func ApplyReplacedFile(database *db.DB, b *Boundary, thumbnailsPath string, imageID int64, stagedPath, newSHA, newMD5, newType string) (*int64, error) {
+func ApplyReplacedFile(h Handle, imageID int64, stagedPath, newSHA, newMD5, newType string) (*int64, error) {
+	database, b, thumbnailsPath := h.DB, h.Boundary(), h.ThumbnailsPath
 	galleryPath := b.Root()
 	var stored *int64
 	var oldPath string
@@ -49,28 +51,42 @@ func ApplyReplacedFile(database *db.DB, b *Boundary, thumbnailsPath string, imag
 	if newExt := extForFileType(newType); newExt != "" && ExtFileType(oldPath) != newType {
 		stem := filepath.Base(oldPath)
 		stem = stem[:len(stem)-len(filepath.Ext(stem))]
-		newPath = UniqueDestPath(filepath.Dir(oldPath), stem+newExt)
+		if newPath, err = CreateUnique(filepath.Dir(oldPath), stem+newExt); err != nil {
+			return nil, fmt.Errorf("reserve the new name: %w", err)
+		}
+		if err := b.Check(newPath); err != nil {
+			_ = os.Remove(newPath)
+			return nil, fmt.Errorf("refusing to replace image %d: %w", imageID, err)
+		}
+		if err := refuseAliasCollision(database, imageID, newPath); err != nil {
+			_ = os.Remove(newPath)
+			return nil, fmt.Errorf("refusing to replace image %d: %w", imageID, err)
+		}
+	}
+	dropReservation := func() {
+		if newPath != oldPath {
+			_ = os.Remove(newPath)
+		}
 	}
 
 	backupPath := stagedPath + ".old"
 	if err := moveIntoPlace(oldPath, backupPath); err != nil {
+		dropReservation()
 		return nil, fmt.Errorf("move old file aside: %w", err)
 	}
 
-	commit := func() error {
-		tx, err := database.Write.Begin()
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback() }()
+	commit := func(tx *sql.Tx) error {
 		// phash goes with the old bytes: the backfill revisits a NULL
 		// phash, never a stale one.
 		if _, err := tx.Exec(
 			`UPDATE images SET sha256 = ?, md5 = ?, canonical_path = ?, file_type = ?, file_size = ?,
-			        width = ?, height = ?, source_type = ?, is_missing = 0, phash = NULL WHERE id = ?`,
-			newSHA, newMD5, newPath, newType, fi.Size(), toNullInt(newW), toNullInt(newH), sourceType, imageID,
+			        width = ?, height = ?, source_type = ?, phash = NULL WHERE id = ?`,
+			newSHA, newMD5, newPath, newType, fi.Size(), newW, newH, sourceType, imageID,
 		); err != nil {
 			return fmt.Errorf("update images row: %w", err)
+		}
+		if _, err := setMissingTx(tx, []int64{imageID}, false); err != nil {
+			return fmt.Errorf("mark row present: %w", err)
 		}
 		// The alias paths still hold the old bytes.
 		if _, err := tx.Exec(`DELETE FROM image_paths WHERE image_id = ? AND is_canonical = 0`, imageID); err != nil {
@@ -86,7 +102,7 @@ func ApplyReplacedFile(database *db.DB, b *Boundary, thumbnailsPath string, imag
 		); err != nil {
 			return fmt.Errorf("update canonical path: %w", err)
 		}
-		if err := ReplaceGenerationMetadata(context.Background(), tx, imageID, sdMeta, comfyMeta); err != nil {
+		if err := replaceGenerationMetadata(context.Background(), tx, imageID, sdMeta, comfyMeta); err != nil {
 			return err
 		}
 		if oldW != nil && oldH != nil && newW != nil && newH != nil &&
@@ -102,9 +118,10 @@ func ApplyReplacedFile(database *db.DB, b *Boundary, thumbnailsPath string, imag
 				return fmt.Errorf("scale annotations: %w", err)
 			}
 		}
-		return tx.Commit()
+		return nil
 	}
-	if err := commit(); err != nil {
+	if err := db.InWriteTx(database.Write, commit); err != nil {
+		dropReservation()
 		if rbErr := moveIntoPlace(backupPath, oldPath); rbErr != nil {
 			logx.Warnf("replace: restore of %q failed after aborted swap: %v", oldPath, rbErr)
 		}
@@ -124,14 +141,14 @@ func ApplyReplacedFile(database *db.DB, b *Boundary, thumbnailsPath string, imag
 		logx.Warnf("replace: removing backup %q: %v", backupPath, err)
 	}
 
-	if err := Generate(newPath, thumbnailsPath, imageID, newType); err != nil {
+	if err := generate(newPath, thumbnailsPath, imageID, newType); err != nil {
 		logx.Warnf("replace: thumbnail regen for %q: %v", newPath, err)
 	} else if h, err := RecomputeAndStorePhash(context.Background(), database, imageID, thumbnailsPath); err != nil {
 		logx.Warnf("replace: phash recompute for %q: %v", newPath, err)
 	} else {
 		stored = &h
 	}
-	if err := ApplyMetaTags(database, thumbnailsPath, imageID); err != nil {
+	if err := ApplyMetaTags(h, imageID); err != nil {
 		logx.Warnf("replace: meta tags for %q: %v", newPath, err)
 	}
 	logx.Infof("replace: image id=%d now %q (sha %s)", imageID, newPath, newSHA)
@@ -143,7 +160,9 @@ func ApplyReplacedFile(database *db.DB, b *Boundary, thumbnailsPath string, imag
 // from it, tags kept, rather than both versions being lost.
 func putOldFileBack(database *db.DB, galleryPath string, imageID int64, oldPath, newPath, backupPath string) {
 	if newPath != oldPath {
-		if err := repointCanonical(database.Write, imageID, oldPath, FolderPath(galleryPath, oldPath), newPath); err != nil {
+		if err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+			return repointCanonical(tx, imageID, oldPath, FolderPath(galleryPath, oldPath), newPath)
+		}); err != nil {
 			logx.Warnf("replace: pointing image %d back at %q: %v", imageID, oldPath, err)
 		}
 	}

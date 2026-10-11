@@ -1,14 +1,18 @@
-// Package library owns one open gallery: its database, services, caches
-// and background work.
+// Package library owns the open galleries: the set that publishes, switches
+// and changes them, and each one's database, services, caches and
+// background work.
 package library
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/counts"
@@ -30,29 +34,38 @@ type Gallery struct {
 	// Resolved once at open: the built-in row never changes.
 	GeneralCategoryID int64
 
-	folderTree        atomic.Pointer[[]gallery.FolderNode]
-	sourceLabelCounts atomic.Pointer[[]gallery.SourceLabelCount]
+	// A lazy read stamps what it stores with the generation it read before
+	// its query, so a value taken before an invalidation cannot outlive it.
+	cacheGen          atomic.Uint64
+	folderTreeAll     atomic.Pointer[stamped[[]gallery.FolderNode]]
+	sourceLabelCounts atomic.Pointer[stamped[[]gallery.SourceLabelCount]]
 
 	// Copy-on-write maps: readers hold no lock, so a stored map is never
 	// mutated.
-	inboxCountUnder        atomic.Pointer[map[string]int]
-	phashMissingUnder      atomic.Pointer[map[string]int]
-	folderTreeUnder        atomic.Pointer[map[string][]gallery.FolderNode]
-	sourceLabelCountsUnder atomic.Pointer[map[string][]gallery.SourceLabelCount]
+	inboxCountUnder        atomic.Pointer[stamped[map[string]int]]
+	phashMissingUnder      atomic.Pointer[stamped[map[string]int]]
+	folderTreeUnder        atomic.Pointer[stamped[map[string][]gallery.FolderNode]]
+	sourceLabelCountsUnder atomic.Pointer[stamped[map[string][]gallery.SourceLabelCount]]
 
-	BKTree *relations.BKTree
+	bkTree  *relations.BKTree
+	tallies *counts.Tallies
+	cache   *search.AdjacencyCache
 
+	// bgMu guards the watcher and the reclaimer: a set change starts them
+	// after its lock, so a shutdown's Close can come in between.
+	bgMu          sync.Mutex
 	watcherCancel context.CancelFunc
 	watcherDone   chan struct{}
 
 	mangaReclaim *gallery.MangaCacheReclaimer
 
 	exports atomic.Int32
+	closed  atomic.Bool
 }
 
 // Sync drops the caches itself, so no caller has to remember InvalidateCaches.
 func (cx *Gallery) Sync(ctx context.Context, maxFileSizeMB int, naming gallery.Naming, progress func(processed, total int, message string)) (gallery.SyncResult, error) {
-	result, err := gallery.Sync(ctx, cx.DB, cx.Boundary(), cx.ThumbnailsPath, maxFileSizeMB, naming, progress, cx.InvalidateCaches, relations.PhashSink(cx.DB))
+	result, err := gallery.Sync(ctx, cx.Handle, maxFileSizeMB, naming, progress, cx.InvalidateCaches, cx.phashSink())
 	cx.InvalidateCaches()
 	return result, err
 }
@@ -62,44 +75,53 @@ func (cx *Gallery) InvalidateCaches() {
 	if cx == nil {
 		return
 	}
-	cx.folderTree.Store(nil)
+	cx.cacheGen.Add(1)
+	cx.folderTreeAll.Store(nil)
 	cx.sourceLabelCounts.Store(nil)
 	cx.inboxCountUnder.Store(nil)
 	cx.phashMissingUnder.Store(nil)
 	cx.folderTreeUnder.Store(nil)
 	cx.sourceLabelCountsUnder.Store(nil)
-	if cx.DB != nil {
-		counts.Invalidate(cx.DB)
+	if cx.tallies != nil {
+		cx.tallies.Invalidate()
 	}
-	search.AdjacencyCacheDropForGallery(cx.Name)
+	cx.cache.Drop()
 }
 
-func cachedValue[V any](slot *atomic.Pointer[V], query func() (V, error)) (V, error) {
-	if p := slot.Load(); p != nil {
-		return *p, nil
+type stamped[V any] struct {
+	v   V
+	gen uint64
+}
+
+func cachedValue[V any](gen *atomic.Uint64, slot *atomic.Pointer[stamped[V]], query func() (V, error)) (V, error) {
+	g := gen.Load()
+	if p := slot.Load(); p != nil && p.gen == g {
+		return p.v, nil
 	}
 	v, err := query()
 	if err != nil {
 		var zero V
 		return zero, err
 	}
-	slot.Store(&v)
+	slot.Store(&stamped[V]{v: v, gen: g})
 	return v, nil
 }
 
-func (cx *Gallery) FolderTree() ([]gallery.FolderNode, error) {
-	return cachedValue(&cx.folderTree, func() ([]gallery.FolderNode, error) { return gallery.FolderTree(cx.DB) })
+func (cx *Gallery) folderTree() ([]gallery.FolderNode, error) {
+	return cachedValue(&cx.cacheGen, &cx.folderTreeAll, func() ([]gallery.FolderNode, error) { return gallery.FolderTree(cx.DB) })
 }
 
 func (cx *Gallery) SourceLabelCounts() ([]gallery.SourceLabelCount, error) {
-	return cachedValue(&cx.sourceLabelCounts, func() ([]gallery.SourceLabelCount, error) { return gallery.SourceLabelCountsQuery(cx.DB, 25) })
+	return cachedValue(&cx.cacheGen, &cx.sourceLabelCounts, func() ([]gallery.SourceLabelCount, error) {
+		return gallery.SourceLabelCountsUnderQuery(cx.DB, 25, gallery.RankCeiling{})
+	})
 }
 
-func (cx *Gallery) VisibleCount() (int, bool) { return counts.VisibleCount(cx.DB) }
-func (cx *Gallery) InboxCount() (int, bool)   { return counts.InboxCount(cx.DB) }
-func (cx *Gallery) TagCount() (int, bool)     { return counts.TagCount(cx.DB) }
+func (cx *Gallery) VisibleCount() (int, bool) { return cx.tallies.VisibleCount() }
+func (cx *Gallery) InboxCount() (int, bool)   { return cx.tallies.InboxCount() }
+func (cx *Gallery) TagCount() (int, bool)     { return cx.tallies.TagCount() }
 
-func (cx *Gallery) CollectionsCount() (int, bool) { return counts.CollectionsCount(cx.DB) }
+func (cx *Gallery) CollectionsCount() (int, bool) { return cx.tallies.CollectionsCount() }
 
 func okErr(n int, ok bool) (int, error) {
 	if !ok {
@@ -110,9 +132,9 @@ func okErr(n int, ok bool) (int, error) {
 
 var errCountUnavailable = errors.New("count unavailable")
 
-func lookupByCeiling[V any](slot *atomic.Pointer[map[string]V], level string) (V, bool) {
-	if m := slot.Load(); m != nil {
-		if v, ok := (*m)[level]; ok {
+func lookupByCeiling[V any](slot *atomic.Pointer[stamped[map[string]V]], gen uint64, level string) (V, bool) {
+	if m := slot.Load(); m != nil && m.gen == gen {
+		if v, ok := m.v[level]; ok {
 			return v, true
 		}
 	}
@@ -120,27 +142,31 @@ func lookupByCeiling[V any](slot *atomic.Pointer[map[string]V], level string) (V
 	return zero, false
 }
 
-func storeByCeiling[V any](slot *atomic.Pointer[map[string]V], level string, value V) {
+func storeByCeiling[V any](slot *atomic.Pointer[stamped[map[string]V]], gen uint64, level string, value V) {
 	for {
 		current := slot.Load()
+		if current != nil && current.gen > gen {
+			return
+		}
 		newMap := make(map[string]V, 4)
-		if current != nil {
-			for k, v := range *current {
+		if current != nil && current.gen == gen {
+			for k, v := range current.v {
 				newMap[k] = v
 			}
 		}
 		newMap[level] = value
-		if slot.CompareAndSwap(current, &newMap) {
+		if slot.CompareAndSwap(current, &stamped[map[string]V]{v: newMap, gen: gen}) {
 			return
 		}
 	}
 }
 
-func ceilingCached[V any](c *Ceiling, blind func() (V, error), slot *atomic.Pointer[map[string]V], query func() (V, error)) (V, error) {
+func ceilingCached[V any](c *Ceiling, blind func() (V, error), gen *atomic.Uint64, slot *atomic.Pointer[stamped[map[string]V]], query func() (V, error)) (V, error) {
 	if c == nil || !c.IsActive() {
 		return blind()
 	}
-	if v, ok := lookupByCeiling(slot, c.level); ok {
+	g := gen.Load()
+	if v, ok := lookupByCeiling(slot, g, c.level); ok {
 		return v, nil
 	}
 	v, err := query()
@@ -148,48 +174,51 @@ func ceilingCached[V any](c *Ceiling, blind func() (V, error), slot *atomic.Poin
 		var zero V
 		return zero, err
 	}
-	storeByCeiling(slot, c.level, v)
+	storeByCeiling(slot, g, c.level, v)
 	return v, nil
 }
 
 func (cx *Gallery) InboxCountUnder(c *Ceiling) (int, error) {
-	return ceilingCached(c, func() (int, error) { return okErr(cx.InboxCount()) }, &cx.inboxCountUnder,
-		func() (int, error) { return gallery.InboxCountUnder(cx.DB, c.ExcludedTagIDs()) })
+	return ceilingCached(c, func() (int, error) { return okErr(cx.InboxCount()) }, &cx.cacheGen, &cx.inboxCountUnder,
+		func() (int, error) { return gallery.InboxCountUnder(cx.DB, c.RankFilter()) })
 }
 
 func (cx *Gallery) PhashMissingUnder(c *Ceiling) (int, error) {
 	return ceilingCached(c,
-		func() (int, error) { return okErr(counts.PhashMissing(cx.DB)) },
-		&cx.phashMissingUnder,
-		func() (int, error) { return gallery.PhashMissingUnder(cx.DB, c.ExcludedTagIDs()) })
+		func() (int, error) { return okErr(cx.tallies.PhashMissing()) },
+		&cx.cacheGen, &cx.phashMissingUnder,
+		func() (int, error) { return gallery.PhashMissingUnder(cx.DB, c.RankFilter()) })
 }
 
-// InvalidatePhashMissing is for phash writes that leave image membership alone.
-func (cx *Gallery) InvalidatePhashMissing() {
+// invalidatePhashMissing is for phash writes: they move no image in or out
+// of the folder tree or the tag counts.
+func (cx *Gallery) invalidatePhashMissing() {
 	if cx == nil {
 		return
 	}
-	counts.InvalidatePhashMissing(cx.DB)
+	cx.cacheGen.Add(1)
+	cx.tallies.InvalidatePhashMissing()
 	cx.phashMissingUnder.Store(nil)
+	cx.cache.Drop()
 }
 
 func (cx *Gallery) FolderTreeUnder(c *Ceiling) ([]gallery.FolderNode, error) {
-	return ceilingCached(c, cx.FolderTree, &cx.folderTreeUnder,
-		func() ([]gallery.FolderNode, error) { return gallery.FolderTreeUnder(cx.DB, c.ExcludedTagIDs()) })
+	return ceilingCached(c, cx.folderTree, &cx.cacheGen, &cx.folderTreeUnder,
+		func() ([]gallery.FolderNode, error) { return gallery.FolderTreeUnder(cx.DB, c.RankFilter()) })
 }
 
 func (cx *Gallery) SourceLabelCountsUnder(c *Ceiling) ([]gallery.SourceLabelCount, error) {
-	return ceilingCached(c, cx.SourceLabelCounts, &cx.sourceLabelCountsUnder,
+	return ceilingCached(c, cx.SourceLabelCounts, &cx.cacheGen, &cx.sourceLabelCountsUnder,
 		func() ([]gallery.SourceLabelCount, error) {
-			return gallery.SourceLabelCountsUnderQuery(cx.DB, 25, c.ExcludedTagIDs())
+			return gallery.SourceLabelCountsUnderQuery(cx.DB, 25, c.RankFilter())
 		})
 }
 
-func (cx *Gallery) WarmCaches() {
+func (cx *Gallery) warmCaches() {
 	if cx == nil || cx.DB == nil {
 		return
 	}
-	cx.FolderTree()        //nolint:errcheck
+	cx.folderTree()        //nolint:errcheck
 	cx.SourceLabelCounts() //nolint:errcheck
 	cx.VisibleCount()
 	cx.InboxCount()
@@ -211,6 +240,10 @@ func Open(g config.Gallery) (*Gallery, error) {
 		_ = database.Close()
 		return nil, fmt.Errorf("gallery %q: bootstrap db: %w", g.Name, err)
 	}
+	if err := respellRelativeRows(database, g.GalleryPath); err != nil {
+		_ = database.Close()
+		return nil, fmt.Errorf("gallery %q: respell relative paths: %w", g.Name, err)
+	}
 	if err := os.MkdirAll(g.ThumbnailsPath, 0o755); err != nil {
 		_ = database.Close()
 		return nil, fmt.Errorf("gallery %q: create thumbnails dir: %w", g.Name, err)
@@ -220,66 +253,120 @@ func Open(g config.Gallery) (*Gallery, error) {
 		logx.Warnf("gallery %q: path %q unreadable: %v - degraded mode", g.Name, g.GalleryPath, err)
 		degraded = true
 	}
-	var generalID int64
-	if err := database.Read.QueryRow(
-		`SELECT id FROM tag_categories WHERE name = 'general'`,
-	).Scan(&generalID); err != nil {
+	cx, err := New(gallery.Handle{
+		Name:           g.Name,
+		GalleryPath:    g.GalleryPath,
+		ThumbnailsPath: g.ThumbnailsPath,
+		DBPath:         g.DBPath,
+		DB:             database,
+		Bounds:         new(atomic.Pointer[gallery.Boundary]),
+	})
+	if err != nil {
 		_ = database.Close()
-		return nil, fmt.Errorf("gallery %q: resolve general category: %w", g.Name, err)
+		return nil, err
 	}
-	tree := relations.NewBKTree()
-	relations.DefaultRegistry.Register(database, tree)
-	return &Gallery{
-		Handle: gallery.Handle{
-			Name:           g.Name,
-			GalleryPath:    g.GalleryPath,
-			ThumbnailsPath: g.ThumbnailsPath,
-			DBPath:         g.DBPath,
-			DB:             database,
-			TagSvc:         tags.New(database),
-			Bounds:         new(atomic.Pointer[gallery.Boundary]),
-		},
-		RelationsSvc:      relations.New(database),
-		Degraded:          degraded,
-		GeneralCategoryID: generalID,
-		BKTree:            tree,
-	}, nil
+	cx.Degraded = degraded
+	return cx, nil
 }
 
-func (cx *Gallery) MangaCacheDir() string {
+// New wires a gallery around h's open, bootstrapped database, with its
+// own tag service.
+func New(h gallery.Handle) (*Gallery, error) {
+	generalID, ok, err := tags.CategoryIDByName(h.DB, "general")
+	if err == nil && !ok {
+		err = sql.ErrNoRows
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gallery %q: resolve general category: %w", h.Name, err)
+	}
+	cx := &Gallery{
+		Handle:            h,
+		GeneralCategoryID: generalID,
+		bkTree:            relations.NewBKTree(),
+		tallies:           counts.New(h.DB),
+		cache:             search.NewAdjacencyCache(),
+	}
+	cx.TagSvc = tags.New(h.DB, cx.InvalidateCaches)
+	cx.RelationsSvc = relations.New(h.DB, cx.TagSvc, cx.InvalidateCaches)
+	return cx, nil
+}
+
+func (cx *Gallery) Source() search.Source {
+	return search.Source{DB: cx.DB, Tree: cx.bkTree, Tallies: cx.tallies, Cache: cx.cache}
+}
+
+func (cx *Gallery) phashSink() gallery.PhashSink { return relations.PhashSink(cx.DB, cx.bkTree) }
+
+func (cx *Gallery) mangaCacheDir() string {
 	if cx == nil {
 		return ""
 	}
 	return gallery.MangaCacheDir(cx.ThumbnailsPath)
 }
 
-// Close leaves cx.DB set: an unjoined WarmCaches may still read it, and a
+// Close leaves cx.DB set: an unjoined warmCaches may still read it, and a
 // closed pool errors where a nil one would panic.
 func (cx *Gallery) Close() {
+	cx.closed.Store(true)
+	cx.bgMu.Lock()
 	cx.stopWatcher()
 	cx.stopMangaReclaim()
-	// Keyed by name, the cache would outlive this database and hand its
-	// ids to the next library opened under the name.
-	search.AdjacencyCacheDropForGallery(cx.Name)
+	cx.bgMu.Unlock()
+	cx.cache.Drop()
 	if cx.DB != nil {
-		relations.DefaultRegistry.Unregister(cx.DB)
-		counts.Release(cx.DB)
 		_ = cx.DB.Close()
 	}
 }
 
+// Closed reports a member an import or a refused rename closed and could
+// not reopen: it stays in the set, so the import can be retried or a
+// switch can reopen it.
+func (cx *Gallery) Closed() bool { return cx.closed.Load() }
+
 // An export streams without the gallery lock, so whatever closes the
-// gallery must check Exporting first.
+// gallery must check exporting first.
 func (cx *Gallery) BeginExport()    { cx.exports.Add(1) }
 func (cx *Gallery) EndExport()      { cx.exports.Add(-1) }
-func (cx *Gallery) Exporting() bool { return cx.exports.Load() > 0 }
+func (cx *Gallery) exporting() bool { return cx.exports.Load() > 0 }
+
+// ShrinkMemory skips an exporting gallery: the export holds a read
+// connection the shrink would wait on for the whole stream.
+func (cx *Gallery) ShrinkMemory() error {
+	if cx.exporting() {
+		return nil
+	}
+	return cx.DB.ShrinkMemory(context.Background())
+}
+
+func (cx *Gallery) ReleaseIdle(idle time.Duration) (dropped bool, err error) {
+	dropped = cx.tallies.ReleaseIdleCountedTags(idle)
+	if cx.bkTree.ReleaseIdle(idle) {
+		dropped = true
+	}
+	err = cx.ShrinkMemory()
+	cx.cache.Sweep()
+	return dropped, err
+}
+
+func (cx *Gallery) exportBusy() error {
+	if cx.exporting() {
+		return fmt.Errorf("gallery %q is being exported; try again when the export finishes", cx.Name)
+	}
+	return nil
+}
 
 // WatcherRunning and ReclaimerRunning exist for other packages' tests.
 func (cx *Gallery) WatcherRunning() bool   { return cx != nil && cx.watcherCancel != nil }
 func (cx *Gallery) ReclaimerRunning() bool { return cx != nil && cx.mangaReclaim != nil }
 
-func (cx *Gallery) StartBackground(watchEnabled bool, maxFileSizeMB int, naming gallery.Naming, jm *jobs.Manager) {
-	cx.startWatcher(watchEnabled, maxFileSizeMB, naming, jm)
+// startBackground reads watch once; settings is read again at each ingest.
+func (cx *Gallery) startBackground(settings func() Background, jm *jobs.Manager) {
+	cx.bgMu.Lock()
+	defer cx.bgMu.Unlock()
+	if cx.Closed() {
+		return
+	}
+	cx.startWatcher(settings, jm)
 	cx.startMangaReclaim()
 	cx.indexWorkflows()
 }
@@ -307,19 +394,22 @@ func (cx *Gallery) indexWorkflows() {
 	}()
 }
 
-func (cx *Gallery) startWatcher(watchEnabled bool, maxFileSizeMB int, naming gallery.Naming, jm *jobs.Manager) {
-	if !watchEnabled || cx.Degraded || cx.watcherCancel != nil {
+func (cx *Gallery) startWatcher(settings func() Background, jm *jobs.Manager) {
+	if !settings().Watch || cx.Degraded || cx.watcherCancel != nil {
 		return
 	}
-	w, err := gallery.NewWatcher(cx.Handle, maxFileSizeMB, jm)
+	w, err := gallery.NewWatcher(cx.Handle, jm)
 	if err != nil {
 		logx.Warnf("gallery %q: watcher start: %v", cx.Name, err)
 		return
 	}
-	w.Naming = naming
+	w.Settings = func() (int, gallery.Naming) {
+		b := settings()
+		return b.MaxFileSizeMB, b.Naming
+	}
 	w.OnEvent = jm.SetWatcherMessage
 	w.OnChange = cx.InvalidateCaches
-	w.OnPhash = relations.PhashSink(cx.DB)
+	w.OnPhash = cx.phashSink()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	cx.watcherCancel = cancel
@@ -333,11 +423,16 @@ func (cx *Gallery) startWatcher(watchEnabled bool, maxFileSizeMB int, naming gal
 	logx.Infof("gallery %q: watcher started", cx.Name)
 }
 
-// RestartWatcher is for a folder handed back; the event filter already
+// restartWatcher is for a folder handed back; the event filter already
 // follows a folder fenced off.
-func (cx *Gallery) RestartWatcher(watchEnabled bool, maxFileSizeMB int, naming gallery.Naming, jm *jobs.Manager) {
+func (cx *Gallery) restartWatcher(settings func() Background, jm *jobs.Manager) {
+	cx.bgMu.Lock()
+	defer cx.bgMu.Unlock()
+	if cx.Closed() {
+		return
+	}
 	cx.stopWatcher()
-	cx.startWatcher(watchEnabled, maxFileSizeMB, naming, jm)
+	cx.startWatcher(settings, jm)
 }
 
 func (cx *Gallery) stopWatcher() {
@@ -354,7 +449,7 @@ func (cx *Gallery) startMangaReclaim() {
 	if cx.mangaReclaim != nil {
 		return
 	}
-	r := gallery.NewMangaCacheReclaimer(cx.MangaCacheDir())
+	r := gallery.NewMangaCacheReclaimer(cx.mangaCacheDir())
 	r.Start(context.Background())
 	cx.mangaReclaim = r
 }

@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/counts"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -71,15 +70,19 @@ func similarityOrderClause(seed tags.OverlapSeed, order string) (string, []any) 
 	return "ORDER BY " + sub + " " + dir + ", i.id " + dir, args
 }
 
-func similarityRankSeed(database *db.DB, expr Expr) (tags.OverlapSeed, bool) {
-	if database == nil {
+func similarityRankSeed(src Source, expr Expr) (tags.OverlapSeed, bool) {
+	if src.DB == nil {
 		return tags.OverlapSeed{}, false
 	}
 	id, ok := SimilaritySeedID(expr)
 	if !ok {
 		return tags.OverlapSeed{}, false
 	}
-	seed, err := tags.LoadOverlapSeed(database, id)
+	visible, ok := src.Tallies.VisibleCount()
+	if !ok {
+		return tags.OverlapSeed{}, false
+	}
+	seed, err := tags.LoadOverlapSeed(src.DB, id, visible)
 	if err != nil || len(seed.TagIDs) == 0 {
 		return tags.OverlapSeed{}, false
 	}
@@ -118,33 +121,37 @@ func HasSimilarTerm(expr Expr) bool {
 
 // A list at the cap is partial, so it stays out of the cache. ctx is the
 // only bound on this scan: no fast counter recognises similar:.
-func similarityMatchIDs(ctx context.Context, database *db.DB, q Query) []int64 {
-	seed, ok := similarityRankSeed(database, q.Expr)
+func similarityMatchIDs(ctx context.Context, src Source, q Query) []int64 {
+	database := src.DB
+	gen := src.Cache.gen()
+	key := q.listKey()
+	seed, ok := similarityRankSeed(src, q.Expr)
 	if !ok {
 		return nil
 	}
 	// One scored pass per key: a loser renders without prev/next.
-	if q.CacheKey != "" {
-		if !AdjacencyCacheTryAcquireFan(q.CacheKey) {
+	if key != "" {
+		if !src.Cache.tryAcquireFan(key) {
 			return nil
 		}
-		defer AdjacencyCacheReleaseFan(q.CacheKey)
+		defer src.Cache.releaseFan(key)
 	}
 	driverLegs, _ := pickAndDriverTag(database, q.Expr, false)
-	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(q.Expr, database, driverLegs)
+	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(q.Expr, src, driverLegs)
 	where, args = applyAndDriver(where, args, driverLegs)
 	where = andDefaultVisible(where, hasMissingFilter)
-	ids := fanSimilarityIDs(ctx, database, seed, q.Order, where, args)
+	ids := fanSimilarityIDs(ctx, src, seed, q.Order, where, args)
 	if len(ids) < adjacencyCacheMaxIDs {
-		AdjacencyCacheSet(q.CacheKey, ids)
+		src.Cache.set(key, ids, gen)
 	}
 	return ids
 }
 
 // Scored in Go off the cached tallies: the SQL score re-derives each
 // candidate's total through both tag joins.
-func fanSimilarityIDs(ctx context.Context, database *db.DB, seed tags.OverlapSeed, order, where string, args []any) []int64 {
-	totals, err := counts.CountedTagTotals(ctx, database, seed.MaxUsage)
+func fanSimilarityIDs(ctx context.Context, src Source, seed tags.OverlapSeed, order, where string, args []any) []int64 {
+	database := src.DB
+	totals, err := src.Tallies.CountedTagTotals(ctx, seed.MaxUsage)
 	if err != nil {
 		orderClause, orderArgs := similarityOrderClause(seed, order)
 		return fetchSortedMatchIDs(ctx, database, "", where, args, orderClause, orderArgs, adjacencyCacheMaxIDs)

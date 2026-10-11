@@ -11,7 +11,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 )
@@ -38,7 +40,7 @@ func (s *Server) generateMangaCollection(w http.ResponseWriter, r *http.Request)
 // JobTypeTag on purpose: the watcher skips ingests during a tag job, so
 // the files this job writes are not ingested twice. The snapshot holds:
 // switchGallery refuses while a job runs.
-func (s *Server) collectionJobPrologue(w http.ResponseWriter, r *http.Request) (name string, cx *galleryCtx, writeDir string, naming gallery.Naming, ok bool) {
+func (s *Server) collectionJobPrologue(w http.ResponseWriter, r *http.Request) (name string, cx *library.Gallery, writeDir string, naming gallery.Naming, ok bool) {
 	if !parseFormOK(w, r) {
 		return "", nil, "", naming, false
 	}
@@ -63,27 +65,17 @@ func (s *Server) collectionJobPrologue(w http.ResponseWriter, r *http.Request) (
 	return name, cx, writeDir, naming, true
 }
 
-// The cancel is checked before the error, so it ends as a summary rather
-// than a failure.
 func (s *Server) goGenerationJob(run func(ctx context.Context) (string, error)) {
 	go func() {
 		ctx := s.jobs.Context()
 		summary, err := run(ctx)
-		if ctx.Err() != nil {
-			s.jobs.Complete("generation cancelled")
-			return
-		}
-		if err != nil {
-			s.jobs.Fail(err.Error())
-			return
-		}
-		s.jobs.Complete(summary)
+		_ = s.jobs.Settle(ctx, err, "generation cancelled", summary)
 	}()
 }
 
 // Returns the pages walked and those that landed as new rows; a page the
 // gallery already holds folds onto its row.
-func (s *Server) runMangaCollection(ctx context.Context, cx *galleryCtx, img *models.Image, name, writeDir string, naming gallery.Naming) (int, int, error) {
+func (s *Server) runMangaCollection(ctx context.Context, cx *library.Gallery, img *models.Image, name, writeDir string, naming gallery.Naming) (int, int, error) {
 	destDir, err := cx.Boundary().ResolveSubdir(writeDir)
 	if err != nil {
 		return 0, 0, err
@@ -108,7 +100,7 @@ func (s *Server) runMangaCollection(ctx context.Context, cx *galleryCtx, img *mo
 		if ctx.Err() != nil {
 			return done, created, ctx.Err()
 		}
-		pageID, filed, err := s.extractMangaPageToGallery(cx, img, n, destDir, "p")
+		pageID, filed, err := s.extractMangaPageToGallery(ctx, cx, img, n, destDir, "p", gallery.Naming{})
 		if err != nil {
 			return done, created, fmt.Errorf("page %d/%d: %w", n, total, err)
 		}
@@ -124,19 +116,18 @@ func (s *Server) runMangaCollection(ctx context.Context, cx *galleryCtx, img *mo
 					}
 					filedDir = path.Join(rendered, sub)
 				}
-				if _, moveErr := gallery.PlaceImage(cx.DB, cx.Boundary(), pageID, &filedDir, nil); moveErr != nil {
+				if _, moveErr := cx.PlaceImage(pageID, &filedDir, nil); moveErr != nil {
 					return done, created, fmt.Errorf("page %d/%d file: %w", n, total, moveErr)
 				}
 			}
 		}
 		pos := n
-		if err := gallery.AddCollectionMembership(cx.DB, pageID, name, &pos); err != nil {
+		if err := cx.Edit(func(d *db.DB) error { return gallery.AddCollectionMembership(d, pageID, name, &pos) }); err != nil {
 			return done, created, fmt.Errorf("page %d/%d membership: %w", n, total, err)
 		}
 		done = n
 		s.jobs.Update(done, total, "generating…")
 	}
-	cx.InvalidateCaches()
 	return done, created, nil
 }
 
@@ -170,7 +161,7 @@ func (r collectionCBZResult) summary() string {
 	return msg
 }
 
-func (s *Server) runCollectionCBZ(ctx context.Context, cx *galleryCtx, name, writeDir string, naming gallery.Naming) (collectionCBZResult, error) {
+func (s *Server) runCollectionCBZ(ctx context.Context, cx *library.Gallery, name, writeDir string, naming gallery.Naming) (collectionCBZResult, error) {
 	var res collectionCBZResult
 	members, err := gallery.CollectionCBZMembers(cx.DB, name)
 	if err != nil {
@@ -183,27 +174,25 @@ func (s *Server) runCollectionCBZ(ctx context.Context, cx *galleryCtx, name, wri
 	if err != nil {
 		return res, err
 	}
-	dst := gallery.UniqueDestPath(destDir, collectionCBZFilename(name))
-	res.Filename = filepath.Base(dst)
-	res.Pages, res.Skipped, err = gallery.WriteCollectionCBZ(ctx, dst, members, name,
-		func(processed, total int, message string) { s.jobs.Update(processed, total, message) })
+	filename := collectionCBZFilename(name)
+	landed, err := cx.Land(ctx, destDir, filename, func(dst string) error {
+		var werr error
+		res.Pages, res.Skipped, werr = gallery.WriteCollectionCBZ(ctx, dst, members, name,
+			func(processed, total int, message string) { s.jobs.Update(processed, total, message) })
+		return werr
+	}, library.LandSpec{Origin: models.OriginGenerate, Naming: naming, KeepOnFailure: true})
 	if err != nil {
+		if library.LandStageOf(err) == library.LandIngest {
+			return collectionCBZResult{}, fmt.Errorf("ingest %q: %w", filename, err)
+		}
 		return collectionCBZResult{}, err
 	}
-	archive, isDup, err := gallery.Ingest(cx.DB, cx.GalleryPath, cx.ThumbnailsPath, dst, models.OriginGenerate)
-	if err != nil {
-		return collectionCBZResult{}, fmt.Errorf("ingest %q: %w", res.Filename, err)
-	}
+	res.Filename = filepath.Base(landed.Path)
 	// An unchanged collection packs byte for byte the same, so a rerun
-	// lands on the earlier archive. A dup whose canonical path is dst is
-	// a deleted archive coming back, and stays.
-	if isDup && archive.CanonicalPath != dst {
-		gallery.DropDuplicateCopy(cx.DB, archive.ID, dst, "generate cbz")
-		res.Existing = filepath.Base(archive.CanonicalPath)
-	} else if _, err := naming.Apply(ctx, cx.DB, cx.Boundary(), archive.ID, "", ""); err != nil {
-		logx.Warnf("generate cbz %q: file: %v", res.Filename, err)
+	// lands on the earlier archive.
+	if landed.Dropped {
+		res.Existing = filepath.Base(landed.Image.CanonicalPath)
 	}
-	cx.InvalidateCaches()
 	return res, nil
 }
 
@@ -228,30 +217,19 @@ func sanitizeCollectionFilename(name string) string {
 }
 
 // The bool is false when the page folded onto a row the gallery already held.
-func (s *Server) extractMangaPageToGallery(cx *galleryCtx, img *models.Image, n int, destDir, prefix string) (int64, bool, error) {
+func (s *Server) extractMangaPageToGallery(ctx context.Context, cx *library.Gallery, img *models.Image, n int, destDir, prefix string, naming gallery.Naming) (int64, bool, error) {
 	pagePath, err := gallery.EnsureMangaPage(cx.ThumbnailsPath, img.CanonicalPath, img.ID, n)
 	if err != nil {
 		return 0, false, err
 	}
-	dstPath := gallery.UniqueDestPath(destDir, fmt.Sprintf("%s%04d", prefix, n)+filepath.Ext(pagePath))
-	// Copied, not moved: the manga reclaim can unlink the cache file anytime.
-	if err := gallery.CopyFileContents(pagePath, dstPath); err != nil {
-		return 0, false, fmt.Errorf("copy page: %w", err)
-	}
-	if _, err := gallery.DetectFileType(dstPath); err != nil {
-		_ = os.Remove(dstPath)
-		return 0, false, fmt.Errorf("detect type: %w", err)
-	}
-	// No MaxFileSizeMB check: the bytes are already in the library.
-	page, isDup, err := gallery.Ingest(cx.DB, cx.GalleryPath, cx.ThumbnailsPath, dstPath, models.OriginExtract)
+	// Copied, not moved: the manga reclaim can unlink the cache file
+	// anytime. No size cap: the bytes are already in the library.
+	landed, err := cx.Land(ctx, destDir, fmt.Sprintf("%s%04d", prefix, n)+filepath.Ext(pagePath),
+		library.FromFile(pagePath), library.LandSpec{Origin: models.OriginExtract, Naming: naming})
 	if err != nil {
-		_ = os.Remove(dstPath)
 		return 0, false, err
 	}
-	folded := isDup && page.CanonicalPath != dstPath
-	if folded {
-		gallery.DropDuplicateCopy(cx.DB, page.ID, dstPath, "extract")
-	}
+	page, folded := landed.Image, landed.Dropped
 	if cx.RelationsSvc != nil {
 		// A conflicting relation is a standing operator decision; the
 		// extract stands without the link.

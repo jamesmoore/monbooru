@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/relations"
@@ -45,9 +45,7 @@ func (s *Server) relatedEntriesGet(w http.ResponseWriter, r *http.Request) {
 	if sErr != nil {
 		logx.Warnf("collection siblings load %d: %v", id, sErr)
 	}
-	if len(siblings) > relatedPanelCap {
-		siblings = siblings[:relatedPanelCap]
-	}
+	siblings = siblings[:min(len(siblings), relatedPanelCap)]
 	tiles := flattenRelationsForPanel(rels, id)
 	paths := loadImagePaths(r.Context(), cx.DB, cx.Boundary(), id)
 	back := parseBackContext(r)
@@ -74,35 +72,17 @@ type collectionSibling struct {
 	Order  *int64
 }
 
-func loadCollectionSiblings(cx *galleryCtx, imageID int64) ([]collectionSibling, error) {
-	rows, err := cx.DB.Read.Query(
-		`SELECT jc.image_id, jc.name, jc.position
+func loadCollectionSiblings(cx *library.Gallery, imageID int64) ([]collectionSibling, error) {
+	return db.QueryAll(cx.DB.Read, db.ScanRow(func(sib *collectionSibling) []any {
+		return []any{&sib.ID, &sib.Series, &sib.Order}
+	}), `SELECT jc.image_id, jc.name, jc.position
 		 FROM image_collections self
 		 JOIN image_collections jc ON jc.name = self.name
 		 JOIN images i ON i.id = jc.image_id
 		 WHERE self.image_id = ? AND jc.image_id != ? AND i.is_missing = 0
 		 ORDER BY jc.name, jc.position IS NULL, jc.position, jc.image_id
 		 LIMIT 200`,
-		imageID, imageID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []collectionSibling
-	for rows.Next() {
-		var sib collectionSibling
-		var ord sql.NullInt64
-		if scanErr := rows.Scan(&sib.ID, &sib.Series, &ord); scanErr != nil {
-			return nil, scanErr
-		}
-		if ord.Valid {
-			v := ord.Int64
-			sib.Order = &v
-		}
-		out = append(out, sib)
-	}
-	return out, rows.Err()
+		imageID, imageID)
 }
 
 func flattenRelationsForPanel(rels *relations.ImageRelations, self int64) []relatedTile {
@@ -183,7 +163,6 @@ func (s *Server) imageRelationsPage(w http.ResponseWriter, r *http.Request) {
 		}
 		nextOriginal = next
 	}
-	thumbURL := fmt.Sprintf("/thumbnails/%s/%d.jpg", s.activeGallery(), id)
 	titleName := filepath.Base(img.CanonicalPath)
 	if parent := filepath.Base(filepath.Dir(img.CanonicalPath)); parent != "" && parent != "." && parent != "/" {
 		titleName = parent + "/" + titleName
@@ -195,7 +174,6 @@ func (s *Server) imageRelationsPage(w http.ResponseWriter, r *http.Request) {
 		Relations:                      rels,
 		Self:                           id,
 		Collection:                     collection,
-		ThumbnailURL:                   thumbURL,
 		NextOriginalIfOriginalUnlinked: nextOriginal,
 		AltGroupMembersOrdered:         reorderSelfFirst(rels.AltGroupMembers, id),
 		BackQ:                          back.Q,
@@ -234,7 +212,7 @@ func reorderSelfFirst(members []int64, self int64) []int64 {
 	return out
 }
 
-func versionChainGensForImage(cx *galleryCtx, imageID int64) ([][]int64, error) {
+func versionChainGensForImage(cx *library.Gallery, imageID int64) ([][]int64, error) {
 	root, err := relations.ChainRoot(cx.DB.Read, "version_edges", "parent_image_id", "child_image_id", imageID)
 	if err != nil {
 		return nil, err
@@ -263,7 +241,7 @@ func versionChainGensForImage(cx *galleryCtx, imageID int64) ([][]int64, error) 
 	return gens, nil
 }
 
-func derivativeGraphForImage(cx *galleryCtx, imageID int64) (*derivGraph, error) {
+func derivativeGraphForImage(cx *library.Gallery, imageID int64) (*derivGraph, error) {
 	members, err := relations.DerivativeComponent(cx.DB.Read, imageID)
 	if err != nil || len(members) < 2 {
 		return nil, err
@@ -315,7 +293,6 @@ type relationsImagePageData struct {
 	Relations                      *relations.ImageRelations
 	Self                           int64
 	Collection                     []collectionSibling
-	ThumbnailURL                   string
 	NextOriginalIfOriginalUnlinked int64
 	DupGroupMembersOrdered         []int64
 	AltGroupMembersOrdered         []int64
@@ -361,20 +338,16 @@ func (s *Server) recomputePhashPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h, err := gallery.RecomputeAndStorePhash(r.Context(), cx.DB, id, cx.ThumbnailsPath)
-	if err != nil {
+	if _, err := cx.RecomputePhash(r.Context(), id); err != nil {
 		logx.Warnf("recompute phash %d: %v", id, err)
-		// Flash at 200: htmx ignores HX-Trigger on a non-2xx response.
 		// No refresh here, or the reload would wipe the flash.
 		setFlashHeader(w, "phash recompute failed (is the thumbnail present?)", "err", nil)
 		return
 	}
-	relations.PhashStored(cx.DB, id, h)
-	cx.InvalidatePhashMissing()
 	hxDone(w, r, "phash recomputed.", "", "/images/"+strconv.FormatInt(id, 10))
 }
 
-func (s *Server) relationsForm(w http.ResponseWriter, r *http.Request) (*galleryCtx, bool) {
+func (s *Server) relationsForm(w http.ResponseWriter, r *http.Request) (*library.Gallery, bool) {
 	if !parseFormOK(w, r) {
 		return nil, false
 	}
@@ -414,7 +387,6 @@ func (s *Server) addRelationPost(w http.ResponseWriter, r *http.Request) {
 		writeRelationError(w, err)
 		return
 	}
-	cx.InvalidateCaches()
 	setFlashHeader(w, "Relation added.", "ok", nil)
 	writeInlineFlash(w, "ok", "Relation added.")
 }
@@ -496,7 +468,6 @@ func (s *Server) removeRelationPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusBadRequest, "Unknown relation type.")
 		return
 	}
-	cx.InvalidateCaches()
 	setFlashHeader(w, msg, "ok", nil)
 	writeInlineFlash(w, "ok", msg)
 }
@@ -507,7 +478,7 @@ var reviewAgainRemovers = map[string]func(*relations.Service, int64, int64) erro
 	"not_related": (*relations.Service).RemoveNotRelated,
 }
 
-func reviewAgainPost(w http.ResponseWriter, r *http.Request, cx *galleryCtx) {
+func reviewAgainPost(w http.ResponseWriter, r *http.Request, cx *library.Gallery) {
 	subkind := r.FormValue("kind")
 	var a, b int64
 	switch subkind {
@@ -565,7 +536,6 @@ func reviewAgainPost(w http.ResponseWriter, r *http.Request, cx *galleryCtx) {
 		writeRelationError(w, err)
 		return
 	}
-	cx.InvalidateCaches()
 	// Pinned to the pair, or the session opens on whatever the queue
 	// sorts first.
 	lo, hi := min(a, b), max(a, b)
@@ -595,49 +565,36 @@ func (s *Server) copyTagsToOriginalPreview(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	var original int64
-	if err := cx.DB.Read.QueryRow(`SELECT original_image_id FROM dup_groups WHERE id = ?`, gid).Scan(&original); err != nil {
+	original, err := relations.GroupOriginal(cx.DB.Read, gid)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	rows, err := cx.DB.Read.Query(`
-		SELECT DISTINCT t.name, COALESCE(c.name, ''), COALESCE(c.color, '')
-		FROM image_tags it
-		JOIN dup_group_members m ON m.image_id = it.image_id
-		JOIN tags t ON t.id = it.tag_id
-		LEFT JOIN tag_categories c ON c.id = t.category_id
-		WHERE m.group_id = ?
-		  AND m.image_id != ?
-		  AND it.is_implied = 0
-		  AND (c.name IS NULL OR c.name != 'rating')
-		  AND NOT EXISTS (
-		    SELECT 1 FROM image_tags it2 WHERE it2.image_id = ? AND it2.tag_id = it.tag_id
-		  )
-		ORDER BY c.name, t.name`,
-		gid, original, original,
-	)
+	ids, err := cx.RelationsSvc.TagsToCopy(gid)
 	if err != nil {
 		http.Error(w, "load preview", http.StatusInternalServerError)
 		return
 	}
-	defer func() { _ = rows.Close() }()
 	type row struct {
 		name     string
 		category string
 		color    string
 	}
 	var entries []row
-	for rows.Next() {
-		var rec row
-		if scanErr := rows.Scan(&rec.name, &rec.category, &rec.color); scanErr != nil {
-			http.Error(w, "scan preview", http.StatusInternalServerError)
+	if len(ids) > 0 {
+		placeholders, args := db.InPlaceholders(ids)
+		entries, err = db.QueryAll(cx.DB.Read, db.ScanRow(func(rec *row) []any {
+			return []any{&rec.name, &rec.category, &rec.color}
+		}), `
+			SELECT t.name, COALESCE(c.name, ''), COALESCE(c.color, '')
+			FROM tags t
+			LEFT JOIN tag_categories c ON c.id = t.category_id
+			WHERE t.id IN (`+placeholders+`)
+			ORDER BY c.name, t.name`, args...)
+		if err != nil {
+			http.Error(w, "load preview", http.StatusInternalServerError)
 			return
 		}
-		entries = append(entries, rec)
-	}
-	if err := rows.Err(); err != nil {
-		http.Error(w, "load preview", http.StatusInternalServerError)
-		return
 	}
 	category := func(e row) string { return cmp.Or(e.category, "(uncategorised)") }
 	groups := groupOrdered(entries, nil, category,
@@ -654,7 +611,6 @@ func (s *Server) copyTagsToOriginalPreview(w http.ResponseWriter, r *http.Reques
 		"OriginalID": original,
 		"Groups":     groups,
 		"Total":      total,
-		"CSRFToken":  s.csrfToken(sessionFromContext(r.Context())),
 	})
 }
 
@@ -682,7 +638,6 @@ func (s *Server) reverseRelationPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusBadRequest, "Unknown relation type.")
 		return
 	}
-	cx.InvalidateCaches()
 	writeInlineFlash(w, "ok", "Edge reversed.")
 }
 
@@ -691,8 +646,7 @@ func (s *Server) mergeGroupsPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	kind := r.URL.Query().Get("kind")
-	kind = cmp.Or(kind, r.FormValue("kind"))
+	kind := cmp.Or(r.URL.Query().Get("kind"), r.FormValue("kind"))
 	if kind != "alt" && kind != "dup" {
 		flashStatus(w, http.StatusBadRequest, "Unknown merge kind.")
 		return
@@ -727,7 +681,6 @@ func (s *Server) mergeGroupsPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cx.InvalidateCaches()
 	redirectKind := "duplicate"
 	if kind == "alt" {
 		redirectKind = "alternate"
@@ -741,8 +694,7 @@ func (s *Server) dissolveGroupsPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	kind := r.URL.Query().Get("kind")
-	kind = cmp.Or(kind, r.FormValue("kind"))
+	kind := cmp.Or(r.URL.Query().Get("kind"), r.FormValue("kind"))
 	byRoot := map[string]struct {
 		field    string
 		dissolve func(int64) error
@@ -775,7 +727,6 @@ func (s *Server) dissolveGroupsPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusBadRequest, "Unknown dissolve kind.")
 		return
 	}
-	cx.InvalidateCaches()
 	target := "/relations/browse?kind=" + kind
 	hxRedirect(w, r, target)
 }
@@ -800,15 +751,15 @@ func parseIDList(raw []string) []int64 {
 }
 
 func parsePairValue(raw string) (int64, int64, bool) {
-	colon := strings.IndexByte(raw, ':')
-	if colon <= 0 || colon == len(raw)-1 {
+	aStr, bStr, ok := strings.Cut(raw, ":")
+	if !ok {
 		return 0, 0, false
 	}
-	a, err := strconv.ParseInt(strings.TrimSpace(raw[:colon]), 10, 64)
+	a, err := strconv.ParseInt(strings.TrimSpace(aStr), 10, 64)
 	if err != nil {
 		return 0, 0, false
 	}
-	b, err := strconv.ParseInt(strings.TrimSpace(raw[colon+1:]), 10, 64)
+	b, err := strconv.ParseInt(strings.TrimSpace(bStr), 10, 64)
 	if err != nil {
 		return 0, 0, false
 	}
@@ -829,7 +780,6 @@ func (s *Server) copyTagsToOriginalPost(w http.ResponseWriter, r *http.Request) 
 		writeRelationError(w, err)
 		return
 	}
-	cx.InvalidateCaches()
 	writeInlineFlash(w, "ok", fmt.Sprintf("Copied %d tag(s) to the original.", added))
 }
 

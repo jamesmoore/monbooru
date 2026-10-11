@@ -8,6 +8,10 @@ func mountUsage(_ string) (mountStats, uint64, bool) { return mountStats{}, 0, f
 
 func readVmRSS() uint64 { return 0 }
 
-func readVmHWM() uint64 { return 0 }
+func readRSSOf(_ string) uint64 { return 0 }
+
+func readPeakRSS(_ string) uint64 { return 0 }
+
+func resetPeakRSS(_ string) {}
 
 func procRSSAt(_ int) (rssBreakdown, bool) { return rssBreakdown{}, false }

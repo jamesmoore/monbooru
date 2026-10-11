@@ -35,9 +35,7 @@
         hx-post="/upload"
         hx-target="#inbox-upload-result"
         hx-swap="innerHTML"
-        hx-encoding="multipart/form-data"
-        hx-headers='{"X-CSRF-Token": "{{.CSRFToken}}"}'>
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+        hx-encoding="multipart/form-data">
     <div id="inbox-upload-drop" class="upload-drop-zone">
       <div class="upload-drop-prompt">
         <span class="upload-drop-hint">Drop files here or use the button.</span>

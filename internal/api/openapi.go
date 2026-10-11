@@ -31,91 +31,67 @@ func buildSpec(baseURL string) map[string]any {
 				},
 			},
 			"schemas": map[string]any{
-				"Error": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"error": map[string]any{"type": "string"},
-						"code":  map[string]any{"type": "string"},
-					},
-				},
-				"Tag": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"name":        map[string]any{"type": "string"},
-						"category":    map[string]any{"type": "string"},
-						"is_auto":     map[string]any{"type": "boolean"},
-						"confidence":  map[string]any{"type": "number", "nullable": true},
-						"tagger_name": map[string]any{"type": "string", "nullable": true, "description": "Provenance identifier: auto-tagger subfolder name when is_auto, caller-supplied 'via' (e.g. app name) when manual, null for UI-driven user adds"},
-					},
-				},
-				"TagRow": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":           map[string]any{"type": "integer"},
-						"name":         map[string]any{"type": "string"},
-						"category":     map[string]any{"type": "string"},
-						"color":        map[string]any{"type": "string"},
-						"usage_count":  map[string]any{"type": "integer"},
-						"is_alias":     map[string]any{"type": "boolean"},
-						"origin":       map[string]any{"type": "string", "description": "Creation provenance label: 'user', a booru site, 'ptr', an auto-tagger name, an import label. Empty on rows predating the column."},
-						"last_used_at": map[string]any{"type": "string", "description": "ISO 8601; most recent application to an image. Absent when never applied."},
-					},
-				},
-				"TagDetail": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":           map[string]any{"type": "integer"},
-						"name":         map[string]any{"type": "string"},
-						"category":     map[string]any{"type": "string"},
-						"color":        map[string]any{"type": "string"},
-						"usage_count":  map[string]any{"type": "integer"},
-						"is_alias":     map[string]any{"type": "boolean"},
-						"origin":       map[string]any{"type": "string", "description": "Creation provenance label, as on TagRow."},
-						"last_used_at": map[string]any{"type": "string", "description": "ISO 8601; absent when never applied."},
-						"note":         map[string]any{"type": "string", "description": "The operator's note on the tag, in annotation markup; empty when none. An alias has none."},
-						"links":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "The tag's links as stored, one entry per line; a leading '-' marks a dead link."},
-					},
-				},
-				"Implication": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"parent_id":        map[string]any{"type": "integer"},
-						"implied_id":       map[string]any{"type": "integer"},
-						"implied_name":     map[string]any{"type": "string"},
-						"implied_category": map[string]any{"type": "string"},
-					},
-				},
-				"Category": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":         map[string]any{"type": "integer"},
-						"name":       map[string]any{"type": "string"},
-						"color":      map[string]any{"type": "string"},
-						"is_builtin": map[string]any{"type": "boolean"},
-					},
-				},
-				"Gallery": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"name":   map[string]any{"type": "string"},
-						"images": map[string]any{"type": "integer", "description": "Visible (non-missing) image count"},
-						"tags":   map[string]any{"type": "integer", "description": "Non-alias tag count"},
-						"active": map[string]any{"type": "boolean", "description": "True for the gallery used when no ?gallery= selector is given"},
-					},
-				},
+				"Error": objectSchema(nil, map[string]any{
+					"error": map[string]any{"type": "string"},
+					"code":  map[string]any{"type": "string"},
+				}),
+				"Tag": objectSchema(nil, map[string]any{
+					"name":        map[string]any{"type": "string"},
+					"category":    map[string]any{"type": "string"},
+					"is_auto":     map[string]any{"type": "boolean"},
+					"confidence":  map[string]any{"type": "number", "nullable": true},
+					"tagger_name": map[string]any{"type": "string", "nullable": true, "description": "Provenance identifier: auto-tagger subfolder name when is_auto, caller-supplied 'via' (e.g. app name) when manual, null for UI-driven user adds"},
+				}),
+				"TagRow": objectSchema(nil, map[string]any{
+					"id":           map[string]any{"type": "integer"},
+					"name":         map[string]any{"type": "string"},
+					"category":     map[string]any{"type": "string"},
+					"color":        map[string]any{"type": "string"},
+					"usage_count":  map[string]any{"type": "integer"},
+					"is_alias":     map[string]any{"type": "boolean"},
+					"origin":       map[string]any{"type": "string", "description": "Creation provenance label: 'user', a booru site, 'ptr', an auto-tagger name, an import label. Empty on rows predating the column."},
+					"last_used_at": map[string]any{"type": "string", "description": "ISO 8601; most recent application to an image. Absent when never applied."},
+				}),
+				"TagDetail": objectSchema(nil, map[string]any{
+					"id":           map[string]any{"type": "integer"},
+					"name":         map[string]any{"type": "string"},
+					"category":     map[string]any{"type": "string"},
+					"color":        map[string]any{"type": "string"},
+					"usage_count":  map[string]any{"type": "integer"},
+					"is_alias":     map[string]any{"type": "boolean"},
+					"origin":       map[string]any{"type": "string", "description": "Creation provenance label, as on TagRow."},
+					"last_used_at": map[string]any{"type": "string", "description": "ISO 8601; absent when never applied."},
+					"note":         map[string]any{"type": "string", "description": "The operator's note on the tag, in annotation markup; empty when none. An alias has none."},
+					"links":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "The tag's links as stored, one entry per line; a leading '-' marks a dead link."},
+				}),
+				"Implication": objectSchema(nil, map[string]any{
+					"parent_id":        map[string]any{"type": "integer"},
+					"implied_id":       map[string]any{"type": "integer"},
+					"implied_name":     map[string]any{"type": "string"},
+					"implied_category": map[string]any{"type": "string"},
+				}),
+				"Category": objectSchema(nil, map[string]any{
+					"id":         map[string]any{"type": "integer"},
+					"name":       map[string]any{"type": "string"},
+					"color":      map[string]any{"type": "string"},
+					"is_builtin": map[string]any{"type": "boolean"},
+				}),
+				"Gallery": objectSchema(nil, map[string]any{
+					"name":   map[string]any{"type": "string"},
+					"images": map[string]any{"type": "integer", "description": "Visible (non-missing) image count"},
+					"tags":   map[string]any{"type": "integer", "description": "Non-alias tag count"},
+					"active": map[string]any{"type": "boolean", "description": "True for the gallery used when no ?gallery= selector is given"},
+				}),
 				"PaginatedTags":   paginatedSchema("#/components/schemas/TagRow"),
 				"PaginatedImages": paginatedSchema("#/components/schemas/Image"),
-				"APIInfo": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"api":     map[string]any{"type": "string"},
-						"docs":    map[string]any{"type": "string"},
-						"openapi": map[string]any{"type": "string"},
-					},
-				},
+				"APIInfo": objectSchema(nil, map[string]any{
+					"api":     map[string]any{"type": "string"},
+					"docs":    map[string]any{"type": "string"},
+					"openapi": map[string]any{"type": "string"},
+				}),
 				"CreateImageResponse": map[string]any{
 					"type":        "object",
-					"description": "Bare Image on success; wrapped in {image, tag_warnings?, autotag?} when any tag failed or an auto-tag job was started.",
+					"description": "Bare Image on success; wrapped in {image, tag_warnings?, autotag?} when a tag was refused or autotag was requested.",
 					"properties": map[string]any{
 						"image":        map[string]any{"$ref": "#/components/schemas/Image"},
 						"tag_warnings": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "nullable": true},
@@ -142,124 +118,103 @@ func buildSpec(baseURL string) map[string]any {
 						"source_added":  map[string]any{"type": "boolean"},
 					},
 				},
-				"ReplaceFileResponse": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"replaced":     map[string]any{"type": "boolean", "description": "False when the uploaded bytes already matched the stored file; the metadata merge still applied"},
-						"merge":        map[string]any{"$ref": "#/components/schemas/MergeSummary"},
-						"tag_warnings": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "nullable": true},
-					},
-				},
-				"EnrichResponse": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"merge":        map[string]any{"$ref": "#/components/schemas/MergeSummary"},
-						"verified":     map[string]any{"type": "boolean", "description": "False when verify was requested but the source reported no md5"},
-						"tag_warnings": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "nullable": true},
-					},
-				},
+				"ReplaceFileResponse": objectSchema(nil, map[string]any{
+					"replaced":     map[string]any{"type": "boolean", "description": "False when the uploaded bytes already matched the stored file; the metadata merge still applied"},
+					"merge":        map[string]any{"$ref": "#/components/schemas/MergeSummary"},
+					"tag_warnings": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "nullable": true},
+				}),
+				"EnrichResponse": objectSchema(nil, map[string]any{
+					"merge":        map[string]any{"$ref": "#/components/schemas/MergeSummary"},
+					"verified":     map[string]any{"type": "boolean", "description": "False when verify was requested but the source reported no md5, or when a similarity-matched origin's differing file was applied unverified"},
+					"tag_warnings": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "nullable": true},
+				}),
 				"TagArray": map[string]any{
 					"type":  "array",
 					"items": map[string]any{"$ref": "#/components/schemas/Tag"},
 				},
-				"Image": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"id":                   map[string]any{"type": "integer"},
-						"sha256":               map[string]any{"type": "string"},
-						"md5":                  map[string]any{"type": "string", "description": "md5 of the stored file, \"\" until computed. The local digest, not the one an origin claims (sources[].md5)"},
-						"canonical_path":       map[string]any{"type": "string"},
-						"aliases":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-						"file_type":            map[string]any{"type": "string"},
-						"width":                map[string]any{"type": "integer", "nullable": true},
-						"height":               map[string]any{"type": "integer", "nullable": true},
-						"file_size":            map[string]any{"type": "integer"},
-						"is_favorited":         map[string]any{"type": "boolean"},
-						"is_inbox":             map[string]any{"type": "boolean", "description": "true = needs triage (sits in the inbox); false = curated. New ingests default to true."},
-						"is_missing":           map[string]any{"type": "boolean"},
-						"scheduled_lookup":     map[string]any{"type": "boolean", "description": "Whether the nightly online-booru lookup considers this image. Single-image GET only. Settable via PATCH /images/{id}; setting it true also resets an exhausted retry ladder."},
-						"scheduled_lookup_ptr": map[string]any{"type": "boolean", "description": "The same opt-in for the nightly PTR lookup, which is free per image and has its own ladder. Single-image GET only, settable the same way."},
-						"lookup": map[string]any{
-							"type":        "object",
-							"description": "Recorded lookup history per backend ('ptr' / 'booru'), absent when nothing has ever been tried. Single-image GET only.",
-							"additionalProperties": map[string]any{
-								"type": "object",
-								"properties": map[string]any{
-									"last_at":     map[string]any{"type": "string", "format": "date-time", "description": "When the last attempt concluded"},
-									"last_result": map[string]any{"type": "string", "description": "'hit' or 'miss'; absent while nothing has concluded"},
-									"attempts":    map[string]any{"type": "integer", "description": "Consecutive concluded misses"},
-									"next_due_at": map[string]any{"type": "string", "format": "date-time", "description": "When the backend may try again; absent when nothing is scheduled"},
-								},
-							},
-						},
-						"auto_tagged_at":   map[string]any{"type": "string", "format": "date-time", "nullable": true},
-						"source_type":      map[string]any{"type": "string", "description": "Generation-tool source: 'a1111', 'comfyui', 'a1111,comfyui', or 'none'. Filtered by the search keyword 'ai:'."},
-						"origin":           map[string]any{"type": "string", "description": "How the image got into the gallery: 'ingest' for watcher/sync, 'upload' for the web UI, or any caller-supplied string (app name, URL...) set via POST /images with 'via'"},
-						"source":           map[string]any{"type": "string", "description": "Site label of the primary (first) entry of 'sources'. Empty string when the image has no origin. Filtered by the search keyword 'source:' which matches any of the image's sources. Settable on create and via PATCH /images/{id}."},
-						"url":              map[string]any{"type": "string", "description": "URL of the primary (first) entry of 'sources'. Empty string when the image has no origin. Must start with http:// or https://. Settable on create and via PATCH /images/{id}."},
-						"page_count":       map[string]any{"type": "integer", "nullable": true, "description": "Number of pages for cbz / manga rows; null on every other file type."},
-						"collection":       map[string]any{"type": "string", "description": "Home collection label - mirrors the first entry of 'collections'. Empty string when unset. Filtered by the search keyword 'collection:' (exact match). Settable on create and via PATCH /images/{id}."},
-						"collection_order": map[string]any{"type": "integer", "nullable": true, "description": "1-based position within the home collection. Null when unset. Settable on create and via PATCH /images/{id}."},
-						"collections": map[string]any{
-							"type":        "array",
-							"description": "Every collection the image belongs to. The scalar collection / collection_order fields mirror the home membership. Managed through the web UI; the API sets only the home via collection / collection_order.",
-							"items": map[string]any{
-								"type": "object",
-								"properties": map[string]any{
-									"name":  map[string]any{"type": "string"},
-									"order": map[string]any{"type": "integer", "nullable": true, "description": "1-based position within this collection. Null when unset."},
-								},
-							},
-						},
-						"sources": map[string]any{
-							"type":        "array",
-							"description": "Every origin the image came from. The scalar source / url fields mirror the primary (first) origin. Managed through the web UI; the API sets only the primary via source / url.",
-							"items": map[string]any{
-								"type": "object",
-								"properties": map[string]any{
-									"site":                  map[string]any{"type": "string", "description": "Site label, e.g. \"danbooru\"; empty for a url-only origin."},
-									"post_id":               map[string]any{"type": "string", "description": "Upstream post id; omitted for a manually-added origin."},
-									"url":                   map[string]any{"type": "string"},
-									"commentary":            map[string]any{"type": "string", "description": "Artist commentary pulled from (or hand-entered for) this origin; omitted when empty."},
-									"commentary_translated": map[string]any{"type": "string", "description": "Translation of that commentary where the source published one; omitted when empty."},
-									"original":              map[string]any{"type": "string", "description": "Upstream artist source the post declared (usually a URL, newline-joined when several); omitted when empty."},
-									"similarity":            map[string]any{"type": "number", "description": "Best similarity-service score (0-100) a lookup matched this origin with; omitted for an exact or manual origin. A matched origin's refetches skip the md5 verify."},
-								},
-							},
-						},
-						"note":            map[string]any{"type": "string", "description": "Operator's freeform note. Never written by a push, enrich, or import."},
-						"original_source": map[string]any{"type": "string", "description": "Legacy image-level original source URL. Read-only: only a gallery transfer still carries it."},
-						"annotations": map[string]any{
-							"type":        "array",
-							"description": "Positional note boxes pulled per source, in original-image pixel coordinates. Omitted when empty.",
-							"items": map[string]any{
-								"type": "object",
-								"properties": map[string]any{
-									"site":      map[string]any{"type": "string", "description": "The source site the note came from."},
-									"post_id":   map[string]any{"type": "string", "description": "The post on that site; omitted when the source has none."},
-									"x":         map[string]any{"type": "integer"},
-									"y":         map[string]any{"type": "integer"},
-									"w":         map[string]any{"type": "integer"},
-									"h":         map[string]any{"type": "integer"},
-									"body":      map[string]any{"type": "string", "description": "The stored body, in monbooru's annotation markup."},
-									"body_text": map[string]any{"type": "string", "description": "The body flattened to plain text. Present only when the body carries markup."},
-								},
-							},
-						},
-						"ingested_at":   map[string]any{"type": "string", "format": "date-time"},
-						"thumbnail_url": map[string]any{"type": "string"},
-						"phash":         map[string]any{"type": "string", "nullable": true, "description": "16-char hex perceptual hash; null until the phash backfill or ingest has populated it."},
-						"tags":          map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Tag"}},
-						"tag_sources": map[string]any{
-							"type":                 "object",
-							"description":          "Per-tag source ledger keyed by the tag's category:name form (bare for general): every source that applied or re-confirmed the tag. Present on the single-image GET only.",
-							"additionalProperties": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-						},
+				"Image": objectSchema(nil, map[string]any{
+					"id":                   map[string]any{"type": "integer"},
+					"sha256":               map[string]any{"type": "string"},
+					"md5":                  map[string]any{"type": "string", "description": "md5 of the stored file, \"\" until computed. The local digest, not the md5 an origin claims"},
+					"canonical_path":       map[string]any{"type": "string"},
+					"aliases":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"file_type":            map[string]any{"type": "string"},
+					"width":                map[string]any{"type": "integer", "nullable": true},
+					"height":               map[string]any{"type": "integer", "nullable": true},
+					"file_size":            map[string]any{"type": "integer"},
+					"is_favorited":         map[string]any{"type": "boolean"},
+					"is_inbox":             map[string]any{"type": "boolean", "description": "true = needs triage (sits in the inbox); false = curated. New ingests default to true."},
+					"is_missing":           map[string]any{"type": "boolean"},
+					"scheduled_lookup":     map[string]any{"type": "boolean", "description": "Whether the nightly online-booru lookup considers this image. Single-image GET only. Settable via PATCH /images/{id}; setting it true also resets an exhausted retry ladder."},
+					"scheduled_lookup_ptr": map[string]any{"type": "boolean", "description": "The same opt-in for the nightly PTR lookup, which is free per image and has its own ladder. Single-image GET only, settable the same way."},
+					"lookup": map[string]any{
+						"type":        "object",
+						"description": "Recorded lookup history per backend ('ptr' / 'booru'), absent when nothing has ever been tried. Single-image GET only.",
+						"additionalProperties": objectSchema(nil, map[string]any{
+							"last_at":     map[string]any{"type": "string", "format": "date-time", "description": "When the last attempt concluded"},
+							"last_result": map[string]any{"type": "string", "description": "'hit' or 'miss'; absent while nothing has concluded"},
+							"attempts":    map[string]any{"type": "integer", "description": "Consecutive concluded misses"},
+							"next_due_at": map[string]any{"type": "string", "format": "date-time", "description": "When the backend may try again; absent when nothing is scheduled"},
+						}),
 					},
-				},
+					"auto_tagged_at":   map[string]any{"type": "string", "format": "date-time", "nullable": true},
+					"source_type":      map[string]any{"type": "string", "description": "Generation-tool source: 'a1111', 'comfyui', 'a1111,comfyui', or 'none'. Filtered by the search keyword 'ai:'."},
+					"origin":           map[string]any{"type": "string", "description": "How the image got into the gallery: 'ingest' for watcher/sync, 'upload' for the web UI, or any caller-supplied string (app name, URL...) set via POST /images with 'via'"},
+					"source":           map[string]any{"type": "string", "description": "Site label of the primary (first) entry of 'sources'. Empty string when the image has no origin. Filtered by the search keyword 'source:' which matches any of the image's sources. Settable on create and via PATCH /images/{id}."},
+					"url":              map[string]any{"type": "string", "description": "URL of the primary (first) entry of 'sources'. Empty string when the image has no origin. Must start with http:// or https://. Settable on create and via PATCH /images/{id}."},
+					"page_count":       map[string]any{"type": "integer", "nullable": true, "description": "Number of pages for cbz / manga rows; null on every other file type."},
+					"collection":       map[string]any{"type": "string", "description": "Home collection label - mirrors the first entry of 'collections'. Empty string when unset. Filtered by the search keyword 'collection:' (exact match). Settable on create and via PATCH /images/{id}."},
+					"collection_order": map[string]any{"type": "integer", "nullable": true, "description": "1-based position within the home collection. Null when unset. Settable on create and via PATCH /images/{id}."},
+					"collections": map[string]any{
+						"type":        "array",
+						"description": "Every collection the image belongs to. The scalar collection / collection_order fields mirror the home membership. Managed through the web UI; the API sets the home via collection / collection_order, and a duplicate push files the image into its collection as a further membership.",
+						"items": objectSchema(nil, map[string]any{
+							"name":  map[string]any{"type": "string"},
+							"order": map[string]any{"type": "integer", "nullable": true, "description": "1-based position within this collection. Null when unset."},
+						}),
+					},
+					"sources": map[string]any{
+						"type":        "array",
+						"description": "Every origin the image came from. The scalar source / url fields mirror the primary (first) origin. PATCH edits the primary through source / url; a push or enrich adds or updates the origin it names.",
+						"items": objectSchema(nil, map[string]any{
+							"site":                  map[string]any{"type": "string", "description": "Site label, e.g. \"danbooru\"; empty for a url-only origin."},
+							"post_id":               map[string]any{"type": "string", "description": "Upstream post id; omitted for a manually-added origin."},
+							"url":                   map[string]any{"type": "string"},
+							"commentary":            map[string]any{"type": "string", "description": "Artist commentary pulled from (or hand-entered for) this origin; omitted when empty."},
+							"commentary_translated": map[string]any{"type": "string", "description": "Translation of that commentary where the source published one; omitted when empty."},
+							"original":              map[string]any{"type": "string", "description": "Upstream artist source the post declared (usually a URL, newline-joined when several); omitted when empty."},
+							"similarity":            map[string]any{"type": "number", "description": "Best similarity-service score (0-100) a lookup matched this origin with; omitted for an exact or manual origin. A matched origin's refetches skip the md5 verify."},
+						}),
+					},
+					"note":            map[string]any{"type": "string", "description": "Operator's freeform note. Never written by a push or enrich."},
+					"original_source": map[string]any{"type": "string", "description": "Legacy image-level original source URL. Read-only: only a gallery transfer still carries it."},
+					"annotations": map[string]any{
+						"type":        "array",
+						"description": "Positional note boxes pulled per source, in original-image pixel coordinates. Omitted when empty.",
+						"items": objectSchema(nil, map[string]any{
+							"site":      map[string]any{"type": "string", "description": "The source site the note came from."},
+							"post_id":   map[string]any{"type": "string", "description": "The post on that site; omitted when the source has none."},
+							"x":         map[string]any{"type": "integer"},
+							"y":         map[string]any{"type": "integer"},
+							"w":         map[string]any{"type": "integer"},
+							"h":         map[string]any{"type": "integer"},
+							"body":      map[string]any{"type": "string", "description": "The stored body, in monbooru's annotation markup."},
+							"body_text": map[string]any{"type": "string", "description": "The body flattened to plain text. Present only when the body carries markup."},
+						}),
+					},
+					"ingested_at":   map[string]any{"type": "string", "format": "date-time"},
+					"thumbnail_url": map[string]any{"type": "string"},
+					"phash":         map[string]any{"type": "string", "nullable": true, "description": "16-char hex perceptual hash; null until the phash backfill or ingest has populated it."},
+					"tags":          map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Tag"}},
+					"tag_sources": map[string]any{
+						"type":                 "object",
+						"description":          "Per-tag source ledger keyed by the tag's category:name form (bare for general): every source that applied or re-confirmed the tag. Present on the single-image GET only.",
+						"additionalProperties": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					},
+				}),
 				"ImageRelations": map[string]any{
 					"type":        "object",
-					"description": "Declared relations centred on one image. duplicate_group / alternate_group are null when the image is not part of a group; the four edge slots are null when no edge exists.",
+					"description": "Declared relations centred on one image. duplicate_group / alternate_group are null when the image is not part of a group; version_parent / version_child are null and derivative_sources / derivatives empty when no edge exists.",
 					"properties": map[string]any{
 						"duplicate_group": map[string]any{
 							"type":     "object",
@@ -305,66 +260,58 @@ func buildSpec(baseURL string) map[string]any {
 						"required": true,
 						"content": map[string]any{
 							"multipart/form-data": map[string]any{
-								"schema": map[string]any{
-									"type":     "object",
-									"required": []string{"file"},
-									"properties": map[string]any{
-										"file":                        map[string]any{"type": "string", "format": "binary", "description": "Image or video file"},
-										"tags":                        map[string]any{"type": "string", "description": "JSON-encoded array of tag names"},
-										"folder":                      map[string]any{"type": "string", "description": "Destination subfolder under the gallery root; missing directories are created. Leave blank for the gallery root."},
-										"autotag":                     map[string]any{"type": "string", "description": "Set to \"true\" to kick off an auto-tag job on the new image"},
-										"tagger_name":                 map[string]any{"type": "string", "description": "Optional auto-tagger name; when set with autotag, restricts the job to that tagger"},
-										"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier (app name, URL...). Stored as images.origin and attached to each initial tag via image_tags.tagger_name, unless a non-empty source is sent, which takes the attribution instead so each source owns a prunable slice. Blank defaults images.origin to 'upload' for multipart mode."},
-										"source":                      map[string]any{"type": "string", "description": "Optional site label for the image's origin (site name, scraper...). Recorded as a source; on a duplicate-SHA push its tags and provenance merge into the existing image instead of being discarded."},
-										"url":                         map[string]any{"type": "string", "description": "Optional canonical web URL the image came from. Must start with http:// or https://. Recorded on the same origin as 'source'."},
-										"md5":                         map[string]any{"type": "string", "description": "Optional md5 the source claims for the file (<=64 chars). Recorded on the origin row as an audit trail; never a dedup key."},
-										"post_id":                     map[string]any{"type": "string", "description": "Optional post id at that source, recorded on the origin row."},
-										"post_width":                  map[string]any{"type": "string", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
-										"post_height":                 map[string]any{"type": "string", "description": "The same for height."},
-										"post_size":                   map[string]any{"type": "string", "description": "The same for the file size in bytes."},
-										"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
-										"parent_url":                  map[string]any{"type": "string", "description": "Optional canonical URL of the post this post declares as its parent. Must start with http:// or https://. Recorded on the same origin as 'source'; when the parent's post lands in the gallery too, the pair is linked as a derivative relation."},
-										"commentary":                  map[string]any{"type": "string", "description": "Optional artist commentary for the pushed source (<=10000 chars)."},
-										"commentary_translated":       map[string]any{"type": "string", "description": "Optional translation of that commentary (<=10000 chars)."},
-										"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
-										"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
-										"original":                    map[string]any{"type": "string", "description": "Optional upstream artist source the post declared (<=2048 chars, newline-joined when several). Recorded on the same origin as 'source'."},
-										"notes":                       map[string]any{"type": "string", "description": "Optional JSON-encoded array of positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters) for the pushed source."},
-										"collection":                  map[string]any{"type": "string", "description": "Optional collection label (images.series). Written on the new row; on a duplicate-SHA push added as a membership that never displaces the existing home."},
-										"collection_order":            map[string]any{"type": "string", "description": "Optional 1-based position within the collection. Requires a non-empty collection in the same request."},
-									},
-								},
+								"schema": objectSchema([]string{"file"}, map[string]any{
+									"file":                        map[string]any{"type": "string", "format": "binary", "description": "Image or video file"},
+									"tags":                        map[string]any{"type": "string", "description": "JSON-encoded array of tag names"},
+									"folder":                      map[string]any{"type": "string", "description": "Destination subfolder under the gallery root; missing directories are created. Leave blank for the gallery root."},
+									"autotag":                     map[string]any{"type": "string", "description": "Set to \"true\" to kick off an auto-tag job on the new image"},
+									"tagger_name":                 map[string]any{"type": "string", "description": "Optional auto-tagger name; when set with autotag, restricts the job to that tagger"},
+									"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier (app name, URL...). Stored as images.origin and attached to each initial tag via image_tags.tagger_name, unless a non-empty source is sent, which takes the attribution instead so each source owns a prunable slice. Blank defaults images.origin to 'upload' for multipart mode."},
+									"source":                      map[string]any{"type": "string", "description": "Optional site label for the image's origin (site name, scraper...). Recorded as a source; on a duplicate-SHA push its tags and provenance merge into the existing image instead of being discarded."},
+									"url":                         map[string]any{"type": "string", "description": "Optional canonical web URL the image came from. Must start with http:// or https://. Recorded on the same origin as 'source'."},
+									"md5":                         map[string]any{"type": "string", "description": "Optional md5 the source claims for the file (<=64 chars). Recorded on the origin row as an audit trail; never a dedup key."},
+									"post_id":                     map[string]any{"type": "string", "description": "Optional post id at that source, recorded on the origin row."},
+									"post_width":                  map[string]any{"type": "string", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
+									"post_height":                 map[string]any{"type": "string", "description": "The same for height."},
+									"post_size":                   map[string]any{"type": "string", "description": "The same for the file size in bytes."},
+									"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
+									"parent_url":                  map[string]any{"type": "string", "description": "Optional canonical URL of the post this post declares as its parent. Must start with http:// or https://. Recorded on the same origin as 'source'; when the parent's post lands in the gallery too, the pair is linked as a derivative relation."},
+									"commentary":                  map[string]any{"type": "string", "description": "Optional artist commentary for the pushed source (<=10000 chars)."},
+									"commentary_translated":       map[string]any{"type": "string", "description": "Optional translation of that commentary (<=10000 chars)."},
+									"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
+									"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
+									"original":                    map[string]any{"type": "string", "description": "Optional upstream artist source the post declared (<=2048 chars, newline-joined when several). Recorded on the same origin as 'source'."},
+									"notes":                       map[string]any{"type": "string", "description": "Optional JSON-encoded array of positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters) for the pushed source."},
+									"collection":                  map[string]any{"type": "string", "description": "Optional collection label (images.series). Written on the new row; on a duplicate-SHA push added as a membership that never displaces the existing home."},
+									"collection_order":            map[string]any{"type": "string", "description": "Optional 1-based position within the collection. Requires a non-empty collection in the same request."},
+								}),
 							},
 							"application/json": map[string]any{
-								"schema": map[string]any{
-									"type":     "object",
-									"required": []string{"path"},
-									"properties": map[string]any{
-										"path":                        map[string]any{"type": "string", "description": "Path to a file already inside the gallery. Absolute paths are used as given; a relative path resolves under gallery/<folder> when folder is set, and otherwise against the server's working directory, so send an absolute path or a folder. The file must sit inside the gallery root, in a folder the gallery indexes, or the request is refused with 400."},
-										"tags":                        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-										"folder":                      map[string]any{"type": "string", "description": "Destination subfolder for relative paths"},
-										"autotag":                     map[string]any{"type": "boolean", "description": "Kick off an auto-tag job on the new image"},
-										"tagger_name":                 map[string]any{"type": "string", "description": "Optional auto-tagger name"},
-										"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier. Stored as images.origin and attached to each initial tag, unless a non-empty source is sent, which takes the attribution instead. Blank defaults images.origin to 'ingest' for JSON path-reference mode."},
-										"source":                      map[string]any{"type": "string", "description": "Optional site label for the image's origin (site name, scraper...). Recorded as a source; on a duplicate-SHA push its tags and provenance merge into the existing image instead of being discarded."},
-										"url":                         map[string]any{"type": "string", "description": "Optional canonical web URL the image came from. Must start with http:// or https://. Recorded on the same origin as 'source'."},
-										"md5":                         map[string]any{"type": "string", "description": "Optional md5 the source claims for the file (<=64 chars). Recorded on the origin row as an audit trail; never a dedup key."},
-										"post_id":                     map[string]any{"type": "string", "description": "Optional post id at that source, recorded on the origin row."},
-										"post_width":                  map[string]any{"type": "integer", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
-										"post_height":                 map[string]any{"type": "integer", "description": "The same for height."},
-										"post_size":                   map[string]any{"type": "integer", "description": "The same for the file size in bytes."},
-										"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
-										"parent_url":                  map[string]any{"type": "string", "description": "Optional canonical URL of the post this post declares as its parent. Must start with http:// or https://. Recorded on the same origin as 'source'; when the parent's post lands in the gallery too, the pair is linked as a derivative relation."},
-										"commentary":                  map[string]any{"type": "string", "description": "Optional artist commentary for the pushed source (<=10000 chars)."},
-										"commentary_translated":       map[string]any{"type": "string", "description": "Optional translation of that commentary (<=10000 chars)."},
-										"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
-										"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
-										"original":                    map[string]any{"type": "string", "description": "Optional upstream artist source the post declared (<=2048 chars, newline-joined when several). Recorded on the same origin as 'source'."},
-										"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Optional positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters) for the pushed source."},
-										"collection":                  map[string]any{"type": "string", "description": "Optional collection label (images.series). Written on the new row; on a duplicate-SHA push added as a membership that never displaces the existing home."},
-										"collection_order":            map[string]any{"type": "integer", "description": "Optional 1-based position within the collection. Requires a non-empty collection in the same request."},
-									},
-								},
+								"schema": objectSchema([]string{"path"}, map[string]any{
+									"path":                        map[string]any{"type": "string", "description": "Path to a file already inside the gallery. Absolute paths are used as given; a relative path resolves under gallery/<folder> when folder is set, and otherwise against the server's working directory, so send an absolute path or a folder. The file must sit inside the gallery root, in a folder the gallery indexes, or the request is refused with 400."},
+									"tags":                        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+									"folder":                      map[string]any{"type": "string", "description": "Destination subfolder for relative paths"},
+									"autotag":                     map[string]any{"type": "boolean", "description": "Kick off an auto-tag job on the new image"},
+									"tagger_name":                 map[string]any{"type": "string", "description": "Optional auto-tagger name"},
+									"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier. Stored as images.origin and attached to each initial tag, unless a non-empty source is sent, which takes the attribution instead. Blank defaults images.origin to 'ingest' for JSON path-reference mode."},
+									"source":                      map[string]any{"type": "string", "description": "Optional site label for the image's origin (site name, scraper...). Recorded as a source; on a duplicate-SHA push its tags and provenance merge into the existing image instead of being discarded."},
+									"url":                         map[string]any{"type": "string", "description": "Optional canonical web URL the image came from. Must start with http:// or https://. Recorded on the same origin as 'source'."},
+									"md5":                         map[string]any{"type": "string", "description": "Optional md5 the source claims for the file (<=64 chars). Recorded on the origin row as an audit trail; never a dedup key."},
+									"post_id":                     map[string]any{"type": "string", "description": "Optional post id at that source, recorded on the origin row."},
+									"post_width":                  map[string]any{"type": "integer", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
+									"post_height":                 map[string]any{"type": "integer", "description": "The same for height."},
+									"post_size":                   map[string]any{"type": "integer", "description": "The same for the file size in bytes."},
+									"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
+									"parent_url":                  map[string]any{"type": "string", "description": "Optional canonical URL of the post this post declares as its parent. Must start with http:// or https://. Recorded on the same origin as 'source'; when the parent's post lands in the gallery too, the pair is linked as a derivative relation."},
+									"commentary":                  map[string]any{"type": "string", "description": "Optional artist commentary for the pushed source (<=10000 chars)."},
+									"commentary_translated":       map[string]any{"type": "string", "description": "Optional translation of that commentary (<=10000 chars)."},
+									"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
+									"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
+									"original":                    map[string]any{"type": "string", "description": "Optional upstream artist source the post declared (<=2048 chars, newline-joined when several). Recorded on the same origin as 'source'."},
+									"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Optional positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters) for the pushed source."},
+									"collection":                  map[string]any{"type": "string", "description": "Optional collection label (images.series). Written on the new row; on a duplicate-SHA push added as a membership that never displaces the existing home."},
+									"collection_order":            map[string]any{"type": "integer", "description": "Optional 1-based position within the collection. Requires a non-empty collection in the same request."},
+								}),
 							},
 						},
 					},
@@ -440,28 +387,25 @@ func buildSpec(baseURL string) map[string]any {
 					"operationId": "enrichImage",
 					"description": "Metadata-only counterpart of a duplicate push, used by monloader's source refetch. Shares the duplicate-push merge semantics: the origin upserts, the source's own tag slice reconciles to the pushed set, and empty url / md5 / commentary / commentary_translated / original / notes leave the stored values be.",
 					"parameters":  []map[string]any{pathParam("id", "Image ID"), galleryParam()},
-					"requestBody": jsonBodySchema(true, map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"tags":                        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-							"source":                      map[string]any{"type": "string", "description": "Site label of the origin being refetched"},
-							"url":                         map[string]any{"type": "string"},
-							"source_md5":                  map[string]any{"type": "string", "description": "md5 the source claims (<=64 chars). Compared against the stored file when verify is set; recorded on the origin row."},
-							"parent_url":                  map[string]any{"type": "string", "description": "Canonical URL of the post this post declares as its parent. Recorded on the origin row; when both sides are in the gallery the pair is linked as a derivative relation. Empty keeps the stored value."},
-							"post_width":                  map[string]any{"type": "integer", "description": "What the post says the file it serves is. Recorded on the origin row and rendered beside the origin; drives upgrade:bigger. 0 or absent keeps the stored value."},
-							"post_height":                 map[string]any{"type": "integer"},
-							"post_size":                   map[string]any{"type": "integer", "description": "Byte size the post declares. Used for the gain test when the post publishes no dimensions."},
-							"post_ext":                    map[string]any{"type": "string", "description": "File extension the post serves, no dot."},
-							"verify":                      map[string]any{"type": "boolean", "description": "When true and source_md5 is non-empty, the stored file is hashed and compared first; a mismatch applies nothing and returns 409 - unless the origin is similarity-matched, whose file differs by design."},
-							"similarity":                  map[string]any{"type": "number", "description": "Similarity-service score (0-100) when the post was found by image similarity rather than an exact hash. Recorded on the origin row; a matched origin's refetches skip the md5 verify. 0 or absent keeps the stored score."},
-							"commentary":                  map[string]any{"type": "string"},
-							"commentary_translated":       map[string]any{"type": "string", "description": "Translation of the commentary. A non-empty value overwrites the stored one."},
-							"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
-							"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
-							"original":                    map[string]any{"type": "string", "description": "Upstream artist source the post declared (<=2048 chars, newline-joined when several). A non-empty value overwrites the stored one."},
-							"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters); a non-empty array replaces the set this origin contributed."},
-						},
-					}),
+					"requestBody": jsonBodySchema(true, objectSchema(nil, map[string]any{
+						"tags":                        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"source":                      map[string]any{"type": "string", "description": "Site label of the origin being refetched"},
+						"url":                         map[string]any{"type": "string"},
+						"source_md5":                  map[string]any{"type": "string", "description": "md5 the source claims (<=64 chars). Compared against the stored file when verify is set; recorded on the origin row."},
+						"parent_url":                  map[string]any{"type": "string", "description": "Canonical URL of the post this post declares as its parent. Recorded on the origin row; when both sides are in the gallery the pair is linked as a derivative relation. Empty keeps the stored value."},
+						"post_width":                  map[string]any{"type": "integer", "description": "What the post says the file it serves is. Recorded on the origin row and rendered beside the origin; drives upgrade:bigger. 0 or absent keeps the stored value."},
+						"post_height":                 map[string]any{"type": "integer"},
+						"post_size":                   map[string]any{"type": "integer", "description": "Byte size the post declares. Used for the gain test when the post publishes no dimensions."},
+						"post_ext":                    map[string]any{"type": "string", "description": "File extension the post serves, no dot."},
+						"verify":                      map[string]any{"type": "boolean", "description": "When true and source_md5 is non-empty, the stored file is hashed and compared first; a mismatch applies nothing and returns 409 - unless the origin is similarity-matched, whose file differs by design."},
+						"similarity":                  map[string]any{"type": "number", "description": "Similarity-service score (0-100) when the post was found by image similarity rather than an exact hash. Recorded on the origin row; a matched origin's refetches skip the md5 verify. 0 or absent keeps the stored score."},
+						"commentary":                  map[string]any{"type": "string"},
+						"commentary_translated":       map[string]any{"type": "string", "description": "Translation of the commentary. A non-empty value overwrites the stored one."},
+						"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
+						"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
+						"original":                    map[string]any{"type": "string", "description": "Upstream artist source the post declared (<=2048 chars, newline-joined when several). A non-empty value overwrites the stored one."},
+						"notes":                       map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Positional note boxes ({x, y, w, h, body}; a box may carry body_html instead, the source's own HTML, cut to its first 16000 characters and converted to monbooru's markup on the way in; a body keeps its first 4000 characters); a non-empty array replaces the set this origin contributed."},
+					})),
 					"responses": map[string]any{
 						"200": resp("Metadata applied", "#/components/schemas/EnrichResponse"),
 						"404": resp("Not found", "#/components/schemas/Error"),
@@ -476,14 +420,12 @@ func buildSpec(baseURL string) map[string]any {
 					"operationId": "reportFetchStatus",
 					"description": "Lets monloader report a fetch that failed before it could enrich (unsupported URL, timeout, blocked) so the detail page's pending pill resolves instead of polling to its cap.",
 					"parameters":  []map[string]any{pathParam("id", "Image ID"), galleryParam()},
-					"requestBody": jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"state"},
-						"properties": map[string]any{
-							"state":   map[string]any{"type": "string", "description": "Outcome state, e.g. \"error\""},
-							"message": map[string]any{"type": "string", "description": "Operator-facing detail shown on the image's fetch pill"},
-						},
-					}),
+					"requestBody": jsonBodySchema(true, objectSchema([]string{"state"}, map[string]any{
+						"state":   map[string]any{"type": "string", "description": "Outcome state, e.g. \"error\""},
+						"message": map[string]any{"type": "string", "description": "Operator-facing detail shown on the image's fetch pill"},
+						"kind":    map[string]any{"type": "string", "description": "The reporting job's kind (lookup, metadata or replace): a report of any kind but lookup concludes no scheduled lookup"},
+						"backend": map[string]any{"type": "string", "description": "The lookup job's backend (ptr, booru or all): a terminal state concludes only that backend's in-flight scheduled lookup, all both. Without kind and backend every in-flight lookup on the image concludes"},
+					})),
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Recorded"},
 						"400": resp("Missing state", "#/components/schemas/Error"),
@@ -499,21 +441,17 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 				"post": opBody("Add tags to image", "addImageTags",
 					[]map[string]any{pathParam("id", "Image ID"), galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"tags"},
-						"properties": map[string]any{
-							"tags": map[string]any{
-								"type":        "array",
-								"items":       map[string]any{"type": "string"},
-								"description": "Tag names to add",
-							},
-							"via": map[string]any{
-								"type":        "string",
-								"description": "Optional caller-supplied identifier attached to each added tag (app name, URL...); stored in image_tags.tagger_name so the detail page can surface which third party contributed them",
-							},
+					jsonBodySchema(true, objectSchema([]string{"tags"}, map[string]any{
+						"tags": map[string]any{
+							"type":        "array",
+							"items":       map[string]any{"type": "string"},
+							"description": "Tag names to add",
 						},
-					}),
+						"via": map[string]any{
+							"type":        "string",
+							"description": "Optional caller-supplied identifier attached to each added tag (app name, URL...); stored in image_tags.tagger_name so the detail page can surface which third party contributed them",
+						},
+					})),
 					map[string]any{
 						"400": resp("Invalid request (invalid JSON, no tags, or a malformed via)", "#/components/schemas/Error"),
 						"404": resp("Image not found", "#/components/schemas/Error"),
@@ -524,13 +462,10 @@ func buildSpec(baseURL string) map[string]any {
 									"schema": map[string]any{
 										"oneOf": []map[string]any{
 											{"$ref": "#/components/schemas/TagArray"},
-											{
-												"type": "object",
-												"properties": map[string]any{
-													"tags":         map[string]any{"$ref": "#/components/schemas/TagArray"},
-													"tag_warnings": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-												},
-											},
+											objectSchema(nil, map[string]any{
+												"tags":         map[string]any{"$ref": "#/components/schemas/TagArray"},
+												"tag_warnings": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+											}),
 										},
 									},
 								},
@@ -539,17 +474,13 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 				"delete": opBody("Remove tags from image", "removeImageTags",
 					[]map[string]any{pathParam("id", "Image ID"), galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"tags"},
-						"properties": map[string]any{
-							"tags": map[string]any{
-								"type":        "array",
-								"items":       map[string]any{"type": "string"},
-								"description": "Tag names to remove",
-							},
+					jsonBodySchema(true, objectSchema([]string{"tags"}, map[string]any{
+						"tags": map[string]any{
+							"type":        "array",
+							"items":       map[string]any{"type": "string"},
+							"description": "Tag names to remove",
 						},
-					}),
+					})),
 					map[string]any{
 						"200": resp("Updated tag list", "#/components/schemas/TagArray"),
 						"400": resp("Empty `tags`", "#/components/schemas/Error"),
@@ -573,29 +504,25 @@ func buildSpec(baseURL string) map[string]any {
 						"required": true,
 						"content": map[string]any{
 							"multipart/form-data": map[string]any{
-								"schema": map[string]any{
-									"type":     "object",
-									"required": []string{"file"},
-									"properties": map[string]any{
-										"file":                        map[string]any{"type": "string", "format": "binary"},
-										"tags":                        map[string]any{"type": "string", "description": "JSON array of tag names, merged like an enrich"},
-										"source":                      map[string]any{"type": "string"},
-										"post_id":                     map[string]any{"type": "string"},
-										"url":                         map[string]any{"type": "string"},
-										"md5":                         map[string]any{"type": "string", "description": "md5 the source claims; recorded on the origin row"},
-										"post_width":                  map[string]any{"type": "string", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
-										"post_height":                 map[string]any{"type": "string", "description": "The same for height."},
-										"post_size":                   map[string]any{"type": "string", "description": "The same for the file size in bytes."},
-										"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
-										"parent_url":                  map[string]any{"type": "string"},
-										"commentary":                  map[string]any{"type": "string"},
-										"commentary_translated":       map[string]any{"type": "string"},
-										"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
-										"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
-										"original":                    map[string]any{"type": "string"},
-										"notes":                       map[string]any{"type": "string", "description": "JSON array of positional note boxes"},
-									},
-								},
+								"schema": objectSchema([]string{"file"}, map[string]any{
+									"file":                        map[string]any{"type": "string", "format": "binary"},
+									"tags":                        map[string]any{"type": "string", "description": "JSON array of tag names, merged like an enrich"},
+									"source":                      map[string]any{"type": "string"},
+									"post_id":                     map[string]any{"type": "string"},
+									"url":                         map[string]any{"type": "string"},
+									"md5":                         map[string]any{"type": "string", "description": "md5 the source claims; recorded on the origin row"},
+									"post_width":                  map[string]any{"type": "string", "description": "What the post says its own file's width is; recorded on the origin row beside the md5, never measured from the bytes."},
+									"post_height":                 map[string]any{"type": "string", "description": "The same for height."},
+									"post_size":                   map[string]any{"type": "string", "description": "The same for the file size in bytes."},
+									"post_ext":                    map[string]any{"type": "string", "description": "The same for the extension the post declares."},
+									"parent_url":                  map[string]any{"type": "string"},
+									"commentary":                  map[string]any{"type": "string"},
+									"commentary_translated":       map[string]any{"type": "string"},
+									"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
+									"commentary_translated_dtext": map[string]any{"type": "string", "description": "The same for the translation."},
+									"original":                    map[string]any{"type": "string"},
+									"notes":                       map[string]any{"type": "string", "description": "JSON array of positional note boxes"},
+								}),
 							},
 						},
 					},
@@ -607,6 +534,18 @@ func buildSpec(baseURL string) map[string]any {
 						"415": resp("The file does not decode as an image", "#/components/schemas/Error"),
 						"500": resp("The replacement failed server-side", "#/components/schemas/Error"),
 						"409": resp("wrong_type for an archive/video row or a non-image upload; already_exists when the uploaded bytes are another image (the pair is recorded as potential duplicates); conflict when the image's file is not this gallery's to rewrite (outside its root, or in a folder it leaves out)", "#/components/schemas/Error"),
+					},
+				},
+			},
+			"/images/{id}/still": map[string]any{
+				"get": map[string]any{
+					"summary":     "Download the image in a format any decoder reads",
+					"description": "An AVIF or JPEG XL is rendered by ffmpeg to a lossless WebP at its own size, a JPEG XL's alpha kept, which fails without ffmpeg or past WebP's 16383 px a side. Any other image answers its original bytes, as getImageFile does.",
+					"operationId": "getImageStill",
+					"parameters":  []map[string]any{pathParam("id", "Image ID"), galleryParam()},
+					"responses": map[string]any{
+						"200": map[string]any{"description": "Image bytes: the original, or a lossless WebP for an AVIF or JPEG XL", "content": binaryContent("application/octet-stream")},
+						"404": resp("Not found, or a video or archive row", "#/components/schemas/Error"),
 					},
 				},
 			},
@@ -647,16 +586,12 @@ func buildSpec(baseURL string) map[string]any {
 			"/relations": map[string]any{
 				"post": opBody("Declare a relation", "addRelation",
 					[]map[string]any{galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"type", "a", "b"},
-						"properties": map[string]any{
-							"type":      map[string]any{"type": "string", "description": "One of: duplicate, alternate, version, derivative, not_related"},
-							"a":         map[string]any{"type": "integer", "description": "Left image id. For directed types (version, derivative), `a` is the parent / source (older revision, derived-from)."},
-							"b":         map[string]any{"type": "integer", "description": "Right image id. For directed types, the child / derivative."},
-							"direction": map[string]any{"type": "string", "description": "Optional `ba` swaps left/right; default `ab` treats `a` as the parent/source side."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema([]string{"type", "a", "b"}, map[string]any{
+						"type":      map[string]any{"type": "string", "description": "One of: duplicate, alternate, version, derivative, not_related"},
+						"a":         map[string]any{"type": "integer", "description": "Left image id. For directed types (version, derivative), `a` is the parent / source (older revision, derived-from)."},
+						"b":         map[string]any{"type": "integer", "description": "Right image id. For directed types, the child / derivative."},
+						"direction": map[string]any{"type": "string", "description": "Optional `ba` swaps left/right; default `ab` treats `a` as the parent/source side."},
+					})),
 					map[string]any{
 						"201": map[string]any{"description": "Relation created"},
 						"400": resp("Invalid request (self-relation, unknown type, missing ids)", "#/components/schemas/Error"),
@@ -665,18 +600,14 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 				"delete": opBody("Remove a declared relation", "removeRelation",
 					[]map[string]any{galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"type"},
-						"properties": map[string]any{
-							"type":     map[string]any{"type": "string", "description": "One of: duplicate, alternate, version, derivative, not_related, dissolve_dup, dissolve_alt, dissolve_version, dissolve_derivative, promote_original"},
-							"image_id": map[string]any{"type": "integer", "description": "Required for duplicate / alternate (the member to unlink); the new original for promote_original."},
-							"a":        map[string]any{"type": "integer", "description": "Required for version / derivative / not_related; either order is accepted."},
-							"b":        map[string]any{"type": "integer", "description": "Pair partner for a."},
-							"group_id": map[string]any{"type": "integer", "description": "Required for dissolve_dup / dissolve_alt / promote_original."},
-							"root_id":  map[string]any{"type": "integer", "description": "Required for dissolve_version / dissolve_derivative; any chain or tree member id (the walker locates the root)."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema([]string{"type"}, map[string]any{
+						"type":     map[string]any{"type": "string", "description": "One of: duplicate, alternate, version, derivative, not_related, dissolve_dup, dissolve_alt, dissolve_version, dissolve_derivative, promote_original"},
+						"image_id": map[string]any{"type": "integer", "description": "Required for duplicate / alternate (the member to unlink); the new original for promote_original."},
+						"a":        map[string]any{"type": "integer", "description": "Required for version / derivative / not_related; either order is accepted."},
+						"b":        map[string]any{"type": "integer", "description": "Pair partner for a."},
+						"group_id": map[string]any{"type": "integer", "description": "Required for dissolve_dup / dissolve_alt / promote_original."},
+						"root_id":  map[string]any{"type": "integer", "description": "Required for dissolve_version / dissolve_derivative; any chain or tree member id (the walker locates the root)."},
+					})),
 					map[string]any{
 						"204": map[string]any{"description": "Removed (idempotent)"},
 						"400": resp("Invalid request", "#/components/schemas/Error"),
@@ -687,27 +618,23 @@ func buildSpec(baseURL string) map[string]any {
 					[]map[string]any{
 						galleryParam(),
 						queryParam("q", "Name filter; prefix match, or * as a wildcard anywhere"),
-						queryParam("category", "Filter by category name"),
+						queryParam("category", "Filter by category name. An unknown name matches nothing."),
 						queryParam("sort", "Sort field (usage, alpha)"),
 						queryParam("page", "Page number"),
 						queryParam("limit", "Results per page (default 100, max 500)"),
 						queryParam("show_zero", "Hide zero-usage non-alias tags ('0' to opt out). Default surfaces them so the API total matches the /tags page total."),
 						queryParam("origin", "Filter by stored creation origin ('user', a booru site, 'ptr', an auto-tagger name, ...). The legacy 'alias' value narrows to alias rows. Empty (default) returns every tag."),
-						queryParam("type", "Structural filter: 'tag' (non-alias rows), 'alias' (alias rows). Empty (default) returns both."),
+						queryParam("type", "Structural filter: 'tag' (non-alias rows), 'alias' (alias rows). Empty (default) returns both; any other value matches nothing."),
 					},
 					map[string]any{
 						"200": resp("Paginated tag list", "#/components/schemas/PaginatedTags"),
 					}),
 				"post": opBody("Create a tag (get-or-create)", "createTag",
 					[]map[string]any{galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"name"},
-						"properties": map[string]any{
-							"name":     map[string]any{"type": "string"},
-							"category": map[string]any{"type": "string", "description": "Category name; defaults to general."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema([]string{"name"}, map[string]any{
+						"name":     map[string]any{"type": "string"},
+						"category": map[string]any{"type": "string", "description": "Category name; defaults to general."},
+					})),
 					map[string]any{
 						"201": resp("The tag (created, or the existing row when the name already exists in the category)", "#/components/schemas/TagRow"),
 						"400": resp("Missing name, unknown category, or invalid tag name", "#/components/schemas/Error"),
@@ -722,13 +649,10 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 				"patch": opBody("Rename a tag and/or move it to another category", "patchTag",
 					[]map[string]any{pathParam("id", "Tag ID"), galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"name":     map[string]any{"type": "string", "description": "New name."},
-							"category": map[string]any{"type": "string", "description": "Move to this category by name."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema(nil, map[string]any{
+						"name":     map[string]any{"type": "string", "description": "New name."},
+						"category": map[string]any{"type": "string", "description": "Move to this category by name."},
+					})),
 					map[string]any{
 						"200": resp("Updated tag", "#/components/schemas/TagRow"),
 						"400": resp("No fields supplied, or a rating-tag edit", "#/components/schemas/Error"),
@@ -745,15 +669,11 @@ func buildSpec(baseURL string) map[string]any {
 			"/tags/aliases": map[string]any{
 				"post": opBody("Create an alias", "createAlias",
 					[]map[string]any{galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"name", "canonical_id"},
-						"properties": map[string]any{
-							"name":         map[string]any{"type": "string", "description": "Alias name."},
-							"category":     map[string]any{"type": "string", "description": "Category for the alias; defaults to general."},
-							"canonical_id": map[string]any{"type": "integer", "description": "The tag this alias resolves to."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema([]string{"name", "canonical_id"}, map[string]any{
+						"name":         map[string]any{"type": "string", "description": "Alias name."},
+						"category":     map[string]any{"type": "string", "description": "Category for the alias; defaults to general."},
+						"canonical_id": map[string]any{"type": "integer", "description": "The tag this alias resolves to."},
+					})),
 					map[string]any{
 						"201": resp("The alias row", "#/components/schemas/TagRow"),
 						"400": resp("Missing fields or an invalid alias target", "#/components/schemas/Error"),
@@ -764,17 +684,15 @@ func buildSpec(baseURL string) map[string]any {
 			"/tags/merge": map[string]any{
 				"post": opBody("Merge one tag into another", "mergeTags",
 					[]map[string]any{galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"alias_id", "canonical_id"},
-						"properties": map[string]any{
-							"alias_id":     map[string]any{"type": "integer", "description": "Tag to retire; becomes an alias of canonical_id and its image_tags move onto it."},
-							"canonical_id": map[string]any{"type": "integer", "description": "Surviving tag."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema([]string{"alias_id", "canonical_id"}, map[string]any{
+						"alias_id":     map[string]any{"type": "integer", "description": "Tag to retire; becomes an alias of canonical_id and its image_tags move onto it."},
+						"canonical_id": map[string]any{"type": "integer", "description": "Surviving tag."},
+					})),
 					map[string]any{
 						"200": resp("The canonical tag", "#/components/schemas/TagRow"),
 						"400": resp("Self-merge, missing ids, or a merge into an alias", "#/components/schemas/Error"),
+						"404": resp("alias_id or canonical_id names no tag", "#/components/schemas/Error"),
+						"409": resp("The merge would close an implication cycle", "#/components/schemas/Error"),
 					}),
 			},
 			"/tags/{id}/implications": map[string]any{
@@ -789,13 +707,9 @@ func buildSpec(baseURL string) map[string]any {
 					"operationId": "addImplication",
 					"description": "Declares parent -> implied. The edge is effective immediately for future tag adds; the historical fan-out across images already carrying the parent (the web background job) is not run from the API.",
 					"parameters":  []map[string]any{pathParam("id", "Parent tag ID"), galleryParam()},
-					"requestBody": jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"implied_id"},
-						"properties": map[string]any{
-							"implied_id": map[string]any{"type": "integer", "description": "Existing tag id the parent implies. Both sides must be canonical (non-alias)."},
-						},
-					}),
+					"requestBody": jsonBodySchema(true, objectSchema([]string{"implied_id"}, map[string]any{
+						"implied_id": map[string]any{"type": "integer", "description": "Existing tag id the parent implies. Both sides must be canonical (non-alias)."},
+					})),
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Edge already declared (no-op)"},
 						"201": map[string]any{"description": "Edge created"},
@@ -825,14 +739,10 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 				"post": opBody("Create a category", "createCategory",
 					[]map[string]any{galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type":     "object",
-						"required": []string{"name"},
-						"properties": map[string]any{
-							"name":  map[string]any{"type": "string", "description": "Lowercase letters, digits, underscore, or hyphen. Search-filter keywords are reserved."},
-							"color": map[string]any{"type": "string", "description": "#rgb or #rrggbb; defaults to #888888 when blank."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema([]string{"name"}, map[string]any{
+						"name":  map[string]any{"type": "string", "description": "Lowercase letters, digits, underscore, or hyphen. Search-filter keywords are reserved."},
+						"color": map[string]any{"type": "string", "description": "#rgb or #rrggbb; defaults to #888888 when blank."},
+					})),
 					map[string]any{
 						"201": resp("Created category", "#/components/schemas/Category"),
 						"400": resp("Invalid or reserved name, or invalid colour", "#/components/schemas/Error"),
@@ -842,13 +752,10 @@ func buildSpec(baseURL string) map[string]any {
 			"/categories/{id}": map[string]any{
 				"patch": opBody("Rename and/or recolor a category", "patchCategory",
 					[]map[string]any{pathParam("id", "Category ID"), galleryParam()},
-					jsonBodySchema(true, map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"name":  map[string]any{"type": "string", "description": "New name. Built-in categories refuse a rename."},
-							"color": map[string]any{"type": "string", "description": "#rgb or #rrggbb. Allowed on built-in categories."},
-						},
-					}),
+					jsonBodySchema(true, objectSchema(nil, map[string]any{
+						"name":  map[string]any{"type": "string", "description": "New name. Built-in categories refuse a rename."},
+						"color": map[string]any{"type": "string", "description": "#rgb or #rrggbb. Allowed on built-in categories."},
+					})),
 					map[string]any{
 						"200": resp("Updated category", "#/components/schemas/Category"),
 						"400": resp("No fields, invalid colour, reserved/invalid name, or a built-in rename", "#/components/schemas/Error"),
@@ -857,17 +764,15 @@ func buildSpec(baseURL string) map[string]any {
 					}),
 				"delete": opBody("Delete a category", "deleteCategory",
 					[]map[string]any{pathParam("id", "Category ID"), galleryParam()},
-					jsonBodySchema(false, map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"action":    map[string]any{"type": "string", "description": "'move' (default; reparent the category's tags) or 'delete_all' (drop the tags too)."},
-							"target_id": map[string]any{"type": "integer", "description": "Move target category id; defaults to general when omitted."},
-						},
-					}),
+					jsonBodySchema(false, objectSchema(nil, map[string]any{
+						"action":    map[string]any{"type": "string", "description": "'move' (default; reparent the category's tags) or 'delete_all' (drop the tags too)."},
+						"target_id": map[string]any{"type": "integer", "description": "Move target category id; defaults to general when omitted."},
+					})),
 					map[string]any{
 						"204": map[string]any{"description": "Deleted"},
 						"400": resp("Built-in category, an unknown action, or an unusable move target", "#/components/schemas/Error"),
 						"404": resp("Category not found", "#/components/schemas/Error"),
+						"409": resp("A moved tag collides with a same-named tag in the target category", "#/components/schemas/Error"),
 					}),
 			},
 			"/galleries": map[string]any{
@@ -940,16 +845,21 @@ func jsonBodySchema(required bool, schema map[string]any) map[string]any {
 	}
 }
 
-func paginatedSchema(itemRef string) map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"page":    map[string]any{"type": "integer"},
-			"limit":   map[string]any{"type": "integer"},
-			"total":   map[string]any{"type": "integer"},
-			"results": map[string]any{"type": "array", "items": map[string]any{"$ref": itemRef}},
-		},
+func objectSchema(required []string, props map[string]any) map[string]any {
+	s := map[string]any{"type": "object", "properties": props}
+	if required != nil {
+		s["required"] = required
 	}
+	return s
+}
+
+func paginatedSchema(itemRef string) map[string]any {
+	return objectSchema(nil, map[string]any{
+		"page":    map[string]any{"type": "integer"},
+		"limit":   map[string]any{"type": "integer"},
+		"total":   map[string]any{"type": "integer"},
+		"results": map[string]any{"type": "array", "items": map[string]any{"$ref": itemRef}},
+	})
 }
 
 func jsonContent(ref string) map[string]any {
@@ -1192,14 +1102,10 @@ func extractProps(props map[string]any) []propertyView {
 	return out
 }
 
+var anchorReplacer = strings.NewReplacer("/", "-", "{", "", "}", "")
+
 func anchorize(s string) string {
-	r := strings.ToLower(s)
-	r = strings.ReplaceAll(r, "/", "-")
-	r = strings.ReplaceAll(r, "{", "")
-	r = strings.ReplaceAll(r, "}", "")
-	r = strings.Trim(r, "-")
-	r = cmp.Or(r, "root")
-	return r
+	return cmp.Or(strings.Trim(anchorReplacer.Replace(strings.ToLower(s)), "-"), "root")
 }
 
 var docsTemplate = template.Must(template.New("api-docs").Parse(`<!DOCTYPE html>

@@ -2,8 +2,12 @@ package tagger
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/monbooru/monbooru/internal/logx"
 )
@@ -26,22 +30,19 @@ type DispatchEntry struct {
 func DispatchTargetCategories(modelPath, taggerName string) []string {
 	seen := map[string]bool{}
 	var out []string
-	add := func(entries []DispatchEntry) {
-		for _, e := range entries {
-			if e.Category == "" || seen[e.Category] {
-				continue
-			}
-			seen[e.Category] = true
-			out = append(out, e.Category)
+	for _, e := range allDispatchRules(modelPath, taggerName) {
+		if e.Category == "" || seen[e.Category] {
+			continue
 		}
+		seen[e.Category] = true
+		out = append(out, e.Category)
 	}
-	add(EmbeddedDispatchRules(taggerName))
-	add(OverlayDispatchRules(modelPath, taggerName))
 	return out
 }
 
-func OverlayRuleCount(modelPath, taggerName string) int {
-	return len(OverlayDispatchRules(modelPath, taggerName))
+// Overlay rules come last, so a map keyed on Source keeps them.
+func allDispatchRules(modelPath, taggerName string) []DispatchEntry {
+	return slices.Concat(EmbeddedDispatchRules(taggerName), OverlayDispatchRules(modelPath, taggerName))
 }
 
 func EmbeddedDispatchRules(taggerName string) []DispatchEntry {
@@ -53,23 +54,43 @@ func EmbeddedDispatchRules(taggerName string) []DispatchEntry {
 }
 
 func OverlayDispatchRules(modelPath, taggerName string) []DispatchEntry {
-	p := filepath.Join(modelPath, taggerName, "dispatch.json")
-	data, err := os.ReadFile(p)
+	rules, err := ReadDispatchOverlay(modelPath, taggerName)
 	if err != nil {
+		logx.Warnf("tagger: %s: %v", filepath.Join(modelPath, taggerName, "dispatch.json"), err)
 		return nil
 	}
-	return parseDispatchDoc(data, p)
+	return rules
+}
+
+// ReadDispatchOverlay is the strict read for edits: a missing file is no
+// rules, any other failure is an error.
+func ReadDispatchOverlay(modelPath, taggerName string) ([]DispatchEntry, error) {
+	data, err := os.ReadFile(filepath.Join(modelPath, taggerName, "dispatch.json"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decodeDispatchDoc(data)
 }
 
 func parseDispatchDoc(data []byte, source string) []DispatchEntry {
+	rules, err := decodeDispatchDoc(data)
+	if err != nil {
+		logx.Warnf("tagger: %s dispatch: %v", source, err)
+		return nil
+	}
+	return rules
+}
+
+func decodeDispatchDoc(data []byte) ([]DispatchEntry, error) {
 	var doc dispatchDoc
 	if err := json.Unmarshal(data, &doc); err != nil {
-		logx.Warnf("tagger: %s dispatch parse failed: %v", source, err)
-		return nil
+		return nil, fmt.Errorf("parse failed: %w", err)
 	}
 	if doc.Version != dispatchSchemaVersion {
-		logx.Warnf("tagger: %s dispatch schema version %d unsupported (want %d)", source, doc.Version, dispatchSchemaVersion)
-		return nil
+		return nil, fmt.Errorf("schema version %d unsupported (want %d)", doc.Version, dispatchSchemaVersion)
 	}
-	return doc.Rules
+	return doc.Rules, nil
 }

@@ -2,8 +2,6 @@ package api
 
 import (
 	"net/http"
-
-	"github.com/monbooru/monbooru/internal/counts"
 )
 
 type galleryListEntry struct {
@@ -26,8 +24,8 @@ func (h *Handler) listGalleries(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		entry := galleryListEntry{Name: gc.Name, Active: gc.Name == activeName}
-		entry.Images, _ = counts.VisibleCount(g.DB)
-		entry.Tags, _ = counts.TagCount(g.DB)
+		entry.Images, _ = g.VisibleCount()
+		entry.Tags, _ = g.TagCount()
 		out = append(out, entry)
 	}
 	WriteJSON(w, http.StatusOK, out)

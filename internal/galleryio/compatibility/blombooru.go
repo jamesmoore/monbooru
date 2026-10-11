@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -71,9 +72,9 @@ func translateBlombooru(entries []NormalizedEntry) (Result, error) {
 		return Result{}, err
 	}
 
-	rc, err := backupFile.Open()
+	rc, err := openDocument(backupFile)
 	if err != nil {
-		return Result{}, fmt.Errorf("open backup.json: %w", err)
+		return Result{}, err
 	}
 	var bb blombooruBackup
 	err = json.NewDecoder(rc).Decode(&bb)
@@ -84,8 +85,7 @@ func translateBlombooru(entries []NormalizedEntry) (Result, error) {
 
 	out := Result{Files: map[string]*zip.File{}}
 	for _, m := range bb.Media {
-		rel := strings.TrimPrefix(m.ArchivePath, "media/")
-		rel = cmp.Or(rel, m.Filename)
+		rel := cmp.Or(strings.TrimPrefix(m.ArchivePath, "media/"), m.Filename)
 		if rel == "" {
 			continue
 		}
@@ -113,9 +113,13 @@ func blombooruTagTokens(names []string, catByTag map[string]string) []string {
 		if name == "" {
 			continue
 		}
-		if cat != "" && cat != "general" {
+		switch {
+		case cat != "" && cat != "general":
 			out = append(out, cat+":"+name)
-		} else {
+		case strings.Contains(name, ":"):
+			// Bare, the importer would read the part before the colon as a category.
+			out = append(out, "general:"+name)
+		default:
 			out = append(out, name)
 		}
 	}
@@ -123,14 +127,14 @@ func blombooruTagTokens(names []string, catByTag map[string]string) []string {
 }
 
 // Rows are name, category_id[, ...]; a malformed row ends the read,
-// keeping the rows before it.
+// keeping the rows before it, while a file over the cap is refused.
 func readBlombooruTagsCSV(tagsFile *zip.File) (map[string]string, error) {
 	if tagsFile == nil {
 		return map[string]string{}, nil
 	}
-	rc, err := tagsFile.Open()
+	rc, err := openDocument(tagsFile)
 	if err != nil {
-		return nil, fmt.Errorf("open tags.csv: %w", err)
+		return nil, err
 	}
 	defer func() { _ = rc.Close() }()
 	out := map[string]string{}
@@ -140,6 +144,9 @@ func readBlombooruTagsCSV(tagsFile *zip.File) (map[string]string, error) {
 		rec, err := r.Read()
 		if err == io.EOF {
 			break
+		}
+		if errors.Is(err, errDocumentTooLarge) {
+			return nil, err
 		}
 		if err != nil {
 			return out, nil
@@ -151,23 +158,14 @@ func readBlombooruTagsCSV(tagsFile *zip.File) (map[string]string, error) {
 		if name == "" {
 			continue
 		}
-		out[name] = blombooruCategoryByID(strings.TrimSpace(rec[1]))
+		out[name] = cmp.Or(blombooruCategories[strings.TrimSpace(rec[1])], "general")
 	}
 	return out, nil
 }
 
-func blombooruCategoryByID(id string) string {
-	switch id {
-	case "0":
-		return "general"
-	case "1":
-		return "artist"
-	case "3":
-		return "copyright"
-	case "4":
-		return "character"
-	case "5":
-		return "meta"
-	}
-	return "general"
+var blombooruCategories = map[string]string{
+	"1": "artist",
+	"3": "copyright",
+	"4": "character",
+	"5": "meta",
 }

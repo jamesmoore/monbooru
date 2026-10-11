@@ -2,6 +2,8 @@ package web
 
 import (
 	"cmp"
+	"github.com/monbooru/monbooru/internal/monloader"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -9,24 +11,28 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/plugins"
 )
 
 type pluginRowView struct {
-	Name       string
-	Version    string
-	Address    string
-	Conn       string
-	Buttons    []config.PluginButton
-	TokenName  string
-	Scopes     []string
-	Paused     bool
-	Paired     bool
-	Companion  bool
-	APIURL     string
-	WebURL     string
-	WebURLHint string
-	Command    string
-	RunState   string
+	Name         string
+	Version      string
+	Address      string
+	Conn         string
+	Buttons      []config.PluginButton
+	TokenName    string
+	Scopes       []string
+	Paused       bool
+	Paired       bool
+	Companion    bool
+	APIURL       string
+	WebURL       string
+	WebURLHint   string
+	APIURLPinned string
+	WebURLPinned string
+	Command      string
+	RunState     string
 	// Installed is a plugin found in the plugins folder: its Enable
 	// button is the operator's consent to a launch line they never typed.
 	Installed   bool
@@ -44,7 +50,7 @@ func (s *Server) pluginRows() []pluginRowView {
 		}
 		row := pluginRowView{
 			Name:      p.Name,
-			Version:   s.pluginVersion(p.PluginConfig),
+			Version:   s.peers.Version(p.PluginConfig),
 			Address:   s.pluginAddress(p.PluginConfig),
 			Buttons:   p.Buttons,
 			Paused:    p.Paused,
@@ -57,7 +63,7 @@ func (s *Server) pluginRows() []pluginRowView {
 			row.Paired = true
 		}
 		if p.Installed {
-			row.Command = commandLine(p)
+			row.Command = p.CommandLine()
 			row.RunState = s.peers.State(p.Name)
 			managed = append(managed, row)
 			continue
@@ -78,35 +84,34 @@ func (s *Server) pluginRows() []pluginRowView {
 }
 
 func (s *Server) monloaderRow() pluginRowView {
-	ml := s.mlStatus.Seed()
+	ml := s.ml.Status()
 	s.cfgMu.RLock()
 	apiURL, webURL := s.cfg.Monloader.APIURL, s.cfg.Server.MonloaderURL
+	apiPinned, webPinned := s.cfg.EnvPinned("monloader.api_url"), s.cfg.EnvPinned("server.monloader_url")
 	paused := s.cfg.Monloader.Paused
 	s.cfgMu.RUnlock()
-	name, scopes := s.pairedTokenInfo(monloaderApp)
+	name, scopes := s.pairedTokenInfo(monloader.App)
 	return pluginRowView{
-		Name:       monloaderApp,
-		Version:    ml.Version,
-		Address:    s.monloaderAPIBase(),
-		Conn:       peerConn(paused, ml.Conn),
-		TokenName:  name,
-		Scopes:     scopes,
-		Paused:     paused,
-		Paired:     s.pairedWith(monloaderApp),
-		Companion:  true,
-		APIURL:     apiURL,
-		WebURL:     webURL,
-		WebURLHint: "http://localhost:8456",
+		Name:         monloader.App,
+		Version:      ml.Version,
+		Address:      s.ml.Base(),
+		Conn:         peerConn(paused, ml.Conn),
+		TokenName:    name,
+		Scopes:       scopes,
+		Paused:       paused,
+		Paired:       s.pairedWith(monloader.App),
+		Companion:    true,
+		APIURL:       apiURL,
+		WebURL:       webURL,
+		WebURLHint:   "http://localhost:8456",
+		APIURLPinned: apiPinned,
+		WebURLPinned: webPinned,
 	}
-}
-
-func commandLine(p effectivePlugin) string {
-	return strings.TrimSpace(p.Launch.Command + " " + strings.Join(p.Launch.Args, " "))
 }
 
 func peerConn(paused bool, probe string) string {
 	if paused {
-		return "paused"
+		return peer.ConnPaused
 	}
 	return cmp.Or(probe, "checking")
 }
@@ -118,10 +123,6 @@ func (s *Server) pairedTokenInfo(app string) (string, []string) {
 		return t.Name, t.Scopes
 	}
 	return "", nil
-}
-
-func (s *Server) pluginVersion(p config.PluginConfig) string {
-	return cmp.Or(s.peers.ProbeSeed(p.Name).Version, p.Version)
 }
 
 func (s *Server) pairedPeerCount() int {
@@ -138,10 +139,35 @@ func (s *Server) pairedPeerCount() int {
 
 func (s *Server) pairViewData(r *http.Request) map[string]any {
 	return map[string]any{
-		"Pending":   s.pairs.listPending(),
-		"Paired":    s.pairedPeerCount(),
-		"CSRFToken": s.csrfToken(sessionFromContext(r.Context())),
+		"Pending": s.pendingOffers(),
+		"Paired":  s.pairedPeerCount(),
 	}
+}
+
+type pendingOffer struct {
+	peer.Req
+	SessionNote bool
+}
+
+// A managed plugin is a process on this box, which outranks a session
+// already. The offer's name is unauthenticated, so it counts as one only
+// from loopback.
+func (s *Server) pendingOffers() []pendingOffer {
+	pending := s.pairs.ListPending()
+	if len(pending) == 0 {
+		return nil
+	}
+	managed := map[string]bool{}
+	for _, p := range s.effectivePlugins() {
+		managed[p.Name] = p.Installed
+	}
+	out := make([]pendingOffer, 0, len(pending))
+	for _, req := range pending {
+		ip := net.ParseIP(req.Source)
+		local := managed[req.App] && ip != nil && ip.IsLoopback()
+		out = append(out, pendingOffer{Req: req, SessionNote: req.OpenOutranksScopes() && !local})
+	}
+	return out
 }
 
 func (s *Server) pluginPairingFragment(w http.ResponseWriter, r *http.Request) {
@@ -158,7 +184,7 @@ func (s *Server) pluginPairDeny(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	s.pairs.setState(r.PathValue("id"), pairDenied)
+	s.pairs.SetState(r.PathValue("id"), peer.Denied)
 	s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData(r))
 }
 
@@ -168,19 +194,15 @@ func (s *Server) pluginPairRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	var notifyErr error
-	if name == monloaderApp {
+	if name == monloader.App {
 		notifyErr = s.teardownMonloaderPairing(r)
 	} else {
 		notifyErr = s.teardownPluginPairing(name)
 		logx.Infof("pairing: removed %s pairing from %s", name, clientIP(r))
 		if p, ok := s.effective(name); ok && p.Installed {
-			// A plugin left running would offer to pair again a moment
-			// later and undo the click.
 			if p.Enabled {
 				s.setPluginEnabled(name, false)
-				s.peers.Stop(name)
-				s.peers.MarkDown(name)
-				s.pairs.dropPending(name)
+				s.peers.Retire(s.pairs, name)
 			}
 			// No flash: a folder has no far end to clean up by hand, and
 			// the token is revoked either way, so a copy the plugin kept
@@ -208,16 +230,13 @@ func (s *Server) pluginPause(w http.ResponseWriter, r *http.Request) {
 	s.renderPluginRows(w, r, false)
 }
 
-// Start and stop both drop the cached probe so the dot and buttons follow
-// the click, not the next probe.
 func (s *Server) pluginStart(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
 	if p, ok := s.effective(r.PathValue("name")); ok && p.Installed {
 		s.setPluginEnabled(p.Name, true)
-		s.peers.Start(p.Launch)
-		s.peers.ClearProbe(p.Name)
+		s.peers.Run(p)
 		logx.Infof("plugins: started %s from %s", p.Name, clientIP(r))
 	}
 	s.renderPluginRows(w, r, false)
@@ -231,19 +250,14 @@ func (s *Server) pluginStop(w http.ResponseWriter, r *http.Request) {
 	if p, ok := s.effective(name); ok && p.Installed {
 		s.setPluginEnabled(name, false)
 	}
-	s.peers.Stop(name)
-	s.peers.MarkDown(name)
+	s.peers.Halt(name)
 	logx.Infof("plugins: stopped %s from %s", name, clientIP(r))
 	s.renderPluginRows(w, r, false)
 }
 
 func (s *Server) setPluginEnabled(name string, enabled bool) {
 	err := s.withConfig(func(c *config.Config) error {
-		if p := c.FindPlugin(name); p != nil {
-			p.Enabled = enabled
-		} else if enabled {
-			c.Plugins = append(c.Plugins, config.PluginConfig{Name: name, Enabled: true})
-		}
+		plugins.SetEnabled(c, name, enabled)
 		return nil
 	})
 	if err != nil {
@@ -253,20 +267,14 @@ func (s *Server) setPluginEnabled(name string, enabled bool) {
 
 func (s *Server) renderPluginRows(w http.ResponseWriter, r *http.Request, oob bool) {
 	s.renderTemplate(w, "partials/plugin_rows.html", map[string]any{
-		"Rows":      s.pluginRows(),
-		"CSRFToken": s.csrfToken(sessionFromContext(r.Context())),
-		"OOB":       oob,
+		"Rows": s.pluginRows(),
+		"OOB":  oob,
 	})
 }
 
 func (s *Server) setPluginPaused(name string, paused bool) error {
-	if name == monloaderApp {
-		return s.setMonloaderPaused(paused)
-	}
 	return s.withConfig(func(c *config.Config) error {
-		if p := c.FindPlugin(name); p != nil {
-			p.Paused = paused
-		}
+		peer.SetPaused(c, name, paused)
 		return nil
 	})
 }
@@ -281,10 +289,5 @@ func (s *Server) teardownPluginPairing(name string) error {
 	if err := s.removePairing(name); err != nil {
 		logx.Errorf("pairing: remove %s failed: %v", name, err)
 	}
-	s.peers.ClearProbe(name)
-	notifyErr := notifyPeerTeardown(name, base, token)
-	if notifyErr != nil {
-		logx.Warnf("pairing: could not notify %s of teardown: %v", name, notifyErr)
-	}
-	return notifyErr
+	return s.peers.Teardown(name, base, token)
 }

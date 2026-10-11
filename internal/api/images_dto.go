@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/markup"
 	"github.com/monbooru/monbooru/internal/models"
 )
@@ -68,35 +70,108 @@ func validateImageCollection(s string) error {
 	return validateMaxLen("collection", s, maxImageSourceLen)
 }
 
-func validateCreateProvenance(source, postID, url, md5, parentURL, collection, commentary, translated, original, postExt string, order *int) error {
-	if err := validateImageSource(source); err != nil {
-		return err
+type provenanceJSON struct {
+	Source          string           `json:"source"`
+	PostID          string           `json:"post_id"`
+	URL             string           `json:"url"`
+	ParentURL       string           `json:"parent_url"`
+	Commentary      string           `json:"commentary"`
+	Translated      string           `json:"commentary_translated"`
+	CommentaryDText string           `json:"commentary_dtext"`
+	TranslatedDText string           `json:"commentary_translated_dtext"`
+	Original        string           `json:"original"`
+	Notes           []annotationJSON `json:"notes"`
+	PostWidth       int              `json:"post_width"`
+	PostHeight      int              `json:"post_height"`
+	PostSize        int64            `json:"post_size"`
+	PostExt         string           `json:"post_ext"`
+}
+
+func provenanceFromForm(r *http.Request) provenanceJSON {
+	p := provenanceJSON{
+		Source:          r.FormValue("source"),
+		PostID:          r.FormValue("post_id"),
+		URL:             r.FormValue("url"),
+		ParentURL:       r.FormValue("parent_url"),
+		Commentary:      r.FormValue("commentary"),
+		Translated:      r.FormValue("commentary_translated"),
+		CommentaryDText: r.FormValue("commentary_dtext"),
+		TranslatedDText: r.FormValue("commentary_translated_dtext"),
+		Original:        r.FormValue("original"),
+		PostWidth:       atoiOrZero(r.FormValue("post_width")),
+		PostHeight:      atoiOrZero(r.FormValue("post_height")),
+		PostSize:        int64(atoiOrZero(r.FormValue("post_size"))),
+		PostExt:         r.FormValue("post_ext"),
 	}
-	if err := validateMaxLen("post_id", postID, maxSourcePostIDLen); err != nil {
-		return err
+	if raw := r.FormValue("notes"); strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &p.Notes); err != nil {
+			p.Notes = nil
+		}
 	}
-	if err := validateImageURL(url); err != nil {
-		return err
+	return p
+}
+
+type provenance struct {
+	source     string
+	postID     string
+	url        string
+	parentURL  string
+	commentary string
+	translated string
+	original   string
+	notes      []models.Annotation
+	postFile   gallery.PostFile
+}
+
+// The limits apply to what is stored, after a DText body has superseded
+// the plain one.
+func (p provenanceJSON) read() (provenance, error) {
+	if err := validateMaxLen("commentary_dtext", p.CommentaryDText, maxImageCommentaryDTextLen); err != nil {
+		return provenance{}, err
 	}
-	if err := validateImageURL(parentURL); err != nil {
-		return fmt.Errorf("parent_url: %v", err)
+	if err := validateMaxLen("commentary_translated_dtext", p.TranslatedDText, maxImageCommentaryDTextLen); err != nil {
+		return provenance{}, err
 	}
+	v := provenance{
+		source:     strings.TrimSpace(p.Source),
+		postID:     strings.TrimSpace(p.PostID),
+		url:        strings.TrimSpace(p.URL),
+		parentURL:  strings.TrimSpace(p.ParentURL),
+		commentary: commentaryFromInput(p.Commentary, p.CommentaryDText),
+		translated: commentaryFromInput(p.Translated, p.TranslatedDText),
+		original:   strings.TrimSpace(p.Original),
+		postFile:   postFileFrom(p.PostWidth, p.PostHeight, p.PostSize, p.PostExt),
+	}
+	v.notes = annotationsFromInput(p.Notes, v.url)
+	if err := validateImageSource(v.source); err != nil {
+		return v, err
+	}
+	if err := validateMaxLen("post_id", v.postID, maxSourcePostIDLen); err != nil {
+		return v, err
+	}
+	if err := validateImageURL(v.url); err != nil {
+		return v, err
+	}
+	if err := validateImageURL(v.parentURL); err != nil {
+		return v, fmt.Errorf("parent_url: %v", err)
+	}
+	if err := validateMaxLen("commentary", v.commentary, maxImageCommentaryLen); err != nil {
+		return v, err
+	}
+	if err := validateMaxLen("commentary_translated", v.translated, maxImageCommentaryLen); err != nil {
+		return v, err
+	}
+	if err := validateMaxLen("original", v.original, maxImageOriginalLen); err != nil {
+		return v, err
+	}
+	if err := validateMaxLen("post_ext", v.postFile.Ext, maxSourcePostExtLen); err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+func validateCollection(collection string, order *int) error {
 	if err := validateImageCollection(collection); err != nil {
-		return err
-	}
-	if err := validateMaxLen("md5", md5, maxSourceMD5Len); err != nil {
-		return err
-	}
-	if err := validateMaxLen("commentary", commentary, maxImageCommentaryLen); err != nil {
-		return err
-	}
-	if err := validateMaxLen("commentary_translated", translated, maxImageCommentaryLen); err != nil {
-		return err
-	}
-	if err := validateMaxLen("original", original, maxImageOriginalLen); err != nil {
-		return err
-	}
-	if err := validateMaxLen("post_ext", postExt, maxSourcePostExtLen); err != nil {
 		return err
 	}
 	if order != nil {
@@ -205,10 +280,7 @@ func commentaryFromInput(plain, dtext string) string {
 	}
 	body := markup.FromDText(dtext)
 	// Converting can grow a body, so the cap applies to what is stored.
-	if r := []rune(body); len(r) > maxImageCommentaryLen {
-		body = string(r[:maxImageCommentaryLen])
-	}
-	return body
+	return firstRunes(body, maxImageCommentaryLen)
 }
 
 func annotationsFromInput(in []annotationJSON, postURL string) []models.Annotation {
@@ -225,25 +297,12 @@ func annotationsFromInput(in []annotationJSON, postURL string) []models.Annotati
 		if n.BodyHTML != "" {
 			body = markup.FromHTML(firstRunes(n.BodyHTML, maxAnnotationBodyHTMLLen), base)
 		}
-		if r := []rune(body); len(r) > maxAnnotationBodyLen {
-			body = string(r[:maxAnnotationBodyLen])
-		}
+		body = firstRunes(body, maxAnnotationBodyLen)
 		out = append(out, models.Annotation{
 			X: max(n.X, 0), Y: max(n.Y, 0), W: max(n.W, 0), H: max(n.H, 0), Body: body,
 		})
 	}
 	return out
-}
-
-func parseNotesField(raw, postURL string) []models.Annotation {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	var in []annotationJSON
-	if err := json.Unmarshal([]byte(raw), &in); err != nil {
-		return nil
-	}
-	return annotationsFromInput(in, postURL)
 }
 
 type imageTagJSON struct {
@@ -254,7 +313,7 @@ type imageTagJSON struct {
 	TaggerName *string  `json:"tagger_name"`
 }
 
-func makeImageResponse(g Gallery, img models.Image, tags []imageTagJSON, aliases []string) imageResponse {
+func makeImageResponse(g *library.Gallery, img models.Image, tags []imageTagJSON, aliases []string) imageResponse {
 	if tags == nil {
 		tags = []imageTagJSON{}
 	}

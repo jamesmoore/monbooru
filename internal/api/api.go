@@ -3,7 +3,6 @@ package api
 
 import (
 	"cmp"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"math"
@@ -14,53 +13,45 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
-	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/library"
 )
 
-type Gallery struct {
-	gallery.Handle
-
-	RelationsSvc     *relations.Service
-	InvalidateCaches func()
-	RecordFetch      func(imageID int64, state, message string)
-}
-
-func (g Gallery) invalidate() {
-	if g.InvalidateCaches != nil {
-		g.InvalidateCaches()
-	}
-}
-
-func (g Gallery) recordFetch(imageID int64, state, message string) {
-	if g.RecordFetch != nil {
-		g.RecordFetch(imageID, state, message)
-	}
-}
-
-func relationsOnDelete(svc *relations.Service) func(*sql.Tx, int64) error {
-	if svc == nil {
-		return nil
-	}
-	return svc.OnImageDeleteTx
-}
-
 // ResolverFunc resolves an empty name to the active gallery.
-type ResolverFunc func(name string) (Gallery, bool)
+type ResolverFunc func(name string) (*library.Gallery, bool)
 
 type Handler struct {
 	// Must return a snapshot: settings rewrites the live config under a
 	// lock this package does not hold.
-	cfg      func() *config.Config
-	jobs     *jobs.Manager
-	resolver ResolverFunc
-	version  string
-	lock     func() (unlock func())
+	cfg         func() *config.Config
+	jobs        *jobs.Manager
+	resolver    ResolverFunc
+	version     string
+	lock        func() (unlock func())
+	fetchStatus func(galleryName string, imageID int64, state, message string)
+	memoryMark  func() func(scope string)
 }
 
 func New(cfg func() *config.Config, jobManager *jobs.Manager, resolver ResolverFunc, version string) *Handler {
 	return &Handler{cfg: cfg, jobs: jobManager, resolver: resolver, version: version}
+}
+
+func (h *Handler) WithFetchStatus(record func(galleryName string, imageID int64, state, message string)) *Handler {
+	h.fetchStatus = record
+	return h
+}
+
+func (h *Handler) recordFetch(g *library.Gallery, imageID int64, state, message string) {
+	if h.fetchStatus != nil {
+		h.fetchStatus(g.Name, imageID, state, message)
+	}
+}
+
+// WithMemoryMark: mark runs at an auto-tag job's start, and the func it
+// returns logs the peak.
+func (h *Handler) WithMemoryMark(mark func() func(scope string)) *Handler {
+	h.memoryMark = mark
+	return h
 }
 
 // WithGalleryLock hands the upload routes the gallery lock their caller
@@ -101,9 +92,8 @@ func (h *Handler) uploadDestination() (folder, name string) {
 	return cfg.Gallery.DefaultUploadFolder, cfg.Gallery.DefaultUploadName
 }
 
-func (h *Handler) resolveGallery(w http.ResponseWriter, r *http.Request) (Gallery, bool) {
-	name := strings.TrimSpace(r.URL.Query().Get("gallery"))
-	name = cmp.Or(name, strings.TrimSpace(r.Header.Get("X-Monbooru-Gallery")))
+func (h *Handler) resolveGallery(w http.ResponseWriter, r *http.Request) (*library.Gallery, bool) {
+	name := cmp.Or(strings.TrimSpace(r.URL.Query().Get("gallery")), strings.TrimSpace(r.Header.Get("X-Monbooru-Gallery")))
 	g, ok := h.resolver(name)
 	if !ok {
 		if name == "" {
@@ -111,7 +101,7 @@ func (h *Handler) resolveGallery(w http.ResponseWriter, r *http.Request) (Galler
 		} else {
 			apiError(w, http.StatusBadRequest, "invalid_gallery", "unknown gallery: "+name)
 		}
-		return Gallery{}, false
+		return nil, false
 	}
 	return g, true
 }
@@ -124,28 +114,28 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
-func (h *Handler) galleryAndID(w http.ResponseWriter, r *http.Request) (Gallery, int64, bool) {
+func (h *Handler) galleryAndID(w http.ResponseWriter, r *http.Request) (*library.Gallery, int64, bool) {
 	g, ok := h.resolveGallery(w, r)
 	if !ok {
-		return Gallery{}, 0, false
+		return nil, 0, false
 	}
 	id, ok := apiPathInt64(w, r, "id")
 	if !ok {
-		return Gallery{}, 0, false
+		return nil, 0, false
 	}
 	return g, id, true
 }
 
 // Without the probe, a tag add on a missing id still creates its tags
 // before failing.
-func (h *Handler) galleryAndExistingID(w http.ResponseWriter, r *http.Request) (Gallery, int64, bool) {
+func (h *Handler) galleryAndExistingID(w http.ResponseWriter, r *http.Request) (*library.Gallery, int64, bool) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
-		return Gallery{}, 0, false
+		return nil, 0, false
 	}
 	if !imageExists(g, id) {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
-		return Gallery{}, 0, false
+		return nil, 0, false
 	}
 	return g, id, true
 }
@@ -164,6 +154,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/v1/images/{id}/file", h.auth(h.serveImageFile))
 	mux.HandleFunc("POST /api/v1/images/{id}/file", h.auth(h.bodyThenLock(h.replaceImageFile)))
+	mux.HandleFunc("GET /api/v1/images/{id}/still", h.auth(h.serveImageStill))
 	mux.HandleFunc("GET /api/v1/images/{id}/thumbnail", h.auth(h.serveThumbnail))
 	mux.HandleFunc("GET /api/v1/images/{id}/page/{n}", h.auth(h.serveMangaPage))
 	mux.HandleFunc("GET /api/v1/images/{id}/page/{n}/thumb", h.auth(h.serveMangaPageThumb))
@@ -197,7 +188,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/v1/", h.auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/" {
-			apiError(w, http.StatusNotFound, "not_found", "endpoint not found: "+r.URL.Path)
+			apiError(w, http.StatusNotFound, "not_found", "endpoint not found: "+r.Method+" "+r.URL.Path)
 			return
 		}
 		WriteJSON(w, http.StatusOK, map[string]any{
@@ -206,6 +197,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 			"docs":    "/api/v1/docs",
 			"openapi": "/api/v1/openapi.json",
 		})
+	}))
+	mux.HandleFunc("/api/v1/", h.auth(func(w http.ResponseWriter, r *http.Request) {
+		apiError(w, http.StatusNotFound, "not_found", "endpoint not found: "+r.Method+" "+r.URL.Path)
 	}))
 }
 
@@ -382,8 +376,7 @@ func parsePage(r *http.Request, defaultLimit, maxLimit int) (offset, limit int) 
 			page = n
 		}
 	}
-	l := q.Get("limit")
-	l = cmp.Or(l, q.Get("page_size"))
+	l := cmp.Or(q.Get("limit"), q.Get("page_size"))
 	if l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 {
 			limit = min(n, maxLimit)

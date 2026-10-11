@@ -24,10 +24,8 @@ const DefaultTopKFallback = 10
 
 // ResolveTopK returns 0 (uncapped) when the override is an explicit 0.
 func ResolveTopK(overrides map[string]int, cat string) int {
-	if overrides != nil {
-		if v, ok := overrides[cat]; ok {
-			return v
-		}
+	if v, ok := overrides[cat]; ok {
+		return v
 	}
 	if v, ok := DefaultPerCategoryTopK[cat]; ok {
 		return v
@@ -44,14 +42,7 @@ func ResolveMinHits(fraction float64, frameCount int) int {
 	if fraction <= 0 {
 		return 1
 	}
-	raw := int(math.Ceil(fraction * float64(frameCount)))
-	if raw < 2 {
-		return 2
-	}
-	if raw > 10 {
-		return 10
-	}
-	return raw
+	return min(max(int(math.Ceil(fraction*float64(frameCount))), 2), 10)
 }
 
 type CandidateLabel struct {
@@ -94,12 +85,9 @@ func AggregateInferenceScores(perFrame [][]float32, labels []CandidateLabel, opt
 		}
 	}
 
-	var disabled map[string]bool
-	if len(opts.DisabledCategories) > 0 {
-		disabled = make(map[string]bool, len(opts.DisabledCategories))
-		for _, c := range opts.DisabledCategories {
-			disabled[c] = true
-		}
+	disabled := make(map[string]bool, len(opts.DisabledCategories))
+	for _, c := range opts.DisabledCategories {
+		disabled[c] = true
 	}
 
 	byCat := map[int64][]AggregatedCandidate{}

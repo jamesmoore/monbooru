@@ -2,11 +2,13 @@ package galleryio
 
 import (
 	"archive/zip"
+	"context"
 	"maps"
 	"slices"
 
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/galleryio/compatibility"
+	"github.com/monbooru/monbooru/internal/library"
 )
 
 func detectCompatFormat(files []*zip.File) string { return compatibility.Detect(files) }
@@ -23,24 +25,21 @@ func replaceFromCompatArchive(files []*zip.File, format, dbPath, thumbsPath stri
 	)
 }
 
-func mergeFromCompatArchive(cx gallery.Handle, files []*zip.File, format string, maxFileSizeMB int) (MergeResult, error) {
+func mergeFromCompatArchive(ctx context.Context, cx *library.Gallery, files []*zip.File, format string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
 	result, err := compatibility.Translate(files, format)
 	if err != nil {
 		return MergeResult{}, err
 	}
 	records := make([]mergeRecord, 0, len(result.Manifest.Images))
 	for _, m := range result.Manifest.Images {
-		rec := mergeRecord{
+		records = append(records, mergeRecord{
 			SHA256:     m.SHA256,
 			Tags:       m.Tags,
 			SourcePath: m.Path,
-		}
-		if zf, ok := result.Files[m.Path]; ok {
-			rec.zipEntry = zf
-		}
-		records = append(records, rec)
+			zipEntry:   result.Files[m.Path],
+		})
 	}
-	return applyMergeRecords(cx, records, format, maxFileSizeMB), nil
+	return applyMergeRecords(ctx, cx, records, format, maxFileSizeMB, progress)
 }
 
 func toLightManifest(m compatibility.Manifest) LightManifest {

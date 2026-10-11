@@ -120,7 +120,6 @@ type detailData struct {
 	ManualAnnotations []annotationEntry
 	NoteHTML          template.HTML
 	ExtraPaths        int
-	ThumbnailURL      string
 	PrevID            *int64
 	NextID            *int64
 	RefURL            string
@@ -152,14 +151,14 @@ type detailData struct {
 	PreviewScaled  bool
 	PreviewMaxDim  int
 	PluginSlot     pluginSlotView
+	RewrittenBy    int64
 }
 
 // External links go by sha because an image id can be reused after a delete.
 func (s *Server) imageByHashHandler(w http.ResponseWriter, r *http.Request) {
 	sha := r.PathValue("sha")
 	if d := s.db(); d != nil {
-		var id int64
-		if err := d.Read.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, sha).Scan(&id); err == nil {
+		if id, err := gallery.ImageIDBySHA(d.Read, sha); err == nil {
 			http.Redirect(w, r, "/images/"+strconv.FormatInt(id, 10), http.StatusFound)
 			return
 		}
@@ -169,8 +168,8 @@ func (s *Server) imageByHashHandler(w http.ResponseWriter, r *http.Request) {
 		if cx.DB == nil {
 			continue
 		}
-		var id int64
-		if err := cx.DB.Read.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, sha).Scan(&id); err != nil {
+		id, err := gallery.ImageIDBySHA(cx.DB.Read, sha)
+		if err != nil {
 			continue
 		}
 		if err := s.switchGallery(cx.Name); err != nil {
@@ -224,7 +223,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 	var rankPage string
 	rankReady := make(chan struct{})
 	rankFired := false
-	pendingKey := ""
+	var pending *search.Query
 	pageSize := s.pageSize(r)
 	posPage, posIdx, havePos := 0, 0, false
 	if p, err := strconv.Atoi(backPage); err == nil && p > 0 && pageSize > 0 {
@@ -236,26 +235,21 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		backPage = strconv.Itoa(posPage)
 	}
 	if wantAdjacent && pageSize > 0 && !havePos {
-		var seed int64
-		if backSort == "random" && backSeed != "" {
-			seed, _ = strconv.ParseInt(backSeed, 10, 64)
-		}
-		cacheKey := search.BuildAdjacencyCacheKey(s.activeGallery(), backQ, backSort, backOrder, seed, ceiling.Level())
-		switch ids, ok := search.AdjacencyCacheGet(cacheKey); {
-		case ok:
+		sq := adjacentSearchQuery(backQ, backSort, backOrder, backSeed, ceiling)
+		switch page, listed := search.PageOf(s.source(), sq, id, pageSize); {
+		case listed:
 			// A miss here means back_q no longer matches; don't rank it.
-			if page, found := s.pageOfMatch(ids, id, pageSize); found {
-				backPage = page
+			if page > 0 {
+				backPage = strconv.Itoa(page)
 			}
 		case backSort == "similarity":
 			// A rank by score would re-run the fan the adjacency lookup pays;
 			// the page comes off that lookup's cached list afterwards.
-			pendingKey = cacheKey
+			pending = &sq
 		default:
 			rankFired = true
 			go func() {
 				defer close(rankReady)
-				sq := adjacentSearchQuery(backQ, backSort, backOrder, backSeed, ceiling)
 				ctx, cancel := context.WithTimeout(r.Context(), rankPageBudget)
 				defer cancel()
 				if arrived, err := strconv.Atoi(backPage); err == nil {
@@ -264,7 +258,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 				}
-				rank, err := search.RankInQuery(ctx, s.db(), sq, id)
+				rank, err := search.RankInQuery(ctx, s.source(), sq, id)
 				if err != nil || rank < 0 {
 					return
 				}
@@ -292,7 +286,6 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		prevID      *int64
 		nextID      *int64
 	)
-	csrfToken := s.csrfToken(sessionFromContext(ctx))
 	tagMode := readTagModeCookie(r)
 	isManga := img.FileType == models.FileTypeCBZ
 	misnamedExt := ""
@@ -300,43 +293,37 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		misnamedExt = strings.ToLower(filepath.Ext(img.CanonicalPath))
 	}
 	var wg sync.WaitGroup
-	wg.Add(9)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		_, imageTags, _ = s.tagSvc().GetImageTags(id)
-		sidebar = s.buildTagSidebar(id, csrfToken, tagMode, imageTags)
-	}()
-	go func() { defer wg.Done(); sdMeta = loadSDMeta(ctx, s.db(), id) }()
-	go func() { defer wg.Done(); comfyMeta = loadComfyMeta(ctx, s.db(), id) }()
-	go func() { defer wg.Done(); imagePaths = loadImagePaths(ctx, s.db(), s.boundary(), id) }()
-	go func() { defer wg.Done(); collections, _ = gallery.CollectionsForImage(s.db(), id) }()
-	go func() { defer wg.Done(); sources, _ = gallery.SourcesForImage(s.db(), id) }()
-	go func() { defer wg.Done(); lookupState = s.lookupViewFor(s.active(), id) }()
-	go func() { defer wg.Done(); annotations, _ = gallery.AnnotationsForImage(s.db(), id) }()
-	go func() {
-		defer wg.Done()
+		sidebar = s.buildTagSidebar(id, tagMode, imageTags)
+	})
+	wg.Go(func() { sdMeta = loadSDMeta(ctx, s.db(), id) })
+	wg.Go(func() { comfyMeta = loadComfyMeta(ctx, s.db(), id) })
+	wg.Go(func() { imagePaths = loadImagePaths(ctx, s.db(), s.boundary(), id) })
+	wg.Go(func() { collections, _ = gallery.CollectionsForImage(s.db(), id) })
+	wg.Go(func() { sources, _ = gallery.SourcesForImage(s.db(), id) })
+	wg.Go(func() { lookupState = s.lookupViewFor(s.active(), id) })
+	wg.Go(func() { annotations, _ = gallery.AnnotationsForImage(s.db(), id) })
+	wg.Go(func() {
 		if !isManga {
 			genericMeta = meta.ExtractGeneric(img.CanonicalPath, img.FileType)
 		}
-	}()
+	})
 	if isManga {
-		wg.Add(1)
-		go func() { defer wg.Done(); mangaMeta = loadMangaMeta(ctx, s.db(), id) }()
+		wg.Go(func() { mangaMeta = loadMangaMeta(ctx, s.db(), id) })
 	}
 	if wantAdjacent {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			prevID, nextID = s.findAdjacentImages(ctx, id, backQ, backSort, backOrder, backSeed, ceiling)
-		}()
+		})
 	}
 	wg.Wait()
 	<-rankReady
 	if rankPage != "" {
 		backPage = rankPage
-	} else if ids, ok := search.AdjacencyCacheGet(pendingKey); ok {
-		if page, found := s.pageOfMatch(ids, id, pageSize); found {
-			backPage = page
+	} else if pending != nil {
+		if page, _ := search.PageOf(s.source(), *pending, id, pageSize); page > 0 {
+			backPage = strconv.Itoa(page)
 		}
 	}
 
@@ -429,11 +416,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 	if isManga {
 		mangaHint = strings.TrimSuffix(baseName, filepath.Ext(baseName))
 		if mangaMeta != nil {
-			if series := strings.TrimSpace(mangaMeta.Series); series != "" {
-				mangaHint = series
-			} else if title := strings.TrimSpace(mangaMeta.Title); title != "" {
-				mangaHint = title
-			}
+			mangaHint = cmp.Or(strings.TrimSpace(mangaMeta.Series), strings.TrimSpace(mangaMeta.Title), mangaHint)
 		}
 	}
 	data := detailData{
@@ -457,7 +440,6 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		ManualAnnotations: buildAnnotationEntries(manualAnnotations),
 		NoteHTML:          noteDoc.Render(mkRes),
 		ExtraPaths:        extraImagePaths(imagePaths),
-		ThumbnailURL:      fmt.Sprintf("/thumbnails/%s/%d.jpg", s.activeGallery(), id),
 		PrevID:            prevID,
 		NextID:            nextID,
 		RefURL:            refURL,
@@ -487,6 +469,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		PreviewNote:       previewNote,
 		PreviewScaled:     previewScaled,
 		PreviewMaxDim:     gallery.ViewMaxDim,
+		RewrittenBy:       gallery.RewrittenBy(s.db().Read, img.ID),
 		PluginSlot:        s.pluginSlot(r, config.SlotDetailActions, id, img.FileType),
 	}
 	s.renderTemplate(w, "detail.html", data)
@@ -507,7 +490,7 @@ func (s *Server) relatedImagesHandler(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, dst, http.StatusSeeOther)
 		return
 	}
-	related, _ := s.tagSvc().RelatedImages(id, 6, readRatingCookie(r))
+	related, _ := s.tagSvc().RelatedImages(id, 6, resolveCeiling(r, s.active()).ExcludedTagIDs())
 	back := parseBackContext(r)
 	s.renderTemplate(w, "partials/related_images.html", map[string]any{
 		"Images":        related,
@@ -535,14 +518,6 @@ func distinctTaggerNames(tags []models.ImageTag, auto bool) []string {
 	return out
 }
 
-func (s *Server) pageOfMatch(ids []int64, id int64, pageSize int) (string, bool) {
-	i := slices.Index(ids, id)
-	if i < 0 {
-		return "", false
-	}
-	return strconv.Itoa(i/pageSize + 1), true
-}
-
 // One prev/next step reaches at most a neighbour page, and a page-sized
 // read costs the same at any depth, where a rank COUNT grows with it.
 func (s *Server) pageHoldingMatch(ctx context.Context, sq search.Query, id int64, arrived, pageSize int) (int, bool) {
@@ -555,8 +530,8 @@ func (s *Server) pageHoldingMatch(ctx context.Context, sq search.Query, id int64
 		}
 		probe := sq
 		probe.Page, probe.Limit = page, pageSize
-		probe.SkipCount, probe.CacheKey = true, ""
-		res, err := search.Execute(s.db(), probe)
+		probe.SkipCount, probe.Cached = true, false
+		res, err := search.Execute(s.source(), probe)
 		if err != nil {
 			return 0, false
 		}
@@ -569,8 +544,7 @@ func (s *Server) pageHoldingMatch(ctx context.Context, sq search.Query, id int64
 
 func (s *Server) findAdjacentImages(ctx context.Context, currentID int64, queryStr, sortStr, orderStr, seedStr string, ceiling *Ceiling) (prevID, nextID *int64) {
 	sq := adjacentSearchQuery(queryStr, sortStr, orderStr, seedStr, ceiling)
-	sq.CacheKey = search.BuildAdjacencyCacheKey(s.activeGallery(), queryStr, sortStr, orderStr, sq.RandomSeed, ceiling.Level())
-	prevID, nextID, err := search.ExecuteAdjacent(ctx, s.db(), sq, currentID)
+	prevID, nextID, err := search.ExecuteAdjacent(ctx, s.source(), sq, currentID)
 	if err != nil {
 		logx.Warnf("findAdjacentImages: %v", err)
 	}
@@ -582,9 +556,12 @@ func adjacentSearchQuery(queryStr, sortStr, orderStr, seedStr string, ceiling *C
 	pinnedCollection := search.PinnedCollectionName(expr)
 	expr = ceiling.Apply(expr)
 	sq := search.Query{
-		Expr:  expr,
-		Sort:  sortStr,
-		Order: orderStr,
+		Expr:         expr,
+		Sort:         sortStr,
+		Order:        orderStr,
+		Cached:       true,
+		Text:         queryStr,
+		CeilingLevel: ceiling.Level(),
 	}
 	if sortStr == "order" {
 		sq.OrderCollection = pinnedCollection
@@ -616,7 +593,7 @@ func (s *Server) md5CellGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	sum, err := gallery.ComputeAndStoreMD5(r.Context(), cx.DB, id)
+	sum, err := cx.StoreMD5(r.Context(), id)
 	if err != nil {
 		logx.Debugf("md5 cell %d: %v", id, err)
 	}

@@ -1,0 +1,422 @@
+package monloader
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+
+	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/tags"
+)
+
+const PTRLookupBatch = 500
+
+// Both halves share the job slot the caller already holds.
+// The spelling is exact, a bare one meaning general, as the PTR writes it.
+func (l *Link) PTRMergeSweep(svc *tags.Service, id int64, spelling string) {
+	catID, bare, ok := svc.ParseForm(spelling)
+	if !ok {
+		l.jobs.Fail("not a tag name: " + spelling)
+		return
+	}
+	target, err := svc.GetOrCreateTag(bare, catID)
+	if err != nil {
+		l.jobs.Fail(err.Error())
+		return
+	}
+	l.jobs.Update(0, 1, "aliasing tag…")
+	if err := svc.MergeTags(id, target.ID); err != nil {
+		l.jobs.Fail(err.Error())
+		return
+	}
+	l.PTRTagSweep(svc, []int64{target.ID}, "")
+}
+
+type ptrLookupCand struct {
+	id   int64
+	name string
+}
+
+// Rating tags are immutable, so they are never swept.
+func ptrLookupCands(svc *tags.Service, ids []int64) ([]ptrLookupCand, error) {
+	forms, err := svc.PlainForms(ids)
+	if err != nil {
+		return nil, err
+	}
+	cands := make([]ptrLookupCand, len(forms))
+	for i, f := range forms {
+		cands[i] = ptrLookupCand{id: f.ID, name: f.Form}
+	}
+	return cands, nil
+}
+
+// An orphan spelling answers known with nothing behind it, so a connected
+// candidate beats it wherever it turns up; otherwise the tag's own orphan
+// name would shadow an alias holding the whole cluster.
+func ResolvePTRSpelling(graph map[string]PTRTagInfo, own string, aliases []string) (string, PTRTagInfo, bool) {
+	bareName, bareInfo, haveBare := "", PTRTagInfo{}, false
+	connected := func(name string, info PTRTagInfo) bool {
+		if len(info.Aliases)+len(info.Implications)+len(info.ImpliedBy) > 0 || (info.Ideal != "" && info.Ideal != name) {
+			return true
+		}
+		if !haveBare {
+			bareName, bareInfo, haveBare = name, info, true
+		}
+		return false
+	}
+	if info, ok := graph[own]; ok && info.Known && connected(own, info) {
+		return own, info, true
+	}
+	var first string
+	for _, a := range aliases {
+		info, ok := graph[a]
+		if !ok || !info.Known || !connected(a, info) {
+			continue
+		}
+		if info.Ideal == a {
+			return a, info, true
+		}
+		first = cmp.Or(first, a)
+	}
+	if first != "" {
+		return first, graph[first], true
+	}
+	if haveBare {
+		return bareName, bareInfo, true
+	}
+	return "", PTRTagInfo{}, false
+}
+
+func ptrAliasForms(svc *tags.Service, ids []int64) (map[int64][]string, error) {
+	aliases, err := svc.AliasesForTagIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	forms := make(map[int64][]string, len(aliases))
+	for id, rows := range aliases {
+		for _, a := range rows {
+			forms[id] = append(forms[id], tags.FormName(a.CategoryName, a.Name))
+		}
+	}
+	return forms, nil
+}
+
+// A spelling that answered for the tag joins its aliases, so the pull
+// adopts it and the staleness sync never retires it. An `as` the operator
+// named gets no alias fallback.
+func (l *Link) ptrResolveChunk(ctx context.Context, svc *tags.Service, chunk []ptrLookupCand, as string) (map[int64]PTRTagInfo, error) {
+	if as != "" && len(chunk) == 1 {
+		graph, err := l.PTRTagLookup(ctx, []string{as})
+		if err != nil {
+			return nil, err
+		}
+		info := graph[as]
+		if !info.Known {
+			return map[int64]PTRTagInfo{}, nil
+		}
+		if as != chunk[0].name {
+			info.Aliases = append(info.Aliases, as)
+		}
+		return map[int64]PTRTagInfo{chunk[0].id: info}, nil
+	}
+	names := make([]string, len(chunk))
+	for i, c := range chunk {
+		names[i] = c.name
+	}
+	graph, err := l.PTRTagLookup(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64]PTRTagInfo, len(chunk))
+	var unknown []int64
+	for _, c := range chunk {
+		if info := graph[c.name]; info.Known {
+			out[c.id] = info
+		} else {
+			unknown = append(unknown, c.id)
+		}
+	}
+	if len(unknown) == 0 {
+		return out, nil
+	}
+	forms, err := ptrAliasForms(svc, unknown)
+	if err != nil {
+		return nil, err
+	}
+	var all []string
+	for _, id := range unknown {
+		all = append(all, forms[id]...)
+	}
+	for start := 0; start < len(all); start += PTRLookupBatch {
+		part, err := l.PTRTagLookup(ctx, all[start:min(start+PTRLookupBatch, len(all))])
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(graph, part)
+	}
+	for _, c := range chunk {
+		if _, done := out[c.id]; done {
+			continue
+		}
+		if spelling, info, ok := ResolvePTRSpelling(graph, c.name, forms[c.id]); ok {
+			info.Aliases = append(info.Aliases, spelling)
+			out[c.id] = info
+		}
+	}
+	return out, nil
+}
+
+// Each id is swept at most once, which is what ends the follow-up rounds
+// over tags the fan-in created.
+func (l *Link) PTRTagSweep(svc *tags.Service, ids []int64, as string) {
+	ctx := l.jobs.Context()
+	lookedUpAs := as
+
+	cands, err := ptrLookupCands(svc, ids)
+	if err != nil {
+		l.jobs.Fail(err.Error())
+		return
+	}
+
+	// Implied-by is pulled only for the requested tags: a series is
+	// implied by every character carrying it, so recursing would pull in
+	// the whole graph.
+	seed := make(map[int64]bool, len(cands))
+	for _, c := range cands {
+		seed[c.id] = true
+	}
+
+	total := len(cands)
+	aliases, implications, unknown, processed, dropped, aliased, retired := 0, 0, 0, 0, 0, 0, 0
+	cancelled := false
+	unavailable := false
+	fanOutParents := map[int64]struct{}{}
+	swept := make(map[int64]struct{}, total)
+	l.jobs.Update(0, total, "PTR lookup…")
+	for len(cands) > 0 && !cancelled && !unavailable {
+		createdTags := map[int64]struct{}{}
+		for start := 0; start < len(cands) && !cancelled; start += PTRLookupBatch {
+			if ctx.Err() != nil {
+				cancelled = true
+				break
+			}
+			chunk := cands[start:min(start+PTRLookupBatch, len(cands))]
+			results, err := l.ptrResolveChunk(ctx, svc, chunk, as)
+			if errors.Is(err, ErrPTRUnavailable) {
+				// The PTR going away mid-sweep is a degraded stop, not a
+				// failure: what already applied stays.
+				unavailable = true
+				break
+			}
+			if err != nil {
+				l.jobs.Fail("PTR lookup failed: " + err.Error())
+				return
+			}
+			for _, c := range chunk {
+				swept[c.id] = struct{}{}
+				info := results[c.id]
+				if !info.Known {
+					// Unknown now, so every relation it pulled earlier
+					// goes stale.
+					unknown++
+					retired += syncPTRStaleness(svc, c.id, nil, nil)
+				} else {
+					a, i, d, al, r := applyPTRTagInfo(svc, c.id, info, fanOutParents, createdTags, seed[c.id])
+					aliases += a
+					implications += i
+					dropped += d
+					aliased += al
+					retired += r
+				}
+				processed++
+			}
+			l.jobs.Update(processed, total, "PTR lookup…")
+		}
+		if cancelled || unavailable {
+			break
+		}
+		as = ""
+		var next []int64
+		for id := range createdTags {
+			if _, ok := swept[id]; !ok {
+				next = append(next, id)
+			}
+		}
+		if cands, err = ptrLookupCands(svc, next); err != nil {
+			l.jobs.Fail(err.Error())
+			return
+		}
+		total += len(cands)
+	}
+
+	// Inline, since the propagation job cannot start while this sweep holds
+	// the runner; one pass per parent applies its full implied closure.
+	for parentID := range fanOutParents {
+		if ctx.Err() != nil {
+			cancelled = true
+			break
+		}
+		if _, err := svc.PropagateImplication(ctx, parentID, nil); err != nil {
+			logx.Warnf("ptr lookup fan-out for tag %d: %v", parentID, err)
+		}
+	}
+
+	msg := fmt.Sprintf("PTR: added %d alias(es) and %d implication(s) across %d tag(s)", aliases, implications, processed)
+	if lookedUpAs != "" {
+		msg += ", looked up as " + lookedUpAs
+	}
+	if unknown > 0 {
+		msg += fmt.Sprintf("; %d unknown to the PTR", unknown)
+	}
+	if dropped > 0 {
+		msg += fmt.Sprintf("; %d spelling(s) not representable", dropped)
+	}
+	if aliased > 0 {
+		msg += fmt.Sprintf("; %d relation(s) skipped, an alias here points elsewhere", aliased)
+	}
+	if retired > 0 {
+		msg += fmt.Sprintf("; %d relation(s) no longer on the PTR", retired)
+	}
+	msg += "."
+	if unavailable && !cancelled {
+		l.jobs.Complete(fmt.Sprintf("PTR lookup stopped at %d/%d: the PTR became unavailable on monloader. %s", processed, total, msg))
+		return
+	}
+	l.jobs.Finish(nil, cancelled, fmt.Sprintf("PTR lookup cancelled (%d/%d processed)", processed, total), msg)
+}
+
+// The PTR ideal becomes an alias too, since locally this tag stays the
+// canonical. An alias only takes an unused name, so the operator's
+// catalog wins; AddImplicationFrom guards cycles and aliases.
+func applyPTRTagInfo(svc *tags.Service, tagID int64, info PTRTagInfo, fanOutParents, createdTags map[int64]struct{}, pullImpliedBy bool) (aliases, implications, dropped, aliased, retired int) {
+	freshAliases := map[tags.AliasKey]bool{}
+	freshImplied := map[int64]bool{}
+	aliasNames := info.Aliases
+	if info.Ideal != "" {
+		aliasNames = append([]string{info.Ideal}, aliasNames...)
+	}
+	for _, name := range aliasNames {
+		catID, bare, ok := svc.ParseForm(name)
+		if !ok {
+			dropped++
+			continue
+		}
+		normalized, err := tags.ValidateTagName(bare)
+		if err != nil {
+			dropped++
+			continue
+		}
+		freshAliases[tags.AliasKey{CategoryID: catID, Name: normalized}] = true
+		exists, err := svc.TagNameExists(catID, normalized)
+		if err != nil {
+			logx.Warnf("ptr alias %q: %v", name, err)
+			continue
+		}
+		if exists {
+			continue
+		}
+		if _, err := svc.CreateAliasFrom(normalized, catID, tagID, "ptr"); err != nil {
+			logx.Warnf("ptr alias %q: %v", name, err)
+			continue
+		}
+		aliases++
+	}
+	for _, name := range info.Implications {
+		catID, bare, ok := svc.ParseForm(name)
+		if !ok {
+			continue
+		}
+		normalized, err := tags.ValidateTagName(bare)
+		if err != nil {
+			logx.Warnf("ptr implication %q: %v", name, err)
+			continue
+		}
+		exists, err := svc.TagNameExists(catID, normalized)
+		if err != nil {
+			logx.Warnf("ptr implication %q: %v", name, err)
+			continue
+		}
+		implied, err := svc.GetOrCreateTagFrom(normalized, catID, "ptr")
+		if err != nil {
+			logx.Warnf("ptr implication %q: %v", name, err)
+			continue
+		}
+		if redirected(implied, normalized, catID) {
+			aliased++
+			continue
+		}
+		freshImplied[implied.ID] = true
+		if !exists {
+			createdTags[implied.ID] = struct{}{}
+		}
+		isNew, err := svc.AddImplicationFrom(tagID, implied.ID, "ptr")
+		if err != nil {
+			logx.Warnf("ptr implication %q: %v", name, err)
+			continue
+		}
+		if isNew {
+			implications++
+			fanOutParents[tagID] = struct{}{}
+		}
+	}
+	if pullImpliedBy {
+		for _, name := range info.ImpliedBy {
+			catID, bare, ok := svc.ParseForm(name)
+			if !ok {
+				continue
+			}
+			normalized, err := tags.ValidateTagName(bare)
+			if err != nil {
+				logx.Warnf("ptr implied-by %q: %v", name, err)
+				continue
+			}
+			// The parent is not swept: its implications reach this tag's
+			// siblings (solo_futanari implies futanari) and would drag
+			// the cluster in.
+			parent, err := svc.GetOrCreateTagFrom(normalized, catID, "ptr")
+			if err != nil {
+				logx.Warnf("ptr implied-by %q: %v", name, err)
+				continue
+			}
+			if redirected(parent, normalized, catID) {
+				aliased++
+				continue
+			}
+			isNew, err := svc.AddImplicationFrom(parent.ID, tagID, "ptr")
+			if err != nil {
+				logx.Warnf("ptr implied-by %q: %v", name, err)
+				continue
+			}
+			if isNew {
+				implications++
+				fanOutParents[parent.ID] = struct{}{}
+			}
+		}
+	}
+	retired = syncPTRStaleness(svc, tagID, freshAliases, freshImplied)
+	return aliases, implications, dropped, aliased, retired
+}
+
+// A redirected name is an alias here: storing the edge on its canonical
+// would assert one neither source declares, which the contribution dialog
+// would then offer back as new.
+func redirected(got *models.Tag, name string, categoryID int64) bool {
+	return got.Name != name || got.CategoryID != categoryID
+}
+
+func syncPTRStaleness(svc *tags.Service, tagID int64, freshAliases map[tags.AliasKey]bool, freshImplied map[int64]bool) int {
+	retired := 0
+	n, err := svc.SyncAliasStaleness(tagID, "ptr", freshAliases)
+	if err != nil {
+		logx.Warnf("ptr alias staleness for tag %d: %v", tagID, err)
+	}
+	retired += n
+	n, err = svc.SyncImplicationStaleness(tagID, "ptr", freshImplied)
+	if err != nil {
+		logx.Warnf("ptr implication staleness for tag %d: %v", tagID, err)
+	}
+	return retired + n
+}

@@ -1,7 +1,5 @@
 {{define "relations_session.html"}}
-{{template "layout_head" .}}
-<div id="sidebar-inner"></div>
-{{template "layout_mid" .}}
+{{template "layout_head_bare" .}}
 
 <div id="relations-session-page" class="relations-session" data-esc-back="/relations">
   <div class="detail-topbar">
@@ -40,7 +38,6 @@
     <form hx-post="/internal/rating-ceiling?level=explicit" hx-swap="none"
           hx-on::after-request="if(event.detail.successful){window.location.reload()}"
           style="display:inline">
-      <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
       <button type="submit" class="btn-sm btn-success">Raise ceiling to explicit</button>
     </form>
     {{else if gt .Skipped 0}}
@@ -125,7 +122,6 @@
 
     <form id="session-decision-form" hx-post="/relations/session/decide" hx-target="#flash-relations" hx-swap="innerHTML"
           hx-on::after-request="onSessionDecideResponse(event)">
-      <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
       <input type="hidden" name="a" value="{{.Pair.A.ID}}">
       <input type="hidden" name="b" value="{{.Pair.B.ID}}">
       <input type="hidden" name="left" id="session-left" value="{{.Pair.LeftID}}">
@@ -190,6 +186,7 @@
         <input type="checkbox" id="postdecide-copy-tags">
         Copy unique tags onto the original first
       </label>
+      <div id="postdecide-flash"></div>
       <div class="dialog-actions">
         <button type="button" id="postdecide-keep" class="btn-sm" autofocus>Keep file</button>
         <button type="button" id="postdecide-delete" class="btn-danger btn-sm">Delete now</button>
@@ -350,8 +347,7 @@
   }
 
   var postdecideDlg = document.getElementById('session-postdecide-delete-dialog');
-  var pdCsrf = form.querySelector('input[name="_csrf"]');
-  var pdCSRFValue = pdCsrf ? pdCsrf.value : '';
+  var pdFlash = document.getElementById('postdecide-flash');
   var pdState = { dupID: 0, originalID: 0, groupID: 0 };
   window.onSessionDecideResponse = function(evt) {
     var detail = evt.detail || {};
@@ -372,6 +368,7 @@
       if (origEl) origEl.textContent = '#' + pdState.originalID;
       if (copyBox) copyBox.checked = false;
       if (copyLabel) copyLabel.hidden = !hasUnique;
+      if (pdFlash) pdFlash.innerHTML = '';
       if (postdecideDlg) postdecideDlg.showModal();
       return;
     }
@@ -379,43 +376,43 @@
       window.location.reload();
     }
   };
-  // URL-encoded, not FormData: r.ParseForm does not read a multipart body.
-  var pdHeaders = {
-    'HX-Request': 'true',
-    'X-CSRF-Token': pdCSRFValue,
-    'X-Monbooru-Gallery': document.body.dataset.gallery || '',
-    'Content-Type': 'application/x-www-form-urlencoded',
-  };
-  function pdCopyTags() {
+  function pdDone() {
+    if (postdecideDlg) postdecideDlg.close();
+    window.location.reload();
+  }
+  // A refused copy answers 200 with an error body, so the body decides.
+  function pdCopyTags(next) {
     var copyBox = document.getElementById('postdecide-copy-tags');
-    if (!copyBox || !copyBox.checked || pdState.groupID <= 0) return Promise.resolve();
-    var copyParams = new URLSearchParams();
-    copyParams.append('_csrf', pdCSRFValue);
-    return fetch('/relations/dup-group/' + pdState.groupID + '/copy-tags', {
-      method: 'POST', headers: pdHeaders, body: copyParams.toString(),
+    if (!copyBox || !copyBox.checked || pdState.groupID <= 0) { next(); return; }
+    postForm('/relations/dup-group/' + pdState.groupID + '/copy-tags', {}, {
+      hx: true, flashId: 'postdecide-flash',
+      onOK: function(res) {
+        res.text().then(function(t) {
+          if (t.indexOf('flash-err') !== -1) { pdFlash.innerHTML = t; return; }
+          next();
+        });
+      },
     });
   }
   var pdKeep = document.getElementById('postdecide-keep');
   if (pdKeep) pdKeep.addEventListener('click', function() {
     // Keep honours the copy box too: it is a choice about the tags, not
     // the file.
-    pdCopyTags().then(function() {
-      if (postdecideDlg) postdecideDlg.close();
-      window.location.reload();
-    });
+    pdCopyTags(pdDone);
   });
   var pdDelete = document.getElementById('postdecide-delete');
   if (pdDelete) pdDelete.addEventListener('click', function() {
-    pdCopyTags().then(function() {
-      var delParams = new URLSearchParams();
-      delParams.append('_csrf', pdCSRFValue);
-      delParams.append('image_id', String(pdState.dupID));
-      return fetch('/relations/duplicates/marked/delete-one', {
-        method: 'POST', headers: pdHeaders, body: delParams.toString(),
+    pdCopyTags(function() {
+      postForm('/relations/duplicates/marked/delete-one', {image_id: String(pdState.dupID)}, {
+        hx: true, flashId: 'postdecide-flash',
+        onOK: function(res) {
+          // A raw fetch does not process HX-Trigger, so the flash is stashed
+          // for the reload by hand.
+          var f = JSON.parse(res.headers.get('HX-Trigger') || '{}')['monbooru:flash'];
+          if (f) stashActionFlash(f.text, f.kind);
+          pdDone();
+        },
       });
-    }).then(function() {
-      if (postdecideDlg) postdecideDlg.close();
-      window.location.reload();
     });
   });
   // Esc keeps the file but, as a cancel, skips the tag copy.

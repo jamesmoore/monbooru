@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
 )
 
@@ -26,7 +27,36 @@ func (h *Handler) serveImageFile(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, canonPath)
 }
 
-func containedCanonical(w http.ResponseWriter, g Gallery, id int64) (canonPath, fileType string, ok bool) {
+func (h *Handler) serveImageStill(w http.ResponseWriter, r *http.Request) {
+	g, id, ok := h.galleryAndID(w, r)
+	if !ok {
+		return
+	}
+	canonPath, fileType, ok := containedCanonical(w, g, id)
+	if !ok {
+		return
+	}
+	if gallery.IsVideoType(fileType) || fileType == models.FileTypeCBZ {
+		apiError(w, http.StatusNotFound, "not_found", "image is a video or an archive")
+		return
+	}
+	if !gallery.IsFFmpegStill(fileType) {
+		if ct := gallery.MIMEForFileType(fileType); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		http.ServeFile(w, r, canonPath)
+		return
+	}
+	frame, err := gallery.RenderStillFrame(canonPath, os.TempDir(), 0)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	defer func() { _ = os.Remove(frame) }()
+	http.ServeFile(w, r, frame)
+}
+
+func containedCanonical(w http.ResponseWriter, g *library.Gallery, id int64) (canonPath, fileType string, ok bool) {
 	if err := g.DB.Read.QueryRow(
 		`SELECT canonical_path, file_type FROM images WHERE id = ?`, id,
 	).Scan(&canonPath, &fileType); err != nil {

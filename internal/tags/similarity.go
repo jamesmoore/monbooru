@@ -2,15 +2,11 @@ package tags
 
 import (
 	"database/sql"
-	"errors"
 	"math"
 	"sort"
 
-	"github.com/monbooru/monbooru/internal/counts"
 	"github.com/monbooru/monbooru/internal/db"
 )
-
-var errVisibleCount = errors.New("tags: visible image count unavailable")
 
 const SimilarMaxTagUsage = relatedMaxTagUsage
 
@@ -58,13 +54,11 @@ func SimilarityScore(shared, seedNorm, candNorm float64) float64 {
 	return math.Min(1, shared/math.Sqrt(seedNorm*candNorm))
 }
 
-func LoadSimilaritySeed(database *db.DB, imageID int64) (SimilaritySeed, error) {
+// visibleCount is the gallery's count of visible images, the base of the
+// tag weights.
+func LoadSimilaritySeed(database *db.DB, imageID int64, visibleCount int) (SimilaritySeed, error) {
 	seed := SimilaritySeed{ImageID: imageID}
-	n, ok := counts.VisibleCount(database)
-	if !ok {
-		return seed, errVisibleCount
-	}
-	visible := int64(n)
+	visible := int64(visibleCount)
 	if visible <= 0 {
 		return seed, nil
 	}
@@ -108,12 +102,8 @@ type SimilarityCorpusImage struct {
 	Norm float64
 }
 
-func LoadSimilarityCorpus(database *db.DB, minTagCount int) ([]SimilarityCorpusImage, error) {
-	n, ok := counts.VisibleCount(database)
-	if !ok {
-		return nil, errVisibleCount
-	}
-	visible := int64(n)
+func LoadSimilarityCorpus(database *db.DB, minTagCount, visibleCount int) ([]SimilarityCorpusImage, error) {
+	visible := int64(visibleCount)
 	if visible <= 0 {
 		return nil, nil
 	}
@@ -236,13 +226,9 @@ type OverlapSeed struct {
 
 // LoadOverlapSeed caps usage one short of the library: a tag every image
 // carries says nothing.
-func LoadOverlapSeed(database *db.DB, imageID int64) (OverlapSeed, error) {
+func LoadOverlapSeed(database *db.DB, imageID int64, visibleCount int) (OverlapSeed, error) {
 	seed := OverlapSeed{ImageID: imageID}
-	n, ok := counts.VisibleCount(database)
-	if !ok {
-		return seed, errVisibleCount
-	}
-	seed.MaxUsage = min(int64(SimilarMaxTagUsage), int64(n)-1)
+	seed.MaxUsage = min(int64(SimilarMaxTagUsage), int64(visibleCount)-1)
 	if seed.MaxUsage < 1 {
 		return seed, nil
 	}
@@ -298,11 +284,11 @@ func (s OverlapSeed) ScoreExpr(imageCol, alias string) (string, []any) {
 	return expr, append(args, len(s.TagIDs), s.MaxUsage)
 }
 
-func OverlapPercentsAgainst(database *db.DB, seedID int64, ids []int64) (map[int64]int, error) {
+func OverlapPercentsAgainst(database *db.DB, seedID int64, ids []int64, visibleCount int) (map[int64]int, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	seed, err := LoadOverlapSeed(database, seedID)
+	seed, err := LoadOverlapSeed(database, seedID, visibleCount)
 	if err != nil || len(seed.TagIDs) == 0 {
 		return nil, err
 	}
@@ -342,8 +328,8 @@ type SharedTag struct {
 }
 
 // SharedTags also returns how many tags are shared before the limit.
-func SharedTags(database *db.DB, a, b int64, limit int) ([]SharedTag, int, error) {
-	seed, err := LoadSimilaritySeed(database, a)
+func SharedTags(database *db.DB, a, b int64, limit, visibleCount int) ([]SharedTag, int, error) {
+	seed, err := LoadSimilaritySeed(database, a, visibleCount)
 	if err != nil || len(seed.Tags) == 0 {
 		return nil, 0, err
 	}

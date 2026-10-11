@@ -14,65 +14,50 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/search"
-	"github.com/monbooru/monbooru/internal/tags"
 	"github.com/monbooru/monbooru/internal/upgrade"
 )
 
 func (s *Server) ratingCeilingPost(w http.ResponseWriter, r *http.Request) {
-	level := r.URL.Query().Get("level")
-	level = cmp.Or(level, r.FormValue("level"))
+	level := cmp.Or(r.URL.Query().Get("level"), r.FormValue("level"))
 	writeRatingCookie(w, level)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) viewPrefsPost(w http.ResponseWriter, r *http.Request) {
 	if v := r.FormValue("page_size"); v != "" {
-		age := 31_536_000
 		if v == "default" {
-			v, age = "", -1
+			v = ""
 		} else if n, err := strconv.Atoi(v); err != nil || !slices.Contains(PageSizeOptions, n) {
 			http.Error(w, "unknown page size", http.StatusBadRequest)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     pageSizeCookieName,
-			Value:    v,
-			Path:     "/",
-			HttpOnly: true,
-			MaxAge:   age,
-			SameSite: http.SameSiteLaxMode,
-		})
+		setPrefCookie(w, pageSizeCookieName, v)
 	}
 	if v := r.FormValue("thumb"); v != "" {
 		if v != "s" && v != "m" && v != "l" {
 			http.Error(w, "unknown thumbnail size", http.StatusBadRequest)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     thumbSizeCookieName,
-			Value:    v,
-			Path:     "/",
-			HttpOnly: true,
-			MaxAge:   31_536_000,
-			SameSite: http.SameSiteLaxMode,
-		})
+		setPrefCookie(w, thumbSizeCookieName, v)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) toggleBoolColumn(w http.ResponseWriter, r *http.Request, column, onHTML, offHTML string, oob func(*http.Request) string) {
+func (s *Server) toggleBoolColumn(w http.ResponseWriter, r *http.Request, flag gallery.ImageFlag, onHTML, offHTML string, oob func(*http.Request, *library.Gallery) string) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
 		return
 	}
-	var newVal int
-	if err := s.db().Write.QueryRow(
-		`UPDATE images SET `+column+` = 1 - `+column+` WHERE id = ? RETURNING `+column, id,
-	).Scan(&newVal); err != nil {
+	cx := s.active()
+	on, err := cx.ToggleFlag(id, flag)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
@@ -80,23 +65,20 @@ func (s *Server) toggleBoolColumn(w http.ResponseWriter, r *http.Request, column
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if cx := s.active(); cx != nil {
-		cx.InvalidateCaches()
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if newVal == 1 {
+	if on {
 		_, _ = w.Write([]byte(onHTML))
 	} else {
 		_, _ = w.Write([]byte(offHTML))
 	}
 	if oob != nil {
-		_, _ = w.Write([]byte(oob(r)))
+		_, _ = w.Write([]byte(oob(r, cx)))
 	}
 }
 
 // FE0E pins the heart to text style; bare U+2665 turns into an oversized emoji.
 func (s *Server) toggleFavorite(w http.ResponseWriter, r *http.Request) {
-	s.toggleBoolColumn(w, r, "is_favorited",
+	s.toggleBoolColumn(w, r, gallery.FlagFavorited,
 		`<button type="submit" id="fav-btn" class="btn-fav active" title="Unfavorite">♥&#xFE0E;</button>`,
 		`<button type="submit" id="fav-btn" class="btn-fav" title="Favorite">♡</button>`,
 		nil,
@@ -104,20 +86,16 @@ func (s *Server) toggleFavorite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) toggleInbox(w http.ResponseWriter, r *http.Request) {
-	s.toggleBoolColumn(w, r, "is_inbox",
+	s.toggleBoolColumn(w, r, gallery.FlagInbox,
 		`<button type="submit" id="inbox-btn" class="btn-inbox active" title="Archive (i)">In inbox</button>`,
 		`<button type="submit" id="inbox-btn" class="btn-inbox" title="Send to inbox (i)">Archived</button>`,
-		s.inboxNavOOB,
+		inboxNavOOB,
 	)
 }
 
 // Only the count span is swapped: the link's classes depend on a search
 // this POST doesn't carry.
-func (s *Server) inboxNavOOB(r *http.Request) string {
-	cx := s.active()
-	if cx == nil {
-		return ""
-	}
+func inboxNavOOB(r *http.Request, cx *library.Gallery) string {
 	n, err := cx.InboxCountUnder(resolveCeiling(r, cx))
 	if err != nil {
 		return ""
@@ -148,24 +126,21 @@ func (s *Server) deleteImage(w http.ResponseWriter, r *http.Request) {
 	// Before the delete: the neighbours can't be found once this row is gone.
 	var prevID, nextID *int64
 	if refID == nil && (back.Sort != "" || back.Q != "") {
-		sortStr := back.Sort
-		sortStr = cmp.Or(sortStr, "newest")
-		orderStr := back.Order
-		orderStr = cmp.Or(orderStr, search.DefaultOrder(sortStr))
+		sortStr := cmp.Or(back.Sort, "newest")
+		orderStr := cmp.Or(back.Order, search.DefaultOrder(sortStr))
 		prevID, nextID = s.findAdjacentImages(r.Context(), id, back.Q, sortStr, orderStr, back.Seed, resolveCeiling(r, s.active()))
 	}
 
-	_, err := gallery.DeleteImage(s.db(), s.boundary(), s.thumbnailsPath(), id, tags.RemoveAllTagsFromImageTx, s.onImageDeleteCallback())
+	res, err := s.active().DeleteImages(context.Background(), []int64{id}, library.DeleteOptions{}, nil)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			http.NotFound(w, r)
-			return
-		}
 		logx.Errorf("delete image %d: %v", id, err)
 		flashStatus(w, http.StatusInternalServerError, "Delete failed; check server log.")
 		return
 	}
-	s.active().InvalidateCaches()
+	if len(res.Deleted) == 0 {
+		http.NotFound(w, r)
+		return
+	}
 
 	redirectURL := ""
 	switch {
@@ -179,7 +154,7 @@ func (s *Server) deleteImage(w http.ResponseWriter, r *http.Request) {
 		redirectURL = back.GalleryURL()
 	}
 
-	flashText := fmt.Sprintf("Deleted image #%d.", id)
+	flashText := fmt.Sprintf("Deleted image #%d%s.", id, keptChanged(res.Changed))
 	if isHTMXRequest(r) {
 		// A redirect would push a history entry that drops the ref chain; the
 		// client goes back instead, the fallback serving a tab with no history.
@@ -235,7 +210,7 @@ func (s *Server) promoteCanonical(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := gallery.PromoteCanonicalByPath(s.db(), s.boundary(), id, newCanonical); err != nil {
+	if err := s.active().Edit(func(d *db.DB) error { return gallery.PromoteCanonicalByPath(d, s.boundary(), id, newCanonical) }); err != nil {
 		code := http.StatusInternalServerError
 		if errors.As(err, new(gallery.Exclusion)) {
 			code = http.StatusBadRequest
@@ -243,7 +218,6 @@ func (s *Server) promoteCanonical(w http.ResponseWriter, r *http.Request) {
 		fail(err.Error(), code)
 		return
 	}
-	s.active().InvalidateCaches()
 	hxDone(w, r, "Canonical path updated.", "", fmt.Sprintf("/images/%d", id))
 }
 
@@ -290,12 +264,12 @@ func (s *Server) setSource(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "image not found", http.StatusNotFound)
 		return
 	}
-	if hasPrev && (!strings.EqualFold(prevSite, site) || prevPost != postID) {
-		if err := gallery.RenameSourceMembership(s.db(), id, prevSite, prevPost, site, postID, url); err != nil {
-			externalErr(w, r, err.Error(), http.StatusInternalServerError)
-			return
+	if err := s.active().Edit(func(d *db.DB) error {
+		if hasPrev && (!strings.EqualFold(prevSite, site) || prevPost != postID) {
+			return gallery.RenameSourceMembership(d, id, prevSite, prevPost, site, postID, url)
 		}
-	} else if err := gallery.AddSourceMembership(s.db(), id, site, postID, url); err != nil {
+		return gallery.AddSourceMembership(d, id, site, postID, url)
+	}); err != nil {
 		externalErr(w, r, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -348,9 +322,9 @@ func (s *Server) fetchSource(w http.ResponseWriter, r *http.Request) {
 	if pageGalleryStale(w, r, galleryName) {
 		return
 	}
-	s.fetchStatus.record(galleryName, id, "pending", "")
-	if err := s.enqueueMetadataFetch(r.Context(), id, galleryName, url); err != nil {
-		s.fetchStatus.clear(galleryName, id)
+	s.ml.Fetches.Record(galleryName, id, monloader.StatePending, "")
+	if err := s.ml.EnqueueMetadataFetch(r.Context(), id, galleryName, url); err != nil {
+		s.ml.Fetches.Clear(galleryName, id)
 		externalErr(w, r, "could not reach monloader: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -377,7 +351,7 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 	var md5 string
 	if backend != "ptr" {
 		var err error
-		if md5, err = lookupMD5(r.Context(), cx, id, storedMD5); err != nil {
+		if md5, err = monloader.LookupMD5(r.Context(), cx, id, storedMD5); err != nil {
 			externalErr(w, r, "cannot hash the file: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -389,18 +363,16 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 	case "booru":
 		hashes = "md5 " + md5
 	}
-	s.fetchStatus.recordLookup(galleryName, id, hashes)
-	jobID, err := s.enqueueHashLookup(r.Context(), id, galleryName, backend, md5, sha, false, false)
-	if err != nil {
-		s.fetchStatus.clear(galleryName, id)
-		if errors.Is(err, errPTRUnavailable) {
+	s.ml.Fetches.RecordLookup(galleryName, id, hashes)
+	if err := s.ml.EnqueueLookup(r.Context(), cx, id, backend, md5, sha, false, false); err != nil {
+		s.ml.Fetches.Clear(galleryName, id)
+		if errors.Is(err, monloader.ErrPTRUnavailable) {
 			externalErr(w, r, err.Error(), http.StatusConflict)
 			return
 		}
 		externalErr(w, r, "could not reach monloader: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	s.recordLookupEnqueued(cx, id, backend, jobID)
 	respondFetchPending(w, r, id)
 }
 
@@ -424,21 +396,21 @@ func (s *Server) replaceImage(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "this source's file is not known to differ from the local one", http.StatusConflict)
 		return
 	}
-	if e, ok := s.fetchStatus.load(galleryName, id); ok && e.State == "pending" {
+	if e, ok := s.ml.Fetches.Load(galleryName, id); ok && e.State == monloader.StatePending {
 		externalErr(w, r, "a fetch is already running for this image; wait for it to finish", http.StatusConflict)
 		return
 	}
-	s.fetchStatus.record(galleryName, id, "pending", "")
-	if err := s.enqueueReplace(r.Context(), id, galleryName, src.URL); err != nil {
-		s.fetchStatus.clear(galleryName, id)
+	s.ml.Fetches.Record(galleryName, id, monloader.StatePending, "")
+	if err := s.ml.EnqueueReplace(r.Context(), id, galleryName, src.URL); err != nil {
+		s.ml.Fetches.Clear(galleryName, id)
 		externalErr(w, r, "could not reach monloader: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	respondFetchPending(w, r, id)
 }
 
-// Free routes hold no ctxMu across a peer call, so they snapshot the name.
-func (s *Server) imageAndGallery(w http.ResponseWriter, r *http.Request) (int64, *galleryCtx, string, bool) {
+// Free routes hold no lock across a peer call, so they snapshot the name.
+func (s *Server) imageAndGallery(w http.ResponseWriter, r *http.Request) (int64, *library.Gallery, string, bool) {
 	id, ok := imageIDForm(w, r)
 	if !ok {
 		return 0, nil, "", false
@@ -471,7 +443,6 @@ func externalErr(w http.ResponseWriter, r *http.Request, msg string, code int) {
 }
 
 func (s *Server) imageEditDone(w http.ResponseWriter, r *http.Request, id int64, msg string) {
-	s.active().InvalidateCaches()
 	hxDone(w, r, msg, "", "/images/"+strconv.FormatInt(id, 10))
 }
 
@@ -480,7 +451,7 @@ func (s *Server) applyImageEdit(w http.ResponseWriter, r *http.Request, id int64
 		externalErr(w, r, "image not found", http.StatusNotFound)
 		return
 	}
-	if err := edit(); err != nil {
+	if err := s.active().Edit(func(*db.DB) error { return edit() }); err != nil {
 		externalErr(w, r, err.Error(), imageEditStatus(err))
 		return
 	}
@@ -521,13 +492,12 @@ func (s *Server) setNote(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, fmt.Sprintf("note too long (max %d chars)", maxImageNoteLen), http.StatusBadRequest)
 		return
 	}
-	res, err := s.db().Write.Exec(`UPDATE images SET note = ? WHERE id = ?`, note, id)
-	if err != nil {
+	if err := gallery.SetNote(s.db(), id, note); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			externalErr(w, r, "image not found", http.StatusNotFound)
+			return
+		}
 		externalErr(w, r, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		externalErr(w, r, "image not found", http.StatusNotFound)
 		return
 	}
 	hxDone(w, r, "Note updated.", "", "/images/"+strconv.FormatInt(id, 10))
@@ -632,12 +602,12 @@ func (s *Server) setAnnotation(w http.ResponseWriter, r *http.Request) {
 			externalErr(w, r, "bad annotation id", http.StatusBadRequest)
 			return
 		}
-		if err := gallery.UpdateAnnotation(s.db(), id, annID, x, y, bw, bh, body); err != nil {
+		if err := s.active().Edit(func(d *db.DB) error { return gallery.UpdateAnnotation(d, id, annID, x, y, bw, bh, body) }); err != nil {
 			externalErr(w, r, err.Error(), imageEditStatus(err))
 			return
 		}
 		done = "Annotation updated."
-	} else if err := gallery.AddManualAnnotation(s.db(), id, x, y, bw, bh, body); err != nil {
+	} else if err := s.active().Edit(func(d *db.DB) error { return gallery.AddManualAnnotation(d, id, x, y, bw, bh, body) }); err != nil {
 		externalErr(w, r, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -698,13 +668,13 @@ func (s *Server) setCollection(w http.ResponseWriter, r *http.Request) {
 		}
 		order = &n
 	}
-	var err error
-	if prev := strings.TrimSpace(r.FormValue("prev")); prev != "" && !strings.EqualFold(prev, name) {
-		err = gallery.RenameCollectionMembership(s.db(), id, prev, name, order)
-	} else {
-		err = gallery.AddCollectionMembership(s.db(), id, name, order)
-	}
-	if err != nil {
+	prev := strings.TrimSpace(r.FormValue("prev"))
+	if err := s.active().Edit(func(d *db.DB) error {
+		if prev != "" && !strings.EqualFold(prev, name) {
+			return gallery.RenameCollectionMembership(d, id, prev, name, order)
+		}
+		return gallery.AddCollectionMembership(d, id, name, order)
+	}); err != nil {
 		externalErr(w, r, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -734,14 +704,9 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var isCanon int
-	var aliasPath string
-	var canonicalPath string
-	var size int64
 	if err := s.db().Read.QueryRow(
-		`SELECT ip.is_canonical, ip.path, i.canonical_path, i.file_size
-		 FROM image_paths ip JOIN images i ON i.id = ip.image_id
-		 WHERE ip.id = ? AND ip.image_id = ?`, pathID, id,
-	).Scan(&isCanon, &aliasPath, &canonicalPath, &size); err != nil {
+		`SELECT is_canonical FROM image_paths WHERE id = ? AND image_id = ?`, pathID, id,
+	).Scan(&isCanon); err != nil {
 		http.Error(w, "alias path not found", http.StatusNotFound)
 		return
 	}
@@ -750,16 +715,15 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := gallery.DeleteAliasPath(s.db(), pathID); err != nil {
-		logx.Warnf("delete alias row %d: %v", pathID, err)
+	res, err := s.active().DeleteCopies(context.Background(), []int64{pathID}, nil)
+	if err != nil {
+		logx.Warnf("delete alias %d: %v", pathID, err)
 		http.Error(w, "delete failed", http.StatusInternalServerError)
 		return
 	}
-
-	if aliasPath != "" {
-		if err := unlinkAliasFile(s.boundary(), aliasPath, canonicalPath, size); err != nil {
-			logx.Warnf("delete alias file %q: %v", aliasPath, err)
-		}
+	if len(res.Kept) > 0 {
+		replyKeptCopy(w, r, res.Kept[0])
+		return
 	}
 
 	if isHTMXRequest(r) {
@@ -771,54 +735,15 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/images/%d", id), http.StatusSeeOther)
 }
 
-// Refuses a path outside the root or the boundary, an alias that is the
-// canonical file by another name (a re-entering link left such rows
-// behind), and one no longer the row's size: a file written over it since.
-func unlinkAliasFile(b *gallery.Boundary, aliasPath, canonicalPath string, size int64) error {
-	galleryAbs, err := filepath.Abs(b.Root())
-	if err != nil {
-		return fmt.Errorf("resolve gallery root: %w", err)
+// A 204 under htmx swaps nothing, so the refused copy's row stays listed.
+func replyKeptCopy(w http.ResponseWriter, r *http.Request, k library.KeptCopy) {
+	msg := fmt.Sprintf("Kept %s: %v.", k.Path, k.Reason)
+	if !isHTMXRequest(r) {
+		flashStatus(w, http.StatusConflict, msg)
+		return
 	}
-	aliasAbs, err := filepath.Abs(aliasPath)
-	if err != nil {
-		return fmt.Errorf("resolve alias: %w", err)
-	}
-	if !gallery.PathInside(galleryAbs, aliasAbs) {
-		return fmt.Errorf("refuse: path %q is outside gallery root", aliasPath)
-	}
-	if err := b.Check(aliasAbs); err != nil {
-		return fmt.Errorf("refuse: %w", err)
-	}
-	if isCanonicalEntry(aliasPath, canonicalPath) {
-		return fmt.Errorf("refuse: path %q reaches the canonical file through a link", aliasPath)
-	}
-	if info, err := os.Stat(aliasPath); err == nil && info.Size() != size {
-		return fmt.Errorf("refuse: %q holds %d bytes, not the row's %d", aliasPath, info.Size(), size)
-	}
-	if err := os.Remove(aliasPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-// Compares resolved names, not inodes: removing a symlink or a hard link
-// never takes the canonical file.
-func isCanonicalEntry(aliasPath, canonicalPath string) bool {
-	if canonicalPath == "" {
-		return false
-	}
-	if info, err := os.Lstat(aliasPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return false
-	}
-	alias, err := filepath.EvalSymlinks(aliasPath)
-	if err != nil {
-		return false
-	}
-	canonical, err := filepath.EvalSymlinks(canonicalPath)
-	if err != nil {
-		return false
-	}
-	return alias == canonical
+	setFlashHeader(w, msg, "err", nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // A move job even for one image: the watcher suppression hangs off it.
@@ -836,7 +761,6 @@ func (s *Server) singleImageMoveJob(w http.ResponseWriter, r *http.Request, op f
 		externalErr(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.active().InvalidateCaches()
 	s.jobs.Complete(summary)
 	if answered {
 		return
@@ -870,20 +794,20 @@ func (s *Server) placeImage(w http.ResponseWriter, r *http.Request) {
 		}
 		var folder, name *string
 		if wantFolder {
-			rendered, err := s.singleName(r.Context(), folderTmpl, rawFolder, id)
+			rendered, err := s.renderName(r.Context(), folderTmpl, rawFolder, 0, 1, id)
 			if err != nil {
 				return "", false, err
 			}
 			folder = &rendered
 		}
 		if nameTmpl != nil {
-			rendered, err := s.singleName(r.Context(), nameTmpl, rawName, id)
+			rendered, err := s.renderName(r.Context(), nameTmpl, rawName, 0, 1, id)
 			if err != nil {
 				return "", false, err
 			}
 			name = &rendered
 		}
-		res, err := gallery.PlaceImage(s.db(), s.boundary(), id, folder, name)
+		res, err := s.active().PlaceImage(id, folder, name)
 		if err != nil {
 			return "", false, err
 		}
@@ -912,17 +836,6 @@ func placeVerbs(folder, name bool) (verb, gerund, past string) {
 }
 
 func titleCase(s string) string { return strings.ToUpper(s[:1]) + s[1:] }
-
-func (s *Server) singleName(ctx context.Context, tmpl *gallery.NameTemplate, literal string, id int64) (string, error) {
-	if !tmpl.HasTokens() {
-		return literal, nil
-	}
-	facts, err := gallery.LoadNameFacts(ctx, s.db(), s.activeGallery(), id, 0, tmpl)
-	if err != nil {
-		return "", err
-	}
-	return tmpl.Render(facts)
-}
 
 // Exclusive upper bound of prefix's BINARY range, for a >=, < scan in
 // place of LIKE 'prefix%'.

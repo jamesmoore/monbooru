@@ -1,9 +1,6 @@
 {{define "categories.html"}}
-{{template "layout_head" .}}
-<div id="sidebar-inner"></div>
-{{template "layout_mid" .}}
+{{template "layout_head_bare" .}}
 
-{{$csrf := .CSRFToken}}
 
 <div id="categories-page">
   <h2>Categories</h2>
@@ -13,7 +10,7 @@
   <div class="table-scroll">
   <table class="cat-table">
     <thead><tr><th>Name</th><th>Color</th><th>Actions</th></tr></thead>
-    <tbody id="cat-list" hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'>
+    <tbody id="cat-list">
       {{range .Categories}}
       {{template "partials/category_row.html" .}}
       {{end}}
@@ -23,7 +20,6 @@
   <form hx-post="/tags/categories"
         hx-target="#cat-flash" hx-swap="innerHTML"
         class="add-cat-form">
-    <input type="hidden" name="_csrf" value="{{$csrf}}">
     <input type="text" name="name" placeholder="New category" required>
     <span class="cat-color-pair">
       <input type="color" id="add-cat-swatch" value="#5c6bc0" aria-label="Color for the new category">
@@ -41,7 +37,6 @@
 
 <dialog id="cat-rename-dialog">
   <form id="cat-rename-form" hx-post="" hx-target="#cat-rename-error" hx-swap="innerHTML">
-    <input type="hidden" name="_csrf" value="{{$csrf}}">
     <p>Rename category <strong id="cat-rename-src"></strong></p>
     <div class="field">
       <label>New name</label>
@@ -121,6 +116,8 @@ function openCatDeleteDialog(catId, catName) {
     .then(function(r) { return r.json(); })
     .then(function(data) {
       var count = data.count || 0;
+      var aliases = data.aliases || 0;
+      var linked = data.linked_aliases || 0;
       var info = document.getElementById('del-cat-tag-info');
       var moveSection = document.getElementById('del-cat-move-section');
       var deleteAllBtn = document.getElementById('del-cat-delete-all-btn');
@@ -136,15 +133,17 @@ function openCatDeleteDialog(catId, catName) {
         }
       });
 
-      if (count === 0) {
+      if (count === 0 && aliases === 0 && linked === 0) {
         info.textContent = 'No tags in this category.';
         moveSection.style.display = 'none';
         deleteAllBtn.textContent = 'Delete category';
         moveBtn.style.display = 'none';
       } else {
-        info.textContent = count + ' tag(s) will be affected.';
+        var what = [count ? count + ' tag(s)' : '', aliases ? aliases + ' alias(es)' : ''].filter(Boolean).join(', ');
+        info.textContent = what + ' will be affected.' +
+          (linked ? ' Deleting them also deletes ' + linked + ' alias(es) in other categories that point at these tags.' : '');
         moveSection.style.display = '';
-        deleteAllBtn.textContent = 'Delete all ' + count + ' tag(s) & category';
+        deleteAllBtn.textContent = 'Delete all ' + what + ' & category';
         moveBtn.style.display = '';
       }
 
@@ -170,7 +169,6 @@ function doDeleteCategory(catId, action, targetCatId) {
   if (targetCatId) url += '&target_id=' + encodeURIComponent(targetCatId);
   postForm(url, null, {
     method: 'DELETE',
-    catchMsg: null,
     onOK: function() {
       // A raw fetch does not process HX-Trigger, so the flash is stashed
       // by hand.
@@ -178,14 +176,7 @@ function doDeleteCategory(catId, action, targetCatId) {
       document.getElementById('delete-cat-dialog').close();
       window.location.href = window.location.pathname + window.location.search;
     },
-    onErr: function(t) {
-      var el = document.getElementById('del-cat-flash');
-      var div = document.createElement('div');
-      div.className = 'flash flash-err';
-      div.textContent = t;
-      el.innerHTML = '';
-      el.appendChild(div);
-    }
+    onErr: function(t) { setFlashText(document.getElementById('del-cat-flash'), 'err', t); }
   });
 }
 </script>

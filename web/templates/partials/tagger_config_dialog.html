@@ -1,7 +1,6 @@
 {{define "partials/tagger_config_dialog.html"}}
 <form hx-post="/settings/tagger/{{.Name}}/config"
       hx-target="#flash-tagger-config-{{.Name}}" hx-swap="innerHTML">
-  <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
   <div class="dialog-tabs">
     <button type="button" class="dialog-tab active" data-panel="tc-galleries-{{.Name}}">galleries</button>
     <button type="button" class="dialog-tab" data-panel="tc-thresholds-{{.Name}}">thresholds</button>
@@ -118,7 +117,17 @@
       </tr>
     </template>
   </div>
-  <div class="dialog-panel" id="tc-export-{{.Name}}" hidden>
+  {{template "tagger_export_panel" .}}
+  <div id="flash-tagger-config-{{.Name}}">{{if .OverlayErr}}<div class="flash flash-err">dispatch.json cannot be read, so mapping edits are refused: {{.OverlayErr}}</div>{{end}}</div>
+  <div class="dialog-actions">
+    <button type="submit">Save</button>
+    <button type="button" onclick="this.closest('dialog').close()">Close</button>
+  </div>
+</form>
+{{end}}
+
+{{define "tagger_export_panel"}}
+  <div class="dialog-panel" id="tc-export-{{.Name}}" hidden{{if .OOB}} hx-swap-oob="true"{{end}}>
     <p class="field-hint">Click copy to export your current configuration.</p>
     <p class="code-block-label"><strong>rules</strong>
       <span class="field-hint">{{.RuleCount}} rules - {{.CustomRules}} changes vs stock</span>
@@ -137,10 +146,12 @@
     <textarea id="tc-profile-json-{{.Name}}" hidden readonly>{{.ProfileJSON}}</textarea>
     {{end}}
   </div>
-  <div id="flash-tagger-config-{{.Name}}"></div>
-  <div class="dialog-actions">
-    <button type="submit">Save</button>
-    <button type="button" onclick="this.closest('dialog').close()">Close</button>
-  </div>
-</form>
 {{end}}
+
+{{define "tagger_reset_button"}}<span id="tagger-reset-{{.Name}}" class="tagger-reset-slot"{{if .OOB}} hx-swap-oob="true"{{end}}>{{if .Differs}}
+  <button type="button" class="btn-sm tagger-act-reset"
+          hx-post="/settings/tagger/{{.Name}}/reset" hx-target="#flash-tagger" hx-swap="innerHTML"
+          hx-confirm="Reset tagger {{.Name}} to stock?"
+          data-confirm-danger="Thresholds, gallery scope and custom mapping rules will be discarded."
+          data-confirm-ok="Reset">Reset</button>
+{{end}}</span>{{end}}

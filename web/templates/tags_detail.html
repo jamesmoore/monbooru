@@ -1,9 +1,6 @@
 {{define "tags_detail.html"}}
-{{template "layout_head" .}}
-<div id="sidebar-inner"></div>
-{{template "layout_mid" .}}
+{{template "layout_head_bare" .}}
 
-{{$csrf := .CSRFToken}}
 {{$kinds := .OriginKinds}}
 <div id="tag-detail-page" data-esc-back="{{if .BackURL}}{{.BackURL}}{{else}}/tags{{end}}">
   <div class="tag-detail-crumb">
@@ -34,11 +31,11 @@
     {{end}}
     <span class="tag-detail-actions">
       {{if not .IsRating}}
-      <button type="button" id="btn-detail-rename" class="btn-sm" data-id="{{.Tag.ID}}" data-name="{{.Tag.Name}}">Rename</button>
-      <button type="button" id="btn-detail-category" class="btn-sm">Change category…</button>
-      <button type="button" id="btn-detail-alias" class="btn-sm">{{if .Tag.IsAlias}}Repoint to…{{else}}Alias to…{{end}}</button>
+      <button type="button" id="btn-detail-rename" class="btn-sm" data-id="{{.Tag.ID}}" data-name="{{.Tag.Name}}" onclick="openRenameDialog(this)">Rename</button>
+      <button type="button" id="btn-detail-category" class="btn-sm" onclick="document.getElementById('detail-category-dialog').showModal()">Change category…</button>
+      <button type="button" id="btn-detail-alias" class="btn-sm" onclick="openDetailAlias()">{{if .Tag.IsAlias}}Repoint to…{{else}}Alias to…{{end}}</button>
       {{end}}
-      <button type="button" id="btn-detail-delete" class="btn-sm btn-danger"
+      <button type="button" id="btn-detail-delete" class="btn-sm btn-danger" onclick="deleteThisTag(this)"
               data-name="{{.Tag.Name}}" data-category="{{.Tag.CategoryName}}"
               title="{{if .IsRating}}Strip this rating from every image (the catalog row stays){{else}}Delete this tag from every image{{end}}">Delete</button>
     </span>
@@ -86,7 +83,6 @@
           <p class="relation-origin-sub">{{if .Stale}}stale, {{end}}added by {{originLabel $kinds .Origin}}
             {{if gt (len .Tags) 1}}<button type="button" class="btn-link-accent"
                     hx-delete="/tags/{{$.Tag.ID}}/aliases/group?origin={{urlQ .Origin}}&stale={{if .Stale}}1{{else}}0{{end}}"
-                    hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
                     hx-confirm="Delete all {{len .Tags}} {{if .Stale}}stale {{end}}aliases added by {{originLabel $kinds .Origin}}?"
                     data-confirm-danger="Nothing records which spellings they mapped."
                     data-confirm-ok="Delete"
@@ -98,7 +94,6 @@
               <a href="/tags/{{.ID}}" style="color:{{catColor .CategoryColor}}" title="Alias details">{{.Name}}</a>
               <button class="tag-remove-btn"
                       hx-delete="/tags/{{.ID}}"
-                      hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
                       hx-confirm="Delete the alias {{.Name}}?"
                       data-confirm-ok="Delete"
                       hx-on::after-request="if(event.detail.successful){pruneRelationRow(this)}"
@@ -112,7 +107,6 @@
           {{end}}
           <form class="add-tag-form" hx-post="/tags/{{.Tag.ID}}/aliases"
                 hx-target="#alias-add-flash" hx-swap="innerHTML">
-            <input type="hidden" name="_csrf" value="{{$csrf}}">
             <input type="text" name="name" placeholder="Alias name(s)..." required autocomplete="off">
             <button type="submit" class="btn-sm">Add</button>
           </form>
@@ -123,14 +117,13 @@
           <h3>Implied by</h3>
           {{if .ImpliedBy}}
           {{range groupImplicationsByOrigin .ImpliedBy}}
-          {{template "partials/implication_group_header.html" (dict "Group" . "OriginKinds" $kinds "CSRFToken" $csrf "BaseURL" (printf "/tags/%d/implied-by/group" $.Tag.ID))}}
+          {{template "partials/implication_group_header.html" (dict "Group" . "OriginKinds" $kinds "BaseURL" (printf "/tags/%d/implied-by/group" $.Tag.ID))}}
           <ul class="tag-list">
             {{range .Implications}}
             <li class="tag-item">
               <a href="/tags/{{.ParentID}}" style="color:{{catColor .ParentCategoryColor}}">{{.ParentName}}</a>
               <button class="tag-remove-btn"
                       hx-delete="/tags/{{.ParentID}}/implications/{{$.Tag.ID}}"
-                      hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
                       hx-confirm="Remove the implication that {{.ParentName}} implies {{$.Tag.Name}}?"
                       data-confirm-ok="Remove"
                       hx-on::after-request="if(event.detail.successful){pruneRelationRow(this)}"
@@ -144,7 +137,6 @@
           {{end}}
           <form class="add-tag-form" hx-post="/tags/{{.Tag.ID}}/implied-by"
                 hx-target="#implied-by-add-flash" hx-swap="innerHTML">
-            <input type="hidden" name="_csrf" value="{{$csrf}}">
             <div class="add-tag-input-wrap">
               {{template "multi_tag_suggest_input" dict "Name" "parent_id" "InputID" "implied-by-add-input" "SuggestID" "implied-by-add-suggest" "Placeholder" "Implied by tag(s)..." "Required" true "ValsKey" "q"}}
             </div>
@@ -160,7 +152,7 @@
         <section class="tag-detail-section">
           <h3>Implies</h3>
           <div id="implications-editor" data-tag-id="{{.Tag.ID}}">
-            {{template "partials/implications_dialog.html" (dict "Parent" .Tag "Implications" .Implications "CSRFToken" $csrf "OriginKinds" $kinds)}}
+            {{template "partials/implications_dialog.html" (dict "Parent" .Tag "Implications" .Implications "OriginKinds" $kinds)}}
           </div>
         </section>
       </div>
@@ -174,10 +166,10 @@
       <section class="tag-detail-section" id="tag-note">
         <h3>Note
           {{if or .NoteBody .NoteLinks}}
-          <button type="button" id="btn-detail-note" class="btn-link-accent" data-note="{{.NoteBody}}" data-links="{{.NoteLinksText}}" title="Edit the note and links">[edit]</button>
+          <button type="button" id="btn-detail-note" class="btn-link-accent" data-note="{{.NoteBody}}" data-links="{{.NoteLinksText}}" title="Edit the note and links" onclick="openTagNote('tag-note-body')">[edit]</button>
           {{else}}
-          <button type="button" id="btn-detail-note" class="btn-link-accent" title="Add a note">[+ add note]</button>
-          <button type="button" id="btn-detail-links" class="btn-link-accent" title="Add links">[+ add links]</button>
+          <button type="button" id="btn-detail-note" class="btn-link-accent" title="Add a note" onclick="openTagNote('tag-note-body')">[+ add note]</button>
+          <button type="button" id="btn-detail-links" class="btn-link-accent" title="Add links" onclick="openTagNote('tag-note-links')">[+ add links]</button>
           {{end}}
         </h3>
         {{if .NoteBody}}<div class="commentary-body">{{.NoteHTML}}</div>{{end}}
@@ -217,7 +209,7 @@
   {{end}}
 </div>
 
-{{template "partials/tag_rename_dialog.html" (dict "CSRFToken" .CSRFToken "KeepAlias" (not .Tag.IsAlias))}}
+{{template "partials/tag_rename_dialog.html" (dict "KeepAlias" (not .Tag.IsAlias))}}
 
 {{if not .IsRating}}
 <dialog id="detail-category-dialog">
@@ -225,7 +217,6 @@
         hx-target="#tag-flash"
         hx-swap="innerHTML"
         hx-on::after-request="onDetailCategoryChanged(event)">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <p>Move <strong>{{.Tag.Name}}</strong> to:</p>
     <div class="field">
       <label>Target category</label>
@@ -265,7 +256,6 @@
         hx-target="#tag-note-error"
         hx-swap="innerHTML"
         hx-on::after-request="onExternalEditResponse(event, 'tag-note-dialog')">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <p>Note on <strong style="color:{{catColor .Tag.CategoryColor}}">{{.Tag.Name}}</strong></p>
     <div class="field">
       <label for="tag-note-body">Note (max 10000 chars)</label>
@@ -287,42 +277,14 @@
 var TAG_ID = {{.Tag.ID}};
 var TAG_NAME = {{.Tag.Name}};
 
-(function() {
-  var btn = document.getElementById('btn-detail-rename');
-  if (!btn) return;
-  btn.addEventListener('click', function() {
-    document.getElementById('rename-src-name').textContent = this.dataset.name;
-    clearSlots('rename-error');
-    var input = document.getElementById('rename-new-name');
-    input.value = this.dataset.name;
-    openHxRewriteDialog('rename-form', 'hx-post', '/tags/' + this.dataset.id + '/rename', 'rename-dialog');
-    input.focus();
-    input.select();
-  });
-})();
-
-(function() {
+function openTagNote(focusID) {
   var note = document.getElementById('btn-detail-note');
-  if (!note) return;
-  function open(focusID) {
-    document.getElementById('tag-note-body').value = note.dataset.note || '';
-    document.getElementById('tag-note-links').value = note.dataset.links || '';
-    clearSlots('tag-note-error', 'tag-note-body-preview');
-    document.getElementById('tag-note-dialog').showModal();
-    document.getElementById(focusID).focus();
-  }
-  note.addEventListener('click', function() { open('tag-note-body'); });
-  var links = document.getElementById('btn-detail-links');
-  if (links) links.addEventListener('click', function() { open('tag-note-links'); });
-})();
-
-(function() {
-  var btn = document.getElementById('btn-detail-category');
-  if (!btn) return;
-  btn.addEventListener('click', function() {
-    document.getElementById('detail-category-dialog').showModal();
-  });
-})();
+  document.getElementById('tag-note-body').value = note.dataset.note || '';
+  document.getElementById('tag-note-links').value = note.dataset.links || '';
+  clearSlots('tag-note-error', 'tag-note-body-preview');
+  document.getElementById('tag-note-dialog').showModal();
+  document.getElementById(focusID).focus();
+}
 
 // A collision answers 200 with a flash-err, so success alone does not
 // mean the category moved.
@@ -337,16 +299,12 @@ function onDetailCategoryChanged(event) {
   if (cat && opt) cat.textContent = opt.text;
 }
 
-(function() {
-  var btn = document.getElementById('btn-detail-alias');
-  if (!btn) return;
-  btn.addEventListener('click', function() {
-    clearSlots('detail-alias-flash', 'detail-alias-suggest');
-    document.getElementById('detail-alias-canon').value = '';
-    document.getElementById('detail-alias-dialog').showModal();
-    document.getElementById('detail-alias-canon').focus();
-  });
-})();
+function openDetailAlias() {
+  clearSlots('detail-alias-flash', 'detail-alias-suggest');
+  document.getElementById('detail-alias-canon').value = '';
+  document.getElementById('detail-alias-dialog').showModal();
+  document.getElementById('detail-alias-canon').focus();
+}
 
 function confirmDetailAlias() {
   clearSlots('detail-alias-flash');
@@ -392,29 +350,14 @@ function pullTagPTRKeeping(spelling) {
   }, 'Every image tagged ' + TAG_NAME + ' moves to it and ' + TAG_NAME + ' stays as a zero-usage alias. This cannot be undone.', 'Pull and keep');
 }
 
-(function() {
-  var btn = document.getElementById('btn-detail-delete');
-  if (!btn) return;
-  btn.addEventListener('click', function() {
-    deleteTagFlow(btn, TAG_ID, function() { window.location.href = '/tags'; });
-  });
-})();
+function deleteThisTag(btn) {
+  deleteTagFlow(btn, TAG_ID, function() { window.location.href = '/tags'; });
+}
 
 function updateDetailColor(sel) {
   var opt = sel.options[sel.selectedIndex];
   var name = document.getElementById('tag-detail-name');
   if (opt && name && opt.dataset.color) name.style.color = opt.dataset.color;
-}
-
-function reloadImplicationsBody() {
-  var body = document.getElementById('implications-editor');
-  if (!body) return;
-  fetch('/tags/' + TAG_ID + '/implications', {credentials: 'same-origin', headers: {'HX-Request': 'true'}})
-    .then(function(r) { return r.text(); })
-    .then(function(html) {
-      body.innerHTML = html;
-      if (window.htmx) window.htmx.process(body);
-    });
 }
 
 function handleImplicationAdded(event) {
@@ -423,7 +366,7 @@ function handleImplicationAdded(event) {
     var input = document.getElementById('implication-add-input');
     if (input) input.value = '';
     clearSlots('implication-add-suggest');
-    reloadImplicationsBody();
+    htmx.ajax('GET', '/tags/' + TAG_ID + '/implications', {target: '#implications-editor', swap: 'innerHTML'});
   }
 }
 </script>

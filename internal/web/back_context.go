@@ -16,7 +16,10 @@ type backContext struct {
 }
 
 func parseBackContext(r *http.Request) backContext {
-	q := r.URL.Query()
+	return backContextFrom(r.URL.Query())
+}
+
+func backContextFrom(q url.Values) backContext {
 	return backContext{
 		Q:     q.Get("back_q"),
 		Sort:  q.Get("back_sort"),
@@ -27,19 +30,34 @@ func parseBackContext(r *http.Request) backContext {
 }
 
 func (b backContext) values(prefix string) url.Values {
-	v := url.Values{}
-	for _, f := range []struct{ key, val string }{
-		{"q", b.Q},
-		{"sort", b.Sort},
-		{"order", b.Order},
-		{"page", b.Page},
-		{"seed", b.Seed},
-	} {
-		if f.val != "" {
-			v.Set(prefix+f.key, f.val)
+	return setNonEmpty(url.Values{}, prefix+"q", b.Q, prefix+"sort", b.Sort, prefix+"order", b.Order,
+		prefix+"page", b.Page, prefix+"seed", b.Seed)
+}
+
+// pairs alternate key and value; a pair with an empty value is skipped.
+func setNonEmpty(v url.Values, pairs ...string) url.Values {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if pairs[i+1] != "" {
+			v.Set(pairs[i], pairs[i+1])
 		}
 	}
 	return v
+}
+
+// setPrefCookie keeps a preference for a year; an empty value deletes it.
+func setPrefCookie(w http.ResponseWriter, name, value string) {
+	age := 31_536_000
+	if value == "" {
+		age = -1
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   age,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 func (b backContext) URLValues() url.Values { return b.values("back_") }

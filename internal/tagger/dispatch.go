@@ -19,18 +19,7 @@ type DispatchRule struct {
 // An overlay rule that fails to compile leaves the embedded rule for its
 // source in place.
 func LoadDispatch(modelPath, taggerName string, catIDs map[string]int64) *DispatchTable {
-	out := &DispatchTable{rules: map[string]DispatchRule{}}
-	for _, r := range EmbeddedDispatchRules(taggerName) {
-		if rule, ok := compileDispatchRule(r, catIDs); ok {
-			out.rules[r.Source] = rule
-		}
-	}
-	for _, r := range OverlayDispatchRules(modelPath, taggerName) {
-		if rule, ok := compileDispatchRule(r, catIDs); ok {
-			out.rules[r.Source] = rule
-		}
-	}
-	return out
+	return &DispatchTable{rules: compileEntries(allDispatchRules(modelPath, taggerName), catIDs)}
 }
 
 func compileDispatchRule(r DispatchEntry, catIDs map[string]int64) (DispatchRule, bool) {

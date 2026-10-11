@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -29,10 +30,16 @@ func toTagResponse(t *models.Tag) tagResponse {
 	return resp
 }
 
-func resolveCategoryID(g Gallery, name string) (int64, bool, error) {
-	name = strings.TrimSpace(name)
-	name = cmp.Or(name, "general")
-	return tags.CategoryIDByName(g.DB, name)
+func resolveCategoryID(w http.ResponseWriter, g *library.Gallery, name string) (int64, bool) {
+	id, found, err := tags.CategoryIDByName(g.DB, cmp.Or(strings.TrimSpace(name), "general"))
+	if serverError(w, err) {
+		return 0, false
+	}
+	if !found {
+		apiError(w, http.StatusBadRequest, "invalid_request", "unknown category: "+name)
+		return 0, false
+	}
+	return id, true
 }
 
 type sentinelStatus struct {
@@ -51,31 +58,31 @@ func writeSentinelError(w http.ResponseWriter, err error, table []sentinelStatus
 	return false
 }
 
-// The rename, alias and merge errors the service has no sentinel for
-// match by phrase.
 func writeTagError(w http.ResponseWriter, err error) {
-	if writeSentinelError(w, err, []sentinelStatus{
+	var coll *tags.ErrCategoryCollision
+	if errors.As(err, &coll) {
+		apiError(w, http.StatusConflict, "conflict", err.Error())
+		return
+	}
+	if !writeSentinelError(w, err, []sentinelStatus{
 		{tags.ErrTagNotFound, http.StatusNotFound, "not_found"},
+		{tags.ErrImplicationNotFound, http.StatusNotFound, "not_found"},
 		{tags.ErrCategoryNotFound, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrTagNameTaken, http.StatusConflict, "conflict"},
 		{tags.ErrAliasNameInUse, http.StatusConflict, "conflict"},
 		{tags.ErrImplicationCycle, http.StatusConflict, "conflict"},
 		{tags.ErrInvalidTagName, http.StatusBadRequest, "invalid_request"},
 		{tags.ErrNonCanonicalRating, http.StatusBadRequest, "invalid_request"},
 		{tags.ErrRatingTagImmutable, http.StatusBadRequest, "invalid_request"},
 		{tags.ErrRatingCategoryClosed, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrAliasToAlias, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrAliasToItself, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrMergeIntoSelf, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrMergeIntoAlias, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrImplicationSelf, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrImplicationAlias, http.StatusBadRequest, "invalid_request"},
 	}) {
-		return
-	}
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, "already exists"):
-		apiError(w, http.StatusConflict, "conflict", msg)
-	case strings.Contains(msg, "not found"):
-		apiError(w, http.StatusNotFound, "not_found", msg)
-	case strings.Contains(msg, "itself"), strings.Contains(msg, "alias"):
-		apiError(w, http.StatusBadRequest, "invalid_request", msg)
-	default:
-		apiError(w, http.StatusInternalServerError, "internal_error", msg)
+		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
 	}
 }
 
@@ -95,12 +102,8 @@ func (h *Handler) createTag(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "name is required")
 		return
 	}
-	catID, found, err := resolveCategoryID(g, body.Category)
-	if serverError(w, err) {
-		return
-	}
-	if !found {
-		apiError(w, http.StatusBadRequest, "invalid_request", "unknown category: "+body.Category)
+	catID, ok := resolveCategoryID(w, g, body.Category)
+	if !ok {
 		return
 	}
 	tag, err := g.TagSvc.GetOrCreateTagFrom(body.Name, catID, "api")
@@ -112,7 +115,6 @@ func (h *Handler) createTag(w http.ResponseWriter, r *http.Request) {
 	if serverError(w, err) {
 		return
 	}
-	g.invalidate()
 	WriteJSON(w, http.StatusCreated, toTagResponse(full))
 }
 
@@ -134,34 +136,28 @@ func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
 	}
 	var catID int64
 	if body.Category != nil {
-		cid, found, cerr := resolveCategoryID(g, *body.Category)
-		if serverError(w, cerr) {
-			return
-		}
-		if !found {
-			apiError(w, http.StatusBadRequest, "invalid_request", "unknown category: "+*body.Category)
-			return
-		}
-		catID = cid
-	}
-	if body.Name != nil {
-		if err := g.TagSvc.RenameTag(id, *body.Name); err != nil {
-			writeTagError(w, err)
+		if catID, ok = resolveCategoryID(w, g, *body.Category); !ok {
 			return
 		}
 	}
-	if body.Category != nil {
-		if err := g.TagSvc.ChangeTagCategory(id, catID); err != nil {
-			writeTagError(w, err)
-			return
-		}
+	var err error
+	switch {
+	case body.Name != nil && body.Category != nil:
+		err = g.TagSvc.RenameAndMoveTag(id, *body.Name, catID)
+	case body.Name != nil:
+		err = g.TagSvc.RenameTag(id, *body.Name)
+	default:
+		err = g.TagSvc.ChangeTagCategory(id, catID)
+	}
+	if err != nil {
+		writeTagError(w, err)
+		return
 	}
 	full, err := g.TagSvc.GetTag(id)
 	if err != nil {
 		writeTagError(w, err)
 		return
 	}
-	g.invalidate()
 	WriteJSON(w, http.StatusOK, toTagResponse(full))
 }
 
@@ -174,7 +170,6 @@ func (h *Handler) deleteTag(w http.ResponseWriter, r *http.Request) {
 		writeTagError(w, err)
 		return
 	}
-	g.invalidate()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -199,12 +194,8 @@ func (h *Handler) createAlias(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "canonical_id is required")
 		return
 	}
-	catID, found, err := resolveCategoryID(g, body.Category)
-	if serverError(w, err) {
-		return
-	}
-	if !found {
-		apiError(w, http.StatusBadRequest, "invalid_request", "unknown category: "+body.Category)
+	catID, ok := resolveCategoryID(w, g, body.Category)
+	if !ok {
 		return
 	}
 	alias, err := g.TagSvc.CreateAliasFrom(body.Name, catID, body.CanonicalID, "api")
@@ -212,7 +203,6 @@ func (h *Handler) createAlias(w http.ResponseWriter, r *http.Request) {
 		writeTagError(w, err)
 		return
 	}
-	g.invalidate()
 	WriteJSON(w, http.StatusCreated, toTagResponse(alias))
 }
 
@@ -241,7 +231,6 @@ func (h *Handler) mergeTags(w http.ResponseWriter, r *http.Request) {
 		writeTagError(w, err)
 		return
 	}
-	g.invalidate()
 	WriteJSON(w, http.StatusOK, toTagResponse(canon))
 }
 
@@ -278,11 +267,7 @@ func (h *Handler) listImplications(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) addImplication(w http.ResponseWriter, r *http.Request) {
-	g, ok := h.resolveGallery(w, r)
-	if !ok {
-		return
-	}
-	parentID, ok := apiPathInt64(w, r, "id")
+	g, parentID, ok := h.galleryAndID(w, r)
 	if !ok {
 		return
 	}
@@ -309,11 +294,7 @@ func (h *Handler) addImplication(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) removeImplication(w http.ResponseWriter, r *http.Request) {
-	g, ok := h.resolveGallery(w, r)
-	if !ok {
-		return
-	}
-	parentID, ok := apiPathInt64(w, r, "id")
+	g, parentID, ok := h.galleryAndID(w, r)
 	if !ok {
 		return
 	}

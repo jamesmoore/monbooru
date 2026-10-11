@@ -23,13 +23,26 @@ type Query struct {
 	Limit       int
 	PresetTotal *int
 	SkipCount   bool
-	// Empty skips the adjacency cache.
-	CacheKey        string
+	// Cached opts into the adjacency cache. Text, the query as typed, and
+	// CeilingLevel key its list: Expr is already ceiling-wrapped.
+	Cached          bool
+	Text            string
+	CeilingLevel    string
 	OrderCollection string
 }
 
-func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
+func (q Query) listKey() string {
+	if !q.Cached {
+		return ""
+	}
+	return adjacencyKey(q.Text, q.Sort, q.Order, q.RandomSeed, q.CeilingLevel)
+}
+
+func Execute(src Source, q Query) (*models.SearchResult, error) {
+	database := src.DB
 	started := time.Now()
+	gen := src.Cache.gen()
+	key := q.listKey()
 	page := max(q.Page, 1)
 	limit := q.Limit
 	if limit < 1 {
@@ -39,8 +52,8 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 	// must not overflow into a negative offset or slice bound.
 	page = min(page, math.MaxInt/limit/driverIDBoundMargin)
 
-	if q.CacheKey != "" && !q.SkipCount && q.PresetTotal == nil {
-		if ids, ok := AdjacencyCacheGet(q.CacheKey); ok {
+	if key != "" && !q.SkipCount && q.PresetTotal == nil {
+		if ids, ok := src.Cache.get(key); ok {
 			return executeFromCachedIDs(database, ids, page, limit)
 		}
 	}
@@ -51,12 +64,13 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 	// sit in the newest page*limit*driverIDBoundMargin visible ids. asc wants
 	// the other end, and missing: rows fall outside that walk.
 	idBounded := false
+	var boundTotal int
 	if len(driverLegs) >= 2 &&
 		(q.Sort == "" || q.Sort == "newest") &&
 		q.Order != "asc" &&
 		!containsMissingFilter(q.Expr) {
-		if total, ok := fastTagTotal(database, q.Expr); ok {
-			if visible, vOk := fastVisibleCount(database); vOk &&
+		if total, ok := fastTagTotal(src, q.Expr); ok {
+			if visible, vOk := fastVisibleCount(src); vOk &&
 				total*driverIDBoundDensityCutoff >= visible {
 				targetOffset := (page * limit) * driverIDBoundMargin
 				var bound int64
@@ -71,6 +85,7 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 						driverLegs[i].idBound = bound
 					}
 					idBounded = true
+					boundTotal = total
 				}
 				// ErrNoRows: the library is smaller than the offset, so
 				// there is nothing to cut.
@@ -78,54 +93,68 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 		}
 	}
 
-	where, args, hasMissingFilter, ceilingRewrote := buildWhereDBDriverFull(q.Expr, database, driverLegs)
+	where, args, hasMissingFilter, ceilingRewrote := buildWhereDBDriverFull(q.Expr, src, driverLegs)
 	where, args = applyAndDriver(where, args, driverLegs)
 
 	where = andDefaultVisible(where, hasMissingFilter)
+	unbound := func() {
+		for i := range driverLegs {
+			driverLegs[i].idBound = 0
+		}
+		where, args, _, _ = buildWhereDBDriverFull(q.Expr, src, driverLegs)
+		where, args = applyAndDriver(where, args, driverLegs)
+		where = andDefaultVisible(where, hasMissingFilter)
+		idBounded = false
+	}
 
-	orderClause, orderArgs, rankSeed, hasRankSeed := viewOrder(database, q.Expr, q.Sort, q.Order, q.RandomSeed, q.OrderCollection)
+	orderClause, orderArgs, rankSeed, hasRankSeed := viewOrder(src, q.Expr, q.Sort, q.Order, q.RandomSeed, q.OrderCollection)
 
 	// Similarity has no key column: COUNT and the scored ORDER BY would each
 	// walk the whole match set for one page, so the fan runs first, on any
 	// page. An empty or capped fan falls through rather than guess a total.
-	if q.Sort == "similarity" && hasRankSeed && q.CacheKey != "" &&
-		!q.SkipCount && q.PresetTotal == nil && AdjacencyCacheTryAcquireFan(q.CacheKey) {
-		ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started)))
-		ids := fanSimilarityIDs(ctx, database, rankSeed, q.Order, where, args)
+	if q.Sort == "similarity" && hasRankSeed && key != "" &&
+		!q.SkipCount && q.PresetTotal == nil && src.Cache.tryAcquireFan(key) {
+		ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started), 0))
+		ids := fanSimilarityIDs(ctx, src, rankSeed, q.Order, where, args)
 		cancel()
-		AdjacencyCacheReleaseFan(q.CacheKey)
+		src.Cache.releaseFan(key)
 		if len(ids) > 0 && len(ids) < adjacencyCacheMaxIDs {
-			AdjacencyCacheSet(q.CacheKey, ids)
+			src.Cache.set(key, ids, gen)
 			return executeFromCachedIDs(database, ids, page, limit)
 		}
-		AdjacencyCacheMarkFanOverBudget(q.CacheKey)
+		src.Cache.markFanOverBudget(key)
 	}
 
 	offset := (page - 1) * limit
 
 	var total int
-	fastEmpty := false
+	counted, totalIsBound := false, false
 	switch {
 	case q.SkipCount:
 	case q.PresetTotal != nil:
 		total = *q.PresetTotal
 	default:
+		counted = true
 		// The fast counts are visible-only, which a missing: filter
 		// doesn't want.
-		if !hasMissingFilter {
-			if n, ok := fastTagTotal(database, q.Expr); ok {
-				total = n
-				fastEmpty = n == 0
+		wrapped := ceilingWrapsLoneLiteral(q.Expr)
+		if !hasMissingFilter && !wrapped {
+			if n, ok := fastTagTotal(src, q.Expr); ok {
+				total, totalIsBound = n, !fastTotalExact(q.Expr)
 				break
 			}
 		}
-		countSQL := "SELECT COUNT(*) FROM images i WHERE " + where
-		if err := database.Read.QueryRow(countSQL, args...).Scan(&total); err != nil {
+		countWhere, countArgs := where, args
+		if wrapped {
+			countWhere, countArgs = exactCountWhere(src, q.Expr)
+		}
+		countSQL := "SELECT COUNT(*) FROM images i WHERE " + countWhere
+		if err := database.Read.QueryRow(countSQL, countArgs...).Scan(&total); err != nil {
 			return nil, fmt.Errorf("count query: %w", err)
 		}
 	}
 
-	if fastEmpty {
+	if counted && total == 0 {
 		return &models.SearchResult{Page: page, Limit: limit, Total: 0}, nil
 	}
 
@@ -139,65 +168,65 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 		dataHint = ""
 	}
 
-	dataSQL := fmt.Sprintf(
-		"SELECT "+models.ImageRowColumns+`
-		 FROM images i%s
-		 WHERE %s
-		 %s
-		 LIMIT ? OFFSET ?`,
-		dataHint, where, orderClause,
-	)
-
-	dataArgs := append(slices.Concat(args, orderArgs), limit, offset)
-	rows, err := database.Read.Query(dataSQL, dataArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("data query: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var images []models.Image
-	for rows.Next() {
-		img, scanErr := models.ScanImageRow(rows)
-		if scanErr != nil {
-			return nil, scanErr
+	readPage := func() ([]models.Image, error) {
+		dataSQL := fmt.Sprintf(
+			"SELECT "+models.ImageRowColumns+`
+			 FROM images i%s
+			 WHERE %s
+			 %s
+			 LIMIT ? OFFSET ?`,
+			dataHint, where, orderClause,
+		)
+		dataArgs := append(slices.Concat(args, orderArgs), limit, offset)
+		images, err := db.QueryAll(database.Read, scanImageRow, dataSQL, dataArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("data query: %w", err)
 		}
-		images = append(images, img)
+		return images, nil
 	}
-	if err := rows.Err(); err != nil {
+
+	images, err := readPage()
+	if err != nil {
 		return nil, err
+	}
+	// The fast total is an upper bound, so a window that holds too few rows
+	// may only mean the matches are older than it.
+	if idBounded && len(images) < limit && boundTotal > offset+len(images) {
+		unbound()
+		if images, err = readPage(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Page 1 fans synchronously: an async fan loses the race to the next
 	// page-flip or prev/next. The fan drops the recent-id bound, which only
 	// holds for this page, and a short fan corrects the fast counter's total.
-	if q.CacheKey != "" && total > 0 && total <= adjacencyCacheMaxIDs {
+	if key != "" && total > 0 && total <= adjacencyCacheMaxIDs {
 		if len(images) == total {
 			ids := make([]int64, len(images))
 			for i, img := range images {
 				ids[i] = img.ID
 			}
-			AdjacencyCacheSet(q.CacheKey, ids)
-		} else if page == 1 && AdjacencyCacheTryAcquireFan(q.CacheKey) {
-			defer AdjacencyCacheReleaseFan(q.CacheKey)
-			fanWhere, fanArgs := where, args
+			src.Cache.set(key, ids, gen)
+		} else if page == 1 && src.Cache.tryAcquireFan(key) {
+			defer src.Cache.releaseFan(key)
 			if idBounded {
-				for i := range driverLegs {
-					driverLegs[i].idBound = 0
-				}
-				fanWhere, fanArgs, _, _ = buildWhereDBDriverFull(q.Expr, database, driverLegs)
-				fanWhere, fanArgs = applyAndDriver(fanWhere, fanArgs, driverLegs)
-				fanWhere = andDefaultVisible(fanWhere, hasMissingFilter)
+				unbound()
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started)))
-			ids := fetchSortedMatchIDs(ctx, database, indexHint, fanWhere, fanArgs, orderClause, orderArgs, total)
+			budgetTotal := total
+			if totalIsBound {
+				budgetTotal = 0
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started), budgetTotal))
+			ids := fetchSortedMatchIDs(ctx, database, indexHint, where, args, orderClause, orderArgs, total)
 			cancel()
 			if len(ids) > 0 {
-				AdjacencyCacheSet(q.CacheKey, ids)
+				src.Cache.set(key, ids, gen)
 				if len(ids) < min(total, adjacencyCacheMaxIDs) {
 					total = len(ids)
 				}
 			} else {
-				AdjacencyCacheMarkFanOverBudget(q.CacheKey)
+				src.Cache.markFanOverBudget(key)
 			}
 		}
 	}
@@ -209,6 +238,8 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 		Results: images,
 	}, nil
 }
+
+func scanImageRow(rows *sql.Rows) (models.Image, error) { return models.ScanImageRow(rows) }
 
 func executeFromCachedIDs(database *db.DB, ids []int64, page, limit int) (*models.SearchResult, error) {
 	total := len(ids)
@@ -223,22 +254,13 @@ func executeFromCachedIDs(database *db.DB, ids []int64, page, limit int) (*model
 	sql := fmt.Sprintf(
 		"SELECT "+models.ImageRowColumns+" FROM images i WHERE i.id IN (%s)", placeholders,
 	)
-	rows, err := database.Read.Query(sql, args...)
+	images, err := db.QueryAll(database.Read, scanImageRow, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("cached id fetch: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	byID := make(map[int64]models.Image, len(pageIDs))
-	for rows.Next() {
-		img, scanErr := models.ScanImageRow(rows)
-		if scanErr != nil {
-			return nil, scanErr
-		}
+	byID := make(map[int64]models.Image, len(images))
+	for _, img := range images {
 		byID[img.ID] = img
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	out := make([]models.Image, 0, len(pageIDs))
 	for _, id := range pageIDs {
@@ -367,7 +389,8 @@ type adjacencyPlan struct {
 	ok           bool // false for an unseeded random sort
 }
 
-func buildAdjacencyPlan(ctx context.Context, database *db.DB, q Query, currentID int64, driverLegs []andDriverLeg, bucketed bool, bucketLo, bucketHi int64) (adjacencyPlan, error) {
+func buildAdjacencyPlan(ctx context.Context, src Source, q Query, currentID int64, driverLegs []andDriverLeg, bucketed bool, bucketLo, bucketHi int64) (adjacencyPlan, error) {
+	database := src.DB
 	var p adjacencyPlan
 	var ingestedAt string
 	var fileSize int64
@@ -379,7 +402,7 @@ func buildAdjacencyPlan(ctx context.Context, database *db.DB, q Query, currentID
 		return p, err
 	}
 
-	where, args, hasMissingFilter, ceilingRewrote := buildWhereDBDriverFull(q.Expr, database, driverLegs)
+	where, args, hasMissingFilter, ceilingRewrote := buildWhereDBDriverFull(q.Expr, src, driverLegs)
 	where, args = applyAndDriver(where, args, driverLegs)
 
 	// The folder legs carry the folder predicate, so the per-image where
@@ -462,15 +485,16 @@ func buildAdjacencyPlan(ctx context.Context, database *db.DB, q Query, currentID
 	return p, nil
 }
 
-func ExecuteAdjacent(ctx context.Context, database *db.DB, q Query, currentID int64) (*int64, *int64, error) {
-	if ids, ok := AdjacencyCacheGet(q.CacheKey); ok {
+func ExecuteAdjacent(ctx context.Context, src Source, q Query, currentID int64) (*int64, *int64, error) {
+	database := src.DB
+	if ids, ok := src.Cache.get(q.listKey()); ok {
 		prev, next := findInAdjacencyList(ids, currentID)
 		return prev, next, nil
 	}
 
 	// No key column to seek on, so the neighbours come from the ranked list.
 	if q.Sort == "similarity" {
-		ids := similarityMatchIDs(ctx, database, q)
+		ids := similarityMatchIDs(ctx, src, q)
 		if len(ids) == 0 {
 			return nil, nil, nil
 		}
@@ -482,7 +506,7 @@ func ExecuteAdjacent(ctx context.Context, database *db.DB, q Query, currentID in
 	// INTERSECT of popular legs materialises far more rows than a bucket holds.
 	// Small candidate sets skip it, as a bucket would rarely hold a second match.
 	smallCandidate := false
-	if total, ok := adjacencyTotalEstimate(database, q.Expr); ok && total < fastApproxThreshold {
+	if total, ok := adjacencyTotalEstimate(src, q.Expr); ok && total < fastApproxThreshold {
 		smallCandidate = true
 	}
 
@@ -512,7 +536,7 @@ func ExecuteAdjacent(ctx context.Context, database *db.DB, q Query, currentID in
 		}
 	}
 
-	p, err := buildAdjacencyPlan(ctx, database, q, currentID, driverLegs, bucketed, bucketLo, bucketHi)
+	p, err := buildAdjacencyPlan(ctx, src, q, currentID, driverLegs, bucketed, bucketLo, bucketHi)
 	if err != nil || !p.ok {
 		return nil, nil, nil
 	}
@@ -555,28 +579,24 @@ func ExecuteAdjacent(ctx context.Context, database *db.DB, q Query, currentID in
 // RankInQuery is 0-based and -1 when it has no useful answer. A sparse
 // predicate can walk far before reaching the rank cap, so callers pass a
 // deadline.
-func RankInQuery(ctx context.Context, database *db.DB, q Query, currentID int64) (int, error) {
+func RankInQuery(ctx context.Context, src Source, q Query, currentID int64) (int, error) {
+	database := src.DB
 	// The cursor COUNT has no score column to compare against.
 	if q.Sort == "similarity" {
-		for i, id := range similarityMatchIDs(ctx, database, q) {
-			if id == currentID {
-				return i, nil
-			}
-		}
-		return -1, nil
+		return slices.Index(similarityMatchIDs(ctx, src, q), currentID), nil
 	}
 
 	// A lone leaf is materialised only while that is cheaper than the
 	// cursor's walk to currentID; random sort, with no index to walk,
 	// takes it regardless.
 	allowSingle := q.Sort == "random"
-	if total, ok := fastTagTotal(database, q.Expr); !ok || total <= fastApproxThreshold {
+	if total, ok := fastTagTotal(src, q.Expr); !ok || total <= fastApproxThreshold {
 		allowSingle = true
 	}
 	driverLegs, _ := pickAndDriverTag(database, q.Expr, allowSingle)
 
 	// No bucket: the COUNT must see every row before currentID.
-	p, err := buildAdjacencyPlan(ctx, database, q, currentID, driverLegs, false, 0, 0)
+	p, err := buildAdjacencyPlan(ctx, src, q, currentID, driverLegs, false, 0, 0)
 	if err != nil {
 		return -1, err
 	}
@@ -621,20 +641,13 @@ func RankInQuery(ctx context.Context, database *db.DB, q Query, currentID int64)
 	return rank, nil
 }
 
-type DeleteTarget struct {
-	ID            int64
-	CanonicalPath string
-	FolderPath    string
-	IsMissing     bool
-}
-
-func viewOrder(database *db.DB, expr Expr, sort, order string, seed int64, collection string) (string, []any, tags.OverlapSeed, bool) {
+func viewOrder(src Source, expr Expr, sort, order string, seed int64, collection string) (string, []any, tags.OverlapSeed, bool) {
 	switch {
 	case sort == "order" && collection != "":
 		clause, args := collectionOrderClause(collection, order)
 		return clause, args, tags.OverlapSeed{}, false
 	case sort == "similarity":
-		if rankSeed, ok := similarityRankSeed(database, expr); ok {
+		if rankSeed, ok := similarityRankSeed(src, expr); ok {
 			clause, args := similarityOrderClause(rankSeed, order)
 			return clause, args, rankSeed, true
 		}
@@ -642,44 +655,61 @@ func viewOrder(database *db.DB, expr Expr, sort, order string, seed int64, colle
 	return buildOrder(sort, order, seed), nil, tags.OverlapSeed{}, false
 }
 
-// Scope names images by query. Expr must already carry the viewer's ceiling,
-// or the scope takes in rows the operator cannot see; delete-all walks it, so
-// a term the executor honours and the scope ignores would delete everything.
+// Scope names images by query under the viewer's rating ceiling, so it never
+// takes in rows the operator cannot see; delete-all walks it, so a term the
+// executor honours and the scope ignores would delete everything.
 type Scope struct {
-	Expr Expr
-	// Only for jobs that depend on position: a sort without a covering
-	// index temp-sorts the whole set.
-	ViewOrder       bool
-	Sort            string
-	Order           string
-	RandomSeed      int64
-	OrderCollection string
+	expr            Expr
+	level           string
+	viewOrder       bool
+	sort            string
+	order           string
+	randomSeed      int64
+	orderCollection string
 }
 
-func (sc Scope) Stream(database *db.DB, visit func(DeleteTarget) error) error {
-	order, orderArgs := "ORDER BY i.id", []any(nil)
-	if sc.ViewOrder {
-		order, orderArgs, _, _ = viewOrder(database, sc.Expr, sc.Sort, sc.Order, sc.RandomSeed, sc.OrderCollection)
+// NewScope takes the ceiling level as the rating cookie holds it; "" means
+// none.
+func NewScope(expr Expr, level string) Scope {
+	return Scope{expr: expr, level: level}
+}
+
+// InViewOrder is only for jobs that depend on position: a sort without a
+// covering index temp-sorts the whole set.
+func (sc Scope) InViewOrder(sort, order string, seed int64) Scope {
+	sc.viewOrder, sc.sort, sc.order, sc.randomSeed = true, sort, order, seed
+	if sort == "order" {
+		sc.orderCollection = PinnedCollectionName(sc.expr)
 	}
-	return streamScope(database, sc.Expr, order, orderArgs, visit)
+	return sc
 }
 
-func (sc Scope) IDs(database *db.DB) ([]int64, error) {
+func (sc Scope) Stream(src Source, visit func(id int64) error) error {
+	expr := ApplyCeiling(sc.expr, sc.level)
+	order, orderArgs := "ORDER BY i.id", []any(nil)
+	if sc.viewOrder {
+		order, orderArgs, _, _ = viewOrder(src, expr, sc.sort, sc.order, sc.randomSeed, sc.orderCollection)
+	}
+	return streamScope(src, expr, order, orderArgs, visit)
+}
+
+func (sc Scope) IDs(src Source) ([]int64, error) {
 	var ids []int64
-	return ids, sc.Stream(database, func(t DeleteTarget) error {
-		ids = append(ids, t.ID)
+	return ids, sc.Stream(src, func(id int64) error {
+		ids = append(ids, id)
 		return nil
 	})
 }
 
-func streamScope(database *db.DB, expr Expr, orderBy string, orderArgs []any, visit func(DeleteTarget) error) error {
+func streamScope(src Source, expr Expr, orderBy string, orderArgs []any, visit func(id int64) error) error {
+	database := src.DB
 	driverLegs, _ := pickAndDriverTag(database, expr, false)
-	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(expr, database, driverLegs)
+	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(expr, src, driverLegs)
 	where, args = applyAndDriver(where, args, driverLegs)
 	where = andDefaultVisible(where, hasMissingFilter)
 
 	rows, err := database.Read.Query(
-		"SELECT i.id, i.canonical_path, i.folder_path, i.is_missing FROM images i WHERE "+where+" "+orderBy,
+		"SELECT i.id FROM images i WHERE "+where+" "+orderBy,
 		append(args, orderArgs...)...,
 	)
 	if err != nil {
@@ -688,13 +718,11 @@ func streamScope(database *db.DB, expr Expr, orderBy string, orderArgs []any, vi
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
-		var t DeleteTarget
-		var isMissing int
-		if err := rows.Scan(&t.ID, &t.CanonicalPath, &t.FolderPath, &isMissing); err != nil {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
 			return err
 		}
-		t.IsMissing = isMissing == 1
-		if err := visit(t); err != nil {
+		if err := visit(id); err != nil {
 			return err
 		}
 	}
@@ -705,7 +733,8 @@ const sidebarMaxPerCategory = 25
 
 // SidebarTagsWithGlobalCount ranks by count on the page but reports the
 // library-wide usage_count.
-func SidebarTagsWithGlobalCount(database *db.DB, imageIDs []int64) ([]models.Tag, error) {
+func SidebarTagsWithGlobalCount(src Source, imageIDs []int64) ([]models.Tag, error) {
+	database := src.DB
 	if len(imageIDs) == 0 {
 		return nil, nil
 	}
@@ -738,8 +767,8 @@ func SidebarTagsWithGlobalCount(database *db.DB, imageIDs []int64) ([]models.Tag
 		append(args, sidebarMaxPerCategory)...)
 }
 
-// The 10 suggestions shown, with headroom for the de-dup between the
-// prefix and substring passes.
+// The 10 suggestions shown, with headroom for the candidates that match
+// no image in the context.
 const suggestCandidateCap = 25
 
 // Past this many context images the combination counts become lower bounds.
@@ -747,18 +776,16 @@ const suggestContextCap = 1000
 
 // SuggestTagsWithFilter's UsageCount counts the images matching both expr
 // and the tag.
-func SuggestTagsWithFilter(database *db.DB, expr Expr, prefix, categoryName string, limit int) ([]models.Tag, error) {
+func SuggestTagsWithFilter(src Source, expr Expr, prefix, categoryName string, limit int) ([]models.Tag, error) {
+	database := src.DB
 	prefix = tags.NormalizeTagName(prefix)
 	// With no context the combination count is the global usage count.
 	if expr == nil {
 		return tags.SuggestUsageRanked(database, prefix, categoryName, true, limit)
 	}
 
-	where, args, hasMissingFilter := buildWhereDB(expr, database)
+	where, args, hasMissingFilter := buildWhereDB(expr, src)
 	where = andDefaultVisible(where, hasMissingFilter)
-
-	prefixPat := db.EscapeLike(prefix) + "%"
-	substrPat := "%" + db.EscapeLike(prefix) + "%"
 
 	// ctx is materialised once and each candidate probes image_tags
 	// against it. (image_id, tag_id) is image_tags' key, so a plain COUNT
@@ -793,55 +820,22 @@ func SuggestTagsWithFilter(database *db.DB, expr Expr, prefix, categoryName stri
 		catArgs = []any{categoryName}
 	}
 
-	run := func(pat string, prior []models.Tag, remaining int, nameNotLike string) ([]models.Tag, error) {
+	return tags.SuggestTwoPass(db.EscapeLike(prefix), limit, func(pat, notLike string, n int) ([]models.Tag, error) {
 		extra := catClause
 		qargs := make([]any, 0, 5+len(args)+len(catArgs))
 		qargs = append(qargs, args...)
 		qargs = append(qargs, suggestContextCap)
 		qargs = append(qargs, pat)
 		qargs = append(qargs, catArgs...)
-		if nameNotLike != "" {
+		if notLike != "" {
 			extra = extra + ` AND name NOT LIKE ? ESCAPE '\'`
-			qargs = append(qargs, nameNotLike)
+			qargs = append(qargs, notLike)
 		}
-		qargs = append(qargs, suggestCandidateCap)
-		qargs = append(qargs, remaining)
-		rows, err := database.Read.Query(fmt.Sprintf(baseSQL, where, extra), qargs...)
-		if err != nil {
-			return prior, err
-		}
-		defer func() { _ = rows.Close() }()
-		seen := map[int64]bool{}
-		for _, t := range prior {
-			seen[t.ID] = true
-		}
-		for rows.Next() {
-			var t models.Tag
-			var combo int
-			if err := rows.Scan(&t.ID, &t.Name, &t.CategoryName, &t.CategoryColor, &combo); err != nil {
-				return prior, err
-			}
-			if seen[t.ID] {
-				continue
-			}
-			t.UsageCount = combo
-			prior = append(prior, t)
-			seen[t.ID] = true
-		}
-		return prior, rows.Err()
-	}
-
-	out, err := run(prefixPat, nil, limit, "")
-	if err != nil {
-		return nil, err
-	}
-	if len(out) < limit {
-		out, err = run(substrPat, out, limit-len(out), prefixPat)
-		if err != nil {
-			return out, err
-		}
-	}
-	return out, nil
+		qargs = append(qargs, suggestCandidateCap, n)
+		return db.QueryAll(database.Read, db.ScanRow(func(t *models.Tag) []any {
+			return []any{&t.ID, &t.Name, &t.CategoryName, &t.CategoryColor, &t.UsageCount}
+		}), fmt.Sprintf(baseSQL, where, extra), qargs...)
+	})
 }
 
 func sqlDir(order, def string) string {
@@ -868,20 +862,12 @@ func collectionOrderClause(name, order string) (string, []any) {
 func PinnedCollectionName(expr Expr) string {
 	seen := map[string]struct{}{}
 	last := ""
-	var walk func(Expr)
-	walk = func(e Expr) {
-		switch v := e.(type) {
-		case AndExpr:
-			walk(v.Left)
-			walk(v.Right)
-		case FilterExpr:
-			if v.Key == "collection" && v.Val != "" && !strings.EqualFold(v.Val, "any") {
-				seen[strings.ToLower(v.Val)] = struct{}{}
-				last = v.Val
-			}
+	WalkAndedLeaves(expr, func(e Expr) {
+		if v, ok := e.(FilterExpr); ok && v.Key == "collection" && v.Val != "" && !strings.EqualFold(v.Val, "any") {
+			seen[strings.ToLower(v.Val)] = struct{}{}
+			last = v.Val
 		}
-	}
-	walk(expr)
+	})
 	if len(seen) == 1 {
 		return last
 	}
@@ -905,10 +891,7 @@ func buildOrder(sort, order string, randomSeed int64) string {
 	case "order":
 		// NULL positions sort last in both directions; id makes the order
 		// total.
-		dir := "ASC"
-		if order == "desc" {
-			dir = "DESC"
-		}
+		dir := sqlDir(order, "ASC")
 		return "ORDER BY i.series " + dir + ", i.series_order IS NULL, i.series_order " + dir + ", i.id " + dir
 	case "random":
 		if randomSeed != 0 {

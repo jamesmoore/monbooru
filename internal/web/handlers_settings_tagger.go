@@ -3,7 +3,10 @@ package web
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
+	"io/fs"
 	"maps"
 	"net/http"
 	"os"
@@ -25,6 +28,7 @@ type taggerRow struct {
 	Description         string
 	Available           bool
 	Reason              string
+	Malformed           bool
 	Enabled             bool
 	ConfidenceThreshold float64
 	ConfigSummary       string
@@ -41,15 +45,16 @@ type taggerRow struct {
 }
 
 func (s *Server) installedTaggerRow(t tagger.TaggerStatus, totalGalleries int, modelPath string) taggerRow {
-	ruleCount := tagger.OverlayRuleCount(modelPath, t.Name)
+	ruleCount := len(tagger.OverlayDispatchRules(modelPath, t.Name))
 	return taggerRow{
 		Name:                t.Name,
 		Available:           t.Available,
 		Reason:              t.Reason,
+		Malformed:           t.Malformed,
 		Enabled:             t.Enabled,
 		ConfidenceThreshold: t.ConfidenceThreshold,
 		ConfigSummary:       taggerConfigSummary(t.TaggerInstance, totalGalleries, ruleCount),
-		Differs:             taggerDiffersFromStock(t.TaggerInstance, modelPath, ruleCount),
+		Differs:             taggerDiffersFromStock(t.TaggerInstance, modelPath),
 		Installed:           true,
 	}
 }
@@ -72,7 +77,7 @@ func taggerConfigSummary(inst config.TaggerInstance, totalGalleries, ruleCount i
 	return out
 }
 
-func taggerDiffersFromStock(inst config.TaggerInstance, modelPath string, ruleCount int) bool {
+func taggerDiffersFromStock(inst config.TaggerInstance, modelPath string) bool {
 	seed := tagger.SeedTaggerInstance(inst.Name, inst.Enabled, catalogEntryByName(modelPath, inst.Name))
 	if inst.ConfidenceThreshold != seed.ConfidenceThreshold {
 		return true
@@ -83,14 +88,15 @@ func taggerDiffersFromStock(inst config.TaggerInstance, modelPath string, ruleCo
 	if !maps.Equal(inst.PerCategoryTopK, seed.PerCategoryTopK) {
 		return true
 	}
-	a := append([]string(nil), inst.DisabledCategories...)
-	b := append([]string(nil), seed.DisabledCategories...)
-	sort.Strings(a)
-	sort.Strings(b)
-	if !slices.Equal(a, b) {
+	if !slices.Equal(slices.Sorted(slices.Values(inst.DisabledCategories)), slices.Sorted(slices.Values(seed.DisabledCategories))) {
 		return true
 	}
-	return inst.Galleries != nil || ruleCount > 0
+	if inst.Galleries != nil {
+		return true
+	}
+	// An overlay that cannot be read differs too: Reset is how it goes.
+	_, err := os.Stat(filepath.Join(modelPath, inst.Name, "dispatch.json"))
+	return !errors.Is(err, fs.ErrNotExist)
 }
 
 type thresholdRow struct {
@@ -115,8 +121,10 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newProvider := strings.ToLower(strings.TrimSpace(r.FormValue("execution_provider")))
-	newProvider = cmp.Or(newProvider, "cpu")
+	newProvider := cmp.Or(strings.ToLower(strings.TrimSpace(r.FormValue("execution_provider"))), "cpu")
+	if s.envPinned("tagger.execution_provider") != "" {
+		newProvider = s.executionProvider()
+	}
 	if !config.IsValidExecutionProvider(newProvider) {
 		writeInlineFlash(w, "err", "Invalid execution provider: "+newProvider)
 		return
@@ -143,10 +151,8 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(r.FormValue("parallel")); err == nil && n >= 1 {
 		s.cfg.Tagger.Parallel = n
 	}
-	if v := r.FormValue("idle_release_after_minutes"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			s.cfg.Tagger.IdleReleaseAfterMinutes = n
-		}
+	if n, err := strconv.Atoi(r.FormValue("idle_release_after_minutes")); err == nil && n >= 0 {
+		s.cfg.Tagger.IdleReleaseAfterMinutes = n
 	}
 	s.cfgMu.Unlock()
 	if err := s.saveConfig(); err != nil {
@@ -177,15 +183,9 @@ func (s *Server) settingsTaggerDisablePost(w http.ResponseWriter, r *http.Reques
 func (s *Server) updateTagger(name string, mutate func(*config.TaggerInstance)) error {
 	modelPath := s.modelPath()
 	s.cfgMu.Lock()
-	found := false
-	for i := range s.cfg.Tagger.Taggers {
-		if s.cfg.Tagger.Taggers[i].Name == name {
-			mutate(&s.cfg.Tagger.Taggers[i])
-			found = true
-			break
-		}
-	}
-	if !found {
+	if i := slices.IndexFunc(s.cfg.Tagger.Taggers, func(t config.TaggerInstance) bool { return t.Name == name }); i >= 0 {
+		mutate(&s.cfg.Tagger.Taggers[i])
+	} else {
 		catalog := catalogEntryByName(modelPath, name)
 		seeded := tagger.SeedTaggerInstance(name, false, catalog)
 		mutate(&seeded)
@@ -235,8 +235,24 @@ func (s *Server) settingsTaggerConfigGet(w http.ResponseWriter, r *http.Request)
 		labelCount = len(views)
 	}
 
+	export, overlayErr := taggerExport(modelPath, name, inst)
+	data := map[string]any{
+		"Name":       name,
+		"Global":     global,
+		"Rows":       rows,
+		"GalRows":    galRows,
+		"AllChecked": allChecked,
+		"Categories": catList,
+		"LabelCount": labelCount,
+		"OverlayErr": overlayErr,
+	}
+	maps.Copy(data, export)
+	s.renderTemplate(w, "partials/tagger_config_dialog.html", data)
+}
+
+func taggerExport(modelPath, name string, inst config.TaggerInstance) (map[string]any, error) {
 	embedded := tagger.EmbeddedDispatchRules(name)
-	overlay := tagger.OverlayDispatchRules(modelPath, name)
+	overlay, overlayErr := tagger.ReadDispatchOverlay(modelPath, name)
 	merged := tagger.MergedDispatchRules(modelPath, name)
 	exportJSON := ""
 	if b, err := tagger.MarshalDispatchDoc(merged); err == nil {
@@ -261,16 +277,8 @@ func (s *Server) settingsTaggerConfigGet(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
-
-	csrf := s.csrfToken(sessionFromContext(r.Context()))
-	s.renderTemplate(w, "partials/tagger_config_dialog.html", map[string]any{
+	return map[string]any{
 		"Name":         name,
-		"Global":       global,
-		"Rows":         rows,
-		"GalRows":      galRows,
-		"AllChecked":   allChecked,
-		"Categories":   catList,
-		"LabelCount":   labelCount,
 		"CustomRules":  len(overlay),
 		"ExportRules":  exportRuleLines(embedded, overlay),
 		"ExportJSON":   exportJSON,
@@ -278,8 +286,7 @@ func (s *Server) settingsTaggerConfigGet(w http.ResponseWriter, r *http.Request)
 		"ProfileLines": profileLines,
 		"ProfileJSON":  profileJSON,
 		"ProfileStock": len(sidecarFields) == 0,
-		"CSRFToken":    csrf,
-	})
+	}, overlayErr
 }
 
 type exportLine struct {
@@ -296,21 +303,9 @@ func exportRuleLines(embedded, overlay []tagger.DispatchEntry) []exportLine {
 	for _, e := range overlay {
 		ovr[e.Source] = e
 	}
-	sources := make([]string, 0, len(embByte)+len(ovr))
-	seen := map[string]bool{}
-	for _, e := range embedded {
-		if !seen[e.Source] {
-			seen[e.Source] = true
-			sources = append(sources, e.Source)
-		}
-	}
-	for _, e := range overlay {
-		if !seen[e.Source] {
-			seen[e.Source] = true
-			sources = append(sources, e.Source)
-		}
-	}
-	sort.Strings(sources)
+	union := maps.Clone(embByte)
+	maps.Copy(union, ovr)
+	sources := slices.Sorted(maps.Keys(union))
 
 	ruleText := func(e tagger.DispatchEntry) string {
 		b, _ := json.Marshal(e)
@@ -442,10 +437,7 @@ func (s *Server) renderTaggerLabels(w http.ResponseWriter, r *http.Request, name
 }
 
 func taggerTagsFile(inst config.TaggerInstance) string {
-	if inst.TagsFile != "" {
-		return inst.TagsFile
-	}
-	return tagger.DefaultTagsFile
+	return cmp.Or(inst.TagsFile, tagger.DefaultTagsFile)
 }
 
 func (s *Server) categoryChoices() (map[string]int64, []string) {
@@ -508,11 +500,9 @@ func (s *Server) parseGalleriesForm(r *http.Request) []string {
 	}
 	galleries := []string{}
 	valid := map[string]bool{}
-	s.cfgMu.Lock()
-	for _, g := range s.cfg.Galleries {
+	for _, g := range s.galleries() {
 		valid[g.Name] = true
 	}
-	s.cfgMu.Unlock()
 	for _, n := range r.Form["gallery_names"] {
 		n = strings.TrimSpace(n)
 		if n == "" || !valid[n] {
@@ -536,6 +526,16 @@ func (s *Server) settingsTaggerMappingPost(w http.ResponseWriter, r *http.Reques
 	}
 	writeFlashOOB(w, "flash-tagger-config-"+name, "", "")
 	s.renderTaggerLabels(w, r, name)
+	inst, ok := s.resolveTaggerInstance(name)
+	if !ok {
+		return
+	}
+	export, _ := taggerExport(modelPath, name, inst)
+	export["OOB"] = true
+	s.renderTemplate(w, "tagger_export_panel", export)
+	summary := taggerConfigSummary(inst, len(s.galleries()), len(tagger.OverlayDispatchRules(modelPath, name)))
+	_, _ = fmt.Fprintf(w, `<span id="tagger-config-summary-%s" class="field-hint" hx-swap-oob="true">%s</span>`, name, html.EscapeString(summary))
+	s.renderTemplate(w, "tagger_reset_button", map[string]any{"Name": name, "Differs": taggerDiffersFromStock(inst, modelPath), "OOB": true})
 }
 
 func (s *Server) applyMappingRule(name, modelPath string, r *http.Request) (errMsg string) {
@@ -691,9 +691,7 @@ func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global f
 		})
 	}
 	appendSorted := func(cats []string, viaRules bool) {
-		cats = append([]string(nil), cats...)
-		sort.Strings(cats)
-		for _, cat := range cats {
+		for _, cat := range slices.Sorted(slices.Values(cats)) {
 			appendRow(cat, viaRules)
 		}
 	}
@@ -705,22 +703,14 @@ func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global f
 		}
 	}
 	appendSorted(dispatchTargets, true)
-	var rest []string
-	for cat := range colors {
-		rest = append(rest, cat)
-	}
-	appendSorted(rest, false)
+	appendSorted(slices.Collect(maps.Keys(colors)), false)
 	// Overrides for categories the gallery no longer has still render, so
 	// they can be cleared.
-	var stale []string
-	for cat := range inst.CategoryThresholds {
-		stale = append(stale, cat)
-	}
-	for cat := range inst.PerCategoryTopK {
-		stale = append(stale, cat)
-	}
-	stale = append(stale, inst.DisabledCategories...)
-	appendSorted(stale, false)
+	appendSorted(slices.Concat(
+		slices.Collect(maps.Keys(inst.CategoryThresholds)),
+		slices.Collect(maps.Keys(inst.PerCategoryTopK)),
+		inst.DisabledCategories,
+	), false)
 	return rows, global, true
 }
 
@@ -745,9 +735,7 @@ func taggerThresholdSummary(global float64, overrides map[string]float64, disabl
 		out += fmt.Sprintf(", %s %.2f", k, overrides[k])
 	}
 	if len(disabled) > 0 {
-		d := append([]string(nil), disabled...)
-		sort.Strings(d)
-		out += " (disabled: " + strings.Join(d, ", ") + ")"
+		out += " (disabled: " + strings.Join(slices.Sorted(slices.Values(disabled)), ", ") + ")"
 	}
 	return out
 }
@@ -757,9 +745,7 @@ func (s *Server) galleryDialogData(name string) (rows []taggerGalleryRow, allChe
 	if !ok {
 		return nil, false, false
 	}
-	s.cfgMu.Lock()
-	galleries := append([]config.Gallery(nil), s.cfg.Galleries...)
-	s.cfgMu.Unlock()
+	galleries := s.galleries()
 	allChecked = inst.Galleries == nil
 	picked := map[string]bool{}
 	for _, n := range inst.Galleries {
@@ -785,15 +771,21 @@ func catalogEntryByName(modelPath, name string) *tagger.CatalogEntry {
 }
 
 // Persisted, so a re-downloaded model has to be re-enabled deliberately.
-func (s *Server) disableUnavailableTaggers() {
-	available := map[string]bool{}
-	for _, t := range tagger.DiscoverTaggers(s.cfgSnapshot()) {
-		available[t.Name] = t.Available
+// An unmounted model_path would read as every file gone, so it disables
+// nothing.
+func (s *Server) disableMissingTaggers() {
+	cfg := s.cfgSnapshot()
+	if fi, err := os.Stat(cfg.Paths.ModelPath); err != nil || !fi.IsDir() {
+		return
+	}
+	missing := map[string]bool{}
+	for _, t := range tagger.DiscoverTaggers(cfg) {
+		missing[t.Name] = t.Missing
 	}
 	s.cfgMu.Lock()
 	changed := false
 	for i, t := range s.cfg.Tagger.Taggers {
-		if t.Enabled && !available[t.Name] {
+		if t.Enabled && missing[t.Name] {
 			s.cfg.Tagger.Taggers[i].Enabled = false
 			changed = true
 			logx.Infof("settings: auto-disabled tagger %q (files missing)", t.Name)

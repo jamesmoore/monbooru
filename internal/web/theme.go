@@ -3,6 +3,7 @@ package web
 import (
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -176,12 +177,14 @@ func (s *Server) serveThemeFavicon(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveThemeFile(w http.ResponseWriter, r *http.Request, e themeEntry, path, kind string) {
-	if !e.Builtin {
-		s.serveConfiguredFile(w, r, path, kind)
-		return
-	}
 	if path == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if !e.Builtin {
+		// An archive gives every theme it unpacks one mtime.
+		setGalleryScopedCache(w, "custom", kind+"-"+url.PathEscape(e.Name), path)
+		http.ServeFile(w, r, path)
 		return
 	}
 	http.ServeFileFS(w, r, webFS.FS, path)

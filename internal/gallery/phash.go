@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/models"
 )
 
 // The standard pHash settings: a 32x32 greyscale input and an 8x8 DCT block.
@@ -147,6 +148,14 @@ type PhashSink func(imageID int64, phash *int64)
 func (s PhashSink) Stored(imageID int64, phash *int64) {
 	if s != nil {
 		s(imageID, phash)
+	}
+}
+
+// Landed skips a nil phash: Ingest returns a duplicate or a revived row
+// without one, and passing it on would clear a valid entry.
+func (s PhashSink) Landed(img *models.Image) {
+	if img != nil && img.Phash != nil {
+		s.Stored(img.ID, img.Phash)
 	}
 }
 

@@ -12,6 +12,7 @@
 {{$stale := .Stale}}
 {{$folded := ""}}{{if .Folded}}{{$folded = "1"}}{{end}}
 {{$zero := "0"}}{{if .ZeroOnly}}{{$zero = "only"}}{{else if .ShowZero}}{{$zero = "1"}}{{end}}
+{{if not .RowsOnly}}
 <div id="sidebar-inner">
   <div class="sidebar-section"
        hx-boost="true" hx-target="#tags-page" hx-select="#tags-page" hx-swap="outerHTML"
@@ -127,6 +128,7 @@
     </div>
   </div>
 </div>
+{{end}}
 {{template "layout_mid" .}}
 
 <div id="tags-page">
@@ -174,7 +176,6 @@
       </tr>
     </thead>
     <tbody>
-      {{$csrf := .CSRFToken}}
       {{$cats := .Categories}}
       {{$imps := .Implications}}
       {{range .Tags}}
@@ -213,7 +214,6 @@
                   hx-trigger="change"
                   hx-target="#tag-flash"
                   hx-swap="innerHTML"
-                  hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
                   hx-on::after-request="onTagCategoryPatch(event, this)"
                   onchange="updateTagColor(this)">
             {{range $cats}}{{if ne .Name "rating"}}
@@ -270,7 +270,7 @@
 
 </div>
 
-{{template "partials/tag_rename_dialog.html" (dict "CSRFToken" .CSRFToken "KeepAlias" true)}}
+{{template "partials/tag_rename_dialog.html" (dict "KeepAlias" true)}}
 
 <dialog id="batch-category-dialog">
   <p id="batch-category-scope"></p>
@@ -339,7 +339,6 @@
   <form hx-post="/tags/new"
         hx-target="#tag-create-error"
         hx-swap="innerHTML">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <p>Create a new tag.</p>
     <div class="field">
       <label>Tag name</label>
@@ -358,7 +357,6 @@
   <form hx-post="/tags/aliases"
         hx-target="#alias-create-error"
         hx-swap="innerHTML">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <p>Create an alias resolving to another tag.<br>The canonical tag is created if it doesn't exist yet.</p>
     <div class="field">
       <label>Alias name</label>
@@ -403,23 +401,6 @@
 // Delegated: htmx swaps #tags-page in place on filters, live search and
 // header sorts.
 
-function openRenameDialog(btn) {
-  var id = btn.dataset.id;
-  var name = btn.dataset.name;
-  document.getElementById('rename-src-name').textContent = name;
-  clearSlots('rename-error');
-  var input = document.getElementById('rename-new-name');
-  input.value = name;
-  // An alias cannot keep its old name as an alias: that would point an
-  // alias at an alias.
-  var keep = document.getElementById('rename-keep-alias');
-  keep.checked = false;
-  document.getElementById('rename-keep-alias-row').hidden = btn.dataset.isAlias === '1';
-  openHxRewriteDialog('rename-form', 'hx-post', '/tags/' + id + '/rename', 'rename-dialog');
-  input.focus();
-  input.select();
-}
-
 function confirmDeleteTag(btn) {
   deleteTagFlow(btn, btn.dataset.id, function() { window.location.reload(); });
 }
@@ -428,10 +409,8 @@ var tagSelectAllMatching = false;
 var _lastTagCheckbox = null;
 
 function selectedTagIds() {
-  return Array.prototype.filter.call(
-    document.querySelectorAll('.tag-select'),
-    function(b) { return b.checked; }
-  ).map(function(b) { return b.value; });
+  return Array.prototype.map.call(document.querySelectorAll('.tag-select:checked'),
+    function(b) { return b.value; });
 }
 
 function updateTagBatchBar() {
@@ -530,12 +509,14 @@ var tagClickRoutes = [
     document.getElementById('ptr-lookup-search-dialog').showModal();
   }],
   ['#btn-batch-merge-folded', function() {
-    postForm('/tags/merge-folded', tagScopeParams(), {
-      flashId: 'tag-flash',
-      failMsg: 'Merge failed.',
-      catchMsg: 'Merge request failed.',
-      onOK: tagBatchDone
-    });
+    showConfirm('Merge ' + tagScopeLabel() + ' into corrected spellings?', function() {
+      postForm('/tags/merge-folded', tagScopeParams(), {
+        flashId: 'tag-flash',
+        failMsg: 'Merge failed.',
+        catchMsg: 'Merge request failed.',
+        onOK: tagBatchDone
+      });
+    }, "Each old spelling's images move onto its corrected tag and the old name stays as a zero-usage alias. This cannot be undone.", 'Merge');
   }],
   ['#btn-create-alias', function() {
     document.getElementById('alias-create-name').value = '';
@@ -556,7 +537,6 @@ var tagClickRoutes = [
 if (!window.tagsPageWired) {
   window.tagsPageWired = true;
   document.addEventListener('click', function(e) {
-    if (!e.target.closest) return;
     for (var i = 0; i < tagClickRoutes.length; i++) {
       var el = e.target.closest(tagClickRoutes[i][0]);
       if (el) { tagClickRoutes[i][1](el, e); return; }
@@ -613,22 +593,27 @@ function tagScopeLabel() {
 // the reload.
 function tagBatchDone() {
   if (!tagSelectAllMatching) stashSelection(selectedTagIds());
-  _pendingGalleryReload = true;
-  if (typeof refreshJobStatus === 'function') refreshJobStatus();
+  armGalleryReload();
+}
+
+// prefix names the <prefix>-dialog and <prefix>-flash slots; onOK
+// defaults to tagBatchDone.
+function postTagBatch(prefix, url, params, failMsg, catchMsg, onOK) {
+  clearSlots(prefix + '-flash');
+  postForm(url, params, {
+    dialogId: prefix + '-dialog',
+    flashId: prefix + '-flash',
+    failMsg: failMsg,
+    catchMsg: catchMsg,
+    onOK: onOK || tagBatchDone
+  });
 }
 
 function confirmBatchCategory() {
-  clearSlots('batch-category-flash');
   var params = tagScopeParams();
   params.set('category_id', document.getElementById('batch-category-select').value);
   if (document.getElementById('batch-category-merge').checked) params.set('merge', '1');
-  postForm('/tags/batch-category', params, {
-    dialogId: 'batch-category-dialog',
-    flashId: 'batch-category-flash',
-    failMsg: 'Category move failed.',
-    catchMsg: 'Category move request failed.',
-    onOK: tagBatchDone
-  });
+  postTagBatch('batch-category', '/tags/batch-category', params, 'Category move failed.', 'Category move request failed.');
 }
 
 function openBatchMerge() {
@@ -637,10 +622,7 @@ function openBatchMerge() {
     if (flash) flash.innerHTML = '<div class="flash flash-err">Merge needs an explicit selection: check the rows to merge.</div>';
     return;
   }
-  var boxes = Array.prototype.filter.call(
-    document.querySelectorAll('.tag-select'),
-    function(b) { return b.checked; }
-  );
+  var boxes = document.querySelectorAll('.tag-select:checked');
   if (boxes.length < 2) {
     if (flash) flash.innerHTML = '<div class="flash flash-err">Select at least two tags to merge.</div>';
     return;
@@ -664,46 +646,25 @@ function openBatchMerge() {
 }
 
 function confirmBatchMerge() {
-  clearSlots('batch-merge-flash');
   var canon = document.querySelector('#batch-merge-choices input[name=merge_canon]:checked');
   if (!canon) return;
   var params = tagScopeParams();
   params.set('canonical_id', '#' + canon.value);
-  postForm('/tags/batch-alias', params, {
-    dialogId: 'batch-merge-dialog',
-    flashId: 'batch-merge-flash',
-    failMsg: 'Merge failed.',
-    catchMsg: 'Merge request failed.',
-    onOK: tagBatchDone
-  });
+  postTagBatch('batch-merge', '/tags/batch-alias', params, 'Merge failed.', 'Merge request failed.');
 }
 
 function confirmBatchAlias() {
-  clearSlots('batch-alias-flash');
   var params = tagScopeParams();
   params.set('canonical_id', document.getElementById('batch-alias-canon').value);
-  postForm('/tags/batch-alias', params, {
-    dialogId: 'batch-alias-dialog',
-    flashId: 'batch-alias-flash',
-    failMsg: 'Alias failed.',
-    catchMsg: 'Alias request failed.',
-    onOK: tagBatchDone
-  });
+  postTagBatch('batch-alias', '/tags/batch-alias', params, 'Alias failed.', 'Alias request failed.');
 }
 
 function confirmBatchImply() {
-  clearSlots('batch-imply-flash');
   var params = tagScopeParams();
   var mode = document.querySelector('input[name=imply_mode]:checked');
   params.set('mode', mode ? mode.value : 'add');
   params.set('target', document.getElementById('batch-imply-target').value);
-  postForm('/tags/batch-imply', params, {
-    dialogId: 'batch-imply-dialog',
-    flashId: 'batch-imply-flash',
-    failMsg: 'Implication batch failed.',
-    catchMsg: 'Implication batch request failed.',
-    onOK: tagBatchDone
-  });
+  postTagBatch('batch-imply', '/tags/batch-imply', params, 'Implication batch failed.', 'Implication batch request failed.');
 }
 
 // The create dialogs need no after-request hook: success is an
@@ -739,28 +700,15 @@ function markPTRReviewStart() {
 })();
 
 function confirmPTRLookupSearch() {
-  clearSlots('ptr-lookup-search-flash');
-  postForm('/tags/ptr-lookup-search', tagScopeParams(), {
-    dialogId: 'ptr-lookup-search-dialog',
-    flashId: 'ptr-lookup-search-flash',
-    failMsg: 'PTR lookup failed.',
-    catchMsg: 'PTR lookup request failed.',
-    onOK: function() {
+  postTagBatch('ptr-lookup-search', '/tags/ptr-lookup-search', tagScopeParams(),
+    'PTR lookup failed.', 'PTR lookup request failed.', function() {
       markPTRReviewStart();
       tagBatchDone();
-    }
-  });
+    });
 }
 
 function confirmDeleteTagsSearch() {
-  clearSlots('delete-tags-search-flash');
-  postForm('/tags/delete-search', tagScopeParams(), {
-    dialogId: 'delete-tags-search-dialog',
-    flashId: 'delete-tags-search-flash',
-    failMsg: 'Delete failed.',
-    catchMsg: 'Delete request failed.',
-    onOK: tagBatchDone
-  });
+  postTagBatch('delete-tags-search', '/tags/delete-search', tagScopeParams(), 'Delete failed.', 'Delete request failed.');
 }
 
 function updateTagColor(sel) {

@@ -27,8 +27,7 @@ func Bootstrap(db *DB) error {
 	b.ensureColumn("images", "url", `ALTER TABLE images ADD COLUMN url TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("images", "note", `ALTER TABLE images ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("images", "original_source", `ALTER TABLE images ADD COLUMN original_source TEXT NOT NULL DEFAULT ''`)
-	// On older libraries idx_images_source indexes source_type, not source.
-	b.exec("drop legacy idx_images_source", `DROP INDEX IF EXISTS idx_images_source`)
+	b.dropLegacySourceIndex()
 	b.exec("create idx_images_source_type", `CREATE INDEX IF NOT EXISTS idx_images_source_type ON images(source_type)`)
 	b.exec("create idx_images_source", `CREATE INDEX IF NOT EXISTS idx_images_source ON images(source)`)
 	b.exec("create idx_images_source_visible", `CREATE INDEX IF NOT EXISTS idx_images_source_visible ON images(source) WHERE is_missing = 0`)
@@ -129,7 +128,7 @@ func Bootstrap(db *DB) error {
 	b.ensureColumn("potential_relation_pairs", "score", `ALTER TABLE potential_relation_pairs ADD COLUMN score REAL`)
 	b.backfillIfFreshColumn("potential_relation_pairs", "collection_hidden",
 		`ALTER TABLE potential_relation_pairs ADD COLUMN collection_hidden INTEGER NOT NULL DEFAULT 0`,
-		`UPDATE potential_relation_pairs SET collection_hidden = 1 WHERE `+pairHiddenProbe("a_image_id", "b_image_id"),
+		`UPDATE potential_relation_pairs SET collection_hidden = 1 WHERE `+PairHiddenProbe("a_image_id", "b_image_id"),
 		"backfill potential_relation_pairs.collection_hidden")
 	b.ensureColumn("relation_session", "detector", `ALTER TABLE relation_session ADD COLUMN detector TEXT NOT NULL DEFAULT 'both'`)
 	b.widenDerivativeEdgesKey()
@@ -173,9 +172,7 @@ func Bootstrap(db *DB) error {
 			name          TEXT PRIMARY KEY COLLATE NOCASE,
 			visible_count INTEGER NOT NULL DEFAULT 0
 		)`,
-		`INSERT INTO collection_counts (name, visible_count)
-		 SELECT c.name, SUM(EXISTS (SELECT 1 FROM images i WHERE i.id = c.image_id AND i.is_missing = 0))
-		 FROM image_collections c GROUP BY c.name`,
+		collectionCountsFill,
 		"backfill collection_counts")
 	b.exec("create trg_image_collections_count_ai", `CREATE TRIGGER IF NOT EXISTS trg_image_collections_count_ai
 		AFTER INSERT ON image_collections
@@ -223,7 +220,7 @@ func Bootstrap(db *DB) error {
 		END`)
 	b.exec("create trg_potential_pairs_hidden_ai", `CREATE TRIGGER IF NOT EXISTS trg_potential_pairs_hidden_ai
 		AFTER INSERT ON potential_relation_pairs
-		WHEN `+pairHiddenProbe("NEW.a_image_id", "NEW.b_image_id")+`
+		WHEN `+PairHiddenProbe("NEW.a_image_id", "NEW.b_image_id")+`
 		BEGIN
 			UPDATE potential_relation_pairs SET collection_hidden = 1
 			WHERE a_image_id = NEW.a_image_id AND b_image_id = NEW.b_image_id;
@@ -241,9 +238,9 @@ func Bootstrap(db *DB) error {
 	b.exec("create trg_image_collections_pairs_au", `CREATE TRIGGER IF NOT EXISTS trg_image_collections_pairs_au
 		AFTER UPDATE OF name ON image_collections
 		BEGIN
-			UPDATE potential_relation_pairs SET collection_hidden = `+pairHiddenProbe("a_image_id", "b_image_id")+`
+			UPDATE potential_relation_pairs SET collection_hidden = `+PairHiddenProbe("a_image_id", "b_image_id")+`
 			WHERE a_image_id = NEW.image_id;
-			UPDATE potential_relation_pairs SET collection_hidden = `+pairHiddenProbe("a_image_id", "b_image_id")+`
+			UPDATE potential_relation_pairs SET collection_hidden = `+PairHiddenProbe("a_image_id", "b_image_id")+`
 			WHERE b_image_id = NEW.image_id;
 		END`)
 	b.exec("create trg_collection_find_relations_pairs_ai", `CREATE TRIGGER IF NOT EXISTS trg_collection_find_relations_pairs_ai
@@ -391,13 +388,7 @@ func Bootstrap(db *DB) error {
 	// Trigram FTS makes name: substrings a seek; a leading-% LIKE can't seek.
 	b.exec("create image_basename_canonical_fts", `CREATE VIRTUAL TABLE IF NOT EXISTS image_basename_canonical_fts USING fts5(basename, tokenize='trigram', content='', contentless_delete=1)`)
 	b.exec("create image_basename_alias_fts", `CREATE VIRTUAL TABLE IF NOT EXISTS image_basename_alias_fts USING fts5(basename, image_id UNINDEXED, tokenize='trigram', content='', contentless_delete=1)`)
-	if b.err != nil {
-		return b.err
-	}
-	var ratingRankUserVersion int
-	if err := db.Write.QueryRow(`PRAGMA user_version`).Scan(&ratingRankUserVersion); err != nil {
-		return fmt.Errorf("read user_version (fts5 backfill): %w", err)
-	}
+	ratingRankUserVersion := b.queryInt("read user_version (fts5 backfill)", `PRAGMA user_version`)
 	// Each one-shot is pinned to the marker that introduced it, so a
 	// later bump can't replay it over rows written since.
 	if ratingRankUserVersion < 13 {
@@ -465,14 +456,7 @@ func Bootstrap(db *DB) error {
 	// ANALYZE runs once per marker bump: over image_tags it can blow the
 	// start-up budget on a cold cache, and PRAGMA optimize covers the
 	// drift in between. 400 is SQLite's recommended analysis_limit.
-	if b.err != nil {
-		return b.err
-	}
-	var userVersion int
-	if err := db.Write.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
-		return fmt.Errorf("read user_version: %w", err)
-	}
-	if userVersion < bootstrapSchemaVersion {
+	if b.queryInt("read user_version", `PRAGMA user_version`) < bootstrapSchemaVersion {
 		b.exec("set analysis_limit", `PRAGMA analysis_limit = 400`)
 		b.exec("analyze images", `ANALYZE images`)
 		b.exec("analyze image_tags", `ANALYZE image_tags`)
@@ -485,6 +469,22 @@ func Bootstrap(db *DB) error {
 type bootstrapper struct {
 	db  *DB
 	err error
+}
+
+func (b *bootstrapper) queryInt(label, query string, args ...any) int {
+	if b.err != nil {
+		return 0
+	}
+	var n int
+	if err := b.db.Write.QueryRow(query, args...).Scan(&n); err != nil {
+		b.err = fmt.Errorf("%s: %w", label, err)
+	}
+	return n
+}
+
+func (b *bootstrapper) hasColumn(table, column string) bool {
+	return b.queryInt(fmt.Sprintf("inspect %s.%s", table, column),
+		`SELECT COUNT(*) FROM pragma_table_xinfo(?) WHERE name = ?`, table, column) > 0
 }
 
 func (b *bootstrapper) exec(label, sql string) {
@@ -510,6 +510,27 @@ func (b *bootstrapper) execTx(label, stmts string) {
 	}
 }
 
+const collectionCountsFill = `INSERT INTO collection_counts (name, visible_count)
+	SELECT c.name, SUM(EXISTS (SELECT 1 FROM images i WHERE i.id = c.image_id AND i.is_missing = 0))
+	FROM image_collections c GROUP BY c.name`
+
+// RederiveTriggerColumns recomputes what the image_tags and
+// image_collections insert triggers keep, for rows inserted before the
+// images, tags and categories those triggers read.
+func RederiveTriggerColumns(e Execer) error {
+	for _, stmt := range []string{
+		`UPDATE images SET tag_count = (SELECT COUNT(*) FROM image_tags WHERE image_id = images.id),
+		                   rating_rank = ` + ratingRankExpr("images.id"),
+		`DELETE FROM collection_counts`,
+		collectionCountsFill,
+	} {
+		if _, err := e.Exec(stmt); err != nil {
+			return fmt.Errorf("rederive trigger columns: %w", err)
+		}
+	}
+	return nil
+}
+
 func ratingRankExpr(imageIDCol string) string {
 	return `COALESCE((
 				SELECT MAX(CASE t.name
@@ -526,13 +547,13 @@ func ratingRankExpr(imageIDCol string) string {
 }
 
 func pairsResweepBody(predA, predB string) string {
-	return `UPDATE potential_relation_pairs SET collection_hidden = ` + pairHiddenProbe("a_image_id", "b_image_id") + `
+	return `UPDATE potential_relation_pairs SET collection_hidden = ` + PairHiddenProbe("a_image_id", "b_image_id") + `
 			WHERE ` + predA + `;
-			UPDATE potential_relation_pairs SET collection_hidden = ` + pairHiddenProbe("a_image_id", "b_image_id") + `
+			UPDATE potential_relation_pairs SET collection_hidden = ` + PairHiddenProbe("a_image_id", "b_image_id") + `
 			WHERE ` + predB + `;`
 }
 
-func pairHiddenProbe(aCol, bCol string) string {
+func PairHiddenProbe(aCol, bCol string) string {
 	return `EXISTS (
 		SELECT 1 FROM image_collections ca
 		JOIN image_collections cb ON cb.name = ca.name AND cb.image_id = ` + bCol + `
@@ -541,17 +562,7 @@ func pairHiddenProbe(aCol, bCol string) string {
 }
 
 func (b *bootstrapper) ensureColumn(table, column, alterSQL string) {
-	if b.err != nil {
-		return
-	}
-	var count int
-	if err := b.db.Write.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_xinfo(?) WHERE name = ?`, table, column,
-	).Scan(&count); err != nil {
-		b.err = fmt.Errorf("inspect %s.%s: %w", table, column, err)
-		return
-	}
-	if count > 0 {
+	if b.hasColumn(table, column) || b.err != nil {
 		return
 	}
 	if _, err := b.db.Write.Exec(alterSQL); err != nil {
@@ -563,17 +574,8 @@ func (b *bootstrapper) ensureColumn(table, column, alterSQL string) {
 // can't widen a primary key in place, and the DROP takes
 // idx_derivative_edges_source with it.
 func (b *bootstrapper) widenDerivativeEdgesKey() {
-	if b.err != nil {
-		return
-	}
-	var keyed int
-	if err := b.db.Write.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info('derivative_edges') WHERE name = 'source_image_id' AND pk > 0`,
-	).Scan(&keyed); err != nil {
-		b.err = fmt.Errorf("inspect derivative_edges key: %w", err)
-		return
-	}
-	if keyed > 0 {
+	if b.queryInt("inspect derivative_edges key",
+		`SELECT COUNT(*) FROM pragma_table_info('derivative_edges') WHERE name = 'source_image_id' AND pk > 0`) > 0 {
 		return
 	}
 	b.execTx("widen derivative_edges key", `
@@ -590,36 +592,25 @@ func (b *bootstrapper) widenDerivativeEdgesKey() {
 		CREATE INDEX IF NOT EXISTS idx_derivative_edges_source ON derivative_edges(source_image_id);`)
 }
 
+// On older libraries idx_images_source indexes source_type, not source.
+func (b *bootstrapper) dropLegacySourceIndex() {
+	if b.queryInt("inspect idx_images_source",
+		`SELECT COUNT(*) FROM pragma_index_info('idx_images_source') WHERE name = 'source_type'`) > 0 {
+		b.exec("drop legacy idx_images_source", `DROP INDEX idx_images_source`)
+	}
+}
+
 // The DDL and its backfill commit together: a kill between them would
 // leave the column or table in place and the backfill never run.
 func (b *bootstrapper) backfillIfFreshColumn(table, column, alterSQL, backfillSQL, backfillLabel string) {
-	if b.err != nil {
-		return
-	}
-	var pre int
-	if err := b.db.Write.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_xinfo(?) WHERE name = ?`, table, column,
-	).Scan(&pre); err != nil {
-		b.err = fmt.Errorf("inspect %s.%s: %w", table, column, err)
-		return
-	}
-	if pre == 0 {
+	if !b.hasColumn(table, column) {
 		b.execTx(backfillLabel, alterSQL+";\n"+backfillSQL)
 	}
 }
 
 func (b *bootstrapper) backfillIfFreshTable(table, createSQL, backfillSQL, backfillLabel string) {
-	if b.err != nil {
-		return
-	}
-	var pre int
-	if err := b.db.Write.QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
-	).Scan(&pre); err != nil {
-		b.err = fmt.Errorf("inspect table %s: %w", table, err)
-		return
-	}
-	if pre == 0 {
+	if b.queryInt("inspect table "+table,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table) == 0 {
 		b.execTx(backfillLabel, createSQL+";\n"+backfillSQL)
 	}
 }

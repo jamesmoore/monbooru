@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -16,7 +17,7 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cx := s.active()
-	if cx == nil || cx.DB == nil || cx.BKTree == nil {
+	if cx == nil || cx.DB == nil {
 		flashStatus(w, http.StatusInternalServerError, "No active gallery.")
 		return
 	}
@@ -25,13 +26,8 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 	tagPairs := s.cfg.Relations.TagPairs
 	tagPairThreshold := s.cfg.Relations.TagPairThreshold
 	s.cfgMu.Unlock()
-	if distance < 0 || distance > maxPhashDistance {
-		distance = 4
-	}
-	if v := r.FormValue("distance"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= maxPhashDistance {
-			distance = n
-		}
+	if n, err := strconv.Atoi(r.FormValue("distance")); err == nil && n >= 0 && n <= config.MaxPhashDistance {
+		distance = n
 	}
 	replace := r.FormValue("replace") == "true"
 	// A typed confirm, so a bare replace=true from curl or a bookmark
@@ -41,29 +37,20 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.startJob(w, models.JobTypeRelations) {
-		return
-	}
-	database := cx.DB
-	thumbnailsPath := cx.ThumbnailsPath
-	tree := cx.BKTree
 	opts := relations.FindPairsOptions{
 		Distance:         distance,
 		Replace:          replace,
-		ThumbnailsPath:   thumbnailsPath,
 		TagPairs:         tagPairs,
 		TagPairThreshold: config.ClampTagPairThreshold(tagPairThreshold),
 	}
-	go func() {
-		ctx := s.jobs.Context()
-		added, err := relations.FindPairs(ctx, database, tree, opts, func(processed, total int, phase string) {
+	s.goJob(w, models.JobTypeRelations, "Find-pairs started.", func(ctx context.Context) {
+		added, err := cx.FindPairs(ctx, opts, func(processed, total int, phase string) {
 			s.jobs.Update(processed, total, fmt.Sprintf("find-pairs: %s", phase))
 		})
-		_ = s.settleJob(ctx, err,
+		_ = s.jobs.Settle(ctx, err,
 			fmt.Sprintf("find-pairs cancelled (%d added)", added),
 			fmt.Sprintf("find-pairs added %d candidate(s).", added))
-	}()
-	writeInlineFlash(w, "ok", "Find-pairs started.")
+	})
 }
 
 func (s *Server) resetSkippedPost(w http.ResponseWriter, r *http.Request) {

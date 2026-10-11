@@ -14,34 +14,40 @@ import (
 
 // PhashStored must follow every phash write so a built tree stays in step
 // with the column.
-func PhashStored(database *db.DB, id, phash int64) {
-	tree := DefaultRegistry.Lookup(database)
-	if tree == nil || !tree.Built() {
+func PhashStored(database *db.DB, tree *BKTree, id, phash int64) {
+	if tree == nil {
+		return
+	}
+	if !IncrementalProbeEnabled.Load() {
+		if tree.Built() {
+			tree.Insert(id, phash)
+		}
+		return
+	}
+	if err := tree.EnsureBuilt(database); err != nil {
+		logx.Warnf("incremental probe %d: build the tree: %v", id, err)
 		return
 	}
 	tree.Insert(id, phash)
-	if !IncrementalProbeEnabled.Load() {
-		return
-	}
 	distance := int(IncrementalProbeDistance.Load())
 	if err := incrementalProbe(database, tree, id, phash, distance); err != nil {
 		logx.Debugf("incremental probe %d: %v", id, err)
 	}
 }
 
-func PhashCleared(database *db.DB, id int64) {
-	if tree := DefaultRegistry.Lookup(database); tree != nil && tree.Built() {
+func PhashCleared(tree *BKTree, id int64) {
+	if tree != nil && tree.Built() {
 		tree.Remove(id)
 	}
 }
 
-func PhashSink(database *db.DB) gallery.PhashSink {
+func PhashSink(database *db.DB, tree *BKTree) gallery.PhashSink {
 	return func(id int64, phash *int64) {
 		if phash == nil {
-			PhashCleared(database, id)
+			PhashCleared(tree, id)
 			return
 		}
-		PhashStored(database, id, *phash)
+		PhashStored(database, tree, id, *phash)
 	}
 }
 
@@ -220,28 +226,3 @@ func (t *BKTree) searchLocked(node *bkNode, query int64, d int, out *[]int64) {
 }
 
 func hammingDistance(a, b int64) int { return bits.OnesCount64(uint64(a) ^ uint64(b)) }
-
-type Registry struct {
-	mu    sync.RWMutex
-	trees map[*db.DB]*BKTree
-}
-
-var DefaultRegistry = &Registry{trees: map[*db.DB]*BKTree{}}
-
-func (r *Registry) Register(database *db.DB, tree *BKTree) {
-	r.mu.Lock()
-	r.trees[database] = tree
-	r.mu.Unlock()
-}
-
-func (r *Registry) Unregister(database *db.DB) {
-	r.mu.Lock()
-	delete(r.trees, database)
-	r.mu.Unlock()
-}
-
-func (r *Registry) Lookup(database *db.DB) *BKTree {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.trees[database]
-}

@@ -17,10 +17,7 @@ import (
 func runWorker(argv []string) {
 	fs := flag.NewFlagSet("tagger-worker", flag.ExitOnError)
 	addr := fs.String("addr", "", "parent TCP address to connect to")
-	if err := fs.Parse(argv); err != nil {
-		fmt.Fprintf(os.Stderr, "tagger-worker: %v\n", err)
-		os.Exit(2)
-	}
+	_ = fs.Parse(argv)
 	if *addr == "" {
 		fmt.Fprintf(os.Stderr, "tagger-worker: --addr is required\n")
 		os.Exit(2)

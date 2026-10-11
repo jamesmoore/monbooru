@@ -2,11 +2,9 @@
 package tags
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -19,6 +17,7 @@ import (
 var (
 	ErrInvalidTagName       = errors.New("invalid tag name")
 	ErrTagNotFound          = errors.New("tag not found")
+	ErrTagNameTaken         = errors.New("already exists in this category")
 	ErrTagImplied           = errors.New("this tag is implied by another tag on the image; remove the parent, or add it yourself first to take ownership of the row")
 	ErrCategoryNotFound     = errors.New("category not found")
 	ErrBuiltinCategory      = errors.New("cannot delete built-in category")
@@ -109,35 +108,60 @@ type TagFilter struct {
 }
 
 type Service struct {
-	db          *db.DB
-	ratingCatID int64
+	db           *db.DB
+	ratingCatID  int64
+	generalCatID int64
+	onChange     func()
 }
 
-func New(database *db.DB) *Service {
-	s := &Service{db: database}
+// onChange runs after every write the service commits itself; a write
+// into a caller's transaction leaves it to that caller.
+func New(database *db.DB, onChange func()) *Service {
+	s := &Service{db: database, onChange: onChange}
 	if err := database.Read.QueryRow(
 		`SELECT id FROM tag_categories WHERE name = 'rating'`,
 	).Scan(&s.ratingCatID); err != nil {
 		logx.Warnf("tags.New: rating category lookup failed: %v", err)
+	}
+	if id, ok, err := CategoryIDByName(database, "general"); ok && err == nil {
+		s.generalCatID = id
 	}
 	return s
 }
 
 func (s *Service) RatingCategoryID() int64 { return s.ratingCatID }
 
-func (s *Service) inWriteTx(work func(*sql.Tx) error) error { return db.InWriteTx(s.db.Write, work) }
+func (s *Service) inWriteTx(work func(*sql.Tx) error) error {
+	if err := db.InWriteTx(s.db.Write, work); err != nil {
+		return err
+	}
+	s.changed()
+	return nil
+}
 
-// RecalcDB leaves zero-usage tags in place so their aliases and
-// implications survive an empty library.
-func RecalcDB(database *db.DB) {
-	if _, err := RecalcDBCount(database); err != nil {
-		logx.Warnf("RecalcDB: %v", err)
+func writeTx[T any](s *Service, work func(*sql.Tx) (T, error)) (T, error) {
+	var out T
+	err := s.inWriteTx(func(tx *sql.Tx) error {
+		var err error
+		out, err = work(tx)
+		return err
+	})
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return out, nil
+}
+
+func (s *Service) changed() {
+	if s.onChange != nil {
+		s.onChange()
 	}
 }
 
-// A correlated-subquery UPDATE over every tag dominates sync time, so
-// this zeroes the unused ones and fills the rest from one GROUP BY per
-// tag_id chunk, freeing the writer between chunks.
+// A correlated-subquery UPDATE over every tag holds the writer for the
+// whole catalog, so this zeroes the unused ones and fills the rest from
+// one GROUP BY per tag_id chunk, freeing the writer between chunks.
 func RecalcDBCount(database *db.DB) (int64, error) {
 	const chunkSize = 2000
 
@@ -186,80 +210,10 @@ func RecalcDBCount(database *db.DB) (int64, error) {
 	return updated, nil
 }
 
-func (s *Service) RecalcCount() (int64, error) { return RecalcDBCount(s.db) }
-
-// args already carries extraArgs, so deleteFn must append extraSQL to its
-// own statement. The caller must RecalcIDs the returned tags.
-func (s *Service) ChunkedDeleteWithTagRecalc(
-	ctx context.Context,
-	ids []int64,
-	extraSQL string,
-	extraArgs []any,
-	deleteFn func(tx *sql.Tx, chunk []int64, placeholders string, args []any) error,
-	afterCommit func(chunk []int64),
-) (affected []int64, processed int, cancelled bool, err error) {
-	const chunkSize = 500
-	seen := map[int64]struct{}{}
-	for start := 0; start < len(ids); start += chunkSize {
-		if ctx.Err() != nil {
-			cancelled = true
-			break
-		}
-		chunk := ids[start:min(start+chunkSize, len(ids))]
-		placeholders, chunkArgs := db.InPlaceholders(chunk)
-		args := append(chunkArgs, extraArgs...)
-
-		tx, err := s.db.Write.Begin()
-		if err != nil {
-			return tagIDsFromSet(seen), processed, false, err
-		}
-		// A read error aborts the chunk: a short set would leave stale
-		// usage counts.
-		touched, err := db.QueryIDs(tx,
-			`SELECT DISTINCT tag_id FROM image_tags WHERE image_id IN (`+placeholders+`)`+extraSQL,
-			args...)
-		if err != nil {
-			_ = tx.Rollback()
-			return tagIDsFromSet(seen), processed, false, err
-		}
-		for _, tid := range touched {
-			seen[tid] = struct{}{}
-		}
-		if err := deleteFn(tx, chunk, placeholders, args); err != nil {
-			_ = tx.Rollback()
-			return tagIDsFromSet(seen), processed, false, err
-		}
-		if err := tx.Commit(); err != nil {
-			return tagIDsFromSet(seen), processed, false, err
-		}
-		if afterCommit != nil {
-			afterCommit(chunk)
-		}
-		processed += len(chunk)
+func (s *Service) RecalcCount() (int64, error) {
+	n, err := RecalcDBCount(s.db)
+	if n > 0 {
+		s.changed()
 	}
-	return tagIDsFromSet(seen), processed, cancelled, nil
-}
-
-func tagIDsFromSet(seen map[int64]struct{}) []int64 {
-	if len(seen) == 0 {
-		return nil
-	}
-	return slices.Collect(maps.Keys(seen))
-}
-
-func (s *Service) RecalcIDs(ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	return db.Chunked(ids, 500, func(chunk []int64) error {
-		placeholders, args := db.InPlaceholders(chunk)
-		if _, err := s.db.Write.Exec(`UPDATE tags SET usage_count = (
-			SELECT COUNT(*) FROM image_tags it
-			JOIN images i ON i.id = it.image_id
-			WHERE it.tag_id = tags.id AND i.is_missing = 0
-		) WHERE id IN (`+placeholders+`)`, args...); err != nil {
-			return fmt.Errorf("recalc usage_count chunk: %w", err)
-		}
-		return nil
-	})
+	return n, err
 }

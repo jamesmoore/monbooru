@@ -2,10 +2,13 @@ package gallery
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"image"
+	"image/color"
 	"image/jpeg"
 	"io"
 	"math"
@@ -25,7 +28,7 @@ var MetaTagsEnabled atomic.Bool
 
 func init() { MetaTagsEnabled.Store(true) }
 
-type MetaFacts struct {
+type metaFacts struct {
 	Width, Height int
 	FileType      string
 	AnimatedGIF   bool
@@ -39,9 +42,9 @@ type MetaFacts struct {
 	AIGenerated   bool
 }
 
-// MetaTagsFor follows Danbooru's names, thresholds and cumulative
+// metaTagsFor follows Danbooru's names, thresholds and cumulative
 // resolution bands, so a pulled post and a derived row never disagree.
-func MetaTagsFor(f MetaFacts) []string {
+func metaTagsFor(f metaFacts) []string {
 	var out []string
 	if w, h := f.Width, f.Height; w > 0 && h > 0 {
 		if w >= 1600 || h >= 1200 {
@@ -91,31 +94,30 @@ func MetaTagsFor(f MetaFacts) []string {
 	return out
 }
 
-func ApplyMetaTags(database *db.DB, thumbnailsPath string, imageID int64) error {
+func ApplyMetaTags(h Handle, imageID int64) error {
 	if !MetaTagsEnabled.Load() {
 		return nil
 	}
-	metaCat, err := metaCategoryID(database)
+	metaCat, err := metaCategoryID(h.DB)
 	if err != nil {
 		return err
 	}
-	_, err = applyMetaTags(database, tags.New(database), metaCat, thumbnailsPath, imageID)
+	_, err = applyMetaTags(h.DB, h.TagSvc, metaCat, h.ThumbnailsPath, imageID)
 	return err
 }
 
-func BackfillMetaTags(ctx context.Context, database *db.DB, thumbnailsPath string, progress func(processed, total int, message string)) (processed, updated int, err error) {
-	metaCat, err := metaCategoryID(database)
+func BackfillMetaTags(ctx context.Context, h Handle, progress func(processed, total int, message string)) (processed, updated int, err error) {
+	metaCat, err := metaCategoryID(h.DB)
 	if err != nil {
 		return 0, 0, err
 	}
-	ids, err := db.QueryIDs(database.Read, `SELECT id FROM images WHERE is_missing = 0 ORDER BY id`)
+	ids, err := db.QueryIDs(h.DB.Read, `SELECT id FROM images WHERE is_missing = 0 ORDER BY id`)
 	if err != nil {
 		return 0, 0, err
 	}
-	svc := tags.New(database)
 	changed := 0
 	processed, _, err = BackfillWalk(ctx, ids, progress, "meta tags", "Meta tags…", func(id int64) error {
-		moved, err := applyMetaTags(database, svc, metaCat, thumbnailsPath, id)
+		moved, err := applyMetaTags(h.DB, h.TagSvc, metaCat, h.ThumbnailsPath, id)
 		if moved {
 			changed++
 		}
@@ -124,16 +126,15 @@ func BackfillMetaTags(ctx context.Context, database *db.DB, thumbnailsPath strin
 	return processed, changed, err
 }
 
-func RemoveMetaTags(ctx context.Context, database *db.DB, progress func(processed, total int, message string)) (processed, removed int, err error) {
-	ids, err := db.QueryIDs(database.Read,
+func RemoveMetaTags(ctx context.Context, h Handle, progress func(processed, total int, message string)) (processed, removed int, err error) {
+	ids, err := db.QueryIDs(h.DB.Read,
 		`SELECT DISTINCT image_id FROM image_tag_sources WHERE source = ? ORDER BY image_id`, models.TagSourceMonbooru)
 	if err != nil {
 		return 0, 0, err
 	}
-	svc := tags.New(database)
 	dropped := 0
 	processed, _, err = BackfillWalk(ctx, ids, progress, "removing meta tags", "Meta tags…", func(id int64) error {
-		_, n, err := svc.DropSourceFromImageTags(id, models.TagSourceMonbooru, nil)
+		_, n, err := h.TagSvc.DropSourceFromImageTags(id, models.TagSourceMonbooru, nil)
 		dropped += n
 		return err
 	})
@@ -156,7 +157,7 @@ func applyMetaTags(database *db.DB, tagSvc *tags.Service, metaCatID int64, thumb
 	if err != nil {
 		return false, err
 	}
-	want := MetaTagsFor(facts)
+	want := metaTagsFor(facts)
 	held, err := heldMetaTags(database, imageID)
 	if err != nil {
 		return false, err
@@ -251,8 +252,8 @@ func resolveMetaNames(database *db.DB, metaCatID int64, names []string) (map[str
 	return out, rows.Err()
 }
 
-func metaFactsFor(database *db.DB, thumbnailsPath string, imageID int64) (MetaFacts, error) {
-	var f MetaFacts
+func metaFactsFor(database *db.DB, thumbnailsPath string, imageID int64) (metaFacts, error) {
+	var f metaFacts
 	var w, h sql.NullInt64
 	var path, sourceType string
 	if err := database.Read.QueryRow(
@@ -278,7 +279,7 @@ func metaFactsFor(database *db.DB, thumbnailsPath string, imageID int64) (MetaFa
 		}
 		f.AnimatedWebP = f.FileType == models.FileTypeWEBP && animatedWebP(path)
 	case models.FileTypeMP4, models.FileTypeWEBM:
-		f.HasSound = ProbeVideoHasAudio(path)
+		f.HasSound = probeVideoHasAudio(path)
 	}
 	return f, nil
 }
@@ -302,19 +303,42 @@ func greyscaleThumb(thumbPath string) bool {
 	if err != nil {
 		return false
 	}
+	grey, total := greyPixels(img)
+	return total > 0 && float64(grey) >= float64(total)*greyPixelFraction
+}
+
+// The concrete types skip At, which boxes one color.Color per pixel.
+func greyPixels(img image.Image) (grey, total int) {
 	b := img.Bounds()
-	total, grey := 0, 0
+	total = b.Dx() * b.Dy()
+	switch m := img.(type) {
+	case *image.Gray:
+		return total, total
+	case *image.YCbCr:
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				ci := m.COffset(x, y)
+				r, g, bl := color.YCbCrToRGB(m.Y[m.YOffset(x, y)], m.Cb[ci], m.Cr[ci])
+				if greyPixel(int(r), int(g), int(bl)) {
+					grey++
+				}
+			}
+		}
+		return grey, total
+	}
 	for y := b.Min.Y; y < b.Max.Y; y++ {
 		for x := b.Min.X; x < b.Max.X; x++ {
 			r, g, bl, _ := img.At(x, y).RGBA()
-			r8, g8, b8 := int(r>>8), int(g>>8), int(bl>>8)
-			total++
-			if max(r8, g8, b8)-min(r8, g8, b8) <= greyChannelSpread {
+			if greyPixel(int(r>>8), int(g>>8), int(bl>>8)) {
 				grey++
 			}
 		}
 	}
-	return total > 0 && float64(grey) >= float64(total)*greyPixelFraction
+	return grey, total
+}
+
+func greyPixel(r, g, b int) bool {
+	return max(r, g, b)-min(r, g, b) <= greyChannelSpread
 }
 
 // Seeks past the payloads rather than decoding them: one frame's LZW data
@@ -481,10 +505,7 @@ func animatedJXL(path string) bool {
 		if _, err := io.ReadFull(f, box); err != nil {
 			return false
 		}
-		size := int64(binary.BigEndian.Uint32(box))
-		if size == 0 {
-			size = math.MaxInt64 // the box runs to the end of the file
-		}
+		size := cmp.Or(int64(binary.BigEndian.Uint32(box)), math.MaxInt64) // 0: the box runs to the end of the file
 		switch string(box[4:]) {
 		case "jxlc":
 			return jxlHasAnimation(io.LimitReader(f, size-8))

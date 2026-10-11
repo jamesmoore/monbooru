@@ -29,11 +29,9 @@ type SessionStore struct {
 
 func NewSessionStore() *SessionStore { return &SessionStore{sessions: map[string]Session{}} }
 
-func (s *SessionStore) NewSession(lifetimeDays int) (string, error) {
+func (s *SessionStore) NewSession(lifetimeDays int) string {
 	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
+	_, _ = rand.Read(buf)
 	id := base64.RawURLEncoding.EncodeToString(buf)
 
 	s.mu.Lock()
@@ -43,7 +41,7 @@ func (s *SessionStore) NewSession(lifetimeDays int) (string, error) {
 	}
 	s.mu.Unlock()
 
-	return id, nil
+	return id
 }
 
 func (s *SessionStore) GetSession(id string) (Session, bool) {
@@ -227,10 +225,7 @@ func (l *loginRateLimiter) check(ip string) bool {
 	// 1s doubling to a 30s cap; the shift is clamped at 0 because a
 	// negative shift panics.
 	shift := min(max(a.count-1, 0), 5)
-	delay := time.Duration(1<<shift) * time.Second
-	if delay > 30*time.Second {
-		delay = 30 * time.Second
-	}
+	delay := min(time.Duration(1<<shift)*time.Second, 30*time.Second)
 	return time.Since(a.lastFail) >= delay
 }
 

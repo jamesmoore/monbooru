@@ -79,9 +79,6 @@ func ffmpegAvailable() bool {
 	return ffmpegPath != ""
 }
 
-// FFmpegAvailable exists for other packages' tests.
-func FFmpegAvailable() bool { return ffmpegAvailable() }
-
 // Shipped with ffmpeg, but nothing guarantees both are present.
 func ffprobeAvailable() bool {
 	resolveTools()
@@ -134,6 +131,10 @@ func NormalizeImage(srcPath string) error {
 	})
 }
 
+func fitWithin(maxDim int) string {
+	return fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease", maxDim, maxDim)
+}
+
 // ffmpeg picks the encoder from the extension, so the temp file takes
 // dstPath's.
 func renderStill(srcPath, dstPath string, maxDim int) error {
@@ -142,8 +143,7 @@ func renderStill(srcPath, dstPath string, maxDim int) error {
 		// libjxl decoder repeats its error forever instead of stopping.
 		args := []string{"-y", "-xerror", "-i", srcPath, "-update", "1", "-frames:v", "1"}
 		if maxDim > 0 {
-			args = append(args, "-vf", fmt.Sprintf(
-				"scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease", maxDim, maxDim))
+			args = append(args, "-vf", fitWithin(maxDim))
 		}
 		if filepath.Ext(dstPath) == ".webp" {
 			return append(args, "-c:v", "libwebp", "-lossless", "1", "--", tmp)
@@ -155,13 +155,13 @@ func renderStill(srcPath, dstPath string, maxDim int) error {
 // RenderStillFrame renders an AVIF or JPEG XL to a lossless WebP in dir
 // for a Go decode, which keeps a JPEG XL's alpha (the shipped ffmpeg has
 // no PNG encoder); the caller removes it.
-func RenderStillFrame(srcPath, dir string) (string, error) {
+func RenderStillFrame(srcPath, dir string, maxDim int) (string, error) {
 	tmp, err := os.CreateTemp(dir, ".still-frame.*.webp")
 	if err != nil {
 		return "", fmt.Errorf("creating temp frame file: %w", err)
 	}
 	_ = tmp.Close()
-	if err := renderStill(srcPath, tmp.Name(), ViewMaxDim); err != nil {
+	if err := renderStill(srcPath, tmp.Name(), maxDim); err != nil {
 		_ = os.Remove(tmp.Name())
 		return "", err
 	}
@@ -195,7 +195,7 @@ func generateVideoThumb(srcPath, dstPath string) error {
 				"-ss", offset,
 				"-i", srcPath,
 				"-frames:v", "1",
-				"-vf", fmt.Sprintf("scale=%d:-1", thumbMaxDim),
+				"-vf", fitWithin(thumbMaxDim),
 				"-q:v", "2",
 				"--",
 				tmp,
@@ -212,7 +212,7 @@ func generateVideoHover(srcPath, dstPath string) error {
 				"-ss", offset,
 				"-t", "4",
 				"-i", srcPath,
-				"-vf", fmt.Sprintf("scale=%d:-1", thumbMaxDim),
+				"-vf", fitWithin(thumbMaxDim),
 				"-an",
 				"-loop", "0", // infinite loop
 				"--",
@@ -227,7 +227,7 @@ func generateGIFHover(srcPath, dstPath string) error {
 		return []string{
 			"-y",
 			"-i", srcPath,
-			"-vf", fmt.Sprintf("scale=%d:-1", thumbMaxDim),
+			"-vf", fitWithin(thumbMaxDim),
 			"-loop", "0",
 			"--",
 			tmp,
@@ -347,9 +347,9 @@ func ProbeVideoDimensions(srcPath string) (int, int, bool) {
 	return st.Width, st.Height, true
 }
 
-// ProbeVideoHasAudio is false also when ffprobe is missing or fails, so
+// probeVideoHasAudio is false also when ffprobe is missing or fails, so
 // false must not be read as silent.
-func ProbeVideoHasAudio(srcPath string) bool {
+func probeVideoHasAudio(srcPath string) bool {
 	if !ffprobeAvailable() {
 		return false
 	}

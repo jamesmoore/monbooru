@@ -10,9 +10,9 @@ import (
 	"fmt"
 	"html/template"
 	"io/fs"
-	"maps"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,7 +26,6 @@ import (
 
 	"github.com/monbooru/monbooru/internal/api"
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/counts"
 	"github.com/monbooru/monbooru/internal/desktop"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
@@ -34,7 +33,9 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
+	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/plugins"
+	"github.com/monbooru/monbooru/internal/schedule"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -73,7 +74,7 @@ type Server struct {
 	configPath string
 	cfgMu      sync.RWMutex // guards cfg reads/writes and config.Save calls
 	jobs       *jobs.Manager
-	pairs      *pairStore
+	pairs      *peer.Store
 	sessions   *SessionStore
 	loginRL    *loginRateLimiter
 	csrfSecret []byte
@@ -88,24 +89,19 @@ type Server struct {
 	quit         chan struct{}
 	quitOnce     sync.Once
 	restart      atomic.Bool
+	// A field so a test drives the menu and start-at-login entries under its
+	// own name: the HKCU Run value cannot be redirected like HOME.
+	desktopApp string
 
-	// ctxMu serialises gallery mutations and is read-held for a whole read
-	// request, whose handler reads galState and never re-locks ctxMu: a nested
-	// RLock queues behind a pending writer, which waits on the outer one.
-	ctxMu    sync.RWMutex
-	galState atomic.Pointer[galleryState]
-	// Serialises rebuildBoundaries so an older rebuild cannot be stored last.
-	boundsMu sync.Mutex
+	set *library.Set
 
-	sched *scheduler
+	sched *schedule.Scheduler
 
-	mlStatus *monloader.StatusCache
+	ml *monloader.Link
 
 	themeWarn *themeWarnings
 
 	peers *plugins.Peers
-
-	fetchStatus *fetchStatusStore
 
 	downloads downloadList
 }
@@ -134,7 +130,7 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 		cfg:          cfg,
 		configPath:   configPath,
 		jobs:         jobManager,
-		pairs:        newPairStore(),
+		pairs:        peer.NewStore(),
 		sessions:     sessions,
 		loginRL:      newLoginRateLimiter(),
 		csrfSecret:   mustRandBytes(32),
@@ -143,41 +139,21 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 		done:         make(chan struct{}),
 		desktop:      dk.Active,
 		folderOpener: desktop.OpenFolder,
+		desktopApp:   "monbooru",
 		logDir:       dk.LogDir,
 		quit:         make(chan struct{}),
-		sched:        newScheduler(),
-		mlStatus:     &monloader.StatusCache{},
-		fetchStatus:  newFetchStatusStore(),
 		themeWarn:    &themeWarnings{},
 	}
 	s.peers = plugins.NewPeers(s.pluginCallbackURL, s.done)
+	s.ml = monloader.NewLink(s.monloaderLink, jobManager)
 
 	applyRelationsConfig(cfg.Relations)
 	gallery.MetaTagsEnabled.Store(cfg.Gallery.AutoMetaTags)
 
-	opened := &galleryState{contexts: map[string]*galleryCtx{}, active: cfg.DefaultGallery}
-	for _, g := range cfg.Galleries {
-		cx, err := library.Open(g)
-		if err != nil {
-			for _, done := range opened.contexts {
-				done.Close()
-			}
-			return nil, err
-		}
-		opened.contexts[g.Name] = cx
+	if s.set, err = library.OpenSet(setHost{s}, jobManager, cfg.Galleries, cfg.DefaultGallery); err != nil {
+		return nil, err
 	}
-	s.galState.Store(opened)
-	s.rebuildBoundaries()
-	for i, a := range cfg.Galleries {
-		for _, b := range cfg.Galleries[i+1:] {
-			if gallery.SameFolder(a.GalleryPath, b.GalleryPath) {
-				logx.Warnf("galleries %q and %q share the folder %q: each indexes all of it", a.Name, b.Name, a.GalleryPath)
-			}
-		}
-		if err := s.inOwnFolder(a.GalleryPath); err != nil {
-			logx.Warnf("gallery %q: %v", a.Name, err)
-		}
-	}
+	s.sched = schedule.New(s.set, jobManager, schedHost{s}, s.ml, filepath.Join(filepath.Dir(configPath), "state.toml"), s.done)
 
 	if cfg.Server.ThemeColor != "" && !tags.IsValidCategoryColor(cfg.Server.ThemeColor) {
 		logx.Warnf("server.theme_color %q is not a #rgb / #rrggbb colour; the bundled palette is used", cfg.Server.ThemeColor)
@@ -200,12 +176,12 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 
 	go s.runMemoryReclaim()
 
-	go s.runScheduler()
+	go s.sched.Run()
 
 	go s.runPluginProbes()
 	s.seedThemesDir()
-	s.ensurePluginsDir()
-	s.startManagedPlugins()
+	plugins.EnsureDir(s.pluginsDir())
+	s.peers.StartManaged(s.effectivePlugins())
 
 	return s, nil
 }
@@ -222,14 +198,6 @@ const (
 )
 
 func reclaimDue(jobEnded bool, since time.Duration) bool { return jobEnded || since >= reclaimInterval }
-
-// An export holds a read connection the shrink would wait on for the whole stream.
-func shrinkGalleryMemory(cx *galleryCtx) error {
-	if cx.Exporting() {
-		return nil
-	}
-	return cx.DB.ShrinkMemory(context.Background())
-}
 
 func (s *Server) runMemoryReclaim() {
 	ticker := time.NewTicker(reclaimTick)
@@ -249,20 +217,16 @@ func (s *Server) runMemoryReclaim() {
 			seen, last = ended, time.Now()
 			ctxs := s.allContexts()
 			for _, cx := range ctxs {
-				dropped := counts.ReleaseIdleCountedTags(cx.DB, idleIndexReleaseAfter)
-				if cx.BKTree != nil && cx.BKTree.ReleaseIdle(idleIndexReleaseAfter) {
-					dropped = true
-				}
+				dropped, err := cx.ReleaseIdle(idleIndexReleaseAfter)
 				if dropped {
 					logx.Debugf("memory reclaim %q: dropped idle indexes", cx.Name)
 				}
-				if err := shrinkGalleryMemory(cx); err != nil {
+				if err != nil {
 					logx.Warnf("memory reclaim %q: %v", cx.Name, err)
 				}
 			}
-			search.AdjacencyCacheSweep()
-			s.fetchStatus.prune()
-			s.reconcileAllLookups()
+			s.ml.Fetches.Prune()
+			s.ml.ReconcileAll(s.allContexts())
 			debug.FreeOSMemory()
 			s.cfgMu.Lock()
 			mins := s.cfg.Tagger.IdleReleaseAfterMinutes
@@ -284,35 +248,24 @@ func (s *Server) runMemoryReclaim() {
 	}
 }
 
-// Published values are immutable: writers hold ctxMu, clone, mutate the
-// clone and store it.
-type galleryState struct {
-	contexts map[string]*galleryCtx
-	active   string
+func (s *Server) activeGallery() string { return s.set.ActiveName() }
+
+func (s *Server) active() *library.Gallery { return s.set.Active() }
+
+// get answers a member an import or a refused rename closed and could not
+// reopen as it does an unknown name.
+func (s *Server) get(name string) *library.Gallery {
+	if cx := s.set.Get(name); cx != nil && !cx.Closed() {
+		return cx
+	}
+	return nil
 }
-
-func (st *galleryState) clone() *galleryState {
-	next := &galleryState{contexts: make(map[string]*galleryCtx, len(st.contexts)+1), active: st.active}
-	maps.Copy(next.contexts, st.contexts)
-	return next
-}
-
-func (s *Server) galleryState() *galleryState { return s.galState.Load() }
-
-func (s *Server) activeGallery() string { return s.galleryState().active }
-
-func (s *Server) active() *galleryCtx {
-	st := s.galleryState()
-	return st.contexts[st.active]
-}
-
-func (s *Server) get(name string) *galleryCtx { return s.galleryState().contexts[name] }
 
 type routeMode int
 
 const (
 	modeRead routeMode = iota
-	// The handler takes ctxMu.Lock itself; a read lock taken at
+	// The handler takes the set's write lock itself; a read lock taken at
 	// registration would deadlock it.
 	modeWrite
 	// No lock: the handler must not keep a gallery context across a
@@ -341,8 +294,8 @@ func (rt *routes) add(pattern string, mode routeMode, h http.HandlerFunc) {
 func (rt *routes) read(pattern string, h http.HandlerFunc) {
 	s := rt.s
 	rt.add(pattern, modeRead, func(w http.ResponseWriter, r *http.Request) {
-		s.ctxMu.RLock()
-		defer s.ctxMu.RUnlock()
+		s.set.RLock()
+		defer s.set.RUnlock()
 		if pageGalleryStale(w, r, s.activeGallery()) {
 			return
 		}
@@ -354,15 +307,11 @@ func (rt *routes) write(pattern string, h http.HandlerFunc) { rt.add(pattern, mo
 
 func (rt *routes) free(pattern string, h http.HandlerFunc) { rt.add(pattern, modeFree, h) }
 
-// StartWatchers watches every gallery, not just the active one, and
-// pre-warms each one's caches.
-func (s *Server) StartWatchers() {
-	s.ctxMu.Lock()
-	defer s.ctxMu.Unlock()
-	for _, cx := range s.galleryState().contexts {
-		cx.StartBackground(s.cfg.Gallery.WatchEnabled, s.cfg.Gallery.MaxFileSizeMB, s.ingestNaming(cx.Name), s.jobs)
-		go cx.WarmCaches()
-	}
+func (s *Server) StartWatchers() { s.set.StartBackground() }
+
+func (s *Server) background(name string) library.Background {
+	watch, maxMB := s.watcherSettings()
+	return library.Background{Watch: watch, MaxFileSizeMB: maxMB, Naming: s.ingestNaming(name)}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -389,11 +338,11 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.free("GET /manifest.json", s.manifestHandler)
 	rt.free("GET /thumbnails/{gallery}/{file}", s.serveThumbnail)
 	// Found, not permanent: the target follows the active theme.
-	rt.read("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+	rt.free("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, s.booruFaviconURL(), http.StatusFound)
 	})
 
-	rt.read("GET /health", func(w http.ResponseWriter, r *http.Request) {
+	rt.free("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		// Not refused over its Origin: the browser blocks a cross-origin
 		// read itself, and a monitor sending one still gets an answer.
 		api.SetCORS(w, r, s.cfgSnapshot())
@@ -404,9 +353,9 @@ func (s *Server) registerRoutes(rt *routes) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"app": "monbooru", "status": "ok", "version": Version})
 	})
 
-	rt.read("GET /login", s.loginPage)
-	rt.read("POST /login", s.loginPost)
-	rt.read("POST /logout", s.logoutPost)
+	rt.free("GET /login", s.loginPage)
+	rt.free("POST /login", s.loginPost)
+	rt.free("POST /logout", s.logoutPost)
 
 	rt.free("POST /upload", s.uploadPost)
 
@@ -509,25 +458,25 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("GET /settings", s.settingsHandler)
 	rt.read("POST /settings/general", s.settingsGeneralPost)
 	rt.read("POST /settings/general/ignore", s.settingsIgnorePost)
-	rt.read("POST /settings/monloader", s.settingsMonloaderPost)
+	rt.free("POST /settings/monloader", s.settingsMonloaderPost)
 	rt.read("POST /settings/tagger", s.settingsTaggerPost)
-	rt.read("POST /settings/auth/password", s.settingsPasswordPost)
-	rt.read("POST /settings/auth/remove-password", s.settingsRemovePasswordPost)
-	rt.read("POST /settings/auth/tokens", s.settingsTokenCreate)
-	rt.read("DELETE /settings/auth/tokens/{id}", s.settingsTokenRevoke)
-	rt.read("GET /settings/auth/tokens/{id}/privileges", s.settingsTokenPrivilegesGet)
-	rt.read("POST /settings/auth/tokens/{id}/privileges", s.settingsTokenPrivilegesPost)
+	rt.free("POST /settings/auth/password", s.settingsPasswordPost)
+	rt.free("POST /settings/auth/remove-password", s.settingsRemovePasswordPost)
+	rt.free("POST /settings/auth/tokens", s.settingsTokenCreate)
+	rt.free("DELETE /settings/auth/tokens/{id}", s.settingsTokenRevoke)
+	rt.free("GET /settings/auth/tokens/{id}/privileges", s.settingsTokenPrivilegesGet)
+	rt.free("POST /settings/auth/tokens/{id}/privileges", s.settingsTokenPrivilegesPost)
 	rt.read("PATCH /settings/categories/{id}", s.updateCategoryPatch)
 	rt.read("POST /settings/schedule", s.settingsSchedulePost)
 	rt.read("POST /settings/schedule/run", s.settingsScheduleRunPost)
 	rt.read("GET /setup", s.setupPage)
 	// The wizard's submit repoints the default gallery.
 	rt.write("POST /setup", s.setupPost)
-	rt.read("GET /internal/browse", s.browseDirs)
-	rt.read("POST /internal/open-folder", s.openFolder)
-	rt.read("POST /settings/desktop", s.settingsDesktopPost)
-	rt.read("POST /settings/quit", s.settingsQuit)
-	rt.read("POST /settings/restart", s.settingsRestart)
+	rt.free("GET /internal/browse", s.browseDirs)
+	rt.free("POST /internal/open-folder", s.openFolder)
+	rt.free("POST /settings/desktop", s.settingsDesktopPost)
+	rt.free("POST /settings/quit", s.settingsQuit)
+	rt.free("POST /settings/restart", s.settingsRestart)
 	rt.read("POST /settings/maintenance/prune-missing", s.pruneMissingImagesPost)
 	rt.read("POST /settings/maintenance/prune-orphaned-thumbnails", s.pruneOrphanedThumbnailsPost)
 	rt.read("POST /settings/maintenance/empty-folders", s.emptyFoldersScanPost)
@@ -537,14 +486,12 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /settings/maintenance/find-folded-duplicates", s.findFoldedDuplicatesPost)
 	rt.read("POST /settings/maintenance/lookup-due", s.lookupDuePost)
 	rt.read("GET /settings/maintenance/duplicates-list", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/relations/file-duplicates/list", http.StatusMovedPermanently)
+		http.Redirect(w, r, "/relations/duplicates/sha256", http.StatusMovedPermanently)
 	})
 	rt.read("POST /settings/maintenance/remove-duplicates", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/relations/file-duplicates/remove", http.StatusMovedPermanently)
 	})
-	rt.read("GET /relations/file-duplicates/list", s.duplicatesListHandler)
 	rt.read("POST /relations/file-duplicates/remove", s.removeDuplicatesPost)
-	rt.read("POST /relations/file-duplicates/promote", s.promoteAliasPathPost)
 	rt.read("GET /relations/duplicates/sha256", s.sha256WalkerPage)
 	rt.read("POST /relations/duplicates/sha256/remove-one", s.sha256WalkerRemoveOnePost)
 	rt.read("GET /relations/duplicates/marked", s.markedWalkerPage)
@@ -609,7 +556,7 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /internal/batch-download/count", s.batchDownloadCount)
 	rt.read("POST /internal/delete-search", s.deleteSearchPost)
 	rt.read("POST /tags/delete-search", s.deleteTagsSearchPost)
-	rt.free("POST /tags/ptr-lookup-search", s.ptrLookupSearchPost)
+	rt.read("POST /tags/ptr-lookup-search", s.ptrLookupSearchPost)
 	rt.free("GET /tags/{id}/ptr-contrib-panel", s.tagPtrContribPanel)
 	rt.free("GET /tags/{id}/ptr-contrib-dialog", s.tagPtrContribDialog)
 	rt.free("POST /tags/{id}/ptr-contrib", s.tagPtrContribSend)
@@ -660,45 +607,31 @@ func (s *Server) registerRoutes(rt *routes) {
 	// methods are spelled out: a bare "/api/v1/" conflicts with "GET /".
 	apiMux := http.NewServeMux()
 	api.New(s.cfgSnapshot, s.jobs, s.apiResolver, Version).WithGalleryLock(func() func() {
-		s.ctxMu.RLock()
-		return s.ctxMu.RUnlock
-	}).Mount(apiMux)
+		s.set.RLock()
+		return s.set.RUnlock
+	}).WithFetchStatus(s.ml.Fetches.Record).WithMemoryMark(autotagMemoryMark).Mount(apiMux)
 	// The exact pairing routes above answer ahead of this subtree, so
 	// they skip notePeerAddress: none of them may move a peer.
 	apiHandler := s.notePeerAddress(apiMux.ServeHTTP)
 	// The uploads take the gallery lock themselves, once their body is in.
 	rt.free("POST /api/v1/images", apiHandler)
 	rt.free("POST /api/v1/images/{id}/file", apiHandler)
-	for _, method := range []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"} {
+	for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} {
 		rt.read(method+" /api/v1/", apiHandler)
 	}
 }
 
-func (s *Server) allContexts() []*galleryCtx {
-	st := s.galleryState()
-	out := make([]*galleryCtx, 0, len(st.contexts))
-	for _, cx := range st.contexts {
-		out = append(out, cx)
-	}
-	return out
+func (s *Server) allContexts() []*library.Gallery {
+	return slices.DeleteFunc(s.set.All(), (*library.Gallery).Closed)
 }
 
-func (s *Server) apiResolver(name string) (api.Gallery, bool) {
-	var cx *galleryCtx
+func (s *Server) apiResolver(name string) (*library.Gallery, bool) {
 	if name == "" {
-		cx = s.active()
-	} else {
-		cx = s.get(name)
+		cx := s.active()
+		return cx, cx != nil
 	}
-	if cx == nil {
-		return api.Gallery{}, false
-	}
-	return api.Gallery{
-		Handle:           cx.Handle,
-		RelationsSvc:     cx.RelationsSvc,
-		InvalidateCaches: cx.InvalidateCaches,
-		RecordFetch:      func(id int64, state, msg string) { s.fetchStatus.record(cx.Name, id, state, msg) },
-	}, true
+	cx := s.get(name)
+	return cx, cx != nil
 }
 
 func isNoisyPath(path string) bool {
@@ -803,8 +736,8 @@ type baseData struct {
 	MonloaderUsable     bool
 	MonloaderConn       string
 	MonloaderVersion    string
+	MonloaderSeen       string
 	MonloaderPTR        bool
-	MonloaderContrib    bool
 	MonloaderPTRSyncing bool
 	// The render gate, where MonloaderPTR is the live one: a paused or
 	// unreachable link reports no PTR, so it counts as present.
@@ -835,14 +768,13 @@ func (s *Server) base(r *http.Request, nav, title string) baseData {
 	}
 	inboxNavActive := inboxFilterActive(search.Parse(r.URL.Query().Get("q")))
 	galleries := s.galleries()
-	active := readRatingCookie(r)
-	active = cmp.Or(active, "explicit")
-	ml := s.mlStatus.Seed()
-	if s.monloaderPaused() {
-		ml = monloader.Status{Conn: "paused"}
+	active := cmp.Or(readRatingCookie(r), "explicit")
+	ml := s.ml.Status()
+	if s.ml.Paused() {
+		ml = monloader.Status{Conn: peer.ConnPaused}
 	}
-	paired := s.pairedWith("monloader")
-	monloaderUsable := s.monloaderUsable()
+	paired := s.pairedWith(monloader.App)
+	monloaderUsable := s.ml.Usable()
 	themeSheet := s.activeTheme().Path != ""
 	return baseData{
 		Title:               title,
@@ -864,10 +796,10 @@ func (s *Server) base(r *http.Request, nav, title string) baseData {
 		MonloaderUsable:     monloaderUsable,
 		MonloaderConn:       ml.Conn,
 		MonloaderVersion:    ml.Version,
+		MonloaderSeen:       ml.Panels(),
 		MonloaderPTR:        ml.PTR,
 		MonloaderPTRSyncing: ml.PTRSyncing,
 		MonloaderPTRPresent: paired && (ml.PTR || ml.PTRSyncing || !monloaderUsable),
-		MonloaderContrib:    ml.Contrib,
 		ActiveGallery:       s.activeGallery(),
 		Galleries:           galleries,
 		VisibleCount:        visible,
@@ -923,22 +855,10 @@ func (s *Server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, fullPath)
 }
 
-func (s *Server) serveConfiguredFile(w http.ResponseWriter, r *http.Request, path, kind string) {
-	if path == "" {
-		http.NotFound(w, r)
-		return
-	}
-	setGalleryScopedCache(w, "custom", kind, path)
-	http.ServeFile(w, r, path)
-}
-
 func (s *Server) booruName() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
-	if name := s.cfg.Server.BooruName; name != "" {
-		return name
-	}
-	return "Monbooru"
+	return cmp.Or(s.cfg.Server.BooruName, "Monbooru")
 }
 
 func (s *Server) modelPath() string {
@@ -1037,16 +957,21 @@ func (s *Server) defaultGallery() string {
 	return s.cfg.DefaultGallery
 }
 
-func (s *Server) derivePaths(name string) (string, string) {
-	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
-	return s.cfg.DerivePaths(name)
-}
-
 func (s *Server) executionProvider() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return s.cfg.Tagger.ExecutionProvider
+}
+
+func (s *Server) envPinned(key string) string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.EnvPinned(key)
+}
+
+// The password forms write both keys, so either one pinned locks them.
+func (s *Server) passwordPinned() string {
+	return cmp.Or(s.envPinned("auth.password_hash"), s.envPinned("auth.enable_password"))
 }
 
 // The slices settings writers edit in place are cloned; what their elements
@@ -1095,14 +1020,23 @@ func themeFaviconVersion(e themeEntry) string {
 	if err != nil {
 		return e.Name
 	}
-	return strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	return url.QueryEscape(e.Name) + "-" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+}
+
+func (s *Server) monloaderLink() monloader.LinkConfig {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	c := monloader.LinkConfig{APIURL: s.cfg.Monloader.APIURL, Token: s.cfg.Monloader.APIToken, Paused: s.cfg.Monloader.Paused}
+	if t := s.cfg.FindPairedToken(monloader.App); t != nil {
+		c.PeerURL, c.Paired = t.PeerURL, true
+	}
+	return c
 }
 
 func (s *Server) monloaderWebBase() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
-	base := s.cfg.Server.MonloaderURL
-	base = cmp.Or(base, s.cfg.Monloader.APIURL)
+	base := cmp.Or(s.cfg.Server.MonloaderURL, s.cfg.Monloader.APIURL)
 	return strings.TrimRight(base, "/")
 }
 
@@ -1280,11 +1214,7 @@ func (s *Server) Close() {
 	s.jobs.Cancel()
 	s.peers.StopAll()
 	tagger.ReleaseAll()
-	s.ctxMu.Lock()
-	defer s.ctxMu.Unlock()
-	for _, cx := range s.galleryState().contexts {
-		cx.Close()
-	}
+	s.set.Close()
 }
 
 func (s *Server) withConfig(fn func(*config.Config) error) error {
