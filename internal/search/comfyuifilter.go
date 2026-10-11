@@ -81,7 +81,7 @@ func (b *whereBuilder) comfyNumericTerm(name, op, value string) string {
 	// A throwaway builder: a rejected value must not leave args behind
 	// for a clause never emitted.
 	sub := &whereBuilder{}
-	clause := sub.buildCompFilter(`CAST(substr(term, `+off+`) AS REAL) %s ?`, comparison, parseFloatValue, parseFloatComp)
+	clause := sub.buildCompFilter(`CAST(substr(term, `+off+`) AS REAL) %s ?`, comparison, parseFloatValue)
 	if clause == "1=0" {
 		return "1=0"
 	}

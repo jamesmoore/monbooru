@@ -151,12 +151,7 @@ func (p *parser) peek() *token {
 	return &p.tokens[p.pos]
 }
 
-func (p *parser) next() {
-	if p.pos >= len(p.tokens) {
-		return
-	}
-	p.pos++
-}
+func (p *parser) next() { p.pos++ }
 
 func (p *parser) parseAll() []Expr {
 	var exprs []Expr
@@ -166,19 +161,6 @@ func (p *parser) parseAll() []Expr {
 			break
 		}
 
-		if t.kind == tokNot {
-			p.next()
-			next := p.peek()
-			if next == nil {
-				break
-			}
-			inner := p.parseTerm()
-			if inner != nil {
-				exprs = append(exprs, NotExpr{Expr: inner})
-			}
-			continue
-		}
-
 		// parseTerm returns nil at an OR, which would end the loop and
 		// drop the rest of the query.
 		if t.kind == tokOR {
@@ -186,30 +168,23 @@ func (p *parser) parseAll() []Expr {
 			continue
 		}
 
-		left := p.parseTerm()
-		if left == nil {
-			break
-		}
-
-		if or := p.peek(); or != nil && or.kind == tokOR {
-			expr := left
-			for {
-				next := p.peek()
-				if next == nil || next.kind != tokOR {
-					break
-				}
-				p.next()
-				right := p.parseOperand()
-				if right == nil {
-					break
-				}
-				expr = OrExpr{Left: expr, Right: right}
-			}
-			exprs = append(exprs, expr)
+		expr := p.parseOperand()
+		if expr == nil {
 			continue
 		}
-
-		exprs = append(exprs, left)
+		for {
+			or := p.peek()
+			if or == nil || or.kind != tokOR {
+				break
+			}
+			p.next()
+			right := p.parseOperand()
+			if right == nil {
+				break
+			}
+			expr = OrExpr{Left: expr, Right: right}
+		}
+		exprs = append(exprs, expr)
 	}
 	return exprs
 }
@@ -259,7 +234,7 @@ func (p *parser) parseTerm() Expr {
 			return TagExpr{Tag: "", Wildcard: ""}
 		}
 		if strings.HasPrefix(tag, "*") && strings.HasSuffix(tag, "*") && len(tag) > 2 {
-			return TagExpr{Tag: trimWildcards(tag), Wildcard: "substring"}
+			return TagExpr{Tag: tag[1 : len(tag)-1], Wildcard: "substring"}
 		}
 		if strings.HasSuffix(tag, "*") {
 			return TagExpr{Tag: strings.TrimSuffix(tag, "*"), Wildcard: "prefix"}
@@ -270,12 +245,6 @@ func (p *parser) parseTerm() Expr {
 		return TagExpr{Tag: tag, Wildcard: ""}
 	}
 	return nil
-}
-
-func trimWildcards(s string) string {
-	s = strings.TrimPrefix(s, "*")
-	s = strings.TrimSuffix(s, "*")
-	return s
 }
 
 func unescapeQuoted(s string) string {

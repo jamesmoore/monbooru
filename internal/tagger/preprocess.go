@@ -3,6 +3,7 @@
 package tagger
 
 import (
+	"cmp"
 	"fmt"
 	"image"
 	"sync"
@@ -47,34 +48,9 @@ var (
 var camieDefaultFill = [3]uint8{124, 116, 104}
 
 func padAndResize(src image.Image, size int, profile Profile) *image.RGBA {
-	switch profile.Pad {
-	case "mean_color_aspect":
-		return padMeanColorAspect(src, size, profile.FillColor)
-	}
-	return padWhiteSquare(src, size)
-}
-
-// The canvas starts at alpha 0, so one pass over alpha turns both the
-// padding and any transparent source pixel white.
-func padWhiteSquare(src image.Image, size int) *image.RGBA {
-	scaled, offX, offY := resizeAspect(src, size)
-
-	dst := image.NewRGBA(image.Rect(0, 0, size, size))
-	draw.Draw(dst, scaled.Bounds().Add(image.Pt(offX, offY)), scaled, image.Point{}, draw.Src)
-	for i := 3; i < len(dst.Pix); i += 4 {
-		if dst.Pix[i] == 0 {
-			dst.Pix[i-3] = 0xFF
-			dst.Pix[i-2] = 0xFF
-			dst.Pix[i-1] = 0xFF
-			dst.Pix[i] = 0xFF
-		}
-	}
-	return dst
-}
-
-func padMeanColorAspect(src image.Image, size int, fill [3]uint8) *image.RGBA {
-	if fill == ([3]uint8{}) {
-		fill = camieDefaultFill
+	fill := [3]uint8{0xff, 0xff, 0xff}
+	if profile.Pad == "mean_color_aspect" {
+		fill = cmp.Or(profile.FillColor, camieDefaultFill)
 	}
 	scaled, offX, offY := resizeAspect(src, size)
 
@@ -85,7 +61,9 @@ func padMeanColorAspect(src image.Image, size int, fill [3]uint8) *image.RGBA {
 		dst.Pix[i+2] = fill[2]
 		dst.Pix[i+3] = 0xFF
 	}
-	draw.Draw(dst, scaled.Bounds().Add(image.Pt(offX, offY)), scaled, image.Point{}, draw.Src)
+	// Over composites a (half-)transparent pixel onto the fill, as WD14's
+	// reference does onto white; buildTensor ignores alpha.
+	draw.Draw(dst, scaled.Bounds().Add(image.Pt(offX, offY)), scaled, image.Point{}, draw.Over)
 	return dst
 }
 

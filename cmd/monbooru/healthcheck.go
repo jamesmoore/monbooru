@@ -17,10 +17,7 @@ func runHealthcheck(argv []string) {
 	fs := flag.NewFlagSet("healthcheck", flag.ExitOnError)
 	configPath := fs.String("config", "", "optional monbooru.toml to read server.bind_address from")
 	timeout := fs.Duration("timeout", 3*time.Second, "probe timeout")
-	if err := fs.Parse(argv); err != nil {
-		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
-		os.Exit(2)
-	}
+	_ = fs.Parse(argv)
 
 	url := "http://" + resolveHealthAddr(*configPath) + "/health"
 	client := &http.Client{Timeout: *timeout}

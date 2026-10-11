@@ -1,11 +1,10 @@
-// Package counts caches whole-library tallies per gallery.
+// Package counts caches a gallery's whole-library tallies.
 package counts
 
 import (
 	"context"
 	"fmt"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,57 +12,45 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-type cache struct {
-	db                  *db.DB
-	untaggedVisible     atomic.Pointer[int]
-	autoUntaggedVisible atomic.Pointer[int]
+type Tallies struct {
+	db *db.DB
+	// A read stamps what it stores with the generation it read before its
+	// query, so a count taken before an invalidation cannot outlive it.
+	gen                 atomic.Uint64
+	untaggedVisible     atomic.Pointer[stampedCount]
+	autoUntaggedVisible atomic.Pointer[stampedCount]
 	// Cheap, but the tag-pairs pass divides by it once per image.
-	visibleCount     atomic.Pointer[int]
+	visibleCount     atomic.Pointer[stampedCount]
 	countedTags      atomic.Pointer[CountedTags]
-	inboxCount       atomic.Pointer[int]
-	tagCount         atomic.Pointer[int]
-	collectionsCount atomic.Pointer[int]
-	phashMissing     atomic.Pointer[int]
+	inboxCount       atomic.Pointer[stampedCount]
+	tagCount         atomic.Pointer[stampedCount]
+	collectionsCount atomic.Pointer[stampedCount]
+	phashMissing     atomic.Pointer[stampedCount]
 }
 
-var (
-	mu     sync.Mutex
-	caches = map[*db.DB]*cache{}
-)
-
-func forDB(database *db.DB) *cache {
-	mu.Lock()
-	defer mu.Unlock()
-	c, ok := caches[database]
-	if !ok {
-		c = &cache{db: database}
-		caches[database] = c
-	}
-	return c
+type stampedCount struct {
+	n   int
+	gen uint64
 }
 
-func Release(database *db.DB) {
-	mu.Lock()
-	delete(caches, database)
-	mu.Unlock()
-}
+func New(database *db.DB) *Tallies { return &Tallies{db: database} }
 
-func (c *cache) cachedCount(slot *atomic.Pointer[int], sql string) (int, bool) {
-	if p := slot.Load(); p != nil {
-		return *p, true
+func (c *Tallies) cachedCount(slot *atomic.Pointer[stampedCount], sql string) (int, bool) {
+	gen := c.gen.Load()
+	if p := slot.Load(); p != nil && p.gen == gen {
+		return p.n, true
 	}
 	var n int
 	if err := c.db.Read.QueryRow(sql).Scan(&n); err != nil {
 		return 0, false
 	}
-	slot.Store(&n)
+	slot.Store(&stampedCount{n: n, gen: gen})
 	return n, true
 }
 
 // UntaggedVisibleCount must leave out the derived meta rows exactly as
 // the tagged: filter does, or the header count disagrees with the grid.
-func UntaggedVisibleCount(database *db.DB) (int, bool) {
-	c := forDB(database)
+func (c *Tallies) UntaggedVisibleCount() (int, bool) {
 	return c.cachedCount(&c.untaggedVisible,
 		`SELECT COUNT(*) FROM images i
 		 WHERE is_missing = 0
@@ -71,13 +58,11 @@ func UntaggedVisibleCount(database *db.DB) (int, bool) {
 		                    AND it.tagger_name IS NOT '`+models.TagSourceMonbooru+`')`)
 }
 
-func VisibleCount(database *db.DB) (int, bool) {
-	c := forDB(database)
+func (c *Tallies) VisibleCount() (int, bool) {
 	return c.cachedCount(&c.visibleCount, `SELECT COUNT(*) FROM images WHERE is_missing = 0`)
 }
 
-func AutoUntaggedVisibleCount(database *db.DB) (int, bool) {
-	c := forDB(database)
+func (c *Tallies) AutoUntaggedVisibleCount() (int, bool) {
 	return c.cachedCount(&c.autoUntaggedVisible,
 		`SELECT COUNT(*) FROM images i
 		 WHERE is_missing = 0
@@ -87,35 +72,33 @@ func AutoUntaggedVisibleCount(database *db.DB) (int, bool) {
 		       )`)
 }
 
-func InboxCount(database *db.DB) (int, bool) {
-	c := forDB(database)
+func (c *Tallies) InboxCount() (int, bool) {
 	return c.cachedCount(&c.inboxCount, `SELECT COUNT(*) FROM images WHERE is_missing = 0 AND is_inbox = 1`)
 }
 
-func TagCount(database *db.DB) (int, bool) {
-	c := forDB(database)
+func (c *Tallies) TagCount() (int, bool) {
 	return c.cachedCount(&c.tagCount, `SELECT COUNT(*) FROM tags WHERE is_alias = 0`)
 }
 
-func CollectionsCount(database *db.DB) (int, bool) {
-	c := forDB(database)
+func (c *Tallies) CollectionsCount() (int, bool) {
 	return c.cachedCount(&c.collectionsCount, `SELECT COUNT(*) FROM collection_counts WHERE visible_count > 0`)
 }
 
-func PhashMissing(database *db.DB) (int, bool) {
-	c := forDB(database)
+func (c *Tallies) PhashMissing() (int, bool) {
 	return c.cachedCount(&c.phashMissing, `SELECT COUNT(*) FROM images WHERE phash IS NULL AND is_missing = 0`)
 }
 
 // InvalidatePhashMissing is for phash writes that leave image membership
 // alone; anything else calls Invalidate.
-func InvalidatePhashMissing(database *db.DB) {
-	forDB(database).phashMissing.Store(nil)
+func (c *Tallies) InvalidatePhashMissing() {
+	c.gen.Add(1)
+	c.phashMissing.Store(nil)
 }
 
 // CountedTags keeps parallel id-sorted slices rather than a map: a million
 // images cost 12 MB here against about four times that in map buckets.
 type CountedTags struct {
+	gen      uint64
 	maxUsage int64
 	ids      []int64
 	totals   []int32
@@ -129,13 +112,13 @@ func (c *CountedTags) Total(id int64) int32 {
 	return 0
 }
 
-func CountedTagTotals(ctx context.Context, database *db.DB, maxUsage int64) (*CountedTags, error) {
-	c := forDB(database)
-	if t := c.countedTags.Load(); t != nil && t.maxUsage == maxUsage {
+func (c *Tallies) CountedTagTotals(ctx context.Context, maxUsage int64) (*CountedTags, error) {
+	gen := c.gen.Load()
+	if t := c.countedTags.Load(); t != nil && t.gen == gen && t.maxUsage == maxUsage {
 		t.used.Store(time.Now().UnixNano())
 		return t, nil
 	}
-	rows, err := database.Read.QueryContext(ctx,
+	rows, err := c.db.Read.QueryContext(ctx,
 		`SELECT it.image_id, count(*)
 		   FROM image_tags it
 		   JOIN tags t ON t.id = it.tag_id
@@ -146,7 +129,7 @@ func CountedTagTotals(ctx context.Context, database *db.DB, maxUsage int64) (*Co
 		return nil, fmt.Errorf("counted tag totals: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	totals := &CountedTags{maxUsage: maxUsage}
+	totals := &CountedTags{gen: gen, maxUsage: maxUsage}
 	for rows.Next() {
 		var id int64
 		var total int32
@@ -164,8 +147,7 @@ func CountedTagTotals(ctx context.Context, database *db.DB, maxUsage int64) (*Co
 	return totals, nil
 }
 
-func ReleaseIdleCountedTags(database *db.DB, after time.Duration) bool {
-	c := forDB(database)
+func (c *Tallies) ReleaseIdleCountedTags(after time.Duration) bool {
 	t := c.countedTags.Load()
 	if t == nil || time.Since(time.Unix(0, t.used.Load())) < after {
 		return false
@@ -174,8 +156,8 @@ func ReleaseIdleCountedTags(database *db.DB, after time.Duration) bool {
 }
 
 // Invalidate must follow every write that changes image_tags membership.
-func Invalidate(database *db.DB) {
-	c := forDB(database)
+func (c *Tallies) Invalidate() {
+	c.gen.Add(1)
 	c.untaggedVisible.Store(nil)
 	c.autoUntaggedVisible.Store(nil)
 	c.visibleCount.Store(nil)

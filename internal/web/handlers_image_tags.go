@@ -1,17 +1,16 @@
 package web
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -33,32 +32,25 @@ func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
 		generalID = cx.GeneralCategoryID
 	}
 
-	categories, err := s.categoryIDsByName()
-	if err != nil {
-		return nil, nil, err.Error()
-	}
-
 	var catTags []catTag
 	var rejected []string
 	// Unknown prefixes stay in the name and get reported: they may be typos.
 	var unknownCats []string
 	for _, name := range tokens {
-		if idx := strings.Index(name, ":"); idx > 0 {
-			catName := name[:idx]
-			tagName := name[idx+1:]
-			if catID, ok := categories[catName]; ok {
-				if tagName == "" {
-					rejected = append(rejected, "rejected: "+name+": empty tag name after category prefix")
-					continue
-				}
-				catTags = append(catTags, catTag{catID, tagName})
-				continue
+		f, err := tags.SplitForm(s.db(), name)
+		switch {
+		case err != nil:
+			return nil, nil, err.Error()
+		case f.CategoryID != 0 && f.Name == "":
+			rejected = append(rejected, "rejected: "+name+": "+tags.ErrEmptyFormName.Error())
+		case f.CategoryID != 0:
+			catTags = append(catTags, catTag{f.CategoryID, f.Name})
+		default:
+			if f.Namespace != "" && !slices.Contains(unknownCats, f.Namespace) {
+				unknownCats = append(unknownCats, f.Namespace)
 			}
-			if !slices.Contains(unknownCats, catName) {
-				unknownCats = append(unknownCats, catName)
-			}
+			catTags = append(catTags, catTag{generalID, f.Name})
 		}
-		catTags = append(catTags, catTag{generalID, name})
 	}
 
 	return catTags, unknownCats, strings.Join(rejected, "; ")
@@ -66,27 +58,6 @@ func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
 
 func unknownCategoryNote(unknownCats []string) string {
 	return joinLabeled("no category named ", ", ", unknownCats)
-}
-
-// Errors propagate: a dropped category would reparse character:foo as general.
-func (s *Server) categoryIDsByName() (map[string]int64, error) {
-	type catRow struct {
-		id   int64
-		name string
-	}
-	cats, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (catRow, error) {
-		var c catRow
-		err := rows.Scan(&c.id, &c.name)
-		return c, err
-	}, `SELECT id, name FROM tag_categories`)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64, len(cats))
-	for _, c := range cats {
-		out[c.name] = c.id
-	}
-	return out, nil
 }
 
 func splitTagTokens(s string) ([]string, error) {
@@ -203,7 +174,6 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if mutated {
-		s.active().InvalidateCaches()
 		w.Header().Set("HX-Trigger", "tags-changed")
 	}
 
@@ -239,15 +209,22 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request, id int64, errMsg, warnMsg, okMsg string, clearInput bool) {
 	folderPath, imageTags, _ := s.tagSvc().GetImageTags(id)
-	csrfToken := s.csrfToken(sessionFromContext(r.Context()))
 	tagMode := readTagModeCookie(r)
 	if requested := r.URL.Query().Get("tagmode"); requested != "" {
 		tagMode = normalizeTagMode(requested)
 		writeTagModeCookie(w, tagMode)
 	}
 	hasUserTags, hasStaleTags := userAndStaleTags(imageTags)
-	back := parseBackContext(r)
-	// Callers invalidate first, so this tally reads post-write.
+	// The tag routes carry no back context; the page they were sent from does.
+	pageQuery := r.URL.Query()
+	if u, err := url.Parse(r.Header.Get("HX-Current-URL")); err == nil && u.RawQuery != "" {
+		pageQuery = u.Query()
+	}
+	back := backContextFrom(pageQuery)
+	ref := ""
+	if refID, err := strconv.ParseInt(pageQuery.Get("ref"), 10, 64); err == nil && refID != id {
+		ref = strconv.FormatInt(refID, 10)
+	}
 	tagCount := 0
 	if cx := s.active(); cx != nil {
 		tagCount, _ = cx.TagCount()
@@ -262,7 +239,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 	s.renderTemplate(w, "partials/tag_list.html", map[string]any{
 		"ImageID":          id,
 		"ImageTags":        imageTags,
-		"TagSidebar":       s.buildTagSidebar(id, csrfToken, tagMode, imageTags),
+		"TagSidebar":       s.buildTagSidebar(id, tagMode, imageTags),
 		"SidebarTags":      true,
 		"SidebarCollapsed": sidebarCollapsed(r),
 		"DangerZone":       true,
@@ -276,8 +253,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 		"BackOrder":        back.Order,
 		"BackPage":         back.Page,
 		"BackSeed":         back.Seed,
-		"CSRFToken":        csrfToken,
-		"EditMode":         true,
+		"Ref":              ref,
 		"ErrMsg":           errMsg,
 		"WarnMsg":          warnMsg,
 		"OkMsg":            okMsg,
@@ -378,14 +354,10 @@ func (s *Server) removeStaleTagsFromImageHandler(w http.ResponseWriter, r *http.
 }
 
 func removedTagsMsg(removed int) string {
-	switch removed {
-	case 0:
+	if removed == 0 {
 		return ""
-	case 1:
-		return "removed 1 tag"
-	default:
-		return fmt.Sprintf("removed %d tags", removed)
 	}
+	return fmt.Sprintf("removed %d tag%s", removed, plural(removed))
 }
 
 func (s *Server) removeImageTagsHandler(w http.ResponseWriter, r *http.Request, remove func(int64) (int, error)) {
@@ -405,40 +377,31 @@ func (s *Server) removeImageTagsWithMsg(w http.ResponseWriter, r *http.Request, 
 		s.renderTagListWithSidebar(w, r, id, err.Error(), "", "", false)
 		return
 	}
-	s.active().InvalidateCaches()
-	w.Header().Set("HX-Trigger", "tags-changed")
+	if msg != "" {
+		w.Header().Set("HX-Trigger", "tags-changed")
+	}
 	s.renderTagListWithSidebar(w, r, id, "", "", msg, false)
 }
 
 func (s *Server) removeTagFromImage(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt64(w, r, "id")
-	if !ok {
-		return
-	}
 	tagID, ok := pathInt64(w, r, "tagID")
 	if !ok {
 		return
 	}
-
-	var name string
-	_ = s.db().Read.QueryRow(`SELECT name FROM tags WHERE id = ?`, tagID).Scan(&name)
-
-	if err := s.tagSvc().RemoveTagFromImage(id, tagID); err != nil {
-		s.renderTagListWithSidebar(w, r, id, err.Error(), "", "", false)
-		return
-	}
-	s.active().InvalidateCaches()
-	w.Header().Set("HX-Trigger", "tags-changed")
-	okMsg := "removed 1 tag"
-	if name != "" {
-		okMsg = "removed: " + name
-	}
-	s.renderTagListWithSidebar(w, r, id, "", "", okMsg, false)
+	s.removeImageTagsWithMsg(w, r, func(id int64) (string, error) {
+		var name string
+		_ = s.db().Read.QueryRow(`SELECT name FROM tags WHERE id = ?`, tagID).Scan(&name)
+		removed, err := s.tagSvc().RemoveTagFromImage(id, tagID)
+		if err != nil || removed == 0 {
+			return "", err
+		}
+		return "removed: " + name, nil
+	})
 }
 
 // Always category-qualified: a miss is usually a wrong category.
 func (s *Server) tagTokenLabel(ct catTag) string {
-	categories, err := s.categoryIDsByName()
+	categories, err := tags.CategoryIDsByName(s.db().Read)
 	if err != nil {
 		return ct.name
 	}
@@ -505,8 +468,6 @@ func (s *Server) changeTagCategory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, svcErr.Error(), tagCategoryStatus(svcErr))
 		return
 	}
-	// cat: and category-qualified searches match differently after the move.
-	s.active().InvalidateCaches()
 	if isHTMXRequest(r) {
 		if merged {
 			writeInlineFlash(w, "ok", "Merged into the existing tag.")

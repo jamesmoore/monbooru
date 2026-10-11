@@ -10,6 +10,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/tags"
 )
 
 // MoveImageResult's Moved and Renamed report what actually changed, not
@@ -24,13 +25,6 @@ type MoveImageResult struct {
 	Suffixed         bool
 }
 
-// PlaceImage leaves alone whichever of folder and name is nil. Callers
-// holding a watcher must run it under a job type the watcher suppresses,
-// or its events race the DB update.
-func PlaceImage(database *db.DB, b *Boundary, id int64, targetFolder, newName *string) (*MoveImageResult, error) {
-	return placeImage(database, b, id, targetFolder, newName, "place")
-}
-
 type placement struct {
 	oldCanonical string
 	destDir      string
@@ -41,7 +35,7 @@ type placement struct {
 }
 
 // plan touches nothing on disk, so a dry run can share it with the run.
-func plan(database *db.DB, b *Boundary, id int64, folder, name *string, verb string) (placement, error) {
+func plan(database *db.DB, b *Boundary, id int64, folder, name *string) (placement, error) {
 	var p placement
 	if name != nil {
 		p.base = strings.TrimSpace(*name)
@@ -51,7 +45,7 @@ func plan(database *db.DB, b *Boundary, id int64, folder, name *string, verb str
 		p.base = TruncateFilename(p.base, maxNameBytes)
 	}
 
-	oldCanonical, oldFolder, err := loadMoveSource(database, b, id, verb)
+	oldCanonical, oldFolder, err := loadMoveSource(database, b, id)
 	if err != nil {
 		return p, err
 	}
@@ -89,23 +83,36 @@ func plan(database *db.DB, b *Boundary, id int64, folder, name *string, verb str
 	return p, nil
 }
 
-// PlannedPath writes nothing, so the caller adds each result to claimed for
-// the rows after it; numbered reports that the destination was taken.
-func PlannedPath(database *db.DB, b *Boundary, id int64, folder, name *string, claimed map[string]struct{}) (path string, numbered bool, err error) {
-	p, err := plan(database, b, id, folder, name, "place")
+// PlannedPath writes nothing; one planned map passed through a run's rows in
+// order sees each earlier destination taken and each path it frees free.
+// numbered reports that the destination was taken.
+func PlannedPath(database *db.DB, b *Boundary, id int64, folder, name *string, planned map[string]bool) (path string, numbered bool, err error) {
+	p, err := plan(database, b, id, folder, name)
 	if err != nil {
 		return "", false, err
 	}
 	path = filepath.Join(p.destDir, p.base)
 	if !p.moved && !p.renamed {
+		planned[path] = true
 		return path, false, nil
 	}
-	resolved := uniquePathIn(p.destDir, p.base, claimed, placementSuffix(p.renamed))
+	resolved := uniquePathIn(p.destDir, p.base, planned, placementSuffix(p.renamed))
+	// A path an earlier row frees still holds that row's canonical here.
+	if _, freed := planned[resolved]; !freed {
+		if err := refuseAliasCollision(database, id, resolved); err != nil {
+			return "", false, err
+		}
+	}
+	planned[p.oldCanonical] = false
+	planned[resolved] = true
 	return resolved, resolved != path, nil
 }
 
-func placeImage(database *db.DB, b *Boundary, id int64, folder, name *string, verb string) (*MoveImageResult, error) {
-	p, err := plan(database, b, id, folder, name, verb)
+// PlaceImage leaves alone whichever of folder and name is nil. Callers
+// holding a watcher must run it under a job type the watcher suppresses,
+// or its events race the DB update.
+func PlaceImage(database *db.DB, b *Boundary, id int64, folder, name *string) (*MoveImageResult, error) {
+	p, err := plan(database, b, id, folder, name)
 	if err != nil {
 		return nil, err
 	}
@@ -122,16 +129,19 @@ func placeImage(database *db.DB, b *Boundary, id int64, folder, name *string, ve
 		return nil, fmt.Errorf("create destination folder: %w", err)
 	}
 
-	newPath := uniquePathBy(destDir, base, placementSuffix(renamed))
-
+	newPath, err := createUniqueBy(destDir, base, placementSuffix(renamed))
+	if err != nil {
+		return nil, fmt.Errorf("reserve destination: %w", err)
+	}
 	if err := refuseAliasCollision(database, id, newPath); err != nil {
+		_ = os.Remove(newPath)
 		return nil, err
 	}
 	folderArg := &newFolder
 	if folder == nil {
 		folderArg = nil
 	}
-	if err := commitRename(database, verb, id, oldCanonical, newPath, folderArg); err != nil {
+	if err := commitRename(database, id, oldCanonical, newPath, folderArg); err != nil {
 		return nil, err
 	}
 
@@ -150,25 +160,37 @@ func placeImage(database *db.DB, b *Boundary, id int64, folder, name *string, ve
 
 // An empty dropOldPath demotes the current canonical to an alias instead
 // of dropping it, as a reactivation wants.
-func repointCanonical(e db.Execer, id int64, newPath, newFolder, dropOldPath string) error {
-	if _, err := e.Exec(
-		`UPDATE images SET canonical_path = ?, folder_path = ?, is_missing = 0 WHERE id = ?`,
+func repointCanonical(tx *sql.Tx, id int64, newPath, newFolder, dropOldPath string) error {
+	var owner int64
+	switch err := tx.QueryRow(
+		`SELECT image_id FROM image_paths WHERE path = ? AND image_id != ?`, newPath, id,
+	).Scan(&owner); {
+	case err == nil:
+		return fmt.Errorf("%q is a path of image %d", newPath, owner)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("check the new path's owner: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE images SET canonical_path = ?, folder_path = ? WHERE id = ?`,
 		newPath, newFolder, id,
 	); err != nil {
 		return fmt.Errorf("point row at the new path: %w", err)
 	}
+	if _, err := setMissingTx(tx, []int64{id}, false); err != nil {
+		return fmt.Errorf("mark row present: %w", err)
+	}
 	if dropOldPath == "" {
-		if _, err := e.Exec(
+		if _, err := tx.Exec(
 			`UPDATE image_paths SET is_canonical = 0 WHERE image_id = ? AND is_canonical = 1`, id,
 		); err != nil {
 			return fmt.Errorf("demote previous canonical: %w", err)
 		}
-	} else if _, err := e.Exec(
+	} else if _, err := tx.Exec(
 		`DELETE FROM image_paths WHERE image_id = ? AND path = ?`, id, dropOldPath,
 	); err != nil {
 		return fmt.Errorf("drop old canonical: %w", err)
 	}
-	if _, err := e.Exec(
+	if _, err := tx.Exec(
 		`INSERT INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 1)
 		 ON CONFLICT(path) DO UPDATE SET is_canonical = 1`, id, newPath,
 	); err != nil {
@@ -177,7 +199,34 @@ func repointCanonical(e db.Execer, id int64, newPath, newFolder, dropOldPath str
 	return nil
 }
 
-func loadMoveSource(database *db.DB, b *Boundary, id int64, verb string) (oldCanonical, oldFolder string, err error) {
+// setMissingTx flips only the rows whose flag differs, so their tags'
+// usage moves once per image.
+func setMissingTx(tx *sql.Tx, ids []int64, missing bool) (int, error) {
+	var flipped []int64
+	if err := db.Chunked(ids, 500, func(chunk []int64) error {
+		in, args := db.InPlaceholders(chunk)
+		got, err := db.QueryIDs(tx, `UPDATE images SET is_missing = ? WHERE id IN (`+in+`) AND is_missing != ? RETURNING id`,
+			append(append([]any{missing}, args...), missing)...)
+		flipped = append(flipped, got...)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	return len(flipped), tags.ImagesVisibilityChangedTx(tx, flipped, !missing)
+}
+
+// SetMissing reports whether the row's flag changed.
+func SetMissing(database *db.DB, id int64, missing bool) (bool, error) {
+	var n int
+	err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+		var err error
+		n, err = setMissingTx(tx, []int64{id}, missing)
+		return err
+	})
+	return n > 0, err
+}
+
+func loadMoveSource(database *db.DB, b *Boundary, id int64) (oldCanonical, oldFolder string, err error) {
 	galleryPath := b.Root()
 	var isMissing int
 	if err := database.Read.QueryRow(
@@ -189,10 +238,10 @@ func loadMoveSource(database *db.DB, b *Boundary, id int64, verb string) (oldCan
 		return "", "", fmt.Errorf("image %d is missing from disk", id)
 	}
 	if galleryPath != "" && !PathInside(galleryPath, oldCanonical) {
-		return "", "", fmt.Errorf("refusing to %s %q outside gallery root %q", verb, oldCanonical, galleryPath)
+		return "", "", fmt.Errorf("refusing to place %q outside gallery root %q", oldCanonical, galleryPath)
 	}
 	if err := b.Check(oldCanonical); err != nil {
-		return "", "", fmt.Errorf("refusing to %s image %d: %w", verb, id, err)
+		return "", "", fmt.Errorf("refusing to place image %d: %w", id, err)
 	}
 	return oldCanonical, oldFolder, nil
 }
@@ -215,15 +264,17 @@ func refuseAliasCollision(database *db.DB, id int64, newPath string) error {
 }
 
 // The file moves before the tx opens: across filesystems the move is a full
-// copy, which would hold the only write connection throughout.
-func commitRename(database *db.DB, verb string, id int64, oldCanonical, newPath string, newFolder *string) error {
+// copy, which would hold the only write connection throughout. newPath is
+// the caller's reservation, which the move replaces.
+func commitRename(database *db.DB, id int64, oldCanonical, newPath string, newFolder *string) error {
 	if err := moveIntoPlace(oldCanonical, newPath); err != nil {
+		_ = os.Remove(newPath)
 		return fmt.Errorf("rename file: %w", err)
 	}
 	err := func() error {
 		tx, err := database.Write.Begin()
 		if err != nil {
-			return fmt.Errorf("begin %s tx: %w", verb, err)
+			return fmt.Errorf("begin place tx: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
 		update, args := `UPDATE images SET canonical_path = ? WHERE id = ?`, []any{newPath, id}
@@ -235,19 +286,24 @@ func commitRename(database *db.DB, verb string, id int64, oldCanonical, newPath 
 			return fmt.Errorf("update images row: %w", err)
 		}
 		if _, err := tx.Exec(
+			`DELETE FROM image_paths WHERE image_id = ? AND path = ? AND is_canonical = 0`, id, newPath,
+		); err != nil {
+			return fmt.Errorf("drop the image's own alias at the new path: %w", err)
+		}
+		if _, err := tx.Exec(
 			`UPDATE image_paths SET path = ? WHERE image_id = ? AND is_canonical = 1`,
 			newPath, id,
 		); err != nil {
 			return fmt.Errorf("update image_paths row: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit %s tx: %w", verb, err)
+			return fmt.Errorf("commit place tx: %w", err)
 		}
 		return nil
 	}()
 	if err != nil {
 		if rnErr := moveIntoPlace(newPath, oldCanonical); rnErr != nil {
-			logx.Errorf("%s: reverse rename for %d after a failed update: %v (original: %v)", verb, id, rnErr, err)
+			logx.Errorf("place: reverse rename for %d after a failed update: %v (original: %v)", id, rnErr, err)
 		}
 		return err
 	}
@@ -265,51 +321,26 @@ func placementSuffix(renamed bool) func(stem, ext string, i int) string {
 	return uploadSuffix
 }
 
-func promoteCanonical(database *db.DB, galleryPath string, imageID int64, newPath string, promote func(*sql.Tx) error) error {
-	newFolder := FolderPath(galleryPath, newPath)
-	return db.InWriteTx(database.Write, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`UPDATE image_paths SET is_canonical = 0 WHERE image_id = ?`, imageID); err != nil {
-			return err
-		}
-		if err := promote(tx); err != nil {
-			return err
-		}
-		_, err := tx.Exec(
-			`UPDATE images SET canonical_path = ?, folder_path = ? WHERE id = ?`,
-			newPath, newFolder, imageID)
-		return err
-	})
-}
-
 func PromoteCanonicalByPath(database *db.DB, b *Boundary, imageID int64, newPath string) error {
 	if err := b.Check(newPath); err != nil {
 		return err
 	}
-	return promoteCanonical(database, b.Root(), imageID, newPath, func(tx *sql.Tx) error {
+	return db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE image_paths SET is_canonical = 0 WHERE image_id = ?`, imageID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`UPDATE image_paths SET is_canonical = 1 WHERE image_id = ? AND path = ?`, imageID, newPath); err != nil {
+			return err
+		}
 		_, err := tx.Exec(
-			`UPDATE image_paths SET is_canonical = 1 WHERE image_id = ? AND path = ?`, imageID, newPath)
+			`UPDATE images SET canonical_path = ?, folder_path = ? WHERE id = ?`,
+			newPath, FolderPath(b.Root(), newPath), imageID)
 		return err
 	})
 }
 
-// PromoteCanonicalByPathID takes the path's row id; newPath must be that
-// row's path.
-func PromoteCanonicalByPathID(database *db.DB, b *Boundary, imageID, pathID int64, newPath string) error {
-	if err := b.Check(newPath); err != nil {
-		return err
-	}
-	return promoteCanonical(database, b.Root(), imageID, newPath, func(tx *sql.Tx) error {
-		_, err := tx.Exec(`UPDATE image_paths SET is_canonical = 1 WHERE id = ?`, pathID)
-		return err
-	})
-}
-
-// DeleteAliasPath only forgets the row; the file is the caller's to unlink.
-func DeleteAliasPath(database *db.DB, pathID int64) error {
-	_, err := database.Write.Exec(`DELETE FROM image_paths WHERE id = ?`, pathID)
-	return err
-}
-
+// DeleteAliasPaths only forgets the rows; the files are the caller's to unlink.
 func DeleteAliasPaths(database *db.DB, pathIDs []int64) error {
 	placeholders, args := db.InPlaceholders(pathIDs)
 	_, err := database.Write.Exec(`DELETE FROM image_paths WHERE id IN (`+placeholders+`)`, args...)

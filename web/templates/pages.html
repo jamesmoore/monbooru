@@ -5,7 +5,7 @@
 </div>
 {{template "layout_mid" .}}
 
-<div id="pages-grid-page" data-image-id="{{.Image.ID}}">
+<div id="pages-grid-page">
   <div class="detail-topbar">
     <div class="detail-nav-group">
       <a href="/images/{{.Image.ID}}{{.BackQS}}" class="back-link">‹ Image</a>
@@ -15,7 +15,7 @@
   </div>
   {{/* The sidebar's tag buttons target this slot and land their flash
        in it; htmx drops the request outright when the slot is missing. */}}
-  {{template "partials/tag_list.html" (dict "ImageID" .Image.ID "CSRFToken" .CSRFToken)}}
+  {{template "partials/tag_list.html" (dict "ImageID" .Image.ID)}}
   <ul class="manga-pages-grid">
     {{range $i := seq 1 .PageCount}}
     <li class="manga-page-cell{{if lt $i $.LastReadPage}} manga-page-read{{else if eq $i $.LastReadPage}} manga-page-bookmark{{end}}" id="page-{{$i}}">

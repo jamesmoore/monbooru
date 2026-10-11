@@ -43,7 +43,7 @@ func (s *Service) SessionOrder() string {
 }
 
 func (s *Service) SetSessionOrder(mode string) {
-	if _, err := s.db.Write.Exec(
+	if _, err := s.exec(
 		`INSERT INTO relation_session (id, order_mode) VALUES (1, ?)
 		 ON CONFLICT(id) DO UPDATE SET order_mode = excluded.order_mode`,
 		mode,
@@ -55,7 +55,7 @@ func (s *Service) SetSessionOrder(mode string) {
 // SkipPair keeps the pair queued but out of the walk until ResetSkipped,
 // so a skip always moves forward.
 func (s *Service) SkipPair(a, b int64, at string) error {
-	_, err := s.db.Write.Exec(
+	_, err := s.exec(
 		`UPDATE potential_relation_pairs SET skipped_at = ? WHERE a_image_id = ? AND b_image_id = ?`,
 		at, a, b,
 	)
@@ -63,7 +63,7 @@ func (s *Service) SkipPair(a, b int64, at string) error {
 }
 
 func (s *Service) DropQueuedPair(a, b int64) error {
-	_, err := s.db.Write.Exec(
+	_, err := s.exec(
 		`DELETE FROM potential_relation_pairs WHERE a_image_id = ? AND b_image_id = ?`, a, b,
 	)
 	return err
@@ -97,15 +97,12 @@ func ceilingClause(rank *int) (string, []any) {
 	if rank == nil {
 		return "", nil
 	}
-	return "p.max_rating_rank <= ?", []any{*rank}
+	return " AND p.max_rating_rank <= ?", []any{*rank}
 }
 
 func (s *Service) QueueCountsFor(detector string, rank *int) (QueueCounts, error) {
 	where, args := ceilingClause(rank)
-	openExpr := "p.skipped_at IS NULL"
-	if where != "" {
-		openExpr += " AND " + where
-	}
+	openExpr := "p.skipped_at IS NULL" + where
 	var counts QueueCounts
 	var unskipped int
 	err := s.db.Read.QueryRow(`
@@ -133,20 +130,13 @@ func (s *Service) NextPair(order, detector string, rank *int, pinA, pinB int64) 
 	where, args := ceilingClause(rank)
 	scope := detectorFilter(detector)
 
-	ordered := queuedPairSelect + "\n\tWHERE " + collectionPairExcl + scope + " AND p.skipped_at IS NULL"
-	if where != "" {
-		ordered += " AND " + where
-	}
-	ordered += "\n\t" + orderClauseForMode(order) + "\n\tLIMIT 1"
+	ordered := queuedPairSelect + "\n\tWHERE " + collectionPairExcl + scope + " AND p.skipped_at IS NULL" + where +
+		"\n\t" + orderClauseForMode(order) + "\n\tLIMIT 1"
 
 	query, qargs := ordered, args
 	if pinA > 0 && pinB > 0 {
 		lo, hi := canonicalPair(pinA, pinB)
-		pinned := queuedPairSelect + "\n\tWHERE " + collectionPairExcl
-		if where != "" {
-			pinned += " AND " + where
-		}
-		pinned += " AND p.a_image_id = ? AND p.b_image_id = ?\n\tLIMIT 1"
+		pinned := queuedPairSelect + "\n\tWHERE " + collectionPairExcl + where + " AND p.a_image_id = ? AND p.b_image_id = ?\n\tLIMIT 1"
 		query, qargs = pinned, append(append([]any{}, args...), lo, hi)
 	}
 
@@ -177,10 +167,7 @@ func (s *Service) QueueBySource(rank *int) (open, skipped int, bySource map[stri
 	query := `SELECT p.source, p.skipped_at IS NOT NULL, COUNT(*)
 		FROM potential_relation_pairs p WHERE ` + collectionPairExcl
 	where, args := ceilingClause(rank)
-	if where != "" {
-		query += " AND " + where
-	}
-	query += ` GROUP BY p.source, p.skipped_at IS NOT NULL`
+	query += where + ` GROUP BY p.source, p.skipped_at IS NOT NULL`
 
 	rows, err := s.db.Read.Query(query, args...)
 	if err != nil {

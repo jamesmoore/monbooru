@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
-	"github.com/monbooru/monbooru/internal/tags"
 )
 
 type SyncResult struct {
@@ -22,6 +22,7 @@ type SyncResult struct {
 	Moved      int
 	Duplicates int
 	Conflicts  int
+	Conflicted string
 	// Excluded is the part of Removed the boundary left out rather than
 	// found gone.
 	Excluded    int
@@ -41,8 +42,11 @@ func (r SyncResult) Summary() string {
 	if r.Edited > 0 {
 		out += fmt.Sprintf(", %d re-read", r.Edited)
 	}
-	if r.Conflicts > 0 {
-		out += fmt.Sprintf(", %d conflicted", r.Conflicts)
+	switch {
+	case r.Conflicts == 1:
+		out += fmt.Sprintf(", 1 conflicted (%s)", r.Conflicted)
+	case r.Conflicts > 1:
+		out += fmt.Sprintf(", %d conflicted (%s and %d more)", r.Conflicts, r.Conflicted, r.Conflicts-1)
 	}
 	return out
 }
@@ -58,10 +62,6 @@ type FolderNode struct {
 type SourceLabelCount struct {
 	Source string
 	Count  int
-}
-
-func SourceLabelCountsQuery(database *db.DB, limit int) ([]SourceLabelCount, error) {
-	return SourceLabelCountsUnderQuery(database, limit, nil)
 }
 
 type syncFileInfo struct {
@@ -99,8 +99,9 @@ type syncBySHARow struct {
 
 // Sync flags missing the rows whose file is gone or outside bound;
 // maxFileSizeMB <= 0 means no size cap.
-func Sync(ctx context.Context, database *db.DB, bound *Boundary, thumbnailsPath string, maxFileSizeMB int, naming Naming, progress func(processed, total int, message string), onChange func(), onPhash PhashSink) (SyncResult, error) {
+func Sync(ctx context.Context, h Handle, maxFileSizeMB int, naming Naming, progress func(processed, total int, message string), onChange func(), onPhash PhashSink) (SyncResult, error) {
 	var result SyncResult
+	database, bound := h.DB, h.Boundary()
 	galleryPath := bound.Root()
 
 	// The walk skips unreadable directories: an unmounted root would read
@@ -154,7 +155,7 @@ func Sync(ctx context.Context, database *db.DB, bound *Boundary, thumbnailsPath 
 			}
 			progress(i, total, "Phase 2: reconciling...")
 		}
-		if id := reconcileFile(database, bound, thumbnailsPath, fi, known, bySHA, &result, onPhash); id != 0 {
+		if id := reconcileFile(h, bound, fi, known, bySHA, &result, onPhash); id != 0 {
 			ingested = append(ingested, id)
 		}
 	}
@@ -188,11 +189,6 @@ func Sync(ctx context.Context, database *db.DB, bound *Boundary, thumbnailsPath 
 		if err := pruneStaleAliasPaths(ctx, database, bound, foundPaths); err != nil {
 			return result, err
 		}
-	}
-
-	if result.Added > 0 || result.Removed > 0 || result.Moved > 0 || result.Reactivated > 0 {
-		progress(0, 0, "Recalculating tag counts...")
-		tags.RecalcDB(database)
 	}
 
 	progress(0, 0, fmt.Sprintf("Done: %d added, %d missing, %d moved, %d duplicates",
@@ -280,12 +276,7 @@ func (s walkSkips) covers(path string) bool {
 	if _, ok := s.files[path]; ok {
 		return true
 	}
-	for _, dir := range s.dirs {
-		if PathInside(dir, path) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(s.dirs, func(dir string) bool { return PathInside(dir, path) })
 }
 
 func walkGalleryFiles(ctx context.Context, bound *Boundary, maxBytes int64, known map[string]syncKnownEntry) ([]syncFileInfo, walkSkips, error) {
@@ -364,7 +355,8 @@ func loadImagesBySHA(database *db.DB) (map[string]syncBySHARow, error) {
 
 // Every branch updates bySHA, or a later file with the same SHA acts on
 // the stale entry: a moved image would be moved again.
-func reconcileFile(database *db.DB, bound *Boundary, thumbnailsPath string, fi syncFileInfo, known map[string]syncKnownEntry, bySHA map[string]syncBySHARow, result *SyncResult, onPhash PhashSink) int64 {
+func reconcileFile(h Handle, bound *Boundary, fi syncFileInfo, known map[string]syncKnownEntry, bySHA map[string]syncBySHARow, result *SyncResult, onPhash PhashSink) int64 {
+	database := h.DB
 	if k, knownPath := known[fi.path]; knownPath && k.sha256 != fi.sha256 && !k.canonical {
 		// A rewritten copy: its image keeps its own file, and the path is
 		// classified afresh, as the watcher's ingest does.
@@ -380,17 +372,19 @@ func reconcileFile(database *db.DB, bound *Boundary, thumbnailsPath string, fi s
 		if other, held := bySHA[fi.sha256]; held {
 			logx.Warnf("sync: %q was rewritten with the bytes of image %d at %q; row left as it is",
 				fi.path, other.id, other.canonicalPath)
+			if result.Conflicts == 0 {
+				result.Conflicted = path.Join(FolderPath(h.GalleryPath, fi.path), filepath.Base(fi.path))
+			}
 			result.Conflicts++
 			return 0
 		}
-		phash, err := applyInPlaceEdit(database, thumbnailsPath, fi.path, fi.sha256, fi.md5, fi.mtime, fi.mtimeNano, fi.size)
+		phash, err := applyInPlaceEdit(h, fi.path, fi.sha256, fi.md5, fi.mtime, fi.mtimeNano, fi.size)
 		if err != nil {
 			logx.Warnf("sync: in-place edit %q: %v", fi.path, err)
 			return 0
 		}
 		result.Edited++
-		var imgID int64
-		if err := database.Read.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, fi.sha256).Scan(&imgID); err == nil {
+		if imgID, err := ImageIDBySHA(database.Read, fi.sha256); err == nil {
 			bySHA[fi.sha256] = syncBySHARow{id: imgID, canonicalPath: fi.path, isMissing: 0}
 			onPhash.Stored(imgID, phash)
 		}
@@ -401,14 +395,14 @@ func reconcileFile(database *db.DB, bound *Boundary, thumbnailsPath string, fi s
 
 	row, ok := bySHA[fi.sha256]
 	if !ok {
-		return reconcileNewFile(database, bound.Root(), thumbnailsPath, fi, bySHA, result, onPhash)
+		return reconcileNewFile(h, fi, bySHA, result, onPhash)
 	}
 	reconcileExistingSHA(database, bound, fi, row, bySHA, known, result)
 	return 0
 }
 
-func reconcileNewFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncFileInfo, bySHA map[string]syncBySHARow, result *SyncResult, onPhash PhashSink) int64 {
-	img, _, ingestErr := ingestWithHash(database, galleryPath, thumbnailsPath, fi.path, fi.sha256, fi.md5, "")
+func reconcileNewFile(h Handle, fi syncFileInfo, bySHA map[string]syncBySHARow, result *SyncResult, onPhash PhashSink) int64 {
+	img, _, ingestErr := ingestWithHash(h, fi.path, fi.sha256, fi.md5, "")
 	if ingestErr != nil {
 		logx.Warnf("ingest failed for %q: %v", fi.path, ingestErr)
 		return 0
@@ -417,7 +411,7 @@ func reconcileNewFile(database *db.DB, galleryPath, thumbnailsPath string, fi sy
 	if img == nil {
 		return 0
 	}
-	onPhash.Stored(img.ID, img.Phash)
+	onPhash.Landed(img)
 	bySHA[fi.sha256] = syncBySHARow{id: img.ID, canonicalPath: fi.path, isMissing: 0}
 	return img.ID
 }
@@ -432,28 +426,23 @@ func reconcileExistingSHA(database *db.DB, bound *Boundary, fi syncFileInfo, row
 
 	if row.canonicalPath == fi.path {
 		if row.isMissing == 1 {
-			reactivateImage(database, row.id)
-			result.Reactivated++
+			reactivate(database, fi.sha256, row, bySHA, result)
 		}
 		return
 	}
 
+	respelled := respelling(galleryPath, row.canonicalPath, fi.path)
 	if k, knownAlias := known[fi.path]; knownAlias && k.sha256 == fi.sha256 {
-		if canonicalGone(bound, row.canonicalPath) {
-			promoteAliasToCanonical(database, galleryPath, fi.path, row)
-			bySHA[fi.sha256] = syncBySHARow{id: row.id, canonicalPath: fi.path, isMissing: 0}
-			result.Moved++
+		if respelled || CanonicalGone(bound, row.canonicalPath) {
+			repointRow(database, galleryPath, fi.sha256, fi.path, row, bySHA, result)
 		} else if row.isMissing == 1 {
-			reactivateImage(database, row.id)
-			result.Reactivated++
+			reactivate(database, fi.sha256, row, bySHA, result)
 		}
 		return
 	}
 
-	if canonicalGone(bound, row.canonicalPath) {
-		moveCanonical(database, galleryPath, fi.path, row)
-		bySHA[fi.sha256] = syncBySHARow{id: row.id, canonicalPath: fi.path, isMissing: 0}
-		result.Moved++
+	if respelled || CanonicalGone(bound, row.canonicalPath) {
+		repointRow(database, galleryPath, fi.sha256, fi.path, row, bySHA, result)
 		return
 	}
 	if _, wErr := database.Write.Exec(
@@ -465,7 +454,18 @@ func reconcileExistingSHA(database *db.DB, bound *Boundary, fi syncFileInfo, row
 	result.Duplicates++
 }
 
-func canonicalGone(bound *Boundary, path string) bool {
+// The walk names nothing outside the root's spelling, so a canonical there
+// that is the walked file is that file under an older spelling of the root.
+func respelling(root, canonical, walked string) bool {
+	if PathInside(root, canonical) {
+		return false
+	}
+	info, err := os.Stat(walked)
+	return err == nil && sameFile(info, canonical)
+}
+
+// CanonicalGone also holds for a path the boundary refuses.
+func CanonicalGone(bound *Boundary, path string) bool {
 	if bound.Check(path) != nil {
 		return true
 	}
@@ -473,23 +473,28 @@ func canonicalGone(bound *Boundary, path string) bool {
 	return err != nil
 }
 
-func reactivateImage(database *db.DB, imageID int64) {
-	if _, wErr := database.Write.Exec(`UPDATE images SET is_missing = 0 WHERE id = ?`, imageID); wErr != nil {
-		logx.Warnf("sync: reactivate %d: %v", imageID, wErr)
+func reactivate(database *db.DB, sha string, row syncBySHARow, bySHA map[string]syncBySHARow, result *SyncResult) {
+	if _, err := SetMissing(database, row.id, false); err != nil {
+		logx.Warnf("sync: reactivate %d: %v", row.id, err)
+		return
 	}
+	row.isMissing = 0
+	bySHA[sha] = row
+	result.Reactivated++
 }
 
-func promoteAliasToCanonical(database *db.DB, galleryPath, newCanonical string, row syncBySHARow) {
-	if err := repointCanonical(database.Write, row.id, newCanonical,
-		FolderPath(galleryPath, newCanonical), row.canonicalPath); err != nil {
-		logx.Warnf("sync: promote alias %d: %v", row.id, err)
+func repointRow(database *db.DB, galleryPath, sha, newCanonical string, row syncBySHARow, bySHA map[string]syncBySHARow, result *SyncResult) {
+	if err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+		return repointCanonical(tx, row.id, newCanonical, FolderPath(galleryPath, newCanonical), row.canonicalPath)
+	}); err != nil {
+		logx.Warnf("sync: move %d onto %q: %v", row.id, newCanonical, err)
+		return
 	}
-}
-
-func moveCanonical(database *db.DB, galleryPath, newCanonical string, row syncBySHARow) {
-	if err := repointCanonical(database.Write, row.id, newCanonical,
-		FolderPath(galleryPath, newCanonical), row.canonicalPath); err != nil {
-		logx.Warnf("sync: move %d: %v", row.id, err)
+	bySHA[sha] = syncBySHARow{id: row.id, canonicalPath: newCanonical, isMissing: 0}
+	if row.isMissing == 1 {
+		result.Reactivated++
+	} else {
+		result.Moved++
 	}
 }
 
@@ -529,17 +534,16 @@ func markImagesMissingChunked(ctx context.Context, database *db.DB, ids []int64)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		placeholders, args := db.InPlaceholders(chunk)
-		res, wErr := database.Write.Exec(
-			`UPDATE images SET is_missing = 1 WHERE id IN (`+placeholders+`)`, args...,
-		)
-		if wErr != nil {
+		var n int
+		if wErr := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+			var err error
+			n, err = setMissingTx(tx, chunk, true)
+			return err
+		}); wErr != nil {
 			logx.Warnf("sync: mark missing chunk: %v", wErr)
 			return fmt.Errorf("mark missing chunk: %w", wErr)
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			marked += int(n)
-		}
+		marked += n
 		return nil
 	})
 	return marked, err
@@ -555,11 +559,9 @@ func pruneStaleAliasPaths(ctx context.Context, database *db.DB, bound *Boundary,
 	}
 	// Collected before any stat so the read cursor is not held open
 	// across the syscalls.
-	aliases, err := db.QueryAll(database.Read, func(rows *sql.Rows) (aliasPath, error) {
-		var a aliasPath
-		err := rows.Scan(&a.id, &a.path, &a.canonical)
-		return a, err
-	}, `SELECT ip.id, ip.path, i.canonical_path FROM image_paths ip JOIN images i ON i.id = ip.image_id WHERE ip.is_canonical = 0`)
+	aliases, err := db.QueryAll(database.Read, db.ScanRow(func(a *aliasPath) []any {
+		return []any{&a.id, &a.path, &a.canonical}
+	}), `SELECT ip.id, ip.path, i.canonical_path FROM image_paths ip JOIN images i ON i.id = ip.image_id WHERE ip.is_canonical = 0`)
 	if err != nil {
 		return fmt.Errorf("listing alias paths: %w", err)
 	}
@@ -600,7 +602,8 @@ func sameFile(info os.FileInfo, path string) bool {
 }
 
 // applyInPlaceEdit keeps the row's id, so its tags survive the rewrite.
-func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 string, newMtime, newMtimeNano, newSize int64) (*int64, error) {
+func applyInPlaceEdit(h Handle, path, newSHA, newMD5 string, newMtime, newMtimeNano, newSize int64) (*int64, error) {
+	database, thumbnailsPath := h.DB, h.ThumbnailsPath
 	var imageID int64
 	if err := database.Read.QueryRow(
 		`SELECT image_id FROM image_paths WHERE path = ?`, path,
@@ -650,9 +653,12 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 		// duration_seconds is written for every type, or a former video
 		// keeps matching the duration: filter.
 		`UPDATE images SET sha256 = ?, md5 = ?, file_size = ?, file_type = ?, width = ?, height = ?, page_count = ?, duration_seconds = ?, source_type = ?, phash = NULL WHERE id = ?`,
-		newSHA, newMD5, newSize, fileType, toNullInt(imgWidth), toNullInt(imgHeight), toNullInt(pageCount), toNullFloat(durationSec), sourceType, imageID,
+		newSHA, newMD5, newSize, fileType, imgWidth, imgHeight, pageCount, durationSec, sourceType, imageID,
 	); err != nil {
 		return nil, fmt.Errorf("update images row: %w", err)
+	}
+	if _, err := setMissingTx(tx, []int64{imageID}, false); err != nil {
+		return nil, fmt.Errorf("mark row present: %w", err)
 	}
 	if _, err := tx.Exec(
 		`UPDATE image_paths SET mtime_unix = ?, mtime_nsec = ? WHERE path = ?`, newMtime, newMtimeNano, path,
@@ -663,7 +669,7 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 	if err := lookup.DeleteForImage(tx, imageID); err != nil {
 		return nil, fmt.Errorf("clear lookup history: %w", err)
 	}
-	if err := ReplaceGenerationMetadata(context.Background(), tx, imageID, sdMeta, comfyMeta); err != nil {
+	if err := replaceGenerationMetadata(context.Background(), tx, imageID, sdMeta, comfyMeta); err != nil {
 		return nil, err
 	}
 
@@ -678,7 +684,7 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 	}
 
 	phash := regenerateDerived(database, thumbnailsPath, path, imageID, fileType, "in-place edit")
-	if err := ApplyMetaTags(database, thumbnailsPath, imageID); err != nil {
+	if err := ApplyMetaTags(h, imageID); err != nil {
 		logx.Warnf("in-place edit: meta tags for %q: %v", path, err)
 	}
 	logx.Infof("in-place edit: image id=%d at %q now carries sha %s", imageID, path, newSHA)
@@ -688,12 +694,7 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA, newMD5 stri
 // FolderTree's counts include every descendant's, and a folder holding
 // only subfolders still gets a node.
 func FolderTree(database *db.DB) ([]FolderNode, error) {
-	flat, err := db.QueryAll(database.Read, scanFolderRow,
-		`SELECT COALESCE(folder_path, ''), COUNT(*) FROM images WHERE is_missing=0 GROUP BY folder_path ORDER BY folder_path`)
-	if err != nil {
-		return nil, err
-	}
-	return buildFolderTree(flat), nil
+	return FolderTreeUnder(database, RankCeiling{})
 }
 
 func buildFolderTree(flat []folderCount) []FolderNode {

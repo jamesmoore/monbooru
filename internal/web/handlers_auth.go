@@ -77,11 +77,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	s.loginRL.recordSuccess(ip)
 	logx.Infof("login success from %s", ip)
 
-	sessID, err := s.sessions.NewSession(s.sessionLifetimeDays())
-	if err != nil {
-		http.Error(w, "session error", http.StatusInternalServerError)
-		return
-	}
+	sessID := s.sessions.NewSession(s.sessionLifetimeDays())
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     "monbooru_session",
@@ -110,7 +106,6 @@ func (s *Server) renderAuthPasswordOOB(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "partials/auth_password_section.html", map[string]any{
 		"AuthEnabled": s.authEnabled(),
 		"HasPassword": s.passwordHash() != "",
-		"CSRFToken":   s.csrfToken(sessionFromContext(r.Context())),
 		"OOB":         true,
 	})
 }

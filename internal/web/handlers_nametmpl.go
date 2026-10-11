@@ -78,11 +78,12 @@ func (s *Server) namePreview(w http.ResponseWriter, r *http.Request) {
 	var rowErr error
 	var changed bool
 	md5Cap := s.previewMD5Cap()
+	cx := s.active()
 	// Rows arrive in scope order, so the run's collision numbering is
 	// replayed: a preview the run then renames differently would mislead.
-	claimed := make(map[string]struct{}, len(ids))
+	planned := make(map[string]bool, len(ids))
 	for i, id := range ids {
-		facts, factErr := gallery.LoadNameFacts(r.Context(), s.db(), s.activeGallery(), id, md5Cap, folderTmpl, nameTmpl)
+		facts, factErr := cx.NameFacts(r.Context(), id, md5Cap, folderTmpl, nameTmpl)
 		if factErr != nil {
 			rowErr = factErr
 			continue
@@ -112,12 +113,11 @@ func (s *Server) namePreview(w http.ResponseWriter, r *http.Request) {
 			}
 			name = &rendered
 		}
-		dest, _, destErr := gallery.PlannedPath(s.db(), s.boundary(), id, folder, name, claimed)
+		dest, _, destErr := gallery.PlannedPath(s.db(), s.boundary(), id, folder, name, planned)
 		if destErr != nil {
 			rowErr = destErr
 			continue
 		}
-		claimed[dest] = struct{}{}
 		from := namePath(facts.Folder, facts.Base)
 		to := namePath(gallery.FolderPath(s.galleryPath(), dest), filepath.Base(dest))
 		changed = changed || from != to
@@ -206,7 +206,7 @@ func (s *Server) uploadDestPreview(ctx context.Context, w http.ResponseWriter, f
 	if (folderTmpl == nil && nameTmpl == nil) || len(ids) == 0 {
 		return
 	}
-	facts, err := gallery.LoadNameFacts(ctx, s.db(), s.activeGallery(), ids[0], s.previewMD5Cap(), folderTmpl, nameTmpl)
+	facts, err := s.active().NameFacts(ctx, ids[0], s.previewMD5Cap(), folderTmpl, nameTmpl)
 	if err != nil {
 		s.renderNamePreviewError(w, "", err.Error())
 		return

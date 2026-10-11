@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
 
 	"github.com/monbooru/monbooru/internal/models"
 )
@@ -17,6 +16,10 @@ var errNotPNG = errors.New("not a PNG file")
 // Chunk lengths are attacker-controlled, up to 4 GiB; real parameter and
 // workflow chunks are kilobytes.
 const maxChunkBytes = 16 * 1024 * 1024
+
+// The text one PNG keeps, every chunk together: a file can hold any number
+// of chunks under the per-chunk cap.
+const maxPNGTextBytes = 16 * 1024 * 1024
 
 func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 	sig := make([]byte, 8)
@@ -28,6 +31,7 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 	}
 
 	result := map[string]string{}
+	budget := int64(maxPNGTextBytes)
 
 	for {
 		header := make([]byte, 8)
@@ -38,7 +42,8 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 		chunkType := string(header[4:8])
 
 		// Skipped unbuffered: the body plus its 4-byte CRC.
-		if length > maxChunkBytes {
+		textChunk := chunkType == "tEXt" || chunkType == "zTXt" || chunkType == "iTXt"
+		if !textChunk || int64(length) > budget {
 			if _, err := io.CopyN(io.Discard, r, int64(length)+4); err != nil {
 				break
 			}
@@ -60,55 +65,49 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 
 		switch chunkType {
 		case "tEXt":
-			null := strings.IndexByte(string(data), 0)
-			if null < 0 {
+			key, text, ok := bytes.Cut(data, []byte{0})
+			if !ok {
 				continue
 			}
-			result[string(data[:null])] = string(data[null+1:])
+			result[string(key)] = string(text)
+			budget -= int64(len(data))
 
 		case "zTXt":
 			// keyword \x00 cmethod text, the text always compressed
-			null := strings.IndexByte(string(data), 0)
-			if null < 0 || len(data) < null+2 {
+			key, rest, ok := bytes.Cut(data, []byte{0})
+			if !ok || len(rest) < 1 {
 				continue
 			}
-			text, err := inflateText(data[null+2:], data[null+1])
+			text, err := inflateText(rest[1:], rest[0], budget-int64(len(key)))
 			if err != nil {
 				continue
 			}
-			result[string(data[:null])] = string(text)
+			result[string(key)] = string(text)
+			budget -= int64(len(key) + len(text))
 
 		case "iTXt":
 			// keyword \x00 cflag cmethod lang \x00 tkeyword \x00 text
-			null1 := strings.IndexByte(string(data), 0)
-			if null1 < 0 {
-				continue
-			}
-			key := string(data[:null1])
-			rest := data[null1+1:]
-			if len(rest) < 2 {
+			key, rest, ok := bytes.Cut(data, []byte{0})
+			if !ok || len(rest) < 2 {
 				continue
 			}
 			compressed, method := rest[0] == 1, rest[1]
-			rest = rest[2:]
-			null2 := strings.IndexByte(string(rest), 0)
-			if null2 < 0 {
+			if _, rest, ok = bytes.Cut(rest[2:], []byte{0}); !ok {
 				continue
 			}
-			rest = rest[null2+1:]
-			null3 := strings.IndexByte(string(rest), 0)
-			if null3 < 0 {
+			_, text, ok := bytes.Cut(rest, []byte{0})
+			if !ok {
 				continue
 			}
-			text := rest[null3+1:]
 			if compressed {
-				inflated, err := inflateText(text, method)
+				inflated, err := inflateText(text, method, budget-int64(len(key)))
 				if err != nil {
 					continue
 				}
 				text = inflated
 			}
-			result[key] = string(text)
+			result[string(key)] = string(text)
+			budget -= int64(len(key) + len(text))
 		}
 
 		if chunkType == "IEND" {
@@ -120,7 +119,7 @@ func readPNGTextChunks(r io.Reader) (map[string]string, error) {
 }
 
 // Method 0, zlib, is the only one the PNG spec defines.
-func inflateText(b []byte, method byte) ([]byte, error) {
+func inflateText(b []byte, method byte, limit int64) ([]byte, error) {
 	if method != 0 {
 		return nil, errors.New("unknown iTXt compression method")
 	}
@@ -129,7 +128,7 @@ func inflateText(b []byte, method byte) ([]byte, error) {
 		return nil, err
 	}
 	defer func() { _ = zr.Close() }()
-	return io.ReadAll(io.LimitReader(zr, maxChunkBytes))
+	return io.ReadAll(io.LimitReader(zr, limit))
 }
 
 func extractFromPNG(path string) (*models.SDMetadata, *models.ComfyUIMetadata, error) {

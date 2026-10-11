@@ -29,6 +29,8 @@ type FindPairsOptions struct {
 	ThumbnailsPath   string
 	TagPairs         bool
 	TagPairThreshold float64
+	// VisibleCount is the gallery's, read when the tag-pair pass starts.
+	VisibleCount func() (int, bool)
 }
 
 type FindPairsProgress func(processed, total int, phase string)
@@ -84,7 +86,7 @@ func FindPairs(ctx context.Context, database *db.DB, tree *BKTree, opts FindPair
 	const txChunk = 500
 	var pending []pairToInsert
 
-	flush := func() error {
+	flush := func(ctx context.Context) error {
 		if len(pending) == 0 {
 			return nil
 		}
@@ -108,9 +110,17 @@ func FindPairs(ctx context.Context, database *db.DB, tree *BKTree, opts FindPair
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		added += len(pending)
 		pending = pending[:0]
 		return nil
 	}
+	// A cancel or a failed probe keeps what was found: the cancelled ctx
+	// would refuse the transaction.
+	defer func() {
+		if flushErr := flush(context.WithoutCancel(ctx)); flushErr != nil && err == nil {
+			err = flushErr
+		}
+	}()
 
 	// Every phash goes into the tree before any probe: a row pairs only
 	// with higher ids, so probing it before its higher-id partner is in
@@ -136,9 +146,6 @@ func FindPairs(ctx context.Context, database *db.DB, tree *BKTree, opts FindPair
 
 	for idx, e := range entries {
 		if ctx.Err() != nil {
-			if flushErr := flush(); flushErr != nil {
-				logx.Debugf("find-pairs flush during cancel: %v", flushErr)
-			}
 			return added, ctx.Err()
 		}
 		if !e.phash.Valid {
@@ -168,22 +175,25 @@ func FindPairs(ctx context.Context, database *db.DB, tree *BKTree, opts FindPair
 			pending = append(pending, pairToInsert{
 				a: e.id, b: cid, distance: hammingDistance(e.phash.Int64, lookupPhashFromTree(tree, cid)),
 			})
-			added++
 			if len(pending) >= txChunk {
-				if err := flush(); err != nil {
+				if err := flush(ctx); err != nil {
 					return added, err
 				}
 			}
 		}
 	}
-	if err := flush(); err != nil {
+	if err := flush(ctx); err != nil {
 		return added, err
 	}
 	if progress != nil {
 		progress(total, total, "probing")
 	}
 	if opts.TagPairs {
-		tagAdded, err := findTagPairs(ctx, database, opts.TagPairThreshold, progress)
+		visible, ok := opts.VisibleCount()
+		if !ok {
+			return added, errors.New("load tag-pair corpus: visible image count unavailable")
+		}
+		tagAdded, err := findTagPairs(ctx, database, visible, opts.TagPairThreshold, progress)
 		added += tagAdded
 		if err != nil {
 			return added, err
@@ -210,10 +220,8 @@ func pairAlreadyKnown(ctx context.Context, database *db.DB, a, b int64) (bool, e
 	}
 	lo, hi := canonicalPair(a, b)
 	var n int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM potential_relation_pairs WHERE a_image_id = ? AND b_image_id = ?`, lo, hi).Scan(&n); err != nil {
-		return false, err
-	}
-	return n > 0, nil
+	err = tx.QueryRow(`SELECT COUNT(*) FROM potential_relation_pairs WHERE a_image_id = ? AND b_image_id = ?`, lo, hi).Scan(&n)
+	return n > 0, err
 }
 
 // An archive is hashed by its cover page alone (the tag pass pairs

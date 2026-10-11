@@ -8,12 +8,13 @@
     <span class="range-bound range-bound-min">{{$min}}</span>
     <input type="range" name="{{.Name}}" id="{{.Name}}"
            min="{{$min}}" max="{{$max}}" step="{{.Step}}" value="{{.Value}}" list="{{.Name}}_ticks"
-           oninput="document.getElementById('{{.Name}}_out').value=this.value">
+           oninput="document.getElementById('{{.Name}}_out').value=this.value"{{if .Pinned}} disabled{{end}}>
     <span class="range-bound range-bound-max">{{$max}}</span>
   </div>
   <datalist id="{{.Name}}_ticks">
     {{range .Ticks}}<option value="{{.}}"></option>{{end}}
   </datalist>
   {{if .Hint}}<span class="field-hint">{{.Hint}}</span>{{end}}
+  {{if .Pinned}}<span class="field-hint">Set by {{.Pinned}} in the environment.</span>{{end}}
 </div>
 {{end}}

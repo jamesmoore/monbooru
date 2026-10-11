@@ -25,7 +25,7 @@ type Manga struct {
 	byPath map[string]*zip.File
 }
 
-var ErrEmptyManga = errors.New("archive contains no recognised image entries")
+var errEmptyManga = errors.New("archive contains no recognised image entries")
 
 var pageImageExts = map[string]struct{}{
 	".jpg":  {},
@@ -77,7 +77,7 @@ func OpenManga(path string) (*Manga, error) {
 	})
 	if len(pages) == 0 {
 		_ = zr.Close()
-		return nil, ErrEmptyManga
+		return nil, errEmptyManga
 	}
 	return &Manga{Pages: pages, zr: zr, byPath: byPath}, nil
 }
@@ -119,19 +119,6 @@ func (m *Manga) extractPage(n int, dst string) error {
 		}
 		return nil
 	})
-}
-
-func (m *Manga) coverImage() (image.Image, error) {
-	rc, err := m.pageReader(0)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rc.Close() }()
-	img, err := DecodeImageWithCap(rc)
-	if err != nil {
-		return nil, fmt.Errorf("decode cover: %w", err)
-	}
-	return img, nil
 }
 
 func (m *Manga) coverDimensions() (int, int, error) {

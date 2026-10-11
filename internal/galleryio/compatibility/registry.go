@@ -5,8 +5,9 @@ package compatibility
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
-	"path"
+	"io"
 	"strings"
 )
 
@@ -39,6 +40,52 @@ type ManifestImage struct {
 type NormalizedEntry struct {
 	Rel  string
 	File *zip.File
+}
+
+// MaxDocumentBytes caps each document a foreign archive carries.
+const MaxDocumentBytes = 16 << 30
+
+// openDocument refuses a document past MaxDocumentBytes, by its declared
+// size and again by the bytes it yields, which a header can understate.
+func openDocument(f *zip.File) (io.ReadCloser, error) {
+	if f.UncompressedSize64 > MaxDocumentBytes {
+		return nil, documentTooLarge(f.Name)
+	}
+	rc, err := f.Open()
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", f.Name, err)
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{&cappedReader{r: rc, left: MaxDocumentBytes, name: f.Name}, rc}, nil
+}
+
+type cappedReader struct {
+	r    io.Reader
+	left int64
+	name string
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.left < 0 {
+		return 0, documentTooLarge(c.name)
+	}
+	if int64(len(p)) > c.left+1 {
+		p = p[:c.left+1]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	if c.left < 0 {
+		return 0, documentTooLarge(c.name)
+	}
+	return n, err
+}
+
+var errDocumentTooLarge = errors.New("exceeds the import limit")
+
+func documentTooLarge(name string) error {
+	return fmt.Errorf("archive entry %q %w of %d bytes", name, errDocumentTooLarge, int64(MaxDocumentBytes))
 }
 
 var providers []Provider
@@ -104,17 +151,6 @@ func NormalizeEntries(files []*zip.File) []NormalizedEntry {
 		out = append(out, NormalizedEntry{Rel: rel, File: f})
 	}
 	return out
-}
-
-func HasMediaExt(name string) bool {
-	if strings.HasSuffix(name, "/") {
-		return false
-	}
-	switch strings.ToLower(path.Ext(name)) {
-	case ".jpg", ".jpeg", ".png", ".webp", ".avif", ".jxl", ".gif", ".mp4", ".webm":
-		return true
-	}
-	return false
 }
 
 func PickValidSHA256(s string) string {

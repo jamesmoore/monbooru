@@ -13,7 +13,7 @@ import (
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-const MangaPageCacheTTL = 5 * time.Minute
+const mangaPageCacheTTL = 5 * time.Minute
 
 // Shorter than the TTL, so an idle page goes within one tick of its deadline.
 const mangaReclaimInterval = 60 * time.Second
@@ -55,9 +55,6 @@ func extractedPageInDir(imageDir string, n int) string {
 		}
 		name := e.Name()
 		if !strings.HasPrefix(name, prefix) {
-			continue
-		}
-		if strings.HasSuffix(name, "_thumb.jpg") {
 			continue
 		}
 		// Extra digits mean another page: page_1000 is a prefix of page_10000.
@@ -111,41 +108,32 @@ func ensureMangaPageInDir(imageDir, canonPath string, n int) (string, error) {
 }
 
 func EnsureMangaPageThumb(thumbnailsPath, canonPath string, imageID int64, n int) (string, error) {
-	imageDir := mangaImageDir(thumbnailsPath, imageID)
-	if err := os.MkdirAll(imageDir, 0o755); err != nil {
-		return "", fmt.Errorf("create manga cache dir: %w", err)
-	}
-	thumb := mangaPageThumbPath(imageDir, n)
-	if _, err := os.Stat(thumb); err == nil {
-		touchCacheFile(thumb)
-		return thumb, nil
-	}
-	pagePath, err := EnsureMangaPage(thumbnailsPath, canonPath, imageID, n)
-	if err != nil {
-		return "", err
-	}
-	if err := generateImageThumbFromAny(pagePath, thumb); err != nil {
-		return "", err
-	}
-	return thumb, nil
+	thumb := mangaPageThumbPath(mangaImageDir(thumbnailsPath, imageID), n)
+	return ensureFromPage(thumbnailsPath, canonPath, imageID, n, thumb, generateImageThumbFromAny)
 }
 
 // EnsureMangaPageView is a full-size JPEG copy of page n for a browser
 // without AVIF or JPEG XL; the idle reclaim evicts it with the page.
 func EnsureMangaPageView(thumbnailsPath, canonPath string, imageID int64, n int) (string, error) {
 	view := mangaPageViewPath(mangaImageDir(thumbnailsPath, imageID), n)
-	if _, err := os.Stat(view); err == nil {
-		touchCacheFile(view)
-		return view, nil
+	return ensureFromPage(thumbnailsPath, canonPath, imageID, n, view, func(page, dst string) error {
+		return renderStill(page, dst, 0)
+	})
+}
+
+func ensureFromPage(thumbnailsPath, canonPath string, imageID int64, n int, dst string, render func(page, dst string) error) (string, error) {
+	if _, err := os.Stat(dst); err == nil {
+		touchCacheFile(dst)
+		return dst, nil
 	}
 	pagePath, err := EnsureMangaPage(thumbnailsPath, canonPath, imageID, n)
 	if err != nil {
 		return "", err
 	}
-	if err := renderStill(pagePath, view, 0); err != nil {
+	if err := render(pagePath, dst); err != nil {
 		return "", err
 	}
-	return view, nil
+	return dst, nil
 }
 
 func generateImageThumbFromAny(srcPath, dstPath string) error {
@@ -181,7 +169,7 @@ type MangaCacheReclaimer struct {
 
 // NewMangaCacheReclaimer's dir must be the gallery's MangaCacheDir.
 func NewMangaCacheReclaimer(dir string) *MangaCacheReclaimer {
-	return &MangaCacheReclaimer{dir: dir, ttl: MangaPageCacheTTL, done: make(chan struct{})}
+	return &MangaCacheReclaimer{dir: dir, ttl: mangaPageCacheTTL, done: make(chan struct{})}
 }
 
 func (r *MangaCacheReclaimer) Start(ctx context.Context) {

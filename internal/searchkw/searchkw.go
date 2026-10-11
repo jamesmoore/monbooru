@@ -2,51 +2,62 @@
 // nothing of ours.
 package searchkw
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
-// Keywords is in the order the system: cheat sheet lists them.
-var Keywords = []string{
-	"fav",
-	"inbox",
-	"ai",
-	"source",
-	"cat",
-	"width",
-	"height",
-	"date",
-	"missing",
-	"tagged",
-	"autotagged",
-	"stale",
-	"folder",
-	"folderonly",
-	"generated",
-	"rating",
-	"type",
-	"collection",
-	"pages",
-	"name",
-	"size",
-	"mime",
-	"ratio",
-	"tagcount",
-	"duration",
-	"hash",
-	"md5",
-	"prompt",
-	"comfyui",
-	"model",
-	"sampler",
-	"seed",
-	"via",
-	"phash",
-	"relation",
-	"similar",
-	"id",
-	"batch",
-	"lookup",
-	"upgrade",
+// keywordTable is in the order the system: cheat sheet lists them.
+var keywordTable = []struct{ key, desc string }{
+	{"fav", "favorite images"},
+	{"inbox", "in inbox"},
+	{"ai", "AI generation tool"},
+	{"source", "external source label"},
+	{"cat", "by tag category"},
+	{"width", "image width"},
+	{"height", "image height"},
+	{"date", "ingestion date"},
+	{"missing", "files gone from disk"},
+	{"tagged", "has any tag, or by source"},
+	{"autotagged", "has auto-tag, or by tagger"},
+	{"stale", "tags a source dropped"},
+	{"folder", "folder (recursive)"},
+	{"folderonly", "folder (exact)"},
+	{"generated", "generation recipe"},
+	{"rating", "safety rating"},
+	{"type", "image / archive / animated"},
+	{"collection", "collection label"},
+	{"pages", "page count"},
+	{"name", "file name"},
+	{"size", "file size"},
+	{"mime", "file type"},
+	{"ratio", "aspect ratio (width / height)"},
+	{"tagcount", "number of tags"},
+	{"duration", "video duration in seconds"},
+	{"hash", "sha256 or md5 digest"},
+	{"md5", "md5 digest"},
+	{"prompt", "SD / ComfyUI prompt"},
+	{"comfyui", "ComfyUI workflow node or input"},
+	{"model", "SD / ComfyUI model"},
+	{"sampler", "SD / ComfyUI sampler"},
+	{"seed", "SD / ComfyUI seed"},
+	{"via", "added via"},
+	{"phash", "perceptual hash (16-hex; ~d for Hamming distance)"},
+	{"relation", "declared relation"},
+	{"similar", "tag similarity to image id (~score 0..1 for a threshold)"},
+	{"id", "image id"},
+	{"batch", "upload batch id"},
+	{"lookup", "scheduled lookup state"},
+	{"upgrade", "source serves a different file"},
 }
+
+var Keywords = func() []string {
+	out := make([]string, len(keywordTable))
+	for i, k := range keywordTable {
+		out[i] = k.key
+	}
+	return out
+}()
 
 // system is no filter, but a system: query must not be probed as a
 // category-qualified tag.
@@ -101,80 +112,42 @@ var rangeKeys = map[string]bool{
 	"tagged": true, "autotagged": true, "via": true,
 }
 
-var closedVocab = func() map[string]map[string]struct{} {
-	m := make(map[string]map[string]struct{}, len(Expansions))
-	for key, vals := range Expansions {
-		if rangeKeys[key] {
-			continue
-		}
-		set := make(map[string]struct{}, len(vals))
-		for _, v := range vals {
-			set[v] = struct{}{}
-		}
-		m[key] = set
-	}
-	return m
-}()
+var boolSpellings = map[string]bool{
+	"true": true, "yes": true, "y": true, "on": true, "1": true,
+	"false": false, "no": false, "n": false, "off": false, "0": false,
+}
+
+// ParseBool reads a boolean filter value; ok is false for anything else.
+func ParseBool(v string) (val, ok bool) {
+	val, ok = boolSpellings[strings.ToLower(strings.TrimSpace(v))]
+	return val, ok
+}
 
 func ValueKnown(key, val string) bool {
-	set, ok := closedVocab[key]
-	if !ok {
+	vals, ok := Expansions[key]
+	if !ok || rangeKeys[key] {
 		return true
 	}
+	boolRow := slices.Equal(vals, []string{"true", "false"})
 	for _, part := range strings.Split(strings.ToLower(val), ",") {
 		part = strings.TrimSpace(part)
-		if part == "" {
+		if part == "" || slices.Contains(vals, part) {
 			continue
 		}
-		if _, ok := set[part]; !ok {
+		if _, isBool := boolSpellings[part]; !boolRow || !isBool {
 			return false
 		}
 	}
 	return true
 }
 
-var Descriptions = map[string]string{
-	"fav":        "favorite images",
-	"inbox":      "in inbox",
-	"ai":         "AI generation tool",
-	"source":     "external source label",
-	"cat":        "by tag category",
-	"width":      "image width",
-	"height":     "image height",
-	"date":       "ingestion date",
-	"missing":    "files gone from disk",
-	"tagged":     "has any tag, or by source",
-	"autotagged": "has auto-tag, or by tagger",
-	"stale":      "tags a source dropped",
-	"folder":     "folder (recursive)",
-	"folderonly": "folder (exact)",
-	"generated":  "generation recipe",
-	"rating":     "safety rating",
-	"type":       "image / archive / animated",
-	"collection": "collection label",
-	"pages":      "page count",
-	"name":       "file name",
-	"size":       "file size",
-	"mime":       "file type",
-	"ratio":      "aspect ratio (width / height)",
-	"tagcount":   "number of tags",
-	"duration":   "video duration in seconds",
-	"hash":       "sha256 or md5 digest",
-	"md5":        "md5 digest",
-	"prompt":     "SD / ComfyUI prompt",
-	"comfyui":    "ComfyUI workflow node or input",
-	"model":      "SD / ComfyUI model",
-	"sampler":    "SD / ComfyUI sampler",
-	"seed":       "SD / ComfyUI seed",
-	"via":        "added via",
-	"phash":      "perceptual hash (16-hex; ~d for Hamming distance)",
-	"relation":   "declared relation",
-	"similar":    "tag similarity to image id (~score 0..1 for a threshold)",
-	"id":         "image id",
-	"batch":      "upload batch id",
-	"lookup":     "scheduled lookup state",
-	"upgrade":    "source serves a different file",
-}
+var Descriptions = func() map[string]string {
+	m := make(map[string]string, len(keywordTable))
+	for _, k := range keywordTable {
+		m[k.key] = k.desc
+	}
+	return m
+}()
 
 // Shared by four keys, so nothing may write to it.
 var numericComparisons = map[string]string{
@@ -219,10 +192,10 @@ var ExpansionDescriptions = map[string]map[string]string{
 		"..": "range",
 	},
 	"ratio": {
-		">=": "wider than (e.g. 1.5 = 3:2)",
-		"<=": "taller than",
+		">=": "at least (e.g. 1.5 = 3:2)",
+		"<=": "at most",
 		">":  "wider than",
-		"<":  "taller than",
+		"<":  "narrower than",
 		"=":  "exact ratio",
 		"..": "range",
 	},

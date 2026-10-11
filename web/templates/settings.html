@@ -8,11 +8,16 @@
                   {{if .ConfirmDanger}}data-confirm-danger="{{.ConfirmDanger}}"
                   {{end}}data-confirm-ok="{{.ConfirmOK}}"
                   {{end}}style="display:inline">
-              <input type="hidden" name="_csrf" value="{{.CSRF}}">
-              <button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm{{if .Accent}} {{.Accent}}{{end}}"{{if .Disabled}} disabled title="{{.DisabledReason}}"{{end}}>{{.Verb}}</button>
+              <button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm{{if .Accent}} {{.Accent}}{{end}}"{{if .MlGated}} data-ml-title=""{{end}}{{if .Disabled}} disabled title="{{.DisabledReason}}"{{end}}>{{.Verb}}</button>
             </form>
           </td>
         </tr>
+{{end}}
+{{define "settings_section_header"}}
+    <div class="settings-section-header">
+      <h3>{{.Title}}</h3>
+      <p class="field-hint">{{.Hint}}</p>
+    </div>
 {{end}}
 {{define "settings.html"}}
 {{template "layout_head" .}}
@@ -46,20 +51,16 @@
   {{if .DesktopProfile}}
   {{$dk := .Desktop}}
   <section id="desktop" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Desktop</h3>
-      <p class="field-hint">Folders, launch options and the tray icon.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Desktop" "Hint" "Folders, launch options and the tray icon."}}
     <div id="flash-desktop"></div>
     <form id="desktop-switches" hx-post="/settings/desktop" hx-target="#flash-desktop" hx-swap="innerHTML">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
       <div class="settings-cols">
         <div class="field">
           <label>Folders</label>
           <div class="desktop-folders">
             {{range $kind := .DesktopFolders}}
-            <button type="button" class="btn-sm" hx-post="/internal/open-folder" hx-params="_csrf,kind"
-                    hx-vals='{"_csrf":"{{$csrf}}","kind":"{{$kind}}"}'
+            <button type="button" class="btn-sm" hx-post="/internal/open-folder" hx-params="kind"
+                    hx-vals='{"kind":"{{$kind}}"}'
                     hx-target="#flash-desktop" hx-swap="innerHTML">{{$kind}}</button>
             {{end}}
           </div>
@@ -105,18 +106,14 @@
   {{end}}
 
   <section id="general" class="settings-section">
-    <div class="settings-section-header">
-      <h3>General</h3>
-      <p class="field-hint">File handling, display options and meta tags.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "General" "Hint" "File handling, display options and meta tags."}}
     <div id="flash-general"></div>
     <form hx-post="/settings/general" hx-target="#flash-general" hx-swap="innerHTML">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
       <div class="settings-cols">
         <div class="settings-sub">
           <h4>Files</h4>
           {{$sizeHint := "Files larger than this are skipped on upload and during sync."}}{{if eq $cfg.Gallery.MaxFileSizeMB 0}}{{$sizeHint = "0 means no cap: no file is skipped for its size."}}{{end}}
-          {{template "partials/range_field.html" dict "Name" "max_file_size_mb" "Label" "Max file size (MB)" "Min" 1 "Max" 5120 "Step" 1 "Value" $cfg.Gallery.MaxFileSizeMB "Ticks" (list 512 1024 2048 3072 4096 5120) "Hint" $sizeHint}}
+          {{template "partials/range_field.html" dict "Name" "max_file_size_mb" "Label" "Max file size (MB)" "Min" 1 "Max" 5120 "Step" 1 "Value" $cfg.Gallery.MaxFileSizeMB "Ticks" (list 512 1024 2048 3072 4096 5120) "Hint" $sizeHint "Pinned" ($cfg.EnvPinned "gallery.max_file_size_mb")}}
           <div class="field">
             <div class="field-title">
               <label>Ignored files and folders</label>
@@ -154,14 +151,15 @@
               <input type="checkbox" name="rename_on_ingest" {{if $cfg.Gallery.RenameOnIngest}}checked{{end}}>
               Apply to files found on disk too
             </label>
-            <span class="field-hint">Files and names what the watcher and a sync pick up, wherever it was dropped. A sync applies it at once; the watcher after a restart.</span>
+            <span class="field-hint">Files and names what the watcher and a sync pick up, wherever it was dropped.</span>
           </div>
           <div class="field">
             <label>
-              <input type="checkbox" name="watch_enabled" {{if $cfg.Gallery.WatchEnabled}}checked{{end}}>
+              {{$pin := $cfg.EnvPinned "gallery.watch_enabled"}}
+              <input type="checkbox" name="watch_enabled" {{if $cfg.Gallery.WatchEnabled}}checked{{end}}{{if $pin}} disabled{{end}}>
               Watch gallery for new files automatically
             </label>
-            <span class="field-hint">Takes effect after a restart.</span>
+            <span class="field-hint">{{if $pin}}Set by {{$pin}} in the environment.{{else}}Takes effect after a restart.{{end}}</span>
           </div>
         </div>
         <div class="settings-col">
@@ -180,10 +178,12 @@
             <h4>Meta tags</h4>
             <div class="field">
               <label>
-                <input type="checkbox" name="auto_meta_tags" {{if $cfg.Gallery.AutoMetaTags}}checked{{end}}>
+                {{$pin := $cfg.EnvPinned "gallery.auto_meta_tags"}}
+                <input type="checkbox" name="auto_meta_tags" {{if $cfg.Gallery.AutoMetaTags}}checked{{end}}{{if $pin}} disabled{{end}}>
                 Automatically generate meta tags from the file
               </label>
               <span class="field-hint">Generate some meta tags automatically: highres, lowres, animated, greyscale...</span>
+              {{with $pin}}<span class="field-hint">Set by {{.}} in the environment.</span>{{end}}
             </div>
           </div>
         </div>
@@ -195,7 +195,6 @@
   <dialog id="ignore-dialog">
     <form id="ignore-form" hx-post="/settings/general/ignore" hx-target="#flash-ignore" hx-swap="innerHTML"
           hx-on::after-request="onIgnoreSaved()">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
       <p><strong>Ignored files and folders</strong></p>
       <textarea name="ignore" id="ignore" rows="12" spellcheck="false" aria-label="Ignored files and folders"></textarea>
       <ul class="ignore-rules">
@@ -233,10 +232,7 @@
   </script>
 
   <section id="galleries" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Galleries</h3>
-      <p class="field-hint">Add, switch, export or import your galleries.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Galleries" "Hint" "Add, switch, export or import your galleries."}}
     <div id="flash-galleries"></div>
     <div class="table-scroll">
     <table class="gallery-table">
@@ -260,7 +256,6 @@
           <td>
             {{if ne .Name $active}}
             <form hx-post="/internal/gallery/switch" hx-target="#flash-galleries" hx-swap="innerHTML" style="display:inline">
-              <input type="hidden" name="_csrf" value="{{$csrf}}">
               <input type="hidden" name="name" value="{{.Name}}">
               <button type="submit" class="btn-sm">Switch</button>
             </form>
@@ -271,7 +266,6 @@
           <td>
             {{if ne .Name $cfg.DefaultGallery}}
             <form hx-post="/settings/galleries/{{.Name}}/default" hx-target="#flash-galleries" hx-swap="innerHTML" style="display:inline">
-              <input type="hidden" name="_csrf" value="{{$csrf}}">
               <button type="submit" class="btn-sm btn-success">Set default</button>
             </form>
             {{else}}
@@ -309,10 +303,8 @@
     <dialog id="gallery-add-dialog">
       <form hx-post="/settings/galleries" hx-target="#flash-gallery-add" hx-swap="innerHTML"
             hx-encoding="multipart/form-data" class="add-gallery-form"
-            hx-headers='{"X-CSRF-Token": "{{$csrf}}"}'
             hx-on::before-request="setAddGalleryBusy(this, true)"
             hx-on::after-request="onAddGalleryResponse(this)">
-        <input type="hidden" name="_csrf" value="{{$csrf}}">
         <p>Add a new gallery</p>
         <div class="field">
           <label>Name</label>
@@ -332,7 +324,7 @@
           </div>
         </div>
         <div class="field">
-          <label><input type="checkbox" id="gallery-add-import-toggle"> Import an existing gallery</label>
+          <label><input type="checkbox" id="gallery-add-import-toggle" onchange="syncImportToggle()"> Import an existing gallery</label>
         </div>
         <div class="field" id="gallery-add-import-row" hidden>
           <label>Import file (.db / .json / .zip)</label>
@@ -357,8 +349,6 @@
       var row = document.getElementById('gallery-add-import-row');
       if (toggle && row) row.hidden = !toggle.checked;
     }
-    document.getElementById('gallery-add-import-toggle')
-      .addEventListener('change', syncImportToggle);
     function setAddGalleryBusy(form, busy) {
       var submit = form.querySelector('button[type=submit]');
       if (!submit) return;
@@ -371,7 +361,7 @@
       if (flash && flash.querySelector('.flash-ok')) {
         var outer = document.getElementById('flash-galleries');
         if (outer) outer.innerHTML = flash.innerHTML;
-        stashImportFlash(flash.innerHTML);
+        writeStash('monbooru_import_flash', {h: flash.innerHTML});
         flash.innerHTML = '';
         document.getElementById('gallery-add-dialog').close();
         form.reset();
@@ -382,8 +372,8 @@
   </section>
 
   <dialog id="gallery-rename-dialog">
-    <form id="gallery-rename-form" hx-post="" hx-target="#flash-gallery-rename" hx-swap="innerHTML">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
+    <form id="gallery-rename-form" hx-post="" hx-target="#flash-gallery-rename" hx-swap="innerHTML"
+          hx-on::after-request="onRenameGalleryResponse()">
       <p>Rename <strong id="gallery-rename-src"></strong></p>
       <div class="field">
         <label>New name</label>
@@ -399,7 +389,6 @@
   <dialog id="gallery-delete-dialog">
     <form id="gallery-delete-form" hx-post="" hx-target="#flash-gallery-delete" hx-swap="innerHTML"
           hx-on::after-request="onDeleteGalleryResponse()">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
       <p>Delete gallery <strong id="gallery-delete-src"></strong>?</p>
       <p class="confirm-dialog-danger">The database and thumbnails will be erased.</p>
       <div class="field">
@@ -438,15 +427,14 @@
   <dialog id="gallery-import-dialog">
     <form id="gallery-import-form" hx-post="" hx-target="#flash-gallery-import" hx-swap="innerHTML"
           hx-encoding="multipart/form-data"
-          hx-headers='{"X-CSRF-Token": "{{$csrf}}"}'
           hx-on::before-request="setImportBusy(this, true)"
           hx-on::after-request="onImportResponse(this)">
       <p>Import into gallery <strong id="gallery-import-src"></strong></p>
       <div class="field">
-        <label><input type="radio" name="mode" value="merge" checked> Merge: add tags from the uploaded file, and images too when it carries their files (.zip)</label>
+        <label><input type="radio" name="mode" value="merge" checked onchange="syncImportModeFields()"> Merge: add tags from the uploaded file, and images too when it carries their files (.zip)</label>
       </div>
       <div class="field">
-        <label><input type="radio" name="mode" value="replace"> Replace: wipe this gallery and restore from the uploaded file</label>
+        <label><input type="radio" name="mode" value="replace" onchange="syncImportModeFields()"> Replace: wipe this gallery and restore from the uploaded file</label>
       </div>
       <p id="gallery-import-danger" class="confirm-dialog-danger">Destructive: replaces the current database. If the uploaded file is a .zip with images, the source folder is replaced as well.</p>
       <div class="field" id="gallery-import-confirm-row">
@@ -464,71 +452,67 @@
   </dialog>
 
   <script>
-  document.querySelectorAll('.btn-gallery-rename').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      var name = this.dataset.name;
-      var form = document.getElementById('gallery-rename-form');
-      form.setAttribute('hx-post', '/settings/galleries/' + name + '/rename');
-      if (window.htmx) window.htmx.process(form);
-      document.getElementById('gallery-rename-src').textContent = name;
-      clearSlots('flash-gallery-rename');
-      var input = document.getElementById('gallery-rename-input');
-      input.value = name;
-      document.getElementById('gallery-rename-dialog').showModal();
-      input.focus();
-      input.select();
-    });
-  });
-  document.querySelectorAll('.btn-gallery-delete').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      var name = this.dataset.name;
-      var form = document.getElementById('gallery-delete-form');
-      form.setAttribute('hx-post', '/settings/galleries/' + name + '/delete');
-      if (window.htmx) window.htmx.process(form);
-      document.getElementById('gallery-delete-src').textContent = name;
-      var keeps = this.dataset.keeps;
-      document.getElementById('gallery-delete-keeps').textContent = keeps
-        ? 'Kept: the folders it leaves out, ' + keeps + ', and anything the ignore list names.'
-        : 'Anything the ignore list names is kept.';
-      clearSlots('flash-gallery-delete');
-      form.querySelector('input[name="remove_folder"]').checked = false;
-      form.querySelector('input[name="confirm_name"]').value = '';
-      document.getElementById('gallery-delete-dialog').showModal();
-      document.getElementById('gallery-delete-confirm').focus();
-    });
-  });
-  document.querySelectorAll('.btn-gallery-export').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      var name = this.dataset.name;
-      var form = document.getElementById('gallery-export-form');
-      form.setAttribute('action', '/settings/galleries/' + name + '/export');
-      document.getElementById('gallery-export-src').textContent = name;
-      form.querySelector('input[name="format"][value="db"]').checked = true;
-      form.querySelector('input[name="with_images"]').checked = false;
-      document.getElementById('gallery-export-dialog').showModal();
-    });
-  });
-
-  document.querySelectorAll('.btn-gallery-import').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      var name = this.dataset.name;
-      var canReplace = this.dataset.canReplace !== 'false';
-      var form = document.getElementById('gallery-import-form');
-      form.setAttribute('hx-post', '/settings/galleries/' + name + '/import');
-      if (window.htmx) window.htmx.process(form);
-      document.getElementById('gallery-import-src').textContent = name;
-      clearSlots('flash-gallery-import');
-      form.reset();
-      setImportBusy(form, false);
-      var replaceRadio = form.querySelector('input[name="mode"][value="replace"]');
-      var mergeRadio = form.querySelector('input[name="mode"][value="merge"]');
-      var replaceLabel = replaceRadio.parentElement;
-      replaceRadio.disabled = !canReplace;
-      replaceLabel.title = canReplace ? '' : 'Replace is not allowed on the active or default gallery; switch to another first.';
-      mergeRadio.checked = true;
-      syncImportModeFields();
-      document.getElementById('gallery-import-dialog').showModal();
-    });
+  function openGalleryRename(btn) {
+    var name = btn.dataset.name;
+    document.getElementById('gallery-rename-src').textContent = name;
+    clearSlots('flash-gallery-rename');
+    var input = document.getElementById('gallery-rename-input');
+    input.value = name;
+    openHxRewriteDialog('gallery-rename-form', 'hx-post', '/settings/galleries/' + name + '/rename', 'gallery-rename-dialog');
+    input.focus();
+    input.select();
+  }
+  function openGalleryDelete(btn) {
+    var name = btn.dataset.name;
+    var form = document.getElementById('gallery-delete-form');
+    document.getElementById('gallery-delete-src').textContent = name;
+    var keeps = btn.dataset.keeps;
+    document.getElementById('gallery-delete-keeps').textContent = keeps
+      ? 'Kept: the folders it leaves out, ' + keeps + ', and anything the ignore list names.'
+      : 'Anything the ignore list names is kept.';
+    clearSlots('flash-gallery-delete');
+    form.querySelector('input[name="remove_folder"]').checked = false;
+    form.querySelector('input[name="confirm_name"]').value = '';
+    openHxRewriteDialog('gallery-delete-form', 'hx-post', '/settings/galleries/' + name + '/delete', 'gallery-delete-dialog');
+    document.getElementById('gallery-delete-confirm').focus();
+  }
+  function openGalleryExport(btn) {
+    var name = btn.dataset.name;
+    var form = document.getElementById('gallery-export-form');
+    form.setAttribute('action', '/settings/galleries/' + name + '/export');
+    document.getElementById('gallery-export-src').textContent = name;
+    form.querySelector('input[name="format"][value="db"]').checked = true;
+    form.querySelector('input[name="with_images"]').checked = false;
+    document.getElementById('gallery-export-dialog').showModal();
+  }
+  function openGalleryImport(btn) {
+    var name = btn.dataset.name;
+    var canReplace = btn.dataset.canReplace !== 'false';
+    var form = document.getElementById('gallery-import-form');
+    document.getElementById('gallery-import-src').textContent = name;
+    clearSlots('flash-gallery-import');
+    form.reset();
+    setImportBusy(form, false);
+    var replaceRadio = form.querySelector('input[name="mode"][value="replace"]');
+    var mergeRadio = form.querySelector('input[name="mode"][value="merge"]');
+    var replaceLabel = replaceRadio.parentElement;
+    replaceRadio.disabled = !canReplace;
+    replaceLabel.title = canReplace ? '' : 'Replace is not allowed on the active or default gallery; switch to another first.';
+    mergeRadio.checked = true;
+    syncImportModeFields();
+    openHxRewriteDialog('gallery-import-form', 'hx-post', '/settings/galleries/' + name + '/import', 'gallery-import-dialog');
+  }
+  var galleryRowRoutes = [
+    ['.btn-gallery-rename', openGalleryRename],
+    ['.btn-gallery-delete', openGalleryDelete],
+    ['.btn-gallery-export', openGalleryExport],
+    ['.btn-gallery-import', openGalleryImport],
+  ];
+  document.addEventListener('click', function(e) {
+    for (var i = 0; i < galleryRowRoutes.length; i++) {
+      var btn = e.target.closest(galleryRowRoutes[i][0]);
+      if (btn) { galleryRowRoutes[i][1](btn); return; }
+    }
   });
 
   function syncImportModeFields() {
@@ -552,10 +536,6 @@
       submit.classList.add('btn-danger');
     }
   }
-  document.querySelectorAll('#gallery-import-form input[name="mode"]').forEach(function(radio) {
-    radio.addEventListener('change', syncImportModeFields);
-  });
-
   function setImportBusy(form, busy) {
     var submit = form.querySelector('button[type=submit]');
     submit.disabled = busy;
@@ -565,66 +545,56 @@
     document.getElementById('gallery-import-wait').hidden = !busy;
   }
 
+  // A dialog flash matching sel moves to #flash-galleries across the
+  // reload.
+  function reloadWithGalleryFlash(flashId, dialogId, sel) {
+    var flash = document.getElementById(flashId);
+    if (!flash || !flash.querySelector(sel)) return;
+    writeStash('monbooru_import_flash', {h: flash.innerHTML});
+    flash.innerHTML = '';
+    document.getElementById(dialogId).close();
+    window.location.reload();
+  }
+
   // A successful import switches the active gallery, so the page reloads
   // and the summary rides the stash.
   function onImportResponse(form) {
     setImportBusy(form, false);
-    var flash = document.getElementById('flash-gallery-import');
-    if (flash && flash.querySelector('.flash-ok')) {
-      stashImportFlash(flash.innerHTML);
-      flash.innerHTML = '';
-      document.getElementById('gallery-import-dialog').close();
-      window.location.reload();
-    }
+    reloadWithGalleryFlash('flash-gallery-import', 'gallery-import-dialog', '.flash-ok');
   }
 
   // Only a delete that kept folders answers with a flash; a plain one
   // answers with a refresh.
   function onDeleteGalleryResponse() {
-    var flash = document.getElementById('flash-gallery-delete');
-    if (flash && flash.querySelector('.flash-ok')) {
-      stashImportFlash(flash.innerHTML);
-      flash.innerHTML = '';
-      document.getElementById('gallery-delete-dialog').close();
-      window.location.reload();
-    }
+    reloadWithGalleryFlash('flash-gallery-delete', 'gallery-delete-dialog', '.flash-ok');
   }
 
-  function stashImportFlash(html) {
-    try {
-      sessionStorage.setItem('monbooru_import_flash', JSON.stringify({h: html, t: Date.now()}));
-    } catch (e) {}
+  // A rename monloader could not hear about still renamed: the page
+  // reloads onto the new name and keeps the warning.
+  function onRenameGalleryResponse() {
+    reloadWithGalleryFlash('flash-gallery-rename', 'gallery-rename-dialog', '.flash-warn');
   }
+
   document.addEventListener('DOMContentLoaded', function() {
-    var raw, stash;
-    try {
-      raw = sessionStorage.getItem('monbooru_import_flash');
-      if (raw) sessionStorage.removeItem('monbooru_import_flash');
-    } catch (e) { return; }
-    if (!raw) return;
-    try { stash = JSON.parse(raw); } catch (e) { return; }
+    var stash = readStash('monbooru_import_flash', 30000, true);
     var outer = document.getElementById('flash-galleries');
-    if (!stash || !stash.h || !outer || Date.now() - stash.t > 30000) return;
-    outer.innerHTML = stash.h;
+    if (stash && stash.h && outer) outer.innerHTML = stash.h;
   });
   </script>
 
   <section id="plugins" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Plugins</h3>
-      <p class="field-hint">Plugins and themes.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Plugins" "Hint" "Plugins and themes."}}
     <div id="flash-plugins"></div>
     <div class="settings-sub">
       <h4>Pairing requests</h4>
-      {{template "partials/plugin_pairing.html" (dict "Pending" $pluginPending "Paired" $pluginPaired "CSRFToken" $csrf)}}
+      {{template "partials/plugin_pairing.html" (dict "Pending" $pluginPending "Paired" $pluginPaired)}}
     </div>
     <div class="settings-sub">
       <div class="settings-sub-head">
         <h4>Installed</h4>
         <p class="field-hint">Put a plugin folder in <code>{{.PluginsDir}}</code>.</p>
       </div>
-      {{template "partials/plugin_rows.html" (dict "Rows" $pluginRows "CSRFToken" $csrf)}}
+      {{template "partials/plugin_rows.html" (dict "Rows" $pluginRows)}}
     </div>
 
     {{$themes := .Themes}}
@@ -633,7 +603,7 @@
         <h4>Themes</h4>
         <p class="field-hint">Put a theme folder in <code>{{.ThemesDir}}</code>.</p>
       </div>
-      {{template "partials/theme_cluster.html" (dict "Names" $themes.Names "Active" $themes.Active "CSRFToken" $csrf)}}
+      {{template "partials/theme_cluster.html" (dict "Names" $themes.Names "Active" $themes.Active)}}
     </div>
   </section>
 
@@ -647,18 +617,18 @@
     {{$taggers := .Taggers}}
     {{$rows := .TaggerRows}}
     <form hx-post="/settings/tagger" hx-target="#flash-tagger" hx-swap="innerHTML">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
       <div class="settings-sub">
         <h4>Workers / GPU</h4>
         <div class="settings-cols">
           <div class="field">
             <label>Execution provider</label>
+            {{$pin := $cfg.EnvPinned "tagger.execution_provider"}}
             <div class="radio-grid">
               {{range .ExecutionProviders}}
-              <label><input type="radio" name="execution_provider" value="{{.Name}}"{{if eq $cfg.Tagger.ExecutionProvider .Name}} checked{{end}}> {{.Label}}</label>
+              <label><input type="radio" name="execution_provider" value="{{.Name}}"{{if eq $cfg.Tagger.ExecutionProvider .Name}} checked{{end}}{{if $pin}} disabled{{end}}> {{.Label}}</label>
               {{end}}
             </div>
-            <p class="field-hint">Providers need a matching ONNX Runtime library.</p>
+            <p class="field-hint">{{if $pin}}Set by {{$pin}} in the environment.{{else}}Providers need a matching ONNX Runtime library.{{end}}</p>
           </div>
           {{template "partials/range_field.html" dict "Name" "parallel" "Label" "Parallel workers" "Min" 1 "Max" 16 "Step" 1 "Value" $cfg.Tagger.Parallel "Ticks" (list 1 2 4 8 12 16) "Hint" "Images tagged in parallel."}}
           {{template "partials/range_field.html" dict "Name" "idle_release_after_minutes" "Label" "Tagger RAM/VRAM idle release (minutes)" "Min" 0 "Max" 60 "Step" 1 "Value" $cfg.Tagger.IdleReleaseAfterMinutes "Ticks" (list 0 15 30 45 60) "Hint" "Use 0 to free it just after inference."}}
@@ -689,7 +659,9 @@
               {{else}}<span class="status-badge status-off" title="Disabled">disabled</span>{{end}}
             </td>
             <td>
-              {{if $r.Installed}}
+              {{if $r.Malformed}}
+              <span class="field-hint">{{$r.Reason}}</span>
+              {{else if $r.Installed}}
               <button type="button" class="btn-sm"
                       hx-get="/settings/tagger/{{$r.Name}}/config"
                       hx-target="#tagger-config-{{$r.Name}}-body"
@@ -716,28 +688,18 @@
                         data-docker-cmd="{{$r.DockerCommand}}">Install</button>
                 {{end}}
                 {{end}}
-              {{else}}
+              {{else if not $r.Malformed}}
                 {{if $r.Enabled}}
                 <button type="button" class="btn-sm tagger-act-state"
-                        hx-post="/settings/tagger/{{$r.Name}}/disable" hx-target="#flash-tagger" hx-swap="innerHTML"
-                        hx-vals='{"_csrf":"{{$csrf}}"}'>Disable</button>
+                        hx-post="/settings/tagger/{{$r.Name}}/disable" hx-target="#flash-tagger" hx-swap="innerHTML">Disable</button>
                 {{else if $r.Available}}
                 <button type="button" class="btn-sm tagger-act-state btn-success"
-                        hx-post="/settings/tagger/{{$r.Name}}/enable" hx-target="#flash-tagger" hx-swap="innerHTML"
-                        hx-vals='{"_csrf":"{{$csrf}}"}'>Enable</button>
+                        hx-post="/settings/tagger/{{$r.Name}}/enable" hx-target="#flash-tagger" hx-swap="innerHTML">Enable</button>
                 {{end}}
-                {{if $r.Differs}}
-                <button type="button" class="btn-sm tagger-act-reset"
-                        hx-post="/settings/tagger/{{$r.Name}}/reset" hx-target="#flash-tagger" hx-swap="innerHTML"
-                        hx-vals='{"_csrf":"{{$csrf}}"}'
-                        hx-confirm="Reset tagger {{$r.Name}} to stock?"
-                        data-confirm-danger="Thresholds, gallery scope and custom mapping rules will be discarded."
-                        data-confirm-ok="Reset">Reset</button>
-                {{end}}
+                {{template "tagger_reset_button" (dict "Name" $r.Name "Differs" $r.Differs)}}
                 {{if not $r.Enabled}}
                 <button type="button" class="btn-sm tagger-act-delete btn-danger"
                         hx-post="/settings/tagger/{{$r.Name}}/delete" hx-target="#flash-tagger" hx-swap="innerHTML"
-                        hx-vals='{"_csrf":"{{$csrf}}"}'
                         hx-confirm="Delete tagger {{$r.Name}}?"
                         data-confirm-danger="The folder under model_path will be permanently removed from disk."
                         data-confirm-ok="Delete">Delete</button>
@@ -754,7 +716,7 @@
       <p class="field-hint">No tagger subfolders found in <code>{{$cfg.Paths.ModelPath}}</code>.</p>
       {{end}}
     </div>
-    {{range $rows}}{{if .Installed}}
+    {{range $rows}}{{if and .Installed (not .Malformed)}}
     <dialog id="tagger-config-{{.Name}}" class="tagger-config-dialog">
       <h4>{{.Name}}</h4>
       <div id="tagger-config-{{.Name}}-body">Loading...</div>
@@ -775,7 +737,7 @@
         </li>
         <li>Put them in <code>{{.TargetDir}}</code>, keeping the names they download with.
           <button type="button" class="btn-sm" hx-post="/internal/open-folder"
-                  hx-vals='{"_csrf":"{{$csrf}}","kind":"models","name":"{{.Name}}"}'
+                  hx-vals='{"kind":"models","name":"{{.Name}}"}'
                   hx-target="#tagger-get-flash-{{.Name}}" hx-swap="innerHTML">Open the folder</button>
         </li>
         <li>Reload this page.</li>
@@ -809,13 +771,9 @@
   </section>
 
   <section id="relations" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Relations</h3>
-      <p class="field-hint">Settings for duplicate and similar image detection.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Relations" "Hint" "Settings for duplicate and similar image detection."}}
     <div id="flash-relations-settings"></div>
     <form hx-post="/settings/relations" hx-target="#flash-relations-settings" hx-swap="innerHTML">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
       <div class="settings-cols">
         <div class="settings-sub">
           <h4>Default session order</h4>
@@ -848,19 +806,15 @@
   </section>
 
   <section id="auth" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Authentication</h3>
-      <p class="field-hint">UI password and API tokens.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Authentication" "Hint" "UI password and API tokens."}}
     <div id="flash-auth"></div>
     <div class="settings-cols">
-      {{template "partials/auth_password_section.html" (dict "AuthEnabled" $cfg.Auth.EnablePassword "HasPassword" (ne $cfg.Auth.PasswordHash "") "CSRFToken" $csrf)}}
+      {{template "partials/auth_password_section.html" (dict "AuthEnabled" $cfg.Auth.EnablePassword "HasPassword" (ne $cfg.Auth.PasswordHash "") "Pinned" (or ($cfg.EnvPinned "auth.password_hash") ($cfg.EnvPinned "auth.enable_password")))}}
       <div class="settings-sub">
         <h4>API Tokens</h4>
         <p class="field-hint">Bearer tokens for the REST API. The secret is shown once, at creation.</p>
-        {{template "partials/auth_tokens.html" (dict "Tokens" $cfg.Auth.Tokens "CSRFToken" $csrf)}}
+        {{template "partials/auth_tokens.html" (dict "Tokens" $cfg.Auth.Tokens)}}
         <form hx-post="/settings/auth/tokens" hx-target="#flash-auth" hx-swap="innerHTML" style="margin-top:8px">
-          <input type="hidden" name="_csrf" value="{{$csrf}}">
           <input type="text" id="token-name-input" name="name" placeholder="token name" maxlength="64" required>
           <button type="submit">Create token</button>
         </form>
@@ -869,10 +823,7 @@
   </section>
 
   <section id="maintenance" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Maintenance</h3>
-      <p class="field-hint">Cleanup and rebuild tasks for the current gallery.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Maintenance" "Hint" "Cleanup and rebuild tasks for the current gallery."}}
     <div id="flash-maintenance"></div>
     <div class="settings-cols">
       <div class="settings-col">
@@ -889,14 +840,13 @@
                         data-confirm-danger="Tags on those images are removed too. An image whose file is still on disk is kept. Re-mounting the gallery volume before pruning restores the files."
                         data-confirm-ok="Prune"
                         style="display:inline">
-                    <input type="hidden" name="_csrf" value="{{$csrf}}">
                     <button type="submit" class="btn-danger btn-sm">Prune</button>
                   </form>
                 </td>
               </tr>
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Orphaned thumbnails" "Desc" "remove thumbnail files with no matching image" "URL" "/settings/maintenance/prune-orphaned-thumbnails" "Verb" "Remove" "Confirm" "Remove every thumbnail file with no matching image?" "ConfirmOK" "Remove"}}
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Empty folders" "Desc" "list the folders under the gallery root holding nothing, then remove the ones you pick" "URL" "/settings/maintenance/empty-folders" "Verb" "Scan" "Mark" "report"}}
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Rebuild thumbnails" "Desc" "regenerate thumbnail files for every image" "URL" "/settings/maintenance/rebuild-thumbnails" "Verb" "Rebuild" "Mark" "long job" "JobKick" true "Confirm" "Rebuild thumbnails for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Rebuild"}}
+              {{template "maintenance_row" dict "Title" "Orphaned thumbnails" "Desc" "remove thumbnail files with no matching image" "URL" "/settings/maintenance/prune-orphaned-thumbnails" "Verb" "Remove" "Confirm" "Remove every thumbnail file with no matching image?" "ConfirmOK" "Remove"}}
+              {{template "maintenance_row" dict "Title" "Empty folders" "Desc" "list the folders under the gallery root holding nothing, then remove the ones you pick" "URL" "/settings/maintenance/empty-folders" "Verb" "Scan" "Mark" "report"}}
+              {{template "maintenance_row" dict "Title" "Rebuild thumbnails" "Desc" "regenerate thumbnail files for every image" "URL" "/settings/maintenance/rebuild-thumbnails" "Verb" "Rebuild" "Mark" "long job" "JobKick" true "Confirm" "Rebuild thumbnails for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Rebuild"}}
             </tbody>
           </table>
           </div>
@@ -907,17 +857,9 @@
           <div class="table-scroll">
           <table class="maintenance-table">
             <tbody>
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Tag counts" "Desc" "recompute usage counts" "URL" "/settings/maintenance/recalc-tags" "Verb" "Recalculate"}}
-              <tr>
-                <td><strong>Category conflicts</strong><span class="status-badge status-faint">report</span> <span class="field-hint">- list tags whose name occupies more than one category</span></td>
-                <td>
-                  <form hx-post="/settings/maintenance/tag-conflicts" hx-target="#flash-maintenance" hx-swap="innerHTML" style="display:inline">
-                    <input type="hidden" name="_csrf" value="{{$csrf}}">
-                    <button type="submit" class="btn-sm">List</button>
-                  </form>
-                </td>
-              </tr>
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Find folded duplicates" "Desc" "pair pre-widening folded tags with their corrected spelling, then review and merge on the Tags page (Folded dup. filter)" "URL" "/settings/maintenance/find-folded-duplicates" "Verb" "Scan" "Mark" "report" "JobKick" true}}
+              {{template "maintenance_row" dict "Title" "Tag counts" "Desc" "recompute usage counts" "URL" "/settings/maintenance/recalc-tags" "Verb" "Recalculate"}}
+              {{template "maintenance_row" dict "Title" "Category conflicts" "Desc" "list tags whose name occupies more than one category" "URL" "/settings/maintenance/tag-conflicts" "Verb" "List" "Mark" "report"}}
+              {{template "maintenance_row" dict "Title" "Find folded duplicates" "Desc" "pair pre-widening folded tags with their corrected spelling, then review and merge on the Tags page (Folded dup. filter)" "URL" "/settings/maintenance/find-folded-duplicates" "Verb" "Scan" "Mark" "report" "JobKick" true}}
             </tbody>
           </table>
           </div>
@@ -930,11 +872,11 @@
           <div class="table-scroll">
           <table class="maintenance-table">
             <tbody>
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Compute hashes" "Desc" "backfill the perceptual hash and md5 of every image missing one; search -phash: or -md5: to see which" "URL" "/settings/maintenance/compute-hashes" "Verb" "Compute" "Mark" "long job" "JobKick" true "Confirm" "Compute the missing perceptual hashes and md5 digests?" "ConfirmDanger" "The md5 pass reads every file in the gallery from disk. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Compute"}}
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Meta tags" "Desc" "derive the meta tags every image's own properties imply; new files get them as they arrive" "URL" "/settings/maintenance/meta-tags" "Verb" "Generate" "Mark" "long job" "JobKick" true "Confirm" "Derive meta tags for every image in this gallery?" "ConfirmDanger" "Reads a thumbnail per image. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Generate"}}
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Remove meta tags" "Desc" "withdraw every tag monbooru derived; one another source also applied stays under that source" "URL" "/settings/maintenance/meta-tags/remove" "Verb" "Remove" "Mark" "long job" "Danger" true "JobKick" true "Confirm" "Remove every meta tag monbooru derived?" "ConfirmDanger" "Tags you added by hand, and tags a source also vouches for, are kept." "ConfirmOK" "Remove"}}
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Index ComfyUI workflows" "Desc" "rebuild the node and input index the comfyui: search seeks; new files are indexed as they arrive" "URL" "/settings/maintenance/index-workflows" "Verb" "Index" "Mark" "long job" "JobKick" true "Confirm" "Rebuild the ComfyUI workflow index?" "ConfirmDanger" "Re-reads every stored workflow. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Index"}}
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Re-extract metadata" "Desc" "re-parse metadata for every image" "URL" "/settings/maintenance/re-extract-metadata" "Verb" "Re-extract" "Mark" "long job" "Confirm" "Re-parse metadata for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Re-extract"}}
+              {{template "maintenance_row" dict "Title" "Compute hashes" "Desc" "backfill the perceptual hash and md5 of every image missing one; search -phash: or -md5: to see which" "URL" "/settings/maintenance/compute-hashes" "Verb" "Compute" "Mark" "long job" "JobKick" true "Confirm" "Compute the missing perceptual hashes and md5 digests?" "ConfirmDanger" "The md5 pass reads every file in the gallery from disk. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Compute"}}
+              {{template "maintenance_row" dict "Title" "Meta tags" "Desc" "derive the meta tags every image's own properties imply; new files get them as they arrive" "URL" "/settings/maintenance/meta-tags" "Verb" "Generate" "Mark" "long job" "JobKick" true "Confirm" "Derive meta tags for every image in this gallery?" "ConfirmDanger" "Reads a thumbnail per image. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Generate"}}
+              {{template "maintenance_row" dict "Title" "Remove meta tags" "Desc" "withdraw every tag monbooru derived; one another source also applied stays under that source" "URL" "/settings/maintenance/meta-tags/remove" "Verb" "Remove" "Mark" "long job" "Danger" true "JobKick" true "Confirm" "Remove every meta tag monbooru derived?" "ConfirmDanger" "Tags you added by hand, and tags a source also vouches for, are kept." "ConfirmOK" "Remove"}}
+              {{template "maintenance_row" dict "Title" "Index ComfyUI workflows" "Desc" "rebuild the node and input index the comfyui: search seeks; new files are indexed as they arrive" "URL" "/settings/maintenance/index-workflows" "Verb" "Index" "Mark" "long job" "JobKick" true "Confirm" "Rebuild the ComfyUI workflow index?" "ConfirmDanger" "Re-reads every stored workflow. Long-running; blocks other jobs until it finishes. Safe to cancel and resume." "ConfirmOK" "Index"}}
+              {{template "maintenance_row" dict "Title" "Re-extract metadata" "Desc" "re-parse metadata for every image" "URL" "/settings/maintenance/re-extract-metadata" "Verb" "Re-extract" "Mark" "long job" "Confirm" "Re-parse metadata for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Re-extract"}}
             </tbody>
           </table>
           </div>
@@ -946,7 +888,7 @@
           <div class="table-scroll">
           <table class="maintenance-table">
             <tbody>
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Look up unsourced images" "Accent" "monloader-accent" "Desc" "run the scheduled lookup now on the images that are due" "URL" "/settings/maintenance/lookup-due" "Verb" "Look up" "JobKick" true "Confirm" "Look up the images that are due now?" "ConfirmDanger" "Online lookups count against monloader's daily budget." "ConfirmOK" "Look up" "Disabled" (not .MonloaderUsable) "DisabledReason" (monloaderOffReason .MonloaderConn)}}
+              {{template "maintenance_row" dict "Title" "Look up unsourced images" "Accent" "monloader-accent" "Desc" "run the scheduled lookup now on the images that are due" "URL" "/settings/maintenance/lookup-due" "Verb" "Look up" "JobKick" true "Confirm" "Look up the images that are due now?" "ConfirmDanger" "Online lookups count against monloader's daily budget." "ConfirmOK" "Look up" "Disabled" (not .MonloaderUsable) "DisabledReason" (monloaderOffReason .MonloaderConn) "MlGated" true}}
             </tbody>
           </table>
           </div>
@@ -958,8 +900,8 @@
           <div class="table-scroll">
           <table class="maintenance-table">
             <tbody>
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Vacuum database" "Desc" "compact the SQLite file after mass deletions" "URL" "/settings/maintenance/vacuum-db" "Verb" "Vacuum" "Mark" "long job" "Confirm" "Compact the SQLite database now?" "ConfirmDanger" "Holds a database lock for the duration of the VACUUM; other jobs and queries will wait." "ConfirmOK" "Vacuum"}}
-              {{template "maintenance_row" dict "CSRF" $csrf "Title" "Free memory" "Desc" "shrink SQLite caches, return the Go heap, and release the auto-tagger from RAM/VRAM" "URL" "/settings/maintenance/free-memory" "Verb" "Free"}}
+              {{template "maintenance_row" dict "Title" "Vacuum database" "Desc" "compact the SQLite file after mass deletions" "URL" "/settings/maintenance/vacuum-db" "Verb" "Vacuum" "Mark" "long job" "Confirm" "Compact the SQLite database now?" "ConfirmDanger" "Holds a database lock for the duration of the VACUUM; other jobs and queries will wait." "ConfirmOK" "Vacuum"}}
+              {{template "maintenance_row" dict "Title" "Free memory" "Desc" "shrink SQLite caches, return the Go heap, and release the auto-tagger from RAM/VRAM" "URL" "/settings/maintenance/free-memory" "Verb" "Free"}}
             </tbody>
           </table>
           </div>
@@ -993,7 +935,6 @@
     updateEmptyFolderCount();
   });
   document.addEventListener('click', function(e) {
-    if (!e.target.closest) return;
     var btn = e.target.closest('[data-empty-all]');
     if (!btn) return;
     var on = btn.dataset.emptyAll === '1';
@@ -1006,10 +947,7 @@
   {{$sched := $cfg.Schedule}}
   {{$schedSt := .ScheduleStatus}}
   <section id="schedule" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Schedule</h3>
-      <p class="field-hint">Runs the selected actions once per day, one gallery after another.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Schedule" "Hint" "Runs the selected actions once per day, one gallery after another."}}
     <div id="flash-schedule"></div>
     {{template "partials/schedule_status.html" (dict "Status" $schedSt)}}
     {{if $schedSt.LookupInfo}}
@@ -1018,7 +956,6 @@
     </p>
     {{end}}
     <form hx-post="/settings/schedule" hx-target="#flash-schedule" hx-swap="innerHTML">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
       <div class="schedule-grid">
         <div class="field">
           <label><input type="checkbox" name="sync_gallery"{{if $sched.SyncGallery}} checked{{end}}> Sync gallery</label>
@@ -1081,7 +1018,7 @@
       </div>
       <div class="settings-actions">
         <button type="button" hx-post="/settings/schedule/run"
-                hx-vals='{"_csrf":"{{$csrf}}"}' hx-target="#flash-schedule" hx-swap="innerHTML">Run now</button>
+                hx-target="#flash-schedule" hx-swap="innerHTML">Run now</button>
         <button type="submit">Save</button>
       </div>
     </form>
@@ -1109,10 +1046,7 @@
 
   {{$stats := .Stats}}
   <section id="stats" class="settings-section">
-    <div class="settings-section-header">
-      <h3>Stats</h3>
-      <p class="field-hint">Memory, database and disk usage.</p>
-    </div>
+    {{template "settings_section_header" dict "Title" "Stats" "Hint" "Memory, database and disk usage."}}
     <div class="stats-cols">
     <div class="settings-sub">
       <h4>Process memory</h4>

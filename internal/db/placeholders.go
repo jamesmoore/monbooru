@@ -18,15 +18,7 @@ func Chunked[T any](xs []T, chunkSize int, fn func(chunk []T) error) error {
 
 // ScanIDs leaves closing rows to the caller.
 func ScanIDs(rows *sql.Rows) ([]int64, error) {
-	var out []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
+	return ScanAll(rows, scanOne[int64])
 }
 
 // ScanAll leaves closing rows to the caller, and on a scan error returns
@@ -41,6 +33,21 @@ func ScanAll[T any](rows *sql.Rows, scan func(*sql.Rows) (T, error)) ([]T, error
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// ScanRow's fields returns pointers into its argument in column order.
+func ScanRow[T any](fields func(*T) []any) func(*sql.Rows) (T, error) {
+	return func(rows *sql.Rows) (T, error) {
+		var v T
+		err := rows.Scan(fields(&v)...)
+		return v, err
+	}
+}
+
+func scanOne[T any](rows *sql.Rows) (T, error) {
+	var v T
+	err := rows.Scan(&v)
+	return v, err
 }
 
 func QueryAll[T any](q Querier, scan func(*sql.Rows) (T, error), query string, args ...any) ([]T, error) {
@@ -62,11 +69,7 @@ func QueryAllContext[T any](ctx context.Context, q CtxQuerier, scan func(*sql.Ro
 }
 
 func QueryStrings(q Querier, query string, args ...any) ([]string, error) {
-	return QueryAll(q, func(rows *sql.Rows) (string, error) {
-		var v string
-		err := rows.Scan(&v)
-		return v, err
-	}, query, args...)
+	return QueryAll(q, scanOne[string], query, args...)
 }
 
 func InWriteTx(w *sql.DB, work func(*sql.Tx) error) error {
@@ -98,12 +101,7 @@ type CtxQuerier interface {
 }
 
 func QueryIDs(q Querier, query string, args ...any) ([]int64, error) {
-	rows, err := q.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return ScanIDs(rows)
+	return QueryAll(q, scanOne[int64], query, args...)
 }
 
 // QueryIDsFunc stops the scan as soon as visit returns false.
@@ -126,12 +124,7 @@ func QueryIDsFunc(q Querier, visit func(int64) bool, query string, args ...any) 
 }
 
 func QueryIDsContext(ctx context.Context, q CtxQuerier, query string, args ...any) ([]int64, error) {
-	rows, err := q.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return ScanIDs(rows)
+	return QueryAllContext(ctx, q, scanOne[int64], query, args...)
 }
 
 // InPlaceholders returns "" for no input, and SQLite rejects IN (), so

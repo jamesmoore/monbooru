@@ -3,11 +3,13 @@ package compatibility
 import (
 	"archive/zip"
 	"bufio"
+	"errors"
 	"maps"
 	"path"
 	"slices"
 	"strings"
 
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -24,7 +26,7 @@ func detectHydrus(entries []NormalizedEntry) bool {
 	hasImage, hasSidecar := false, false
 	for _, e := range entries {
 		switch {
-		case HasMediaExt(e.Rel):
+		case gallery.ExtFileType(e.Rel) != "":
 			hasImage = true
 		case strings.HasSuffix(strings.ToLower(e.Rel), ".txt"):
 			hasSidecar = true
@@ -40,14 +42,14 @@ func translateHydrus(entries []NormalizedEntry) (Result, error) {
 	images := map[string]*zip.File{}
 	sidecars := map[string]*zip.File{}
 	for _, e := range entries {
-		if HasMediaExt(e.Rel) {
+		if gallery.ExtFileType(e.Rel) != "" {
 			images[e.Rel] = e.File
 			continue
 		}
 		if strings.HasSuffix(strings.ToLower(e.Rel), ".txt") {
 			// Sliced by length: TrimSuffix would miss a .Txt suffix.
 			imgRel := e.Rel[:len(e.Rel)-len(".txt")]
-			if HasMediaExt(imgRel) {
+			if gallery.ExtFileType(imgRel) != "" {
 				sidecars[imgRel] = e.File
 			}
 		}
@@ -62,6 +64,9 @@ func translateHydrus(entries []NormalizedEntry) (Result, error) {
 		var tagsList []string
 		if sc, ok := sidecars[rel]; ok {
 			t, err := readHydrusSidecar(sc)
+			if errors.Is(err, errDocumentTooLarge) {
+				return Result{}, err
+			}
 			if err != nil {
 				logx.Warnf("hydrus import: read sidecar %q: %v", rel+".txt", err)
 			}
@@ -78,7 +83,7 @@ func translateHydrus(entries []NormalizedEntry) (Result, error) {
 }
 
 func readHydrusSidecar(f *zip.File) ([]string, error) {
-	rc, err := f.Open()
+	rc, err := openDocument(f)
 	if err != nil {
 		return nil, err
 	}

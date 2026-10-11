@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/relations"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -104,7 +105,8 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 			logx.Debugf("session compare facts: %v", err)
 		}
 		if pair.FromTags() {
-			shared, total, sErr := tags.SharedTags(cx.DB, leftID, rightID, sharedTagsShown)
+			visible, _ := cx.VisibleCount()
+			shared, total, sErr := tags.SharedTags(cx.DB, leftID, rightID, sharedTagsShown, visible)
 			if sErr != nil {
 				logx.Debugf("session shared tags: %v", sErr)
 			}
@@ -126,7 +128,6 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 		Order:           order,
 		Detector:        detector,
 		TagPairs:        tagPairs,
-		ActiveGallery:   s.activeGallery(),
 		Left:            leftFacts,
 		Right:           rightFacts,
 		SharedTags:      sharedTags,
@@ -146,14 +147,13 @@ type sessionPageData struct {
 	Order           string
 	Detector        string
 	TagPairs        bool
-	ActiveGallery   string
 	Left            relationCompareFacts
 	Right           relationCompareFacts
 	SharedTags      []tags.SharedTag
 	SharedTagsTotal int
 }
 
-func loadNextPair(cx *galleryCtx, order, detector string, ceiling *Ceiling, pinA, pinB int64) (*sessionPairView, relations.QueueCounts, error) {
+func loadNextPair(cx *library.Gallery, order, detector string, ceiling *Ceiling, pinA, pinB int64) (*sessionPairView, relations.QueueCounts, error) {
 	var rank *int
 	if r, active := ceiling.RankCeiling(); active {
 		rank = &r
@@ -216,7 +216,7 @@ type compareTag struct {
 	Color    string
 }
 
-func loadCompareFacts(cx *galleryCtx, leftID, rightID int64) (relationCompareFacts, relationCompareFacts, error) {
+func loadCompareFacts(cx *library.Gallery, leftID, rightID int64) (relationCompareFacts, relationCompareFacts, error) {
 	left := relationCompareFacts{ImageID: leftID}
 	right := relationCompareFacts{ImageID: rightID}
 	if err := scanCompareFacts(cx, leftID, &left); err != nil {
@@ -237,36 +237,23 @@ func loadCompareFacts(cx *galleryCtx, leftID, rightID int64) (relationCompareFac
 	return left, right, nil
 }
 
-func scanCompareFacts(cx *galleryCtx, id int64, dst *relationCompareFacts) error {
-	var w, h sql.NullInt64
-	var addedAt, series sql.NullString
-	var canonical, fileType string
+func scanCompareFacts(cx *library.Gallery, id int64, dst *relationCompareFacts) error {
+	var addedAt, canonical string
 	if err := cx.DB.Read.QueryRow(
-		`SELECT COALESCE(width, 0), COALESCE(height, 0), file_size, ingested_at, canonical_path, file_type, series
+		`SELECT COALESCE(width, 0), COALESCE(height, 0), file_size, ingested_at, canonical_path, series
 		 FROM images WHERE id = ?`, id,
-	).Scan(&w, &h, &dst.FileSize, &addedAt, &canonical, &fileType, &series); err != nil {
+	).Scan(&dst.ResolutionW, &dst.ResolutionH, &dst.FileSize, &addedAt, &canonical, &dst.Collection); err != nil {
 		return err
 	}
-	if w.Valid {
-		dst.ResolutionW = w.Int64
-	}
-	if h.Valid {
-		dst.ResolutionH = h.Int64
-	}
-	if addedAt.Valid {
-		dst.AddedAt = humanISODate(addedAt.String)
-	}
+	dst.AddedAt = humanISODate(addedAt)
 	if dot := strings.LastIndexByte(canonical, '.'); dot >= 0 {
 		dst.Format = strings.ToLower(canonical[dot:])
-	}
-	if series.Valid {
-		dst.Collection = series.String
 	}
 	dst.TagCount = countTags(cx, id)
 	return nil
 }
 
-func loadTagDelta(cx *galleryCtx, leftID, rightID int64) (left []compareTag, right []compareTag, err error) {
+func loadTagDelta(cx *library.Gallery, leftID, rightID int64) (left []compareTag, right []compareTag, err error) {
 	rows, err := cx.DB.Read.Query(`
 		WITH delta AS (
 			SELECT it.tag_id, MAX(it.image_id) AS owner_id
@@ -307,7 +294,7 @@ func loadTagDelta(cx *galleryCtx, leftID, rightID int64) (left []compareTag, rig
 	return left, right, rows.Err()
 }
 
-func countTags(cx *galleryCtx, id int64) int {
+func countTags(cx *library.Gallery, id int64) int {
 	var n int
 	if err := cx.DB.Read.QueryRow(`SELECT COUNT(*) FROM image_tags WHERE image_id = ?`, id).Scan(&n); err != nil {
 		return 0
@@ -316,12 +303,8 @@ func countTags(cx *galleryCtx, id int64) int {
 }
 
 func (s *Server) sessionDecidePost(w http.ResponseWriter, r *http.Request) {
-	if !parseFormOK(w, r) {
-		return
-	}
-	cx := s.active()
-	if cx == nil || cx.RelationsSvc == nil {
-		http.Error(w, "no gallery", http.StatusServiceUnavailable)
+	cx, ok := s.relationsForm(w, r)
+	if !ok {
 		return
 	}
 	a, ok := formInt64(w, r, "a")
@@ -334,10 +317,8 @@ func (s *Server) sessionDecidePost(w http.ResponseWriter, r *http.Request) {
 	}
 	decision := r.FormValue("type")
 	left := a
-	if raw := r.FormValue("left"); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && (v == a || v == b) {
-			left = v
-		}
+	if v, err := strconv.ParseInt(r.FormValue("left"), 10, 64); err == nil && (v == a || v == b) {
+		left = v
 	}
 	right := a
 	if left == a {
@@ -380,14 +361,13 @@ func (s *Server) sessionDecidePost(w http.ResponseWriter, r *http.Request) {
 	if err := cx.RelationsSvc.DropQueuedPair(a, b); err != nil {
 		logx.Warnf("session queue drop: %v", err)
 	}
-	cx.InvalidateCaches()
 	if decision == "duplicate" && writeDuplicatePostDecideHeaders(w, cx, left, right) {
 		return
 	}
 	sessionRedirect(w, r)
 }
 
-func writeDuplicatePostDecideHeaders(w http.ResponseWriter, cx *galleryCtx, left, right int64) bool {
+func writeDuplicatePostDecideHeaders(w http.ResponseWriter, cx *library.Gallery, left, right int64) bool {
 	var gid, original int64
 	if err := cx.DB.Read.QueryRow(`
 		SELECT g.id, g.original_image_id
@@ -401,28 +381,15 @@ func writeDuplicatePostDecideHeaders(w http.ResponseWriter, cx *galleryCtx, left
 		return false
 	}
 	nonOriginal := right
-	var hasUnique int
-	if err := cx.DB.Read.QueryRow(`
-		SELECT COUNT(*) FROM (
-			SELECT it.tag_id
-			FROM image_tags it
-			LEFT JOIN tags t ON t.id = it.tag_id
-			LEFT JOIN tag_categories tc ON tc.id = t.category_id
-			WHERE it.image_id = ?
-			  AND (tc.name IS NULL OR tc.name != 'rating')
-			  AND NOT EXISTS (
-			    SELECT 1 FROM image_tags it2 WHERE it2.image_id = ? AND it2.tag_id = it.tag_id
-			  )
-			LIMIT 1
-		)`, nonOriginal, original,
-	).Scan(&hasUnique); err != nil {
+	withTags, err := cx.RelationsSvc.GroupsWithTagsToCopy([]int64{gid})
+	if err != nil {
 		logx.Debugf("dup post-decide unique tags: %v", err)
 	}
 	w.Header().Set("X-Relations-Post-Decision", "duplicate-cleanup")
 	w.Header().Set("X-Relations-Duplicate-ID", strconv.FormatInt(nonOriginal, 10))
 	w.Header().Set("X-Relations-Duplicate-OriginalID", strconv.FormatInt(original, 10))
 	w.Header().Set("X-Relations-Duplicate-GroupID", strconv.FormatInt(gid, 10))
-	if hasUnique > 0 {
+	if withTags[gid] {
 		w.Header().Set("X-Relations-Duplicate-HasUniqueTags", "1")
 	} else {
 		w.Header().Set("X-Relations-Duplicate-HasUniqueTags", "0")

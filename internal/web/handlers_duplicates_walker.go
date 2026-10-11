@@ -1,17 +1,20 @@
 package web
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
-	"github.com/monbooru/monbooru/internal/tags"
 )
 
 type sha256DuplicateRow struct {
@@ -22,40 +25,38 @@ type sha256DuplicateRow struct {
 }
 
 type markedDuplicateRow struct {
-	GroupID       int64
-	OriginalID    int64
-	DuplicateID   int64
-	MarkedAt      string
-	HasTagsToCopy bool
+	GroupID         int64
+	OriginalID      int64
+	OriginalMissing bool
+	DuplicateID     int64
+	MarkedAt        string
+	HasTagsToCopy   bool
 }
 
 type relationsWalkerData struct {
 	baseData
-	ActiveGallery string
-	Kind          string
-	Sha256Rows    []sha256DuplicateRow
-	MarkedRows    []markedDuplicateRow
-	Total         int
-	Page          int
-	TotalPages    int
+	Kind       string
+	Sha256Rows []sha256DuplicateRow
+	MarkedRows []markedDuplicateRow
+	Total      int
+	Page       int
+	TotalPages int
 }
 
 func (d relationsWalkerData) HasRows() bool { return len(d.Sha256Rows) > 0 || len(d.MarkedRows) > 0 }
 
 const duplicatesWalkerPageSize = 100
 
-func walkerPageOffset(r *http.Request, total int) (page, totalPages, offset int) {
-	page = 1
+func requestedWalkerPage(r *http.Request) int {
 	if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 1 {
-		page = p
+		return min(p, math.MaxInt/duplicatesWalkerPageSize)
 	}
-	totalPages = 1
-	if total > 0 {
-		totalPages = (total + duplicatesWalkerPageSize - 1) / duplicatesWalkerPageSize
-	}
-	if page > totalPages {
-		page = totalPages
-	}
+	return 1
+}
+
+func walkerPageOffset(r *http.Request, total int) (page, totalPages, offset int) {
+	totalPages = max(1, (total+duplicatesWalkerPageSize-1)/duplicatesWalkerPageSize)
+	page = min(requestedWalkerPage(r), totalPages)
 	return page, totalPages, (page - 1) * duplicatesWalkerPageSize
 }
 
@@ -64,22 +65,37 @@ func (s *Server) sha256WalkerPage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	all, err := duplicatePaths(r, cx)
+	requested := (requestedWalkerPage(r) - 1) * duplicatesWalkerPageSize
+	rows, total, err := duplicatePaths(r, cx, requested, duplicatesWalkerPageSize)
+	page, totalPages, offset := walkerPageOffset(r, total)
+	if err == nil && offset != requested {
+		rows, total, err = duplicatePaths(r, cx, offset, duplicatesWalkerPageSize)
+	}
 	if err != nil {
 		logx.Warnf("sha256 walker query: %v", err)
 		http.Error(w, "load duplicates", http.StatusInternalServerError)
 		return
 	}
-	page, totalPages, offset := walkerPageOffset(r, len(all))
 	s.renderTemplate(w, "relations_duplicates_sha256.html", relationsWalkerData{
-		baseData:      s.base(r, "relations", "Duplicate files - "+s.booruName()),
-		ActiveGallery: s.activeGallery(),
-		Kind:          "sha256",
-		Sha256Rows:    all[offset:min(offset+duplicatesWalkerPageSize, len(all))],
-		Total:         len(all),
-		Page:          page,
-		TotalPages:    totalPages,
+		baseData:   s.base(r, "relations", "Duplicate files - "+s.booruName()),
+		Kind:       "sha256",
+		Sha256Rows: rows,
+		Total:      total,
+		Page:       page,
+		TotalPages: totalPages,
 	})
+}
+
+func markedDuplicatesFrom(ceiling *Ceiling) (string, []any) {
+	from := ` FROM dup_group_members m
+		JOIN dup_groups g ON g.id = m.group_id
+		JOIN images o ON o.id = g.original_image_id
+		WHERE m.image_id != g.original_image_id`
+	where, args := ceiling.WhereTwo("g.original_image_id", "m.image_id")
+	if where != "" {
+		from += ` AND ` + where
+	}
+	return from, args
 }
 
 func (s *Server) markedWalkerPage(w http.ResponseWriter, r *http.Request) {
@@ -87,15 +103,7 @@ func (s *Server) markedWalkerPage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ceiling := resolveCeiling(r, cx)
-	from := ` FROM dup_group_members m
-		JOIN dup_groups g ON g.id = m.group_id
-		WHERE m.image_id != g.original_image_id`
-	args := []any{}
-	if where, wargs := ceiling.WhereTwo("g.original_image_id", "m.image_id"); where != "" {
-		from += ` AND ` + where
-		args = append(args, wargs...)
-	}
+	from, args := markedDuplicatesFrom(resolveCeiling(r, cx))
 	var total int
 	if err := cx.DB.Read.QueryRow(`SELECT COUNT(*)`+from, args...).Scan(&total); err != nil {
 		logx.Warnf("marked walker count: %v", err)
@@ -103,82 +111,64 @@ func (s *Server) markedWalkerPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, totalPages, offset := walkerPageOffset(r, total)
-	rows, err := cx.DB.Read.Query(
-		`SELECT g.id, g.original_image_id, m.image_id, m.created_at`+from+
-			` ORDER BY m.created_at DESC, g.id DESC, m.image_id LIMIT ? OFFSET ?`,
+	gone := originalsGone(cx)
+	out, err := db.QueryAll(cx.DB.Read, func(rows *sql.Rows) (markedDuplicateRow, error) {
+		var dr markedDuplicateRow
+		var marked, originalPath string
+		var originalMissing bool
+		if err := rows.Scan(&dr.GroupID, &dr.OriginalID, &originalMissing, &originalPath, &dr.DuplicateID, &marked); err != nil {
+			return dr, err
+		}
+		dr.OriginalMissing = gone(dr.OriginalID, originalMissing, originalPath)
+		dr.MarkedAt = humanISOTime(marked)
+		return dr, nil
+	}, `SELECT g.id, g.original_image_id, o.is_missing, o.canonical_path, m.image_id, m.created_at`+from+
+		` ORDER BY m.created_at DESC, g.id DESC, m.image_id LIMIT ? OFFSET ?`,
 		append(append([]any{}, args...), duplicatesWalkerPageSize, offset)...)
 	if err != nil {
 		logx.Warnf("marked walker query: %v", err)
 		http.Error(w, "load duplicates", http.StatusInternalServerError)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-	var out []markedDuplicateRow
-	for rows.Next() {
-		var dr markedDuplicateRow
-		var marked string
-		if scanErr := rows.Scan(&dr.GroupID, &dr.OriginalID, &dr.DuplicateID, &marked); scanErr != nil {
-			logx.Warnf("marked walker scan: %v", scanErr)
-			http.Error(w, "scan duplicates", http.StatusInternalServerError)
-			return
-		}
-		dr.MarkedAt = humanISOTime(marked)
-		out = append(out, dr)
-	}
-	if err := rows.Err(); err != nil {
-		http.Error(w, "iterate duplicates", http.StatusInternalServerError)
-		return
-	}
 	if err := annotateTagsToCopy(cx, out); err != nil {
 		logx.Warnf("marked walker tags-to-copy: %v", err)
 	}
 	s.renderTemplate(w, "relations_duplicates_marked.html", relationsWalkerData{
-		baseData:      s.base(r, "relations", "Duplicate images - "+s.booruName()),
-		ActiveGallery: s.activeGallery(),
-		Kind:          "marked",
-		MarkedRows:    out,
-		Total:         total,
-		Page:          page,
-		TotalPages:    totalPages,
+		baseData:   s.base(r, "relations", "Duplicate images - "+s.booruName()),
+		Kind:       "marked",
+		MarkedRows: out,
+		Total:      total,
+		Page:       page,
+		TotalPages: totalPages,
 	})
 }
 
-func annotateTagsToCopy(cx *galleryCtx, rows []markedDuplicateRow) error {
-	if len(rows) == 0 {
-		return nil
+// The flag misses a file removed while the watcher was off.
+func originalsGone(cx *library.Gallery) func(id int64, missing bool, path string) bool {
+	seen := map[int64]bool{}
+	return func(id int64, missing bool, path string) bool {
+		gone, ok := seen[id]
+		if !ok {
+			gone = missing || gallery.CanonicalGone(cx.Boundary(), path)
+			seen[id] = gone
+		}
+		return gone
 	}
-	eligible := map[int64]bool{}
-	q, err := cx.DB.Read.Query(`
-		SELECT DISTINCT g.id
-		FROM dup_groups g
-		JOIN dup_group_members m ON m.group_id = g.id
-		JOIN image_tags it ON it.image_id = m.image_id
-		LEFT JOIN tags t ON t.id = it.tag_id
-		LEFT JOIN tag_categories c ON c.id = t.category_id
-		WHERE m.image_id != g.original_image_id
-		  AND (c.name IS NULL OR c.name != 'rating')
-		  AND NOT EXISTS (
-		    SELECT 1 FROM image_tags it2
-		    WHERE it2.image_id = g.original_image_id AND it2.tag_id = it.tag_id
-		  )`)
+}
+
+func annotateTagsToCopy(cx *library.Gallery, rows []markedDuplicateRow) error {
+	var groupIDs []int64
+	for _, dr := range rows {
+		if !slices.Contains(groupIDs, dr.GroupID) {
+			groupIDs = append(groupIDs, dr.GroupID)
+		}
+	}
+	eligible, err := cx.RelationsSvc.GroupsWithTagsToCopy(groupIDs)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = q.Close() }()
-	for q.Next() {
-		var gid int64
-		if err := q.Scan(&gid); err != nil {
-			return err
-		}
-		eligible[gid] = true
-	}
-	if err := q.Err(); err != nil {
-		return err
-	}
 	for i := range rows {
-		if eligible[rows[i].GroupID] {
-			rows[i].HasTagsToCopy = true
-		}
+		rows[i].HasTagsToCopy = eligible[rows[i].GroupID]
 	}
 	return nil
 }
@@ -192,27 +182,23 @@ func (s *Server) sha256WalkerRemoveOnePost(w http.ResponseWriter, r *http.Reques
 		flashStatus(w, http.StatusBadRequest, "Invalid path id.")
 		return
 	}
-	var aliasPath, canonicalPath string
-	var size int64
+	var aliasPath string
 	if err := s.db().Read.QueryRow(
-		`SELECT ip.path, i.canonical_path, i.file_size
-		 FROM image_paths ip JOIN images i ON i.id = ip.image_id
-		 WHERE ip.id = ? AND ip.is_canonical = 0`,
-		pathID,
-	).Scan(&aliasPath, &canonicalPath, &size); err != nil {
+		`SELECT path FROM image_paths WHERE id = ? AND is_canonical = 0`, pathID,
+	).Scan(&aliasPath); err != nil {
 		flashStatus(w, http.StatusNotFound, "Not a non-canonical path.")
 		return
 	}
-	if err := gallery.DeleteAliasPath(s.db(), pathID); err != nil {
+	res, err := s.active().DeleteCopies(context.Background(), []int64{pathID}, nil)
+	if err != nil {
 		flashStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if aliasPath != "" {
-		if err := unlinkAliasFile(s.boundary(), aliasPath, canonicalPath, size); err != nil {
-			logx.Warnf("sha256 walker unlink %q: %v", aliasPath, err)
-		}
+	if len(res.Kept) > 0 {
+		replyKeptCopy(w, r, res.Kept[0])
+		return
 	}
-	redirectWalker(w, r, "sha256")
+	hxDone(w, r, fmt.Sprintf("Deleted %s.", aliasPath), "", "/relations/duplicates/sha256")
 }
 
 func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Request) {
@@ -224,27 +210,44 @@ func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Reques
 		flashStatus(w, http.StatusBadRequest, "Invalid image id.")
 		return
 	}
-	var isOriginal bool
-	if err := s.db().Read.QueryRow(
-		`SELECT EXISTS (SELECT 1 FROM dup_groups WHERE original_image_id = ?)`, imageID,
-	).Scan(&isOriginal); err != nil {
-		flashStatus(w, http.StatusInternalServerError, err.Error())
+	cx, ok := s.requireActive(w)
+	if !ok {
 		return
 	}
-	if isOriginal {
+	var originalID int64
+	var originalMissing bool
+	var originalPath string
+	err = cx.DB.Read.QueryRow(`
+		SELECT g.original_image_id, o.is_missing, o.canonical_path
+		FROM dup_group_members m
+		JOIN dup_groups g ON g.id = m.group_id
+		JOIN images o ON o.id = g.original_image_id
+		WHERE m.image_id = ?`, imageID,
+	).Scan(&originalID, &originalMissing, &originalPath)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		flashStatus(w, http.StatusNotFound, fmt.Sprintf("Image #%d is not a marked duplicate.", imageID))
+		return
+	case err != nil:
+		flashStatus(w, http.StatusInternalServerError, err.Error())
+		return
+	case originalID == imageID:
 		flashStatus(w, http.StatusConflict, fmt.Sprintf("Image #%d is its group's original, so it was kept.", imageID))
 		return
+	case originalMissing || gallery.CanonicalGone(cx.Boundary(), originalPath):
+		flashStatus(w, http.StatusConflict, fmt.Sprintf("Image #%d's original #%d is missing, so it was kept.", imageID, originalID))
+		return
 	}
-	if _, err := gallery.DeleteImage(s.db(), s.boundary(), s.thumbnailsPath(), imageID, tags.RemoveAllTagsFromImageTx, s.onImageDeleteCallback()); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			flashStatus(w, http.StatusNotFound, fmt.Sprintf("Image #%d is already gone.", imageID))
-			return
-		}
+	res, err := cx.DeleteImages(context.Background(), []int64{imageID}, library.DeleteOptions{}, nil)
+	if err != nil {
 		flashStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.active().InvalidateCaches()
-	redirectWalker(w, r, "marked")
+	if len(res.Deleted) == 0 {
+		flashStatus(w, http.StatusNotFound, fmt.Sprintf("Image #%d is already gone.", imageID))
+		return
+	}
+	hxDone(w, r, fmt.Sprintf("Deleted image #%d%s.", imageID, keptChanged(res.Changed)), "", "/relations/duplicates/marked")
 }
 
 // Ceiling-filtered, so delete-all never removes a member the operator
@@ -257,58 +260,48 @@ func (s *Server) markedWalkerDeleteAllPost(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	q := `
-		SELECT m.image_id
-		FROM dup_group_members m
-		JOIN dup_groups g ON g.id = m.group_id
-		WHERE m.image_id != g.original_image_id`
-	args := []any{}
-	if where, wargs := resolveCeiling(r, cx).WhereTwo("g.original_image_id", "m.image_id"); where != "" {
-		q += ` AND ` + where
-		args = append(args, wargs...)
-	}
-	victims, err := db.QueryIDs(cx.DB.Read, q, args...)
+	from, args := markedDuplicatesFrom(resolveCeiling(r, cx))
+	members, err := queryMarkedMembers(cx, `SELECT m.image_id, g.original_image_id, o.is_missing, o.canonical_path`+from, args...)
 	if err != nil {
 		flashStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if len(victims) == 0 {
+	if len(members) == 0 {
 		writeInlineFlash(w, "ok", "Removed 0 marked duplicate(s).")
 		return
 	}
-	if !s.startJob(w, models.JobTypeDelete) {
-		return
-	}
-	bound := s.boundary()
-	thumbnailsPath := s.thumbnailsPath()
-	onDelete := s.onImageDeleteCallback()
-	go func() {
-		ctx := s.jobs.Context()
-		total := len(victims)
-		s.jobs.Update(0, total, "removing…")
-		removed := 0
-		for i, id := range victims {
-			if ctx.Err() != nil {
-				s.jobs.Complete(fmt.Sprintf("marked delete-all cancelled (%d/%d)", removed, total))
-				s.active().InvalidateCaches()
-				return
-			}
-			if _, err := gallery.DeleteImage(s.db(), bound, thumbnailsPath, id, tags.RemoveAllTagsFromImageTx, onDelete); err != nil {
-				logx.Warnf("marked delete-all image %d: %v", id, err)
-				continue
-			}
-			removed++
-			if (i+1)%25 == 0 || i == total-1 {
-				s.jobs.Update(i+1, total, "removing…")
+	s.goJob(w, models.JobTypeDelete, "Marked duplicate removal started.", func(ctx context.Context) {
+		gone := originalsGone(cx)
+		var victims []int64
+		for _, m := range members {
+			if !gone(m.originalID, m.originalMissing, m.originalPath) {
+				victims = append(victims, m.imageID)
 			}
 		}
-		s.active().InvalidateCaches()
-		s.jobs.Complete(fmt.Sprintf("Removed %d marked duplicate(s).", removed))
-	}()
-	writeInlineFlash(w, "ok", "Marked duplicate removal started.")
+		kept := len(members) - len(victims)
+		total := len(victims)
+		s.jobs.Update(0, total, "removing…")
+		res, err := cx.DeleteImages(ctx, victims, library.DeleteOptions{ContinuePastFailure: true}, func(done, total int) {
+			s.jobs.Update(done, total, "removing…")
+		})
+		removed := len(res.Deleted)
+		done := fmt.Sprintf("Removed %d marked duplicate(s)", removed)
+		if kept > 0 {
+			done += fmt.Sprintf("; kept %d whose original is missing", kept)
+		}
+		done += keptChanged(res.Changed) + "."
+		s.jobs.Finish(err, res.Cancelled, fmt.Sprintf("marked delete-all cancelled (%d/%d)", removed, total), done)
+	})
 }
 
-func redirectWalker(w http.ResponseWriter, r *http.Request, kind string) {
-	target := "/relations/duplicates/" + kind
-	hxRedirect(w, r, target)
+type markedMember struct {
+	imageID, originalID int64
+	originalMissing     bool
+	originalPath        string
+}
+
+func queryMarkedMembers(cx *library.Gallery, q string, args ...any) ([]markedMember, error) {
+	return db.QueryAll(cx.DB.Read, db.ScanRow(func(m *markedMember) []any {
+		return []any{&m.imageID, &m.originalID, &m.originalMissing, &m.originalPath}
+	}), q, args...)
 }

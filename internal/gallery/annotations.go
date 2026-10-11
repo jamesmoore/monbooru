@@ -19,22 +19,19 @@ func AnnotationsForImage(database *db.DB, imageID int64) ([]models.Annotation, e
 }
 
 func ReplaceSourceAnnotations(database *db.DB, imageID int64, site, postID string, boxes []models.Annotation) error {
-	tx, err := database.Write.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := deletePulledAnnotationsTx(tx, imageID, site, postID); err != nil {
-		return err
-	}
-	for _, b := range boxes {
-		if _, err := tx.Exec(
-			`INSERT INTO image_annotations (image_id, site, post_id, x, y, w, h, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			imageID, site, postID, b.X, b.Y, b.W, b.H, b.Body); err != nil {
+	return db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+		if err := deletePulledAnnotationsTx(tx, imageID, site, postID); err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		for _, b := range boxes {
+			if _, err := tx.Exec(
+				`INSERT INTO image_annotations (image_id, site, post_id, x, y, w, h, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				imageID, site, postID, b.X, b.Y, b.W, b.H, b.Body); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // AddManualAnnotation takes coordinates in original-image pixels,
@@ -49,14 +46,15 @@ func AddManualAnnotation(database *db.DB, imageID int64, x, y, w, h int, body st
 // UpdateAnnotation keeps the manual flag, so a re-pull overwrites an
 // edited source box.
 func UpdateAnnotation(database *db.DB, imageID, id int64, x, y, w, h int, body string) error {
-	return requireAffected(database.Write.Exec(
+	res, err := database.Write.Exec(
 		`UPDATE image_annotations SET x = ?, y = ?, w = ?, h = ?, body = ? WHERE id = ? AND image_id = ?`,
-		x, y, w, h, body, id, imageID))
+		x, y, w, h, body, id, imageID)
+	return requireAffected(res, err, ErrAnnotationNotFound)
 }
 
 func DeleteAnnotation(database *db.DB, imageID, id int64) error {
-	return requireAffected(database.Write.Exec(
-		`DELETE FROM image_annotations WHERE id = ? AND image_id = ?`, id, imageID))
+	res, err := database.Write.Exec(`DELETE FROM image_annotations WHERE id = ? AND image_id = ?`, id, imageID)
+	return requireAffected(res, err, ErrAnnotationNotFound)
 }
 
 func deletePulledAnnotationsTx(tx *sql.Tx, imageID int64, site, postID string) error {
@@ -68,12 +66,12 @@ func deletePulledAnnotationsTx(tx *sql.Tx, imageID int64, site, postID string) e
 
 var ErrAnnotationNotFound = errors.New("annotation not found")
 
-func requireAffected(res sql.Result, err error) error {
+func requireAffected(res sql.Result, err, notFound error) error {
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrAnnotationNotFound
+		return notFound
 	}
 	return nil
 }

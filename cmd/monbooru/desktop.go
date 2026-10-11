@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"flag"
 	"fmt"
@@ -59,10 +60,7 @@ func portableGallery(l desktop.Layout, cfg *config.Config) {
 
 // Created, not only named: a missing gallery folder boots into degraded mode.
 func seedGalleryDir(l desktop.Layout) string {
-	base := desktop.PicturesDir()
-	if base == "" {
-		base = l.DataDir
-	}
+	base := cmp.Or(desktop.PicturesDir(), l.DataDir)
 	dir := filepath.Join(base, appName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		dir = filepath.Join(l.DataDir, "gallery")
@@ -91,10 +89,7 @@ func claimPort(addr string, openBrowser bool) (string, bool) {
 		}
 		return "", false
 	}
-	other := inst.App
-	if other == "" {
-		other = "another program"
-	}
+	other := cmp.Or(inst.App, "another program")
 	return fmt.Sprintf("%s is already serving %s; free the port or set server.bind_address to another one", other, local), false
 }
 

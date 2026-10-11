@@ -64,9 +64,6 @@ func handle(ctx context.Context, req ipcRequest, conn net.Conn, writeMu *sync.Mu
 	case ipcMethodReleaseIdle:
 		released := defaultBackend.ReleaseIdle(req.IdleAfter)
 		return writeLocked(conn, writeMu, ipcResponse{Released: released})
-	case ipcMethodReleaseAll:
-		defaultBackend.ReleaseAll()
-		return writeLocked(conn, writeMu, ipcResponse{})
 	}
 	return writeLocked(conn, writeMu, ipcResponse{Err: fmt.Sprintf("unknown method %d", req.Method)})
 }

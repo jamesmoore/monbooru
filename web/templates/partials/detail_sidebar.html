@@ -1,7 +1,7 @@
 {{define "partials/detail_sidebar.html"}}
   {{with .TagSidebar}}{{$sb := .}}
   {{if .ImageID}}
-  <div id="tags-section">
+  <div id="tags-section" hx-target="#image-tags" hx-swap="outerHTML">
     <div class="sidebar-section-header">
       <span class="sidebar-section-title">Tags</span>
       <button id="tags-toggle" class="folder-toggle-btn" data-target="tag-groups">▼</button>
@@ -12,13 +12,11 @@
         {{if eq .Mode "category"}}<span class="tag-mode-current">[categories]</span>
         {{else}}<button type="button" class="tag-mode-toggle"
                 hx-get="/images/{{.ImageID}}/tags?tagmode=category"
-                hx-target="#image-tags" hx-swap="outerHTML"
                 title="Group by category">[categories]</button>{{end}}
         <span class="tag-mode-sep">/</span>
         {{if eq .Mode "source"}}<span class="tag-mode-current">[sources]</span>
         {{else}}<button type="button" class="tag-mode-toggle"
                 hx-get="/images/{{.ImageID}}/tags?tagmode=source"
-                hx-target="#image-tags" hx-swap="outerHTML"
                 title="Group by the sources that applied each tag">[sources]</button>{{end}}
       </div>
       {{end}}
@@ -30,9 +28,6 @@
           {{if .DeleteURL}}
           <button type="button" class="tag-group-delete"
                   hx-delete="{{.DeleteURL}}"
-                  hx-target="#image-tags"
-                  hx-swap="outerHTML"
-                  hx-headers='{"X-CSRF-Token":"{{$sb.CSRFToken}}"}'
                   {{if eq $sb.Mode "source"}}
                   hx-confirm="Drop {{.Name}} from the {{.DeleteCount}} {{plural .DeleteCount "tag" "tags"}} it applied?{{if .DeleteShared}} {{.DeleteShared}} that another source also vouches for stay on the image.{{end}}"
                   title="Withdraw {{.Name}} from this image's tags"
@@ -56,9 +51,6 @@
             {{if .Removable}}
             <button type="button" class="tag-entry-remove"
                     hx-delete="{{.RemoveURL}}"
-                    hx-target="#image-tags"
-                    hx-swap="outerHTML"
-                    hx-headers='{"X-CSRF-Token":"{{$sb.CSRFToken}}"}'
                     title="{{if eq $sb.Mode "source"}}Drop this source's claim on the tag{{else}}Remove tag{{end}}">[x]</button>
             {{end}}
           </li>
@@ -72,9 +64,6 @@
       <span>{{.StaleCount}} stale tag{{if ne .StaleCount 1}}s{{end}}</span>
       <button type="button" class="tag-group-delete"
               hx-delete="/images/{{$sb.ImageID}}/stale-tags"
-              hx-target="#image-tags"
-              hx-swap="outerHTML"
-              hx-headers='{"X-CSRF-Token":"{{$sb.CSRFToken}}"}'
               hx-confirm="Remove the {{.StaleCount}} stale tag{{if ne .StaleCount 1}}s{{end}} on this image?"
               data-confirm-ok="Remove"
               title="Remove every tag the sources stopped carrying">[remove all]</button>

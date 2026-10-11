@@ -3,8 +3,6 @@ package search
 import (
 	"strconv"
 	"strings"
-
-	"github.com/monbooru/monbooru/internal/relations"
 )
 
 type relationPresence struct {
@@ -43,17 +41,15 @@ func (b *whereBuilder) buildPhashFilter(e FilterExpr) string {
 		b.args = append(b.args, phash)
 		return "i.phash = ?"
 	}
-	if b.db != nil {
-		if tree := relations.DefaultRegistry.Lookup(b.db); tree != nil {
-			if err := tree.EnsureBuilt(b.db); err == nil {
-				// A tree dropped since EnsureBuilt answers built=false;
-				// reading its empty result as no matches would be wrong.
-				if ids, built := tree.SearchWithinDistance(phash, distance); built {
-					if len(ids) == 0 {
-						return "1=0"
-					}
-					return "i.id IN (" + inlineIDs(ids) + ")"
+	if b.db != nil && b.tree != nil {
+		if err := b.tree.EnsureBuilt(b.db); err == nil {
+			// A tree dropped since EnsureBuilt answers built=false;
+			// reading its empty result as no matches would be wrong.
+			if ids, built := b.tree.SearchWithinDistance(phash, distance); built {
+				if len(ids) == 0 {
+					return "1=0"
 				}
+				return "i.id IN (" + inlineIDs(ids) + ")"
 			}
 		}
 	}
@@ -73,52 +69,32 @@ func (b *whereBuilder) buildRelationFilter(e FilterExpr) string {
 	b.resolveRelationPresence()
 	switch val {
 	case "duplicate":
-		if !b.relPresence.dup {
-			return "1=0"
-		}
-		return relDupMemberExists
+		return gated(b.relPresence.dup, relDupMemberExists)
 	case "original":
-		if !b.relPresence.dup {
-			return "1=0"
-		}
-		return "EXISTS (SELECT 1 FROM dup_groups g WHERE g.original_image_id = i.id)"
+		return gated(b.relPresence.dup, "EXISTS (SELECT 1 FROM dup_groups g WHERE g.original_image_id = i.id)")
 	case "alternate":
-		if !b.relPresence.alt {
-			return "1=0"
-		}
-		return relAltMemberExists
+		return gated(b.relPresence.alt, relAltMemberExists)
 	case "version":
-		if !b.relPresence.version {
-			return "1=0"
-		}
-		return relVersionExists
+		return gated(b.relPresence.version, relVersionExists)
 	case "derivative":
-		if !b.relPresence.derivative {
-			return "1=0"
-		}
-		return "EXISTS (SELECT 1 FROM derivative_edges d WHERE d.derivative_image_id = i.id)"
+		return gated(b.relPresence.derivative, "EXISTS (SELECT 1 FROM derivative_edges d WHERE d.derivative_image_id = i.id)")
 	case "source":
-		if !b.relPresence.derivative {
-			return "1=0"
-		}
-		return "EXISTS (SELECT 1 FROM derivative_edges d WHERE d.source_image_id = i.id)"
+		return gated(b.relPresence.derivative, "EXISTS (SELECT 1 FROM derivative_edges d WHERE d.source_image_id = i.id)")
 	case "collection":
-		if !b.relPresence.series {
-			return "1=0"
-		}
-		return relSeriesCarrier
+		return gated(b.relPresence.series, relSeriesCarrier)
 	case "any":
-		if !b.anyRelationPresent() {
-			return "1=0"
-		}
 		return b.relationAnyClauseForPresence()
 	case "none":
-		if !b.anyRelationPresent() {
-			return "1=1"
-		}
 		return b.relationNoneClauseForPresence()
 	}
 	return "1=0"
+}
+
+func gated(present bool, clause string) string {
+	if !present {
+		return "1=0"
+	}
+	return clause
 }
 
 // An empty relation source makes its predicate constant, so it is emitted
@@ -146,11 +122,6 @@ func (b *whereBuilder) resolveRelationPresence() {
 		derivative: probe(`SELECT EXISTS (SELECT 1 FROM derivative_edges)`),
 		series:     probe(`SELECT EXISTS (SELECT 1 FROM images WHERE series IS NOT NULL AND series != '' LIMIT 1)`),
 	}
-}
-
-func (b *whereBuilder) anyRelationPresent() bool {
-	p := &b.relPresence
-	return p.dup || p.alt || p.version || p.derivative || p.series
 }
 
 func (b *whereBuilder) relationAnyClauseForPresence() string {

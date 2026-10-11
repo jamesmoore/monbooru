@@ -118,28 +118,33 @@ function setFocused(items, idx, block) {
   items[idx].scrollIntoView({ block: block || 'nearest' });
 }
 
-function moveGridCursor(dx, dy) {
-  var cards = Array.from(document.querySelectorAll('.thumb-card'));
+function moveGridCursor(dx, dy, cells) {
+  var cards = cells || Array.from(document.querySelectorAll('.thumb-card'));
   if (cards.length === 0) return false;
-  var focused = document.querySelector('.thumb-card.focused');
-  var idx = focused ? cards.indexOf(focused) : -1;
+  var idx = cards.findIndex(function(c) { return c.classList.contains('focused'); });
   if (idx < 0) {
     idx = 0;
+  } else if (dy !== 0) {
+    // By position: the inbox's cluster headers take full rows and leave
+    // short ones, so the index step drifts across columns.
+    var from = cards[idx];
+    var rowTop = null;
+    cards.forEach(function(c) {
+      var d = (c.offsetTop - from.offsetTop) * dy;
+      if (d > 0 && (rowTop === null || d < (rowTop - from.offsetTop) * dy)) rowTop = c.offsetTop;
+    });
+    if (rowTop === null) {
+      if (dy < 0) scrollToTop(from); else scrollToBottom(from);
+      return true;
+    }
+    var best = -1;
+    cards.forEach(function(c, i) {
+      if (c.offsetTop !== rowTop) return;
+      if (best < 0 || Math.abs(c.offsetLeft - from.offsetLeft) < Math.abs(cards[best].offsetLeft - from.offsetLeft)) best = i;
+    });
+    idx = best;
   } else {
-    var cols = 1;
-    var grid = document.querySelector('.thumb-grid');
-    // The tracks: grid width over card width ignores the gap and overcounts.
-    if (grid) cols = Math.max(1, getComputedStyle(grid).gridTemplateColumns.split(' ').length);
-    var newIdx = idx + dx + dy * cols;
-    if (dy < 0 && newIdx < 0) {
-      scrollToTop(cards[idx]);
-      return true;
-    }
-    if (dy > 0 && newIdx > cards.length - 1) {
-      scrollToBottom(cards[idx]);
-      return true;
-    }
-    idx = Math.max(0, Math.min(cards.length - 1, newIdx));
+    idx = Math.max(0, Math.min(cards.length - 1, idx + dx));
   }
   setFocused(cards, idx);
   return true;
@@ -154,8 +159,8 @@ function moveTagRowCursor(step) {
   return true;
 }
 
-function jumpGridCursor(target) {
-  var cards = Array.from(document.querySelectorAll('.thumb-card'));
+function jumpGridCursor(target, cells) {
+  var cards = cells || Array.from(document.querySelectorAll('.thumb-card'));
   if (cards.length === 0) return false;
   setFocused(cards, target === 'first' ? 0 : cards.length - 1);
   return true;
@@ -325,14 +330,13 @@ function isTagsPage()       { return !!document.getElementById('tags-page'); }
 function isCategoriesPage() { return !!document.getElementById('categories-page'); }
 function isSettingsPage()   { return !!document.getElementById('settings-page'); }
 function batchBarVisible() {
-  var bar = document.getElementById('batch-bar');
-  return !!(bar && bar.classList.contains('visible'));
+  return !!document.querySelector('#batch-bar.visible');
 }
 
 function activeSurfaces() {
   var s = ['anywhere'];
   if (isGalleryPage())    s.push('gallery');
-  if (batchBarVisible())  s.push('selection');
+  if (selectionArmed())   s.push('selection');
   if (isDetailPage())     s.push('detail');
   if (isTagsPage())       s.push('tags');
   if (isTagDetailPage())  s.push('tag-detail');
@@ -385,57 +389,18 @@ function handlePagesGridKey(e) {
   if (document.querySelector('dialog[open]')) return false;
   var cells = Array.from(page.querySelectorAll('.manga-page-cell'));
   if (cells.length === 0) return false;
-  var focused = page.querySelector('.manga-page-cell.focused');
-  var idx = focused ? cells.indexOf(focused) : -1;
-  function moveTo(target) {
-    target = Math.max(0, Math.min(cells.length - 1, target));
-    setFocused(cells, target);
-  }
-  function cols() {
-    if (cells.length === 0) return 1;
-    // Counted off the first row: gridWidth/cellWidth ignores the gap and
-    // overcounts.
-    var firstTop = cells[0].offsetTop;
-    var n = 0;
-    for (var i = 0; i < cells.length; i++) {
-      if (cells[i].offsetTop !== firstTop) break;
-      n++;
-    }
-    return Math.max(1, n);
-  }
-  function tryVerticalScroll(target) {
-    if (idx < 0) return false;
-    if (target < 0) {
-      scrollToTop(cells[idx]);
-      return true;
-    }
-    if (target > cells.length - 1) {
-      scrollToBottom(cells[idx]);
-      return true;
-    }
-    return false;
+  var step = { ArrowRight: [1, 0], ArrowLeft: [-1, 0], ArrowDown: [0, 1], ArrowUp: [0, -1] }[e.key];
+  if (step) {
+    e.preventDefault(); moveGridCursor(step[0], step[1], cells); return true;
   }
   switch (e.key) {
-    case 'ArrowRight':
-      e.preventDefault(); moveTo(idx < 0 ? 0 : idx + 1); return true;
-    case 'ArrowLeft':
-      e.preventDefault(); moveTo(idx < 0 ? 0 : idx - 1); return true;
-    case 'ArrowDown':
-      e.preventDefault();
-      if (tryVerticalScroll(idx + cols())) return true;
-      moveTo(idx < 0 ? 0 : idx + cols()); return true;
-    case 'ArrowUp':
-      e.preventDefault();
-      if (tryVerticalScroll(idx - cols())) return true;
-      moveTo(idx < 0 ? 0 : idx - cols()); return true;
     case 'Home':
-      e.preventDefault(); moveTo(0); return true;
+      e.preventDefault(); jumpGridCursor('first', cells); return true;
     case 'End':
-      e.preventDefault(); moveTo(cells.length - 1); return true;
+      e.preventDefault(); jumpGridCursor('last', cells); return true;
     case 'Enter':
     case 'o':
-      if (idx < 0) return false;
-      var link = cells[idx].querySelector('a');
+      var link = page.querySelector('.manga-page-cell.focused a');
       if (link && link.href) { window.location.href = link.href; return true; }
       return false;
   }
@@ -625,12 +590,7 @@ function handleReaderKey(e) {
   var reader = document.getElementById('reader');
   if (!reader) return false;
   if (e.target.tagName.toLowerCase() === 'input') return false;
-  if (document.querySelector('dialog[open]')) {
-    if (e.key === 'Escape') {
-      // Browser handles dialog Esc; let it through.
-    }
-    return false;
-  }
+  if (document.querySelector('dialog[open]')) return false;
   var page = parseInt(reader.dataset.page, 10) || 1;
   var total = parseInt(reader.dataset.total, 10) || 1;
   var imgID = reader.dataset.imageId;
@@ -674,7 +634,7 @@ function handleReaderKey(e) {
       var extractForm = document.querySelector('.reader-extract');
       if (extractForm) {
         e.preventDefault();
-        extractForm.submit();
+        extractForm.requestSubmit();
         return true;
       }
       return false;
@@ -872,34 +832,26 @@ document.addEventListener('keydown', function(e) {
   }
 
   if (e.key === 'f') {
-    if (batchBarVisible()) {
-      if (typeof openBatchFavoriteDialog === 'function') {
-        e.preventDefault(); openBatchFavoriteDialog('selection'); return;
-      }
-    }
+    if (batchBarVisible()) { e.preventDefault(); openBatchFavoriteDialog('selection'); return; }
     if (clickFirstSelector(['.btn-fav'])) { e.preventDefault(); return; }
   }
 
   if (e.key === 'a' && !e.ctrlKey && !e.metaKey) {
-    if (batchBarVisible()) { e.preventDefault(); openTagSelectedDialog(); return; }
+    if (batchBarVisible()) { e.preventDefault(); openTagDialog('selection'); return; }
     var tagInput = document.getElementById('tag-input');
     if (tagInput) { e.preventDefault(); tagInput.focus(); return; }
   }
 
   if (e.key === 'r') {
-    if (batchBarVisible()) { e.preventDefault(); openStripSelectedDialog(); return; }
+    if (batchBarVisible()) { e.preventDefault(); openStripDialog('selection'); return; }
     if (isDetailPage()) { e.preventDefault(); enterTagFocusMode(); return; }
   }
 
   if (e.key === 'R') {
     var readBtn = document.querySelector('.btn-manga-action.btn-read');
     if (readBtn) { e.preventDefault(); window.location.href = readBtn.href; return; }
-    var pagesGrid = document.getElementById('pages-grid-page');
-    if (pagesGrid && pagesGrid.dataset.imageId) {
-      e.preventDefault();
-      window.location.href = '/images/' + pagesGrid.dataset.imageId + '/read?page=1';
-      return;
-    }
+    var firstPage = document.querySelector('#pages-grid-page #page-1 a');
+    if (firstPage) { e.preventDefault(); window.location.href = firstPage.href; return; }
   }
   if (e.key === 'P' && isDetailPage()) {
     var pagesBtn = document.querySelector('.btn-manga-action.btn-pages');
@@ -925,49 +877,34 @@ document.addEventListener('keydown', function(e) {
 
   if (e.key === 't') {
     if (batchBarVisible()) {
-      if (!document.querySelector('.btn-autotag')) return;
+      if (!document.querySelector('#batch-bar.visible .btn-autotag:not([disabled])')) return;
       e.preventDefault(); openBatchAutotagDialog('selection'); return;
     }
     if (isDetailPage()) {
-      if (clickFirstSelector(['.btn-autotag'])) { e.preventDefault(); return; }
+      if (clickFirstSelector(['.btn-autotag:not([disabled])'])) { e.preventDefault(); return; }
     }
   }
 
   if (e.key === 'm') {
     if (batchBarVisible()) { e.preventDefault(); openBatchPlaceDialog('selection'); return; }
-    if (isDetailPage()) {
-      var placeDlg = document.getElementById('place-image-dialog');
-      if (placeDlg && typeof openPlaceImageDialog === 'function') {
-        e.preventDefault(); openPlaceImageDialog(); return;
-      }
+    if (isDetailPage() && document.getElementById('place-image-dialog')) {
+      e.preventDefault(); openPlaceImageDialog(); return;
     }
   }
 
   if (e.key === 'i') {
-    if (batchBarVisible()) {
-      if (typeof openBatchInboxDialog === 'function') {
-        e.preventDefault(); openBatchInboxDialog('selection'); return;
-      }
-    }
+    if (batchBarVisible()) { e.preventDefault(); openBatchInboxDialog('selection'); return; }
     if (isDetailPage()) {
       if (clickFirstSelector(['.btn-inbox'])) { e.preventDefault(); return; }
     }
   }
 
-  if (e.key === 'c' && batchBarVisible()) {
-    if (typeof openBatchCollectionDialog === 'function') {
-      e.preventDefault(); openBatchCollectionDialog('selection'); return;
-    }
-  }
+  if (e.key === 'c' && batchBarVisible()) { e.preventDefault(); openBatchCollectionDialog('selection'); return; }
 
-  if (e.key === 'd' && batchBarVisible()) {
-    if (typeof openBatchDownloadDialog === 'function') {
-      e.preventDefault(); openBatchDownloadDialog('selection'); return;
-    }
-  }
+  if (e.key === 'd' && batchBarVisible()) { e.preventDefault(); openBatchDownloadDialog('selection'); return; }
 
   if (e.key === 'T' && batchBarVisible()) {
-    if (clickFirstSelector(['#batch-transfer'])) { e.preventDefault(); return; }
+    if (clickFirstSelector(['#batch-bar.visible #batch-transfer'])) { e.preventDefault(); return; }
   }
 
   // Not gated on a selection: invert and select-all-matching are used
@@ -982,7 +919,7 @@ document.addEventListener('keydown', function(e) {
 
   if (e.key === 'L') {
     if (batchBarVisible()) {
-      if (document.querySelector('#batch-bar .monloader-accent')) {
+      if (document.querySelector('#batch-bar.visible .monloader-accent:not([disabled])')) {
         e.preventDefault(); openBatchLookupDialog('selection'); return;
       }
     }
@@ -1012,11 +949,7 @@ document.addEventListener('keydown', function(e) {
   }
 
   if (e.key === 'Delete' || e.key === 'Del') {
-    if (batchBarVisible()) {
-      e.preventDefault();
-      if (typeof batchDeleteSelected === 'function') batchDeleteSelected();
-      return;
-    }
+    if (batchBarVisible()) { e.preventDefault(); openBatchDeleteDialog('selection'); return; }
     if (clickFirstSelector([
       '#delete-image-btn',
       '#tag-batch-bar:not([hidden]) #btn-batch-delete',
@@ -1195,7 +1128,6 @@ document.body.addEventListener('change', function(e) {
 });
 
 document.addEventListener('click', function(e) {
-  if (!e.target.closest) return;
   var form = e.target.closest('#ptr-contrib-form');
   if (!form) return;
   var bulk = e.target.closest('[data-bulk]');
@@ -1366,6 +1298,19 @@ document.body.addEventListener('htmx:afterSwap', function(e) {
   if (table) table.querySelectorAll('tbody tr').forEach(syncThreshRow);
 });
 
+document.body.addEventListener('htmx:afterSwap', function(e) {
+  if (!e.detail || !e.detail.target || e.detail.target.id !== 'monloader-light') return;
+  const light = document.getElementById('monloader-light');
+  if (!light) return;
+  const off = light.dataset.mlOff || '';
+  document.querySelectorAll('[data-ml-title]').forEach(function(el) {
+    el.disabled = off !== '';
+    const title = off || el.dataset.mlTitle;
+    if (title) el.title = title;
+    else el.removeAttribute('title');
+  });
+});
+
 function restoreGalleryFocusFromHash() {
   var m = window.location.hash.match(/^#img-(\d+)$/);
   if (!m) return;
@@ -1395,7 +1340,7 @@ document.addEventListener('mouseover', function(e) {
 
 document.addEventListener('mouseout', function(e) {
   const card = e.target.closest('.thumb-card');
-  if (!card) return;
+  if (!card || (e.relatedTarget && card.contains(e.relatedTarget))) return;
   const img = card.querySelector('.thumb-img');
   if (!img || !img.dataset.orig) return;
   img.src = img.dataset.orig;
@@ -1452,6 +1397,7 @@ if (window.htmx) window.htmx.config.scrollBehavior = 'auto';
 
 document.body.addEventListener('htmx:configRequest', function(e) {
   if (activeGallery()) e.detail.headers['X-Monbooru-Gallery'] = activeGallery();
+  e.detail.headers['X-CSRF-Token'] = getCSRFToken();
 });
 
 document.body.addEventListener('htmx:configRequest', function(e) {
@@ -1516,6 +1462,20 @@ document.body.addEventListener('htmx:beforeSwap', function(e) {
   e.detail.shouldSwap = true;
 });
 
+// A GET saves nothing, and the 2 s job poll fails on every tick of an outage.
+document.body.addEventListener('htmx:sendError', function(e) {
+  if (e.detail.requestConfig && e.detail.requestConfig.verb === 'get') return;
+  [e.detail.target, findActionFlashSlot()].forEach(function(slot) {
+    if (slot) slot.querySelectorAll('.flash-ok').forEach(function(f) { f.remove(); });
+  });
+  showUnansweredNotice();
+});
+
+function showUnansweredNotice() {
+  const el = showPageNotice('The server did not answer: nothing was saved. Retry once it is back.');
+  if (el) el.dataset.session = '1';
+}
+
 document.addEventListener('input', function(e) {
   if (!e.target.matches || !e.target.matches('#sidebar-inner form input[name=q]')) return;
   document.querySelectorAll('#sidebar-inner a.filter-btn').forEach(function(a) {
@@ -1540,9 +1500,7 @@ document.addEventListener('click', function(e) {
   const filtered = terms.filter(t => t !== tagName && t !== bare);
   if (filtered.length === terms.length) filtered.push(tagName);
   si.value = filtered.join(' ');
-  const form = document.getElementById('search-form');
-  if (form && window.htmx) window.htmx.trigger(form, 'submit');
-  else if (form) form.submit();
+  submitSearch();
 });
 
 document.addEventListener('click', function(e) {
@@ -1700,7 +1658,6 @@ function marqueePaint() {
 
 document.addEventListener('mousedown', function(e) {
   if (e.button !== 0 || window.matchMedia('(pointer: coarse)').matches) return;
-  if (!e.target.closest) return;
   var grid = e.target.closest('.thumb-grid');
   // Links are fair game, or the band could only start in the gaps between
   // cards.
@@ -1934,22 +1891,31 @@ function selectionKey() {
   return activeGallery() + location.pathname + '?q=' + (new URLSearchParams(location.search).get('q') || '');
 }
 
-function writeSelection() {
+function writeStash(key, obj) {
+  obj.t = Date.now();
+  try { sessionStorage.setItem(key, JSON.stringify(obj)); } catch (e) {}
+}
+
+// null when absent, unreadable or older than maxAgeMs; take removes it.
+function readStash(key, maxAgeMs, take) {
+  var raw = null;
   try {
-    sessionStorage.setItem('monbooru_selection', JSON.stringify(
-      {ids: pickedIDs, all: selectAllMatching, url: selectionKey(), t: Date.now()}));
+    raw = sessionStorage.getItem(key);
+    if (raw && take) sessionStorage.removeItem(key);
   } catch (e) {}
+  var stash = null;
+  try { stash = JSON.parse(raw); } catch (e) {}
+  if (!stash || Date.now() - stash.t > maxAgeMs) return null;
+  return stash;
+}
+
+function writeSelection() {
+  writeStash('monbooru_selection', {ids: pickedIDs, all: selectAllMatching, url: selectionKey()});
 }
 
 function readSelection() {
-  var raw = null;
-  try { raw = sessionStorage.getItem('monbooru_selection'); } catch (e) {}
-  var stash = null;
-  if (raw) {
-    try { stash = JSON.parse(raw); } catch (e) {}
-  }
-  if (!stash || !stash.ids || Date.now() - stash.t > selectionStashMs ||
-      stash.url !== selectionKey()) {
+  var stash = readStash('monbooru_selection', selectionStashMs);
+  if (!stash || !stash.ids || stash.url !== selectionKey()) {
     pickedIDs = [];
     selectAllMatching = false;
     return;
@@ -1961,10 +1927,7 @@ function readSelection() {
 // For the /tags rows only; the gallery persists its own selection on
 // every change.
 function stashSelection(ids) {
-  try {
-    sessionStorage.setItem('monbooru_tag_selection', JSON.stringify(
-      {ids: ids, url: tagSelectionKey(), t: Date.now()}));
-  } catch (e) {}
+  writeStash('monbooru_tag_selection', {ids: ids, url: tagSelectionKey()});
 }
 
 function tagSelectionKey() {
@@ -1972,16 +1935,8 @@ function tagSelectionKey() {
 }
 
 function takeTagStash() {
-  var raw = null;
-  try { raw = sessionStorage.getItem('monbooru_tag_selection'); } catch (e) {}
-  if (!raw) return [];
-  try { sessionStorage.removeItem('monbooru_tag_selection'); } catch (e) {}
-  var stash = null;
-  try { stash = JSON.parse(raw); } catch (e) {}
-  if (!stash || !stash.ids || Date.now() - stash.t > selectionStashMs ||
-      stash.url !== tagSelectionKey()) {
-    return [];
-  }
+  var stash = readStash('monbooru_tag_selection', selectionStashMs, true);
+  if (!stash || !stash.ids || stash.url !== tagSelectionKey()) return [];
   return stash.ids;
 }
 
@@ -2047,10 +2002,6 @@ function cycleTagFocus(step) {
   setFocused(items, idx);
 }
 
-function batchDeleteSelected() {
-  if (typeof openBatchDeleteDialog === 'function') openBatchDeleteDialog('selection');
-}
-
 function openSaveSearchDialog() {
   var dlg = document.getElementById('save-search-dialog');
   if (!dlg) return false;
@@ -2106,7 +2057,7 @@ document.body.addEventListener('htmx:confirm', function(e) {
   var ds = elt && elt.dataset ? elt.dataset : {};
   var alt = null;
   if (ds.confirmAlt && ds.confirmAltUrl) {
-    // The form's hidden fields carry the CSRF token and the origin's identity.
+    // The form's hidden fields carry the origin's identity.
     alt = {label: ds.confirmAlt, run: function() {
       var values = {};
       var form = elt.closest('form');
@@ -2118,7 +2069,7 @@ document.body.addEventListener('htmx:confirm', function(e) {
       }
       // No source element, or htmx inherits the hx-confirm and asks the
       // same question again.
-      htmx.ajax('POST', ds.confirmAltUrl, {values: values});
+      htmx.ajax('POST', ds.confirmAltUrl, {values: values, target: findActionFlashSlot()});
     }};
   }
   showConfirm(e.detail.question, function() { e.detail.issueRequest(true); }, ds.confirmDanger, ds.confirmOk, alt);
@@ -2167,31 +2118,6 @@ document.addEventListener('click', function(e) {
   });
 });
 
-document.addEventListener('click', function(e) {
-  var btn = e.target.closest('[data-relations-add]');
-  if (!btn) return;
-  e.preventDefault();
-  var dlg = document.getElementById('relation-edit-dialog');
-  if (!dlg) return;
-  var parentInput = document.getElementById('relation-parent-id');
-  var otherInput = document.getElementById('relation-other-id');
-  var self = btn.getAttribute('data-relations-add');
-  if (parentInput) { parentInput.value = self; parentInput.readOnly = true; }
-  if (otherInput) { otherInput.value = ''; otherInput.readOnly = false; }
-  var otherThumb = document.getElementById('relation-edit-thumb-other');
-  if (otherThumb) { otherThumb.hidden = true; otherThumb.removeAttribute('src'); otherThumb.alt = ''; }
-  var dupRadio = dlg.querySelector('input[name="type"][value="duplicate"]');
-  if (dupRadio) dupRadio.checked = true;
-  var err = document.getElementById('relation-edit-error');
-  if (err) err.innerHTML = '';
-  var overwrite = document.getElementById('relation-edit-overwrite-btn');
-  if (overwrite) {
-    overwrite.hidden = true;
-    overwrite.textContent = 'Overwrite existing relation';
-  }
-  dlg.showModal();
-});
-
 // Only the form's own 204 closes: htmx events bubble, and an empty
 // suggest answer from an input inside is a 204 too.
 function onExternalEditResponse(event, dialogID) {
@@ -2228,7 +2154,7 @@ function toggleAnnotations(btn) {
   btn.textContent = hidden ? '[show annotations]' : '[hide annotations]';
 }
 
-var actionFlashSlots = ['gallery-flash', 'detail-flash', 'tag-flash', 'cat-flash', 'collection-flash', 'flash-tagger'];
+var actionFlashSlots = ['gallery-flash', 'detail-flash', 'tag-flash', 'cat-flash', 'collection-flash', 'flash-tagger', 'flash-walker-sha256', 'flash-walker-marked', 'flash-relations'];
 
 function findActionFlashSlot() {
   for (var i = 0; i < actionFlashSlots.length; i++) {
@@ -2271,11 +2197,7 @@ function setFlashText(slot, kind, text) {
 }
 
 function stashActionFlash(html, kind) {
-  if (!html) return;
-  try {
-    sessionStorage.setItem('monbooru_action_flash',
-      JSON.stringify({h: html, k: kind || 'ok', t: Date.now()}));
-  } catch (e) {}
+  if (html) writeStash('monbooru_action_flash', {h: html, k: kind || 'ok'});
 }
 
 // Covers an action's own reload, not a later visit after an action that
@@ -2284,15 +2206,8 @@ var stashStalenessMs = 10000;
 
 document.addEventListener('DOMContentLoaded', function() {
   if (!findActionFlashSlot()) return;
-  var raw;
-  try { raw = sessionStorage.getItem('monbooru_action_flash'); } catch (e) { return; }
-  if (!raw) return;
-  try { sessionStorage.removeItem('monbooru_action_flash'); } catch (e) {}
-  var stash;
-  try { stash = JSON.parse(raw); } catch (e) { return; }
-  if (!stash || !stash.h) return;
-  if (stash.t && Date.now() - stash.t > stashStalenessMs) return;
-  showActionFlash(stash.h, stash.k);
+  var stash = readStash('monbooru_action_flash', stashStalenessMs, true);
+  if (stash && stash.h) showActionFlash(stash.h, stash.k);
 });
 
 // Shown and stashed both: the same response may or may not end in a
@@ -2305,49 +2220,13 @@ document.body.addEventListener('monbooru:flash', function(e) {
   stashActionFlash(text, kind);
 });
 
-function onRelationEditResponse(event) {
-  var src = document.getElementById('relation-edit-error');
-  if (!src) return;
-  var overwrite = document.getElementById('relation-edit-overwrite-btn');
-  // Added and refused both come back 200, so the slot's body tells them
-  // apart; a failed request swaps nothing and must not read the stale slot.
-  var answered = event && event.detail && event.detail.successful &&
-    src.querySelector('.flash-ok, .flash-err');
-  if (!answered) {
-    if (overwrite) overwrite.hidden = true;
-    src.innerHTML = '<div class="flash flash-err">The relation was not saved.</div>';
-    return;
-  }
-  var success = src.querySelector('.flash-ok');
-  if (!success) {
-    // Keyed on the server's conflict wording: rewording those errors
-    // hides the button.
-    var err = src.querySelector('.flash-err');
-    if (overwrite) {
-      var msg = err ? (err.textContent || '') : '';
-      if (/already has a different relation/i.test(msg)) {
-        overwrite.textContent = 'Overwrite existing relation';
-        overwrite.hidden = false;
-      } else if (/already has a version edge/i.test(msg)) {
-        overwrite.textContent = 'Replace existing version edge';
-        overwrite.hidden = false;
-      } else {
-        overwrite.hidden = true;
-      }
-    }
-    return;
-  }
-  if (overwrite) {
-    overwrite.hidden = true;
-    overwrite.textContent = 'Overwrite existing relation';
-  }
-  src.innerHTML = '';
-  var dlg = document.getElementById('relation-edit-dialog');
-  if (dlg) dlg.close();
-  if (window.htmx) {
-    var panel = document.getElementById('related-entries-panel');
-    if (panel) window.htmx.trigger(panel, 'relations-changed');
-  }
+// The form's _gallery field is for a page without JS; postForm sends the header.
+function extractReaderPage(form) {
+  postForm(form.action, null, {
+    hx: true,
+    onOK: function(res) { window.location.href = res.headers.get('HX-Redirect'); },
+    onErr: function() { showPageNotice('Could not extract this page.'); }
+  });
 }
 
 // The URL is copied, not rebuilt: it carries the back context.
@@ -2425,17 +2304,20 @@ function setFolderCookie(set) {
 
 function toggleFolderItem(btn, targetId, path) {
   var list = document.getElementById(targetId);
-  if (!list) return;
-  var state = getFolderCookie();
-  var isCollapsed = list.style.display === 'none';
-  list.style.display = isCollapsed ? '' : 'none';
-  btn.textContent = isCollapsed ? '▼' : '▶';
-  if (isCollapsed) state.add(path || targetId);
-  else state.delete(path || targetId);
-  setFolderCookie(state);
+  if (list) flipSection(btn, list, path || targetId, false);
 }
 
 // The cookie holds the sections toggled off their default, open or collapsed.
+function flipSection(toggle, list, key, defaultOpen) {
+  var opening = list.style.display === 'none';
+  list.style.display = opening ? '' : 'none';
+  toggle.textContent = opening ? '▼' : '▶';
+  var state = getFolderCookie();
+  if (opening !== !!defaultOpen) state.add(key);
+  else state.delete(key);
+  setFolderCookie(state);
+}
+
 function initSectionToggle(toggleId, listId, cookieKey, forceOpen, defaultOpen) {
   var toggle = document.getElementById(toggleId);
   var list = document.getElementById(listId);
@@ -2447,17 +2329,9 @@ function initSectionToggle(toggleId, listId, cookieKey, forceOpen, defaultOpen) 
     list.style.display = '';
     toggle.textContent = '▼';
   }
-  var clickToggle = function() {
-    var state = getFolderCookie();
-    var isCollapsed = list.style.display === 'none';
-    list.style.display = isCollapsed ? '' : 'none';
-    toggle.textContent = isCollapsed ? '▼' : '▶';
-    var nowOffDefault = defaultOpen ? !isCollapsed : isCollapsed;
-    if (nowOffDefault) state.add(cookieKey);
-    else state.delete(cookieKey);
-    setFolderCookie(state);
-  };
-  // onclick, not addEventListener: this runs again on every htmx settle.
+  var clickToggle = function() { flipSection(toggle, list, cookieKey, defaultOpen); };
+  // onclick, not addEventListener: this runs again on each settle that
+  // holds the tree.
   toggle.onclick = clickToggle;
   var header = toggle.closest('.sidebar-section-header');
   var title = header && header.querySelector('.sidebar-section-title');
@@ -2495,7 +2369,8 @@ function initFolderTree() {
   var treeToggle = document.getElementById('folder-tree-toggle');
   var treeList = document.getElementById('folder-tree-list');
 
-  // onclick, not addEventListener: this runs again on every htmx settle.
+  // onclick, not addEventListener: this runs again on each settle that
+  // holds the tree.
   document.querySelectorAll('.folder-toggle-btn[data-path]').forEach(function(btn) {
     var path = btn.dataset.path;
     var targetId = btn.dataset.target || ('fc-' + path);
@@ -2522,7 +2397,10 @@ function initFolderTree() {
 }
 
 document.addEventListener('DOMContentLoaded', initFolderTree);
-document.addEventListener('htmx:afterSettle', initFolderTree);
+document.addEventListener('htmx:afterSettle', function(e) {
+  var el = e.detail.elt;
+  if (el && el.querySelector && el.querySelector('.folder-toggle-btn')) initFolderTree();
+});
 
 function lastWordIndex(words) {
   for (var i = words.length - 1; i >= 0; i--) {
@@ -2635,8 +2513,7 @@ function applySearchSuggest(tagName) {
   // trailing space.
   var keepCursor = /[:<>=]$|\.\.$/.test(tagName);
   si.value = words.join('') + (keepCursor ? '' : ' ');
-  var dd = document.getElementById('search-suggest');
-  if (dd) dd.innerHTML = '';
+  clearSlots('search-suggest');
   si.focus();
   // The synthetic input event makes htmx's input trigger fetch the next
   // level of hints.
@@ -2743,7 +2620,7 @@ var _pendingGalleryReload = false;
 
 function armGalleryReload() {
   _pendingGalleryReload = true;
-  if (typeof refreshJobStatus === 'function') refreshJobStatus();
+  refreshJobStatus();
 }
 
 document.body.addEventListener('htmx:afterSettle', function(e) {
@@ -2758,25 +2635,6 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
     restoreGalleryFocusFromHash();
     initInboxUpload();
     return;
-  }
-
-  // The swap drops .focused; put it back one row above the removed tag,
-  // from the index Enter stashed.
-  if (el && (el.id === 'image-tags' || el.id === 'sidebar-inner') &&
-      document.body.classList.contains('tag-focus')) {
-    var stash = document.body.dataset.tagFocusIdx;
-    if (stash !== undefined) {
-      delete document.body.dataset.tagFocusIdx;
-      var items = tagFocusRows();
-      if (items.length === 0) {
-        document.body.classList.remove('tag-focus');
-      } else {
-        var prev = Math.max(0, parseInt(stash, 10) - 1);
-        if (prev >= items.length) prev = items.length - 1;
-        items[prev].classList.add('focused');
-        items[prev].scrollIntoView({block: 'nearest'});
-      }
-    }
   }
 
   if (!el || el.id !== 'job-status') return;
@@ -2822,8 +2680,6 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
     return;
   }
 
-  // Re-armed whenever FinishedAt advances: a dismiss mid-batch would
-  // strip hx-trigger and stop the widget polling.
   if ((isDone || isErr) && finishedAt && finishedAt !== _jobAutoClearFinishedAt) {
     _jobAutoClearFinishedAt = finishedAt;
     if (_jobAutoClearTimer) clearTimeout(_jobAutoClearTimer);
@@ -2856,6 +2712,11 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
       window.location.reload();
       return;
     }
+    // A walker's delete-all runs as a job that can outlast its form's reload.
+    if (document.getElementById('relations-walker-page') && jobType === 'delete') {
+      window.location.reload();
+      return;
+    }
 
     // A check changes nothing, so the grid is left alone.
     var grid = jobType === 'check' ? null : document.getElementById('gallery-grid');
@@ -2877,9 +2738,7 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
 
 function getCSRFToken() {
   var meta = document.querySelector('meta[name="csrf-token"]');
-  if (meta) return meta.content;
-  var input = document.querySelector('input[name="_csrf"]');
-  return input ? input.value : '';
+  return meta ? meta.content : '';
 }
 
 function scopeCount(scope, countEl, nounEl) {
@@ -2935,7 +2794,7 @@ function relayPlugin(btn) {
   if (!ids.length || !window.htmx) return;
   window.htmx.ajax('POST', '/internal/plugin/relay', {
     swap: 'none',
-    values: {_csrf: getCSRFToken(), plugin: btn.dataset.plugin, button: btn.dataset.button, ids: ids.join(',')}
+    values: {plugin: btn.dataset.plugin, button: btn.dataset.button, ids: ids.join(',')}
   });
 }
 
@@ -2980,8 +2839,7 @@ function closePluginPage() {
 // scope), dialogId, flashId, failMsg, consumesScope (clears the
 // selection: the rows are gone afterwards).
 function runBatchOp(opts) {
-  var flash = document.getElementById(opts.flashId);
-  if (flash) flash.innerHTML = '';
+  clearSlots(opts.flashId);
   var parts = ['scope=' + encodeURIComponent(opts.scope)].concat(opts.params || []);
   postForm(opts.endpoint, new URLSearchParams(parts.join('&')), {
     dialogId: opts.dialogId,
@@ -2989,8 +2847,7 @@ function runBatchOp(opts) {
     failMsg: opts.failMsg || 'Action failed.',
     onOK: function() {
       if (opts.consumesScope) clearSelection();
-      _pendingGalleryReload = true;
-      refreshJobStatus();
+      armGalleryReload();
     }
   });
 }
@@ -3017,8 +2874,7 @@ function openBatchDialog(prefix, scope, opts) {
     if (!el) return;
     if (el.tagName === 'INPUT') el.value = ''; else el.innerHTML = '';
   });
-  var flash = document.getElementById(prefix + '-flash');
-  if (flash) flash.innerHTML = '';
+  clearSlots(prefix + '-flash');
   var dlg = document.getElementById(prefix + '-dialog');
   if (opts.beforeShow) opts.beforeShow();
   dlg.showModal();
@@ -3061,18 +2917,39 @@ function openHxRewriteDialog(formId, attr, url, dialogId) {
   document.getElementById(dialogId).showModal();
 }
 
-function confirmBatchSimple(prefix, endpoint, extraParams, failMsg) {
+function openRenameDialog(btn) {
+  var name = btn.dataset.name;
+  document.getElementById('rename-src-name').textContent = name;
+  clearSlots('rename-error');
+  var input = document.getElementById('rename-new-name');
+  input.value = name;
+  // An alias cannot keep its old name as an alias: that would point an
+  // alias at an alias, so the row is hidden or not rendered for one.
+  var keep = document.getElementById('rename-keep-alias');
+  if (keep) {
+    keep.checked = false;
+    document.getElementById('rename-keep-alias-row').hidden = btn.dataset.isAlias === '1';
+  }
+  openHxRewriteDialog('rename-form', 'hx-post', '/tags/' + btn.dataset.id + '/rename', 'rename-dialog');
+  input.focus();
+  input.select();
+}
+
+function confirmBatchSimple(prefix, endpoint, extraParams, failMsg, consumesScope) {
   var scope = document.getElementById(prefix + '-scope').value;
   var scoped = batchScopeParams(scope, document.getElementById(prefix + '-flash'));
   if (!scoped) return;
   var params = (extraParams || []).concat(scoped);
   runBatchOp({endpoint: endpoint, scope: scope, params: params,
-              dialogId: prefix + '-dialog', flashId: prefix + '-flash', failMsg: failMsg});
+              dialogId: prefix + '-dialog', flashId: prefix + '-flash', failMsg: failMsg,
+              consumesScope: consumesScope});
 }
 
 // opts: method (POST), hx (sends HX-Request), okStatus (the one success
 // status), dialogId (closed on OK), onOK(res), flashId (gets the error
-// body), failMsg, onErr(text) (instead of the flash), catchMsg (null: none).
+// body), failMsg, onErr(text) (instead of the flash), catchMsg (the
+// network-failure text for the flash or onErr; with neither, the page
+// notice says the server did not answer).
 function postForm(url, params, opts) {
   opts = opts || {};
   var csrf = getCSRFToken();
@@ -3107,11 +2984,12 @@ function postForm(url, params, opts) {
       });
     }
   });
-  if (opts.catchMsg !== null) {
-    p.catch(function() {
-      if (flash) flash.innerHTML = '<div class="flash flash-err">' + (opts.catchMsg || 'Request failed.') + '</div>';
-    });
-  }
+  p.catch(function() {
+    var msg = opts.catchMsg || 'Request failed.';
+    if (flash) flash.innerHTML = '<div class="flash flash-err">' + msg + '</div>';
+    else if (opts.onErr) opts.onErr(msg);
+    else showUnansweredNotice();
+  });
 }
 
 function mirrorJobSummary(flashId) {
@@ -3138,13 +3016,8 @@ function dismissJobStatus() {
   _lastWatcherNotices = -1;
   _jobAutoClearFinishedAt = '';
   if (_jobAutoClearTimer) { clearTimeout(_jobAutoClearTimer); _jobAutoClearTimer = null; }
-  postForm('/internal/job/dismiss');
-  var js = document.getElementById('job-status');
-  if (js) {
-    js.innerHTML = '';
-    js.removeAttribute('hx-trigger');
-    if (window.htmx) window.htmx.process(js);
-  }
+  clearSlots('job-status');
+  postForm('/internal/job/dismiss', null, {onOK: refreshJobStatus});
 }
 
 function cancelJobStatus() {
@@ -3184,8 +3057,6 @@ var suggestPairs = {
   'batch-tag-suggest': {input: 'batch-tag-input', clearOnEmpty: true},
   'batch-strip-suggest': {input: 'batch-strip-input', clearOnEmpty: true},
   'source-suggest': {input: 'source-site-input'},
-  'batch-series-search-suggest': {input: 'batch-series-search-input'},
-  'batch-series-selected-suggest': {input: 'batch-series-selected-input'},
   'batch-collection-suggest': {input: 'batch-collection-input'},
   'collection-suggest': {input: 'collection-name-input'},
   'collection-rename-suggest': {input: 'collection-rename-input'},
@@ -3217,8 +3088,7 @@ document.addEventListener('submit', function(e) {
   for (var ddId in suggestPairs) {
     var input = document.getElementById(suggestPairs[ddId].input);
     if (!input || e.target !== input.form) continue;
-    var dd = document.getElementById(ddId);
-    if (dd) dd.innerHTML = '';
+    clearSlots(ddId);
     if (suggestPairs[ddId].blurOnSubmit) input.blur();
   }
 });
@@ -3241,10 +3111,7 @@ document.addEventListener('htmx:afterRequest', function(e) {
   if (!e.detail || !e.detail.elt) return;
   var ddId = suggestDropdownByInput[e.detail.elt.id];
   if (!ddId) return;
-  if (e.detail.xhr && e.detail.xhr.status === 204) {
-    var dd = document.getElementById(ddId);
-    if (dd) dd.innerHTML = '';
-  }
+  if (e.detail.xhr && e.detail.xhr.status === 204) clearSlots(ddId);
 });
 
 function mergeChoiceItem(name, value, checked, decorate) {
@@ -3326,19 +3193,24 @@ function justAddedChip(row) {
   return li;
 }
 
+// The swap drops .focused; put it back one row above the removed tag,
+// from the index Enter stashed.
 document.body.addEventListener('htmx:afterSettle', function(e) {
   var el = e.detail ? e.detail.elt : null;
   if (!el || (el.id !== 'image-tags' && el.id !== 'sidebar-inner')) return;
   separateNewTags();
-  if (document.body.classList.contains('tag-focus') && !focusedTagRow()) {
-    var first = tagFocusRows()[0];
-    if (first) {
-      first.classList.add('focused');
-      first.scrollIntoView({block: 'nearest'});
-    } else {
-      document.body.classList.remove('tag-focus');
-    }
+  if (!document.body.classList.contains('tag-focus')) return;
+  var stash = document.body.dataset.tagFocusIdx;
+  delete document.body.dataset.tagFocusIdx;
+  if (focusedTagRow()) return;
+  var items = tagFocusRows();
+  if (items.length === 0) {
+    document.body.classList.remove('tag-focus');
+    return;
   }
+  var at = stash === undefined ? 0 : Math.min(Math.max(0, parseInt(stash, 10) - 1), items.length - 1);
+  items[at].classList.add('focused');
+  items[at].scrollIntoView({block: 'nearest'});
 });
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -3359,16 +3231,6 @@ document.addEventListener('DOMContentLoaded', function() {
   window.addEventListener('resize', sync);
   window.addEventListener('load', sync);
 })();
-
-document.addEventListener('DOMContentLoaded', function() {
-  var counter = document.getElementById('reader-counter');
-  if (counter && document.getElementById('reader-jump-dialog')) {
-    counter.addEventListener('click', function(e) {
-      e.preventDefault();
-      openReaderJumpDialog();
-    });
-  }
-});
 
 document.addEventListener('DOMContentLoaded', function() {
   if (!document.getElementById('pages-grid-page')) return;
@@ -3480,27 +3342,16 @@ function initInboxUpload() {
 document.addEventListener('DOMContentLoaded', initInboxUpload);
 
 function mergeCategoryCollision(tagID, catID) {
-  var body = new URLSearchParams();
-  body.set('category_id', String(catID));
-  body.set('merge', '1');
-  fetch('/tags/' + tagID + '/category', {
+  postForm('/tags/' + tagID + '/category', {category_id: String(catID), merge: '1'}, {
     method: 'PATCH',
-    headers: {'X-CSRF-Token': getCSRFToken(), 'X-Monbooru-Gallery': activeGallery(), 'Content-Type': 'application/x-www-form-urlencoded'},
-    body: body
-  }).then(function(r) {
-    if (sessionLost(r)) {
-      showLoginNotice();
-      return;
-    }
-    if (r.ok) {
+    flashId: 'tag-flash',
+    catchMsg: 'Merge request failed.',
+    onOK: function() {
       stashActionFlash('Merged into the existing tag.', 'ok');
       window.location.reload();
-    } else {
-      // The body is unescaped plain text, and tag names may hold < and >.
-      r.text().then(function(t) {
-        setFlashText(document.getElementById('tag-flash'), 'err', t || 'Merge failed.');
-      });
-    }
+    },
+    // The body is unescaped plain text, and tag names may hold < and >.
+    onErr: function(t) { setFlashText(document.getElementById('tag-flash'), 'err', t || 'Merge failed.'); }
   });
 }
 

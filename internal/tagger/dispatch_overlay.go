@@ -2,8 +2,10 @@ package tagger
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 
@@ -12,16 +14,10 @@ import (
 
 func MergedDispatchRules(modelPath, taggerName string) []DispatchEntry {
 	merged := map[string]DispatchEntry{}
-	for _, e := range EmbeddedDispatchRules(taggerName) {
+	for _, e := range allDispatchRules(modelPath, taggerName) {
 		merged[e.Source] = e
 	}
-	for _, e := range OverlayDispatchRules(modelPath, taggerName) {
-		merged[e.Source] = e
-	}
-	out := make([]DispatchEntry, 0, len(merged))
-	for _, e := range merged {
-		out = append(out, e)
-	}
+	out := slices.Collect(maps.Values(merged))
 	sort.Slice(out, func(i, j int) bool { return out[i].Source < out[j].Source })
 	return out
 }
@@ -37,18 +33,18 @@ var overlayMu sync.Mutex
 func UpdateDispatchOverlay(modelPath, taggerName string, mutate func(map[string]DispatchEntry) error) error {
 	overlayMu.Lock()
 	defer overlayMu.Unlock()
+	current, err := ReadDispatchOverlay(modelPath, taggerName)
+	if err != nil {
+		return err
+	}
 	overlay := map[string]DispatchEntry{}
-	for _, e := range OverlayDispatchRules(modelPath, taggerName) {
+	for _, e := range current {
 		overlay[e.Source] = e
 	}
 	if err := mutate(overlay); err != nil {
 		return err
 	}
-	rules := make([]DispatchEntry, 0, len(overlay))
-	for _, e := range overlay {
-		rules = append(rules, e)
-	}
-	return SaveDispatchOverlay(modelPath, taggerName, rules)
+	return SaveDispatchOverlay(modelPath, taggerName, slices.Collect(maps.Values(overlay)))
 }
 
 // The overlay stays a pure delta against stock, and an empty one is

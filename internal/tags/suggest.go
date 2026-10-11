@@ -14,9 +14,7 @@ const relatedMaxTagUsage = 10000
 
 // Candidates are ranked from image_tags alone under an inner LIMIT;
 // images is joined last, so the is_missing filter only sees that buffer.
-func (s *Service) RelatedImages(imageID int64, limit int, ratingCeiling string) ([]models.Image, error) {
-	excluded := s.RatingTagIDsAbove(ratingCeiling)
-
+func (s *Service) RelatedImages(imageID int64, limit int, excluded []int64) ([]models.Image, error) {
 	var sourceFileType string
 	if err := s.db.Read.QueryRow(`SELECT file_type FROM images WHERE id = ?`, imageID).Scan(&sourceFileType); err != nil {
 		return nil, err
@@ -119,43 +117,34 @@ func SuggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsa
 		catArgs = []any{categoryName}
 	}
 
-	run := func(pat string, prior []models.Tag, remaining int, nameNotLike string) ([]models.Tag, error) {
+	return SuggestTwoPass(prefix, limit, func(pat, notLike string, n int) ([]models.Tag, error) {
 		extra := catClause
 		qargs := make([]any, 0, 2+len(catArgs))
 		qargs = append(qargs, pat)
 		qargs = append(qargs, catArgs...)
-		if nameNotLike != "" {
+		if notLike != "" {
 			extra = extra + ` AND name NOT LIKE ? ESCAPE '\'`
-			qargs = append(qargs, nameNotLike)
+			qargs = append(qargs, notLike)
 		}
-		qargs = append(qargs, remaining)
-		scanned, err := db.QueryAll(database.Read, ScanTag, fmt.Sprintf(baseSQL, usageClause, extra), qargs...)
-		if err != nil {
-			return prior, err
-		}
-		seen := map[int64]bool{}
-		for _, t := range prior {
-			seen[t.ID] = true
-		}
-		for _, t := range scanned {
-			if seen[t.ID] {
-				continue
-			}
-			prior = append(prior, t)
-			seen[t.ID] = true
-		}
-		return prior, nil
-	}
+		qargs = append(qargs, n)
+		return db.QueryAll(database.Read, ScanTag, fmt.Sprintf(baseSQL, usageClause, extra), qargs...)
+	})
+}
 
-	out, err := run(prefix+"%", nil, limit, "")
+// SuggestTwoPass fills limit with names starting with the LIKE-escaped
+// likePrefix, then tops it up with names containing it. A failed second
+// pass returns the first pass's names with the error.
+func SuggestTwoPass(likePrefix string, limit int, query func(pat, notLike string, n int) ([]models.Tag, error)) ([]models.Tag, error) {
+	out, err := query(likePrefix+"%", "", limit)
 	if err != nil {
 		return nil, err
 	}
 	if len(out) < limit {
-		out, err = run("%"+prefix+"%", out, limit-len(out), prefix+"%")
+		more, err := query("%"+likePrefix+"%", likePrefix+"%", limit-len(out))
 		if err != nil {
 			return out, err
 		}
+		out = append(out, more...)
 	}
 	return out, nil
 }

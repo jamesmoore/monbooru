@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync"
 	"time"
-
-	"github.com/monbooru/monbooru/internal/config"
 )
 
 type Backend interface {
@@ -53,15 +51,20 @@ type CacheStatus struct {
 // RunRequest carries pre-extracted frames: the backend never reads the
 // gallery database or unpacks archives.
 type RunRequest struct {
-	Cfg            *config.Config
-	Taggers        []TaggerStatus
-	Provider       string
-	CatIDs         map[string]int64
-	GeneralCatID   int64
-	InferredCats   map[string]int64
-	MinHitFraction float64
-	Parallel       int
-	Images         []BackendImageRequest
+	ModelPath string
+	DataPath  string
+	// SessionParallel is the configured tagger.parallel, which sizes the
+	// sessions' intra-op threads; Parallel is this batch's worker count.
+	SessionParallel    int
+	IdleReleaseMinutes int
+	Taggers            []TaggerStatus
+	Provider           string
+	CatIDs             map[string]int64
+	GeneralCatID       int64
+	InferredCats       map[string]int64
+	MinHitFraction     float64
+	Parallel           int
+	Images             []BackendImageRequest
 	// OnProgress may be nil. An empty msg marks an image done; any other
 	// is page status.
 	OnProgress func(workerIdx int, msg string)

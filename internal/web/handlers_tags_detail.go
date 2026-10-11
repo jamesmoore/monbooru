@@ -19,23 +19,22 @@ import (
 
 type tagDetailData struct {
 	baseData
-	Tag              *models.Tag
-	Categories       []models.TagCategory
-	IsRating         bool
-	Canonical        *models.Tag
-	Aliases          []models.Tag
-	Implications     []models.Implication
-	ImpliedBy        []models.Implication
-	RecentImageIDs   []int64
-	NoteBody         string
-	NoteHTML         template.HTML
-	NoteLinksText    string
-	NoteLinks        []tagLinkView
-	OriginKinds      map[string]string
-	MonloaderContrib bool
-	BackURL          string
-	PrevURL          string
-	NextURL          string
+	Tag            *models.Tag
+	Categories     []models.TagCategory
+	IsRating       bool
+	Canonical      *models.Tag
+	Aliases        []models.Tag
+	Implications   []models.Implication
+	ImpliedBy      []models.Implication
+	RecentImageIDs []int64
+	NoteBody       string
+	NoteHTML       template.HTML
+	NoteLinksText  string
+	NoteLinks      []tagLinkView
+	OriginKinds    map[string]string
+	BackURL        string
+	PrevURL        string
+	NextURL        string
 }
 
 func (s *Server) tagDetailHandler(w http.ResponseWriter, r *http.Request) {
@@ -56,11 +55,10 @@ func (s *Server) tagDetailHandler(w http.ResponseWriter, r *http.Request) {
 	cats, _ := s.tagSvc().ListCategories()
 
 	data := tagDetailData{
-		baseData:         s.base(r, "tags", tag.Name+" - "+s.booruName()),
-		Tag:              tag,
-		Categories:       cats,
-		IsRating:         tag.CategoryName == "rating",
-		MonloaderContrib: s.contribGateOpen(),
+		baseData:   s.base(r, "tags", tag.Name+" - "+s.booruName()),
+		Tag:        tag,
+		Categories: cats,
+		IsRating:   tag.CategoryName == "rating",
 	}
 	if backRaw := r.URL.Query().Get("back"); backRaw != "" {
 		if bq, err := url.ParseQuery(backRaw); err == nil {
@@ -142,12 +140,8 @@ func (s *Server) tagDetailHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setTagNote(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt64(w, r, "id")
+	id, ok := imageIDForm(w, r)
 	if !ok {
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		externalErr(w, r, "bad form", http.StatusBadRequest)
 		return
 	}
 	body := strings.TrimSpace(r.FormValue("note"))

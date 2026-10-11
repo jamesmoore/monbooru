@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -90,14 +91,8 @@ func parseComfyPromptChunk(raw string) *models.ComfyUIMetadata {
 		node := parsedNodes[id]
 		nodeType := node.typeName()
 		if nodeType == "KSampler" || nodeType == "KSamplerAdvanced" {
-			if posRaw, ok := node.Inputs["positive"]; ok {
-				var ref []json.RawMessage
-				if err := json.Unmarshal(posRaw, &ref); err == nil && len(ref) >= 1 {
-					var nid string
-					if err := json.Unmarshal(ref[0], &nid); err == nil {
-						positiveNodeID = nid
-					}
-				}
+			if nid, ok := refNodeID(node.Inputs["positive"]); ok {
+				positiveNodeID = nid
 			}
 			break
 		}
@@ -127,15 +122,12 @@ func parseComfyPromptChunk(raw string) *models.ComfyUIMetadata {
 	if meta.Prompt == "" {
 		for _, id := range nodeIDs {
 			node := parsedNodes[id]
-			nodeType := node.typeName()
-			if nodeType == "PrimitiveStringMultiline" {
-				if valRaw, ok := node.Inputs["value"]; ok {
-					var val string
-					if err := json.Unmarshal(valRaw, &val); err == nil && val != "" && len(val) > 10 {
-						meta.Prompt = val
-						break
-					}
-				}
+			if node.typeName() != "PrimitiveStringMultiline" {
+				continue
+			}
+			if val, ok := nodeInput[string](node.Inputs, "value"); ok && len(val) > 10 {
+				meta.Prompt = val
+				break
 			}
 		}
 	}
@@ -248,25 +240,28 @@ type comfyAPINode struct {
 	Inputs    map[string]json.RawMessage `json:"inputs"`
 }
 
-func (n comfyAPINode) typeName() string {
-	if n.ClassType != "" {
-		return n.ClassType
-	}
-	return n.Type
-}
+func (n comfyAPINode) typeName() string { return cmp.Or(n.ClassType, n.Type) }
 
 // A reference input is a [nodeID, slotIndex] array.
+func refNodeID(raw json.RawMessage) (string, bool) {
+	var ref []json.RawMessage
+	if err := json.Unmarshal(raw, &ref); err != nil || len(ref) < 1 {
+		return "", false
+	}
+	var nodeID string
+	if err := json.Unmarshal(ref[0], &nodeID); err != nil {
+		return "", false
+	}
+	return nodeID, true
+}
+
 func resolveRefInput[T any](raw json.RawMessage, nodes map[string]comfyAPINode, candidates []string, keep func(T) bool) (T, bool) {
 	var zero, v T
 	if err := json.Unmarshal(raw, &v); err == nil {
 		return v, true
 	}
-	var ref []json.RawMessage
-	if err := json.Unmarshal(raw, &ref); err != nil || len(ref) < 1 {
-		return zero, false
-	}
-	var nodeID string
-	if err := json.Unmarshal(ref[0], &nodeID); err != nil {
+	nodeID, ok := refNodeID(raw)
+	if !ok {
 		return zero, false
 	}
 	refNode, ok := nodes[nodeID]
@@ -289,8 +284,15 @@ func resolveStringInput(raw json.RawMessage, nodes map[string]comfyAPINode) stri
 	return s
 }
 
-func resolveInt64Input(raw json.RawMessage, nodes map[string]comfyAPINode) (int64, bool) {
-	return resolveRefInput(raw, nodes, []string{"seed", "value", "int"}, func(int64) bool { return true })
+// nodes may be nil, which takes a literal only. A seed past MaxInt64 is
+// kept as its two's-complement int64.
+func resolveSeedInput(raw json.RawMessage, nodes map[string]comfyAPINode) (int64, bool) {
+	candidates := []string{"seed", "value", "int"}
+	if n, ok := resolveRefInput(raw, nodes, candidates, func(int64) bool { return true }); ok {
+		return n, true
+	}
+	n, ok := resolveRefInput(raw, nodes, candidates, func(uint64) bool { return true })
+	return int64(n), ok
 }
 
 // ParseComfyWorkflowNodes keeps nodes with no inputs so the graph stays
@@ -299,14 +301,8 @@ func ParseComfyWorkflowNodes(raw string) []models.ComfyNode {
 	graph := comfyGraphNodes(raw)
 	nodes := make([]models.ComfyNode, 0, len(graph))
 	for _, n := range graph {
-		paramKeys := make([]string, 0, len(n.Inputs))
-		for pk := range n.Inputs {
-			paramKeys = append(paramKeys, pk)
-		}
-		slices.Sort(paramKeys)
-
 		var params []models.ComfyNodeParam
-		for _, pk := range paramKeys {
+		for _, pk := range slices.Sorted(maps.Keys(n.Inputs)) {
 			if param := comfyParamToDisplay(pk, n.Inputs[pk]); param != nil {
 				params = append(params, *param)
 			}
@@ -361,12 +357,8 @@ func comfyParamToDisplay(name string, raw json.RawMessage) *models.ComfyNodePara
 	if val, ok := comfyScalar(raw); ok {
 		return &models.ComfyNodeParam{Name: name, Value: val, SearchTerm: comfyLinkTerm(name, val)}
 	}
-	var arr []json.RawMessage
-	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) >= 1 {
-		var ref string
-		if err := json.Unmarshal(arr[0], &ref); err == nil {
-			return &models.ComfyNodeParam{Name: name, Value: "→ " + ref, IsRef: true}
-		}
+	if ref, ok := refNodeID(raw); ok {
+		return &models.ComfyNodeParam{Name: name, Value: "→ " + ref, IsRef: true}
 	}
 	return &models.ComfyNodeParam{Name: name, Value: string(raw)}
 }
@@ -374,10 +366,7 @@ func comfyParamToDisplay(name string, raw json.RawMessage) *models.ComfyNodePara
 // A fixed order: the passes are first-writer-wins, so map order would
 // change the checkpoint, LoRA order and hash between parses.
 func comfyNodeIDs[T any](nodes map[string]T) []string {
-	ids := make([]string, 0, len(nodes))
-	for id := range nodes {
-		ids = append(ids, id)
-	}
+	ids := slices.Collect(maps.Keys(nodes))
 	sortComfyKeys(ids)
 	return ids
 }
@@ -435,7 +424,7 @@ func applyComfyNodeInputs(nodeType string, inputs map[string]json.RawMessage, me
 		}
 	case "KSampler", "KSamplerAdvanced", "KSamplerSelect":
 		if seedRaw, ok := inputs["seed"]; ok && meta.Seed == nil {
-			if seed, ok := resolveInt64Input(seedRaw, nodes); ok {
+			if seed, ok := resolveSeedInput(seedRaw, nodes); ok {
 				meta.Seed = &seed
 			}
 		}
@@ -451,7 +440,7 @@ func applyComfyNodeInputs(nodeType string, inputs map[string]json.RawMessage, me
 		if scheduler, ok := nodeInput[string](inputs, "scheduler"); ok && scheduler != "" && meta.Sampler != "" {
 			meta.Sampler += "/" + scheduler
 		}
-	case "CheckpointLoaderSimple", "CheckpointLoader", "unCLIPCheckpointLoader":
+	case "CheckpointLoaderSimple", "CheckpointLoader", "unCLIPCheckpointLoader", "easy fullLoader", "easy a1111Loader":
 		if ckpt, ok := nodeInput[string](inputs, "ckpt_name"); ok && meta.ModelCheckpoint == "" {
 			meta.ModelCheckpoint = ckpt
 		}
@@ -471,12 +460,8 @@ func applyComfyNodeInputs(nodeType string, inputs map[string]json.RawMessage, me
 			}
 		}
 	case "Seed (rgthree)", "SeedNode", "RandomSeed":
-		if seed, ok := nodeInput[int64](inputs, "seed"); ok && meta.Seed == nil {
+		if seed, ok := resolveSeedInput(inputs["seed"], nil); ok && meta.Seed == nil {
 			meta.Seed = &seed
-		}
-	case "easy fullLoader", "easy a1111Loader":
-		if ckpt, ok := nodeInput[string](inputs, "ckpt_name"); ok && meta.ModelCheckpoint == "" {
-			meta.ModelCheckpoint = ckpt
 		}
 	}
 }

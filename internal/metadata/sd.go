@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -16,7 +17,7 @@ func extractSDFromJPEG(path string) (*models.SDMetadata, error) {
 }
 
 func sdFromEXIF(x *exifData) *models.SDMetadata {
-	tag, ok := x.get(userCommentField)
+	tag, ok := x.tags[userCommentField]
 	if !ok {
 		return nil
 	}
@@ -34,6 +35,8 @@ func parseA1111Parameters(text string) *models.SDMetadata {
 	if text == "" {
 		return nil
 	}
+	// An empty prompt leaves the marker first, with no newline of its own.
+	text = "\n" + text
 
 	negIdx := strings.Index(text, "\nNegative prompt:")
 	paramIdx := findParamLineIndex(text)
@@ -85,7 +88,7 @@ func findParamLineIndex(text string) int {
 	return -1
 }
 
-// ParseAllSDParams keeps the line's order, and a braced value stays whole.
+// ParseAllSDParams keeps the line's order, and a braced or quoted value stays whole.
 func ParseAllSDParams(paramLine string) []models.SDParam {
 	var result []models.SDParam
 	seen := map[string]bool{}
@@ -98,12 +101,29 @@ func ParseAllSDParams(paramLine string) []models.SDParam {
 	return result
 }
 
+// A1111 quotes a value holding a comma as a JSON string, and reads a quote
+// as one only at the start of a value.
 func splitA1111Params(s string) []string {
 	var parts []string
 	depth := 0
 	start := 0
+	quoted, escaped := false, false
+	var prev rune
 	for i, ch := range s {
+		if quoted {
+			switch {
+			case escaped:
+				escaped = false
+			case ch == '\\':
+				escaped = true
+			case ch == '"':
+				quoted = false
+			}
+			continue
+		}
 		switch ch {
+		case '"':
+			quoted = prev == ':'
 		case '{', '(', '[':
 			depth++
 		case '}', ')', ']':
@@ -116,11 +136,26 @@ func splitA1111Params(s string) []string {
 				start = i + 1
 			}
 		}
+		if ch != ' ' {
+			prev = ch
+		}
 	}
 	if start < len(s) {
 		parts = append(parts, s[start:])
 	}
 	return parts
+}
+
+// ParseSeed stores a seed past MaxInt64 as its two's-complement int64, so
+// the whole uint64 range fits the INTEGER column.
+func ParseSeed(s string) (int64, bool) {
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, true
+	}
+	if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return int64(n), true
+	}
+	return 0, false
 }
 
 func eachA1111Param(paramLine string, fn func(key, val string)) {
@@ -134,7 +169,14 @@ func eachA1111Param(paramLine string, fn func(key, val string)) {
 		if key == "" {
 			continue
 		}
-		fn(key, strings.TrimSpace(kv[1]))
+		val := strings.TrimSpace(kv[1])
+		if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+			var unquoted string
+			if json.Unmarshal([]byte(val), &unquoted) == nil {
+				val = unquoted
+			}
+		}
+		fn(key, val)
 	}
 }
 
@@ -152,7 +194,7 @@ func parseA1111Params(paramLine string, sd *models.SDMetadata) {
 				sd.CFGScale = &f
 			}
 		case "Seed":
-			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+			if n, ok := ParseSeed(val); ok {
 				sd.Seed = &n
 			}
 		case "Model":

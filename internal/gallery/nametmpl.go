@@ -1,6 +1,7 @@
 package gallery
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -216,17 +217,17 @@ type NameFacts struct {
 }
 
 // LoadNameFacts leaves Source, PostID and the batch position to the
-// caller. An empty md5 is computed when a template reads it, unless the
-// file is over md5Cap (0 means no cap); then {md5} renders empty.
-func LoadNameFacts(ctx context.Context, database *db.DB, galleryName string, id int64, md5Cap int64, tmpls ...*NameTemplate) (NameFacts, error) {
-	f := NameFacts{ID: id, Gallery: galleryName}
+// caller. A template reading {md5} computes and stores an empty one, unless
+// the file is over md5Cap (0: no cap), when {md5} renders empty.
+func LoadNameFacts(ctx context.Context, database *db.DB, galleryName string, id int64, md5Cap int64, tmpls ...*NameTemplate) (f NameFacts, stored bool, err error) {
+	f = NameFacts{ID: id, Gallery: galleryName}
 	var canonical, ingestedAt string
 	if err := database.Read.QueryRowContext(ctx,
 		`SELECT canonical_path, folder_path, file_type, sha256, md5, origin, file_size,
 		        COALESCE(width, 0), COALESCE(height, 0), ingested_at
 		 FROM images WHERE id = ?`, id,
 	).Scan(&canonical, &f.Folder, &f.Type, &f.SHA256, &f.MD5, &f.Origin, &f.Size, &f.Width, &f.Height, &ingestedAt); err != nil {
-		return f, fmt.Errorf("name facts for image %d: %w", id, err)
+		return f, false, fmt.Errorf("name facts for image %d: %w", id, err)
 	}
 	ext := filepath.Ext(canonical)
 	f.Base = filepath.Base(canonical)
@@ -236,11 +237,12 @@ func LoadNameFacts(ctx context.Context, database *db.DB, galleryName string, id 
 	if f.MD5 == "" && readsMD5(tmpls) && (md5Cap <= 0 || f.Size <= md5Cap) {
 		sum, err := ComputeAndStoreMD5(ctx, database, id)
 		if err != nil {
-			return f, fmt.Errorf("md5 for image %d: %w", id, err)
+			return f, false, fmt.Errorf("md5 for image %d: %w", id, err)
 		}
 		f.MD5 = sum
+		stored = true
 	}
-	return f, nil
+	return f, stored, nil
 }
 
 // Render falls back to the root or the id when an arriving file renders
@@ -291,15 +293,7 @@ var identityTokens = map[nameToken]bool{
 }
 
 func (t *NameTemplate) PerImage() bool {
-	if t == nil {
-		return false
-	}
-	for _, p := range t.parts {
-		if identityTokens[p.tok] {
-			return true
-		}
-	}
-	return false
+	return t != nil && slices.ContainsFunc(t.parts, func(p namePart) bool { return identityTokens[p.tok] })
 }
 
 func (p namePart) value(f NameFacts) string {
@@ -342,10 +336,7 @@ func (p namePart) value(f NameFacts) string {
 	case tokFolder:
 		return f.Folder
 	case tokSeq:
-		width := p.width
-		if width == 0 {
-			width = f.NWidth
-		}
+		width := cmp.Or(p.width, f.NWidth)
 		return fmt.Sprintf("%0*d", max(width, 1), f.N)
 	case tokSource:
 		return f.Source
@@ -386,6 +377,16 @@ func trimSeparatorSuffix(b []byte) []byte {
 // script keeps its letters. It uses Windows' set, as galleries are often
 // shared over SMB, and trims the trailing dots and spaces Windows drops.
 func SanitizeFilename(s string) string {
+	return strings.Trim(foldFilename(s), " .")
+}
+
+// SanitizeReceivedName keeps a sender's leading dots, which the ignore list
+// matches dotfiles by.
+func SanitizeReceivedName(s string) string {
+	return strings.TrimRight(foldFilename(s), " .")
+}
+
+func foldFilename(s string) string {
 	var b strings.Builder
 	for _, r := range s {
 		if r < 0x20 || r == 0x7f || strings.ContainsRune(`<>:"/\|?*`, r) {
@@ -394,7 +395,7 @@ func SanitizeFilename(s string) string {
 		}
 		b.WriteRune(r)
 	}
-	return strings.Trim(b.String(), " .")
+	return b.String()
 }
 
 func TruncateFilename(s string, max int) string {
@@ -422,7 +423,7 @@ func (n Naming) Apply(ctx context.Context, database *db.DB, b *Boundary, id int6
 	if n.Empty() {
 		return "", nil
 	}
-	facts, err := LoadNameFacts(ctx, database, n.Gallery, id, 0, n.Folder, n.Name)
+	facts, _, err := LoadNameFacts(ctx, database, n.Gallery, id, 0, n.Folder, n.Name)
 	if err != nil {
 		return "", err
 	}
@@ -491,7 +492,7 @@ func (n Naming) FolderFor(ctx context.Context, database *db.DB, id int64) (strin
 	if n.Folder == nil {
 		return "", nil
 	}
-	facts, err := LoadNameFacts(ctx, database, n.Gallery, id, 0, n.Folder)
+	facts, _, err := LoadNameFacts(ctx, database, n.Gallery, id, 0, n.Folder)
 	if err != nil {
 		return "", err
 	}

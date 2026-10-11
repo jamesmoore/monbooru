@@ -13,10 +13,10 @@ type TagSource struct {
 	CreatedAt string
 }
 
-// RecordTagSourceTx adds a ledger row for each source that applies or
+// recordTagSourceTx adds a ledger row for each source that applies or
 // re-confirms a tag, where tagger_name keeps only the first. Implication
 // fan-out writes none.
-func RecordTagSourceTx(tx *sql.Tx, imageID, tagID int64, source string) error {
+func recordTagSourceTx(tx *sql.Tx, imageID, tagID int64, source string) error {
 	source = cmp.Or(source, "user")
 	_, err := tx.Exec(
 		`INSERT OR IGNORE INTO image_tag_sources (image_id, tag_id, source) VALUES (?, ?, ?)`,

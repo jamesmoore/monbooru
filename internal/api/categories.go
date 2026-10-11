@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -49,7 +50,7 @@ func writeCategoryError(w http.ResponseWriter, err error) {
 	apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
 }
 
-func getCategory(g Gallery, id int64) (models.TagCategory, error) {
+func getCategory(g *library.Gallery, id int64) (models.TagCategory, error) {
 	var c models.TagCategory
 	var isBuiltin int
 	err := g.DB.Read.QueryRow(
@@ -90,8 +91,7 @@ func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	color := strings.TrimSpace(body.Color)
-	color = cmp.Or(color, "#888888")
+	color := cmp.Or(strings.TrimSpace(body.Color), "#888888")
 	cat, err := g.TagSvc.CreateCategory(body.Name, color)
 	if err != nil {
 		writeCategoryError(w, err)
@@ -127,7 +127,6 @@ func (h *Handler) patchCategory(w http.ResponseWriter, r *http.Request) {
 			writeCategoryError(w, err)
 			return
 		}
-		g.invalidate()
 	}
 	if body.Color != nil {
 		if err := g.TagSvc.UpdateCategoryColor(id, strings.TrimSpace(*body.Color)); err != nil {
@@ -157,8 +156,7 @@ func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 		return
 	}
-	action := body.Action
-	action = cmp.Or(action, "move")
+	action := cmp.Or(body.Action, "move")
 	if action != "move" && action != "delete_all" {
 		apiError(w, http.StatusBadRequest, "invalid_request", "action must be 'move' or 'delete_all'")
 		return
@@ -167,6 +165,5 @@ func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
 		writeCategoryError(w, err)
 		return
 	}
-	g.invalidate()
 	w.WriteHeader(http.StatusNoContent)
 }

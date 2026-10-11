@@ -124,13 +124,25 @@ func decodeBudgetError(cfg image.Config, format string, head []byte) error {
 // Go's progressive decoder keeps a [64]int32 block per 8x8 of every
 // component, on top of the image: up to 5x what the pixels cost.
 func progressiveJPEGCoefficientBytes(head []byte) int64 {
-	for i := 2; i+4 <= len(head) && head[i] == 0xFF; {
-		marker := head[i+1]
-		if marker == 0xFF {
+	for i := 2; i+1 < len(head); {
+		// The marker grammar image/jpeg reads: junk before an 0xFF and fill
+		// bytes are skipped, and FF00 and RST0-7 carry no length.
+		if head[i] != 0xFF || head[i+1] == 0xFF {
 			i++
 			continue
 		}
+		marker := head[i+1]
+		if marker == 0x00 || marker >= 0xD0 && marker <= 0xD7 {
+			i += 2
+			continue
+		}
+		if i+4 > len(head) {
+			return 0
+		}
 		size := int(head[i+2])<<8 | int(head[i+3])
+		if size < 2 {
+			return 0
+		}
 		switch {
 		case marker == 0xC2:
 			seg := head[i+4 : min(i+2+size, len(head))]
@@ -260,9 +272,12 @@ func decodeFirstWebPFrame(r io.Reader, cfg image.Config) (image.Image, error) {
 		if size < 16 {
 			return nil, errors.New("webp: short ANMF chunk")
 		}
-		frame := make([]byte, size)
-		if _, err := io.ReadFull(r, frame); err != nil {
+		frame, err := io.ReadAll(io.LimitReader(r, size))
+		if err != nil {
 			return nil, err
+		}
+		if int64(len(frame)) < size {
+			return nil, io.ErrUnexpectedEOF
 		}
 		return decodeANMF(frame, cfg)
 	}
@@ -283,6 +298,14 @@ func decodeANMF(frame []byte, cfg image.Config) (image.Image, error) {
 	still.Write(data)
 	b := still.Bytes()
 	binary.LittleEndian.PutUint32(b[4:], uint32(len(b)-8))
+	// The budget was sized for the canvas, not the frame's own bitstream.
+	fc, err := webp.DecodeConfig(bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	if fc.Width > cfg.Width || fc.Height > cfg.Height {
+		return nil, fmt.Errorf("webp: a %dx%d frame on a %dx%d canvas", fc.Width, fc.Height, cfg.Width, cfg.Height)
+	}
 	img, err := webp.Decode(bytes.NewReader(b))
 	if err != nil {
 		return nil, err
@@ -303,17 +326,17 @@ func hoverPath(dir string, imageID int64) string {
 	return filepath.Join(dir, fmt.Sprintf("%d_hover.webp", imageID))
 }
 
-func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
-	return generate(srcPath, dstDir, imageID, fileType, false)
+func generate(srcPath, dstDir string, imageID int64, fileType string) error {
+	return writeThumbnails(srcPath, dstDir, imageID, fileType, false)
 }
 
 // Rebuild writes a manga's page thumbs before it returns: queued, an archive
 // past a full queue keeps its old ones.
 func Rebuild(srcPath, dstDir string, imageID int64, fileType string) error {
-	return generate(srcPath, dstDir, imageID, fileType, true)
+	return writeThumbnails(srcPath, dstDir, imageID, fileType, true)
 }
 
-func generate(srcPath, dstDir string, imageID int64, fileType string, pagesInline bool) error {
+func writeThumbnails(srcPath, dstDir string, imageID int64, fileType string, pagesInline bool) error {
 	if err := os.MkdirAll(dstDir, 0755); err != nil {
 		return fmt.Errorf("creating thumbnail dir: %w", err)
 	}
@@ -360,20 +383,8 @@ func generateMangaThumbnails(srcPath, dstDir string, imageID int64, pagesInline 
 	}
 	defer func() { _ = archive.Close() }()
 
-	if archive.ffmpegPage(0) {
-		if err := archive.withPageFile(0, func(page string) error {
-			return renderStill(page, ThumbnailPath(dstDir, imageID), thumbMaxDim)
-		}); err != nil {
-			return fmt.Errorf("render manga cover: %w", err)
-		}
-	} else {
-		cover, err := archive.coverImage()
-		if err != nil {
-			return fmt.Errorf("decode manga cover: %w", err)
-		}
-		if err := writeJPEGAtomic(scaleImage(cover, thumbMaxDim), ThumbnailPath(dstDir, imageID), thumbQuality); err != nil {
-			return err
-		}
+	if err := generateOneMangaPageThumb(archive, 0, ThumbnailPath(dstDir, imageID)); err != nil {
+		return fmt.Errorf("manga cover: %w", err)
 	}
 
 	imageDir := mangaImageDir(dstDir, imageID)
@@ -519,7 +530,7 @@ func writeJPEGAtomic(img image.Image, path string, quality int) error {
 
 // The caller hands the returned phash to the in-memory index.
 func regenerateDerived(database *db.DB, thumbnailsPath, path string, imageID int64, fileType, logCtx string) *int64 {
-	if err := Generate(path, thumbnailsPath, imageID, fileType); err != nil {
+	if err := generate(path, thumbnailsPath, imageID, fileType); err != nil {
 		logx.Warnf("%s: thumbnail for %q: %v", logCtx, path, err)
 		return nil
 	}

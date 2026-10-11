@@ -1,75 +1,28 @@
 package gallery
 
 import (
-	"database/sql"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/logx"
 )
 
-type DeleteImageResult struct {
-	CanonicalPath string
-	FolderPath    string
-	IsMissing     bool
+// Indexed is what a row recorded of the bytes at one of its paths; a zero
+// mtime was not recorded.
+type Indexed struct {
+	Size      int64
+	SHA256    string
+	Mtime     int64
+	MtimeNano int64
 }
 
-// DeleteImage runs onImageDelete before the row delete:
-// dup_groups.original_image_id has no cascade and would block it.
-func DeleteImage(database *db.DB, b *Boundary, thumbnailsPath string, id int64, removeAllTags func(*sql.Tx, int64) error, onImageDelete func(*sql.Tx, int64) error) (*DeleteImageResult, error) {
-	var canonPath, folderPath, fileType string
-	var isMissing int
-	if err := database.Read.QueryRow(
-		`SELECT canonical_path, folder_path, is_missing, file_type FROM images WHERE id = ?`, id,
-	).Scan(&canonPath, &folderPath, &isMissing, &fileType); err != nil {
-		return nil, fmt.Errorf("image not found: %w", err)
-	}
-	aliases, err := AliasPathsFor(database.Read, []int64{id})
-	if err != nil {
-		return nil, fmt.Errorf("alias paths for image %d: %w", id, err)
-	}
-
-	tx, err := database.Write.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("begin delete image %d: %w", id, err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := removeAllTags(tx, id); err != nil {
-		return nil, fmt.Errorf("remove tags for image %d: %w", id, err)
-	}
-	if onImageDelete != nil {
-		if err := onImageDelete(tx, id); err != nil {
-			return nil, fmt.Errorf("relations cleanup for image %d: %w", id, err)
-		}
-	}
-	if _, err := tx.Exec(`DELETE FROM images WHERE id = ?`, id); err != nil {
-		return nil, fmt.Errorf("delete image row: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit delete image %d: %w", id, err)
-	}
-
-	RemoveImageArtifacts(thumbnailsPath, id, fileType)
-
-	result := &DeleteImageResult{
-		CanonicalPath: canonPath,
-		FolderPath:    folderPath,
-		IsMissing:     isMissing == 1,
-	}
-
-	if !result.IsMissing {
-		UnlinkImageFile(b, canonPath, id)
-	}
-	UnlinkAliasFiles(b, id, aliases[id])
-
-	return result, nil
-}
-
-// AliasCopy's Size is the row's, which every true copy shares.
+// AliasCopy's Size and SHA256 are the row's, which every true copy shares.
 type AliasCopy struct {
 	Path string
-	Size int64
+	Indexed
 }
 
 // AliasPathsFor must run before the rows go: image_paths cascades with images.
@@ -79,7 +32,7 @@ func AliasPathsFor(q db.Querier, ids []int64) (map[int64][]AliasCopy, error) {
 		return nil, nil
 	}
 	rows, err := q.Query(
-		`SELECT ip.image_id, ip.path, i.file_size
+		`SELECT ip.image_id, ip.path, i.file_size, i.sha256, ip.mtime_unix, ip.mtime_nsec
 		   FROM image_paths ip
 		   JOIN images i ON i.id = ip.image_id
 		  WHERE ip.is_canonical = 0 AND ip.image_id IN (`+placeholders+`)`, args...)
@@ -91,7 +44,7 @@ func AliasPathsFor(q db.Querier, ids []int64) (map[int64][]AliasCopy, error) {
 	for rows.Next() {
 		var id int64
 		var c AliasCopy
-		if err := rows.Scan(&id, &c.Path, &c.Size); err != nil {
+		if err := rows.Scan(&id, &c.Path, &c.Size, &c.SHA256, &c.Mtime, &c.MtimeNano); err != nil {
 			return nil, err
 		}
 		out[id] = append(out[id], c)
@@ -100,17 +53,126 @@ func AliasPathsFor(q db.Querier, ids []int64) (map[int64][]AliasCopy, error) {
 }
 
 // UnlinkAliasFiles takes the copies with the row, or the next sync ingests
-// one as a new untagged image. A copy no longer the row's length stays: with
-// the watcher off it can be another file written over a recorded path.
-func UnlinkAliasFiles(b *Boundary, id int64, copies []AliasCopy) {
+// one as a new untagged image. It reports how many it kept as changed.
+func UnlinkAliasFiles(b *Boundary, id int64, copies []AliasCopy) (changed int) {
 	for _, c := range copies {
-		if info, err := os.Stat(c.Path); err == nil && info.Size() != c.Size {
-			logx.Warnf("delete image %d: %q holds %d bytes, not the row's %d - left alone",
-				id, c.Path, info.Size(), c.Size)
-			continue
+		if UnlinkImageFile(b, c.Path, c.Indexed, id) {
+			changed++
 		}
-		UnlinkImageFile(b, c.Path, id)
 	}
+	return changed
+}
+
+var (
+	ErrChangedSinceIndexed = errors.New("changed since indexing")
+	ErrCanonicalGone       = errors.New("its canonical file is gone, so it is the only copy left (a sync makes it canonical)")
+)
+
+// With the watcher off, a recorded path can hold another file written over
+// it since it was indexed. Only a file whose length and mtime both match
+// the row's skips the hash, so a touched file still goes.
+func changedSinceIndexed(path string, rec Indexed) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	if info.Size() != rec.Size {
+		return fmt.Errorf("%w (%d bytes, not the row's %d)", ErrChangedSinceIndexed, info.Size(), rec.Size)
+	}
+	known := syncKnownEntry{size: rec.Size, mtime: rec.Mtime, mtimeNano: rec.MtimeNano}
+	if known.unchanged(info.Size(), info.ModTime().Unix(), info.ModTime().UnixNano()) {
+		return nil
+	}
+	sha, err := HashFile(path)
+	if err != nil {
+		return fmt.Errorf("%w (could not read it to compare: %v)", ErrChangedSinceIndexed, err)
+	}
+	if sha != rec.SHA256 {
+		return fmt.Errorf("%w (other bytes of the same length)", ErrChangedSinceIndexed)
+	}
+	return nil
+}
+
+func RewrittenBy(q db.RowQuerier, id int64) int64 {
+	var path string
+	var rec Indexed
+	if err := q.QueryRow(
+		`SELECT i.canonical_path, i.file_size, i.sha256, COALESCE(ip.mtime_unix, 0), COALESCE(ip.mtime_nsec, 0)
+		   FROM images i LEFT JOIN image_paths ip ON ip.image_id = i.id AND ip.is_canonical = 1
+		  WHERE i.id = ? AND i.is_missing = 0`, id,
+	).Scan(&path, &rec.Size, &rec.SHA256, &rec.Mtime, &rec.MtimeNano); err != nil {
+		return 0
+	}
+	info, err := os.Stat(path)
+	known := syncKnownEntry{size: rec.Size, mtime: rec.Mtime, mtimeNano: rec.MtimeNano}
+	if err != nil || known.unchanged(info.Size(), info.ModTime().Unix(), info.ModTime().UnixNano()) {
+		return 0
+	}
+	sha, err := HashFile(path)
+	if err != nil || sha == rec.SHA256 {
+		return 0
+	}
+	other, err := ImageIDBySHA(q, sha)
+	if err != nil {
+		return 0
+	}
+	return other
+}
+
+type CopyOutcome int
+
+const (
+	// CopyRemoved: unlinked, or already gone from disk.
+	CopyRemoved CopyOutcome = iota
+	// CopyForgotten: the row may go, the file stays.
+	CopyForgotten
+	// CopyKept: the row and the file both stay.
+	CopyKept
+)
+
+// RemoveCopy unlinks one alias copy of an image whose canonical file is
+// canonical and whose row recorded rec there; the error says why a copy
+// was forgotten or kept.
+func RemoveCopy(b *Boundary, path, canonical string, rec Indexed) (CopyOutcome, error) {
+	if path == "" {
+		return CopyRemoved, nil
+	}
+	if !PathInside(b.Root(), path) {
+		return CopyForgotten, fmt.Errorf("outside the gallery root %q", b.Root())
+	}
+	if err := b.Check(path); err != nil {
+		return CopyForgotten, err
+	}
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return CopyRemoved, nil
+	}
+	if isCanonicalEntry(path, canonical) {
+		return CopyForgotten, errors.New("it reaches the canonical file through a link")
+	}
+	if err := changedSinceIndexed(path, rec); err != nil {
+		return CopyKept, err
+	}
+	if CanonicalGone(b, canonical) {
+		return CopyKept, ErrCanonicalGone
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return CopyKept, err
+	}
+	return CopyRemoved, nil
+}
+
+// Compares resolved names, not inodes: removing a symlink or a hard link
+// never takes the canonical file.
+func isCanonicalEntry(path, canonical string) bool {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	target, err := filepath.EvalSymlinks(canonical)
+	return err == nil && resolved == target
 }
 
 func RemoveImageArtifacts(thumbnailsPath string, id int64, fileType string) {
@@ -122,21 +184,27 @@ func RemoveImageArtifacts(thumbnailsPath string, id int64, fileType string) {
 	}
 }
 
-// UnlinkImageFile does not trust canonPath: a hand-edited DB or a
-// repointed mount can point it outside the root.
-func UnlinkImageFile(b *Boundary, canonPath string, id int64) {
-	if canonPath == "" {
-		return
+// UnlinkImageFile does not trust path: a hand-edited DB or a repointed
+// mount can point it outside the root. changed reports a file kept because
+// it no longer holds rec's bytes; the next sync takes it as it is now.
+func UnlinkImageFile(b *Boundary, path string, rec Indexed, id int64) (changed bool) {
+	if path == "" {
+		return false
 	}
-	if !PathInside(b.Root(), canonPath) {
-		logx.Warnf("delete image %d: refusing to unlink %q outside gallery root %q", id, canonPath, b.Root())
-		return
+	if !PathInside(b.Root(), path) {
+		logx.Warnf("delete image %d: refusing to unlink %q outside gallery root %q", id, path, b.Root())
+		return false
 	}
-	if err := b.Check(canonPath); err != nil {
-		logx.Warnf("delete image %d: leaving %q alone: %v", id, canonPath, err)
-		return
+	if err := b.Check(path); err != nil {
+		logx.Warnf("delete image %d: leaving %q alone: %v", id, path, err)
+		return false
 	}
-	if err := os.Remove(canonPath); err != nil && !os.IsNotExist(err) {
-		logx.Warnf("delete image file %q: %v", canonPath, err)
+	if err := changedSinceIndexed(path, rec); err != nil {
+		logx.Warnf("delete image %d: %q %v - left alone", id, path, err)
+		return true
 	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		logx.Warnf("delete image file %q: %v", path, err)
+	}
+	return false
 }

@@ -21,7 +21,6 @@
                 hx-delete="/images/{{$.ImageID}}/aliases/{{.ID}}"
                 hx-target="closest .duplicates-entry"
                 hx-swap="outerHTML"
-                hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
                 hx-confirm="Delete this duplicate file?"
                 data-confirm-danger="Its bytes are removed from disk. The canonical path stays."
                 data-confirm-ok="Delete">Delete</button>

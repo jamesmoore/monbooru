@@ -2,16 +2,13 @@
         <form hx-post="/relations/remove" hx-target="#flash-relations" hx-swap="innerHTML"
               hx-confirm="{{.Confirm}}"
               data-confirm-ok="{{.OK}}"
-              {{if .Reload}}hx-on::after-request="if(event.detail.successful){setTimeout(function(){window.location.reload()},1500)}" {{end}}{{with .ExtraClass}}class="{{.}}" {{end}}{{with .Edge}}data-edge="{{.}}" {{end}}style="display:inline">
-          <input type="hidden" name="_csrf" value="{{.CSRF}}">
+              {{if .Reload}}hx-on::after-request="if(event.detail.successful && event.detail.xhr.responseText.indexOf('flash-err') === -1){setTimeout(function(){window.location.reload()},1500)}" {{end}}{{with .ExtraClass}}class="{{.}}" {{end}}{{with .Edge}}data-edge="{{.}}" {{end}}style="display:inline">
           {{range $k, $v := .Fields}}<input type="hidden" name="{{$k}}" value="{{$v}}">
           {{end}}<button type="submit" class="btn-link-accent">[{{.Label}}]</button>
         </form>
 {{end}}
 {{define "relations_browse.html"}}
-{{template "layout_head" .}}
-<div id="sidebar-inner"></div>
-{{template "layout_mid" .}}
+{{template "layout_head_bare" .}}
 
 <div id="relations-browse-page" data-esc-back="/relations">
   <div class="detail-topbar">
@@ -73,12 +70,11 @@
               hx-confirm="Copy tags from the duplicates onto the original? Rating tags are excluded."
               data-confirm-ok="Copy"
               style="display:inline">
-          <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
           <button type="submit" class="btn-link-accent">[copy tags]</button>
         </form>
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Dissolve this same-image group?" "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-dup" "group_id" .GroupID)}}
+        {{template "relation_remove_form" dict "Confirm" "Dissolve this same-image group?" "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-dup" "group_id" .GroupID)}}
         {{if eq (len .Members) 2}}
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Dissolve this group and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "duplicate" "group_id" .GroupID)}}
+        {{template "relation_remove_form" dict "Confirm" "Dissolve this group and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "duplicate" "group_id" .GroupID)}}
         {{end}}
       {{else if eq .Kind "alternate"}}
         <label class="merge-select" title="Select this group for merging">
@@ -86,9 +82,9 @@
         </label>
         <strong>Alternate group #{{.GroupID}}</strong>
         ({{len .Members}} member(s))
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Dissolve this variant group?" "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-alt" "group_id" .GroupID)}}
+        {{template "relation_remove_form" dict "Confirm" "Dissolve this variant group?" "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-alt" "group_id" .GroupID)}}
         {{if eq (len .Members) 2}}
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Dissolve this group and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "alternate" "group_id" .GroupID)}}
+        {{template "relation_remove_form" dict "Confirm" "Dissolve this group and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "alternate" "group_id" .GroupID)}}
         {{end}}
       {{else if eq .Kind "version"}}
         <label class="merge-select" title="Select this chain for removal">
@@ -96,9 +92,9 @@
         </label>
         <strong>Version chain #{{index .Members 0}}</strong>
         ({{len .Members}} image(s), oldest #{{index .Members 0}} → newest #{{index .Members (sub (len .Members) 1)}})
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" (printf "Dissolve this version chain? Every edge between the %d images is dropped." (len .Members)) "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-version" "root_id" (index .Members 0))}}
+        {{template "relation_remove_form" dict "Confirm" (printf "Dissolve this version chain? Every edge between the %d images is dropped." (len .Members)) "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-version" "root_id" (index .Members 0))}}
         {{if eq (len .Members) 2}}
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Unlink this revision edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "version" "a" (index .Members 0) "b" (index .Members 1))}}
+        {{template "relation_remove_form" dict "Confirm" "Unlink this revision edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "version" "a" (index .Members 0) "b" (index .Members 1))}}
         {{end}}
       {{else if eq .Kind "derivative"}}
         <label class="merge-select" title="Select this tree for removal">
@@ -106,9 +102,9 @@
         </label>
         <strong>Derivative tree</strong>
         ({{len .Members}} image(s), source{{if gt (len .Roots) 1}}s{{end}}{{range .Roots}} #{{.}}{{end}})
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" (printf "Dissolve this derivative tree? Every edge between the %d images is dropped." (len .Members)) "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-derivative" "root_id" (index .Members 0))}}
+        {{template "relation_remove_form" dict "Confirm" (printf "Dissolve this derivative tree? Every edge between the %d images is dropped." (len .Members)) "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-derivative" "root_id" (index .Members 0))}}
         {{if eq (len .Members) 2}}
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Unlink this derivative edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "derivative" "a" (index .Members 0) "b" (index .Members 1))}}
+        {{template "relation_remove_form" dict "Confirm" "Unlink this derivative edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "derivative" "a" (index .Members 0) "b" (index .Members 1))}}
         {{end}}
       {{else if eq .Kind "not_related"}}
         <label class="merge-select" title="Select this pair for removal">
@@ -116,8 +112,8 @@
         </label>
         <strong>Not related</strong>
         (#{{index .Members 0}} ↔ #{{index .Members 1}})
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Unlink this not-related pair? It can resurface in find-pairs." "OK" "Unlink" "Label" "unlink" "Reload" true "Fields" (dict "type" "not_related" "a" (index .Members 0) "b" (index .Members 1))}}
-        {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Unlink this pair and queue it back into the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "not_related" "a" (index .Members 0) "b" (index .Members 1))}}
+        {{template "relation_remove_form" dict "Confirm" "Unlink this not-related pair? It can resurface in find-pairs." "OK" "Unlink" "Label" "unlink" "Reload" true "Fields" (dict "type" "not_related" "a" (index .Members 0) "b" (index .Members 1))}}
+        {{template "relation_remove_form" dict "Confirm" "Unlink this pair and queue it back into the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "not_related" "a" (index .Members 0) "b" (index .Members 1))}}
       {{end}}
       {{if .CreatedAt}}
       <div class="relations-card-meta field-hint">declared <time>{{.CreatedAt}}</time></div>
@@ -138,7 +134,7 @@
           <div class="relations-chain-cell">
             {{template "partials/relations_card_thumb.html" (dict "ID" $id "ActiveGallery" $.ActiveGallery "Title" (printf "Image %d - added %s" $id (index $card.MemberIngestedAt $id)) "Date" (index $card.MemberIngestedAt $id))}}
             {{if and $deep $i}}
-            {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Unlink this revision edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "ExtraClass" "relations-inline-action" "Fields" (dict "type" "review-again" "kind" "version" "a" (index $card.Members (sub $i 1)) "b" $id)}}
+            {{template "relation_remove_form" dict "Confirm" "Unlink this revision edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "ExtraClass" "relations-inline-action" "Fields" (dict "type" "review-again" "kind" "version" "a" (index $card.Members (sub $i 1)) "b" $id)}}
             {{end}}
           </div>
           {{end}}
@@ -161,7 +157,7 @@
             <div class="deriv-cell">
               {{template "partials/relations_card_thumb.html" (dict "ID" .ID "ActiveGallery" $.ActiveGallery "Title" (printf "Image %d - added %s" .ID (index $card.MemberIngestedAt .ID)) "Date" (index $card.MemberIngestedAt .ID))}}
               {{range $node.Sources}}
-              {{template "relation_remove_form" dict "CSRF" $.CSRFToken "Confirm" "Unlink this derivative edge and queue the pair for the session?" "OK" "Review again" "Label" (printf "review again #%d" .) "ExtraClass" "relations-inline-action" "Edge" (printf "%d-%d" . $node.ID) "Fields" (dict "type" "review-again" "kind" "derivative" "a" . "b" $node.ID)}}
+              {{template "relation_remove_form" dict "Confirm" "Unlink this derivative edge and queue the pair for the session?" "OK" "Review again" "Label" (printf "review again #%d" .) "ExtraClass" "relations-inline-action" "Edge" (printf "%d-%d" . $node.ID) "Fields" (dict "type" "review-again" "kind" "derivative" "a" . "b" $node.ID)}}
               {{end}}
             </div>
             {{end}}
@@ -236,20 +232,17 @@
   document.querySelectorAll('.merge-checkbox').forEach(function(cb) {
     cb.addEventListener('change', refresh);
   });
+  function setAllBoxes(on) {
+    document.querySelectorAll('.merge-checkbox').forEach(function(cb) { cb.checked = on; });
+    refresh();
+  }
   var selectAllBtn = document.getElementById('merge-select-all-btn');
-  if (selectAllBtn) selectAllBtn.addEventListener('click', function() {
-    document.querySelectorAll('.merge-checkbox').forEach(function(cb) { cb.checked = true; });
-    refresh();
-  });
+  if (selectAllBtn) selectAllBtn.addEventListener('click', function() { setAllBoxes(true); });
   var clearBtn = document.getElementById('merge-clear-btn');
-  if (clearBtn) clearBtn.addEventListener('click', function() {
-    document.querySelectorAll('.merge-checkbox').forEach(function(cb) { cb.checked = false; });
-    refresh();
-  });
+  if (clearBtn) clearBtn.addEventListener('click', function() { setAllBoxes(false); });
   refresh();
   document.addEventListener('click', function(e) {
     if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-    if (!e.target.closest) return;
     if (!selectedCheckboxes().length) return;
     if (e.target.closest('a, button, form, label, input, summary, details')) return;
     var card = e.target.closest('.relations-card');
@@ -263,18 +256,12 @@
     var sel = selectedCheckboxes();
     if (!sel.length) return;
     var n = sel.length;
-    var prompt;
-    if (kind === 'duplicate') {
-      prompt = 'Dissolve ' + n + ' same-image group(s)?';
-    } else if (kind === 'alternate') {
-      prompt = 'Dissolve ' + n + ' variant group(s)?';
-    } else if (kind === 'version') {
-      prompt = 'Dissolve ' + n + ' revision chain(s)? Every edge in each chain is dropped.';
-    } else if (kind === 'derivative') {
-      prompt = 'Dissolve ' + n + ' derivative tree(s)? Every edge in each tree is dropped.';
-    } else {
-      prompt = 'Unlink ' + n + ' not-related pair(s)? They can resurface in find-pairs.';
-    }
+    var prompt = {
+      duplicate: 'Dissolve ' + n + ' same-image group(s)?',
+      alternate: 'Dissolve ' + n + ' variant group(s)?',
+      version: 'Dissolve ' + n + ' revision chain(s)? Every edge in each chain is dropped.',
+      derivative: 'Dissolve ' + n + ' derivative tree(s)? Every edge in each tree is dropped.'
+    }[kind] || 'Unlink ' + n + ' not-related pair(s)? They can resurface in find-pairs.';
     showConfirm(prompt, function() {
       submitDissolve(kind, sel.map(function(cb) { return cb.value; }));
     }, '', 'Remove');
@@ -297,7 +284,6 @@
     postForm('/relations/browse-groups/dissolve?kind=' + encodeURIComponent(kind), params, {
       hx: true,
       flashId: 'flash-relations',
-      catchMsg: null,
       onOK: onBrowseGroupsResponse,
     });
   }
@@ -367,7 +353,6 @@
     postForm(url, params, {
       hx: true,
       flashId: 'flash-relations',
-      catchMsg: null,
       onOK: onBrowseGroupsResponse,
     });
   }

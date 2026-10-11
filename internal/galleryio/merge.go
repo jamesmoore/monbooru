@@ -4,16 +4,20 @@ import (
 	"archive/zip"
 	"bytes"
 	"cmp"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -32,9 +36,14 @@ type LightManifest struct {
 	Images  []LightManifestImage `json:"images"`
 }
 
-func decodeLightManifest(r io.Reader) (LightManifest, error) {
+func readLightManifest(path string) (LightManifest, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return LightManifest{}, fmt.Errorf("open tags.json: %w", err)
+	}
+	defer func() { _ = f.Close() }()
 	var mf LightManifest
-	if err := json.NewDecoder(r).Decode(&mf); err != nil {
+	if err := json.NewDecoder(f).Decode(&mf); err != nil {
 		return mf, fmt.Errorf("decode tags.json: %w", err)
 	}
 	if mf.Version != LightManifestVersion {
@@ -43,11 +52,13 @@ func decodeLightManifest(r io.Reader) (LightManifest, error) {
 	return mf, nil
 }
 
+// A general name holding a colon is qualified: bare, its prefix could read
+// as a category on the way back in.
 func tagToken(category, name string) string {
-	if category == "general" || category == "" {
+	if (category == "general" || category == "") && !strings.Contains(name, ":") {
 		return name
 	}
-	return category + ":" + name
+	return cmp.Or(category, "general") + ":" + name
 }
 
 // ImportSourceNative is the tagger_name of native imports; compat imports
@@ -55,23 +66,9 @@ func tagToken(category, name string) string {
 const ImportSourceNative = "import"
 
 func ExportGalleryLight(cx gallery.Handle, w io.Writer) error {
-	zw := zip.NewWriter(w)
-	defer func() { _ = zw.Close() }()
-
-	inner, err := zw.CreateHeader(&zip.FileHeader{Name: "tags.json", Method: zip.Deflate})
-	if err != nil {
-		return err
-	}
-	if err := ExportGalleryLightManifest(cx, inner); err != nil {
-		return err
-	}
-
-	if err := writeGalleryFilesToZip(zw, cx.Boundary()); err != nil {
-		return err
-	}
-	// Close writes the central directory, so its error must reach the
-	// caller; the deferred Close covers the error paths.
-	return zw.Close()
+	return writeArchive(w, cx.Boundary(), "tags.json", func(inner io.Writer) error {
+		return ExportGalleryLightManifest(cx, inner)
+	})
 }
 
 func ExportGalleryLightManifest(cx gallery.Handle, w io.Writer) error {
@@ -118,8 +115,7 @@ func writeLightManifest(read *sql.DB, w io.Writer, sc exportScope, names map[int
 
 // Grouping depends on the ORDER BY i.id: an image closes when the id changes.
 func walkLightRows(read *sql.DB, sc exportScope, emit func(id int64, sha, relPath string, missing bool, tags []string)) error {
-	where, args := sc.where("i.id")
-	rows, err := read.Query(lightRowsQuery+where+" ORDER BY i.id, tc.name, t.name", args...)
+	rows, err := read.Query(lightRowsQuery+sc.where("i.id")+" ORDER BY i.id, tc.name, t.name", sc.args()...)
 	if err != nil {
 		return err
 	}
@@ -168,22 +164,10 @@ const lightRowsQuery = `
 	LEFT JOIN tags t ON t.id = it.tag_id AND t.is_alias = 0
 	LEFT JOIN tag_categories tc ON tc.id = t.category_id`
 
-func replaceFromLightArchive(manifest *zip.File, galleryFiles []*zip.File, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int) (int, error) {
-	mc, err := manifest.Open()
-	if err != nil {
-		return 0, fmt.Errorf("open tags.json: %w", err)
-	}
-	mf, err := decodeLightManifest(mc)
-	_ = mc.Close()
+func replaceFromLightArchive(manifest *zip.File, files []translatedFile, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int) (int, error) {
+	mf, err := extractLightManifest(manifest, filepath.Dir(dbPath))
 	if err != nil {
 		return 0, err
-	}
-	files := make([]translatedFile, 0, len(galleryFiles))
-	for _, f := range galleryFiles {
-		files = append(files, translatedFile{
-			rel:  strings.TrimPrefix(f.Name, "gallery/"),
-			file: f,
-		})
 	}
 	return ApplyLightReplace(mf, files, dbPath, thumbsPath, b, ImportSourceNative, maxFileSizeMB)
 }
@@ -196,48 +180,109 @@ type translatedFile struct {
 // ApplyLightReplace rebuilds the gallery from mf and files; the count is
 // the files b leaves out.
 func ApplyLightReplace(mf LightManifest, files []translatedFile, dbPath, thumbsPath string, b *gallery.Boundary, source string, maxFileSizeMB int) (int, error) {
-	if mf.Version != LightManifestVersion {
-		return 0, fmt.Errorf("unsupported light export version %d (expected %d)", mf.Version, LightManifestVersion)
-	}
 	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
-	// Before anything is reset: a refused archive leaves the gallery whole.
-	dsts := make([]string, len(files))
-	for i, tf := range files {
-		dst, err := SafeArchiveDest(b.Root(), tf.rel)
-		if err != nil {
-			return 0, fmt.Errorf("rejecting archive entry %q: %w", tf.rel, err)
-		}
-		if !b.Excludes(dst) {
-			if err := checkEntrySize(tf.file, maxBytes); err != nil {
-				return 0, err
-			}
-		}
-		dsts[i] = dst
+	dsts, err := planExtraction(b, files, maxBytes)
+	if err != nil {
+		return 0, err
 	}
 	if err := resetDBAndThumbs(dbPath, thumbsPath); err != nil {
 		return 0, err
 	}
-	// No files means a rebuild against what is on disk; wiping would
-	// delete the files the manifest names.
-	if len(files) > 0 {
-		if _, err := gallery.RemoveOwned(b); err != nil {
-			return 0, fmt.Errorf("wipe gallery: %w", err)
+	leftOut, err := extractPlanned(b, files, dsts, maxBytes)
+	if rebuildErr := rebuildFromLightManifest(dbPath, b, thumbsPath, mf.Images, source); err == nil {
+		err = rebuildErr
+	}
+	return leftOut, err
+}
+
+// planExtraction runs before anything is reset or wiped, so an archive it
+// refuses leaves the gallery whole: it reads every entry it will write.
+func planExtraction(b *gallery.Boundary, files []translatedFile, maxBytes int64) ([]string, error) {
+	root := filepath.Clean(b.Root())
+	dsts := make([]string, len(files))
+	written := make(map[string]string, len(files))
+	lowered := make(map[string]string, len(files))
+	folds := sync.OnceValue(func() bool { return foldsCase(root) })
+	entryAt := func(dst string) (string, bool) {
+		if name, ok := written[dst]; ok {
+			return name, true
+		}
+		name, ok := lowered[strings.ToLower(dst)]
+		return name, ok && folds()
+	}
+	for i, tf := range files {
+		dst, err := SafeArchiveDest(root, tf.rel)
+		if err != nil {
+			return nil, fmt.Errorf("rejecting archive entry %q: %w", tf.file.Name, err)
+		}
+		if dst == root {
+			return nil, fmt.Errorf("rejecting archive entry %q: it names the gallery root", tf.file.Name)
+		}
+		dsts[i] = dst
+		if b.Excludes(dst) {
+			continue
+		}
+		if first, ok := entryAt(dst); ok {
+			return nil, fmt.Errorf("rejecting archive entry %q: it names the same file as %q", tf.file.Name, first)
+		}
+		if err := checkEntrySize(tf.file, maxBytes); err != nil {
+			return nil, err
+		}
+		if err := copyZipEntry(io.Discard, tf.file, maxBytes); err != nil {
+			return nil, err
+		}
+		written[dst] = tf.file.Name
+		lowered[strings.ToLower(dst)] = tf.file.Name
+	}
+	for _, dst := range dsts {
+		for dir := filepath.Dir(dst); dir != root; dir = filepath.Dir(dir) {
+			if name, ok := entryAt(dir); ok {
+				return nil, fmt.Errorf("rejecting archive entry %q: it is both a file and a folder", name)
+			}
 		}
 	}
-	leftOut := 0
+	return dsts, nil
+}
+
+// foldsCase tells whether dir's filesystem takes two names differing only
+// in case for one file, by probing it; where it cannot, it goes by the OS.
+var foldsCase = func(dir string) bool {
+	f, err := os.CreateTemp(dir, ".monbooru-case-*")
+	if err != nil {
+		return runtime.GOOS == "windows"
+	}
+	name := f.Name()
+	_ = f.Close()
+	defer func() { _ = os.Remove(name) }()
+	_, err = os.Stat(filepath.Join(dir, strings.ToUpper(filepath.Base(name))))
+	return err == nil
+}
+
+// extractPlanned carries on past a file it cannot write and returns the
+// first error, so the caller's DB step still sees every file that landed.
+func extractPlanned(b *gallery.Boundary, files []translatedFile, dsts []string, maxBytes int64) (leftOut int, err error) {
+	// No files means a rebuild against what is on disk; wiping would
+	// delete the files the manifest names.
+	if len(files) == 0 {
+		return 0, nil
+	}
+	if _, err := gallery.RemoveOwned(b); err != nil {
+		return 0, fmt.Errorf("wipe gallery: %w", err)
+	}
 	for i, tf := range files {
 		if b.Excludes(dsts[i]) {
 			leftOut++
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(dsts[i]), 0o755); err != nil {
-			return leftOut, err
+		writeErr := os.MkdirAll(filepath.Dir(dsts[i]), 0o755)
+		if writeErr == nil {
+			writeErr = copyZipFile(tf.file, dsts[i], maxBytes)
 		}
-		if err := copyZipFile(tf.file, dsts[i], maxBytes); err != nil {
-			return leftOut, err
+		if err == nil {
+			err = writeErr
 		}
 	}
-	return leftOut, rebuildFromLightManifest(dbPath, b, thumbsPath, mf.Images, source)
+	return leftOut, err
 }
 
 func resetDBAndThumbs(dbPath, thumbsPath string) error {
@@ -256,12 +301,7 @@ func resetDBAndThumbs(dbPath, thumbsPath string) error {
 }
 
 func replaceFromLightManifest(srcPath, dbPath, thumbsPath string, b *gallery.Boundary) error {
-	f, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("open tags.json: %w", err)
-	}
-	mf, err := decodeLightManifest(f)
-	_ = f.Close()
+	mf, err := readLightManifest(srcPath)
 	if err != nil {
 		return err
 	}
@@ -288,7 +328,8 @@ func rebuildFromLightManifest(dbPath string, b *gallery.Boundary, thumbsPath str
 // An entry with no file on disk still gets an is_missing row to keep its tags.
 func ingestLightManifestEntries(database *db.DB, b *gallery.Boundary, thumbsPath string, entries []LightManifestImage, source string) {
 	galleryPath := b.Root()
-	tagSvc := tags.New(database)
+	tagSvc := tags.New(database, nil)
+	h := gallery.Handle{GalleryPath: galleryPath, ThumbnailsPath: thumbsPath, DB: database, TagSvc: tagSvc}
 	generalID := LookupCategoryID(database, "general")
 	for _, r := range entries {
 		path, err := SafeArchiveDest(galleryPath, r.Path)
@@ -309,7 +350,7 @@ func ingestLightManifestEntries(database *db.DB, b *gallery.Boundary, thumbsPath
 			logx.Warnf("light import: unsupported file %q: %v", r.Path, err)
 			continue
 		}
-		img, _, err := gallery.Ingest(database, galleryPath, thumbsPath, path, source)
+		img, _, err := gallery.Ingest(h, path, source)
 		if err != nil {
 			logx.Warnf("light import: ingest %q: %v", r.Path, err)
 			continue
@@ -328,34 +369,29 @@ func insertMissingImageRow(database *db.DB, sha, path, galleryPath, origin strin
 	}
 	origin = cmp.Or(origin, models.OriginIngest)
 	folder := gallery.FolderPath(galleryPath, path)
-	tx, err := database.Write.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
 	var id int64
-	err = tx.QueryRow(
-		`INSERT INTO images (sha256, canonical_path, folder_path, file_type, file_size,
-		                    is_missing, source_type, origin)
-		 VALUES (?, ?, ?, ?, 0, 1, ?, ?)
-		 ON CONFLICT(sha256) DO NOTHING
-		 RETURNING id`,
-		sha, path, folder, ft, models.SourceTypeNone, origin,
-	).Scan(&id)
-	if err == sql.ErrNoRows {
-		if err := tx.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, sha).Scan(&id); err != nil {
-			return 0, fmt.Errorf("fetch existing sha: %w", err)
+	if err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+		err := tx.QueryRow(
+			`INSERT INTO images (sha256, canonical_path, folder_path, file_type, file_size,
+			                    is_missing, source_type, origin)
+			 VALUES (?, ?, ?, ?, 0, 1, ?, ?)
+			 ON CONFLICT(sha256) DO NOTHING
+			 RETURNING id`,
+			sha, path, folder, ft, models.SourceTypeNone, origin,
+		).Scan(&id)
+		if err == sql.ErrNoRows {
+			if id, err = gallery.ImageIDBySHA(tx, sha); err != nil {
+				return fmt.Errorf("fetch existing sha: %w", err)
+			}
+		} else if err != nil {
+			return err
 		}
-	} else if err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(
-		`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 1)`,
-		id, path,
-	); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
+		_, err = tx.Exec(
+			`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 1)`,
+			id, path,
+		)
+		return err
+	}); err != nil {
 		return 0, err
 	}
 	return id, nil
@@ -376,8 +412,9 @@ type MergeResult struct {
 }
 
 // MergeGallery wipes nothing: db and json uploads only tag images matched
-// by sha, and a zip also ingests the images it carries files for.
-func MergeGallery(cx gallery.Handle, format string, upload io.Reader, maxFileSizeMB int) (MergeResult, error) {
+// by sha, and a zip also ingests the images it carries files for. A
+// cancelled ctx stops it before the next record, with what it did so far.
+func MergeGallery(ctx context.Context, cx *library.Gallery, format string, upload io.Reader, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
 	var res MergeResult
 	dataDir := filepath.Dir(cx.DBPath)
 
@@ -396,7 +433,7 @@ func MergeGallery(cx gallery.Handle, format string, upload io.Reader, maxFileSiz
 	var mergeErr error
 	switch format {
 	case "db":
-		res, mergeErr = mergeFromDB(cx, tmpPath, maxFileSizeMB)
+		res, mergeErr = mergeFromDB(ctx, cx, tmpPath, maxFileSizeMB, progress)
 	case "json":
 		isLight, err := isLightManifestJSON(tmpPath)
 		if err != nil {
@@ -404,12 +441,12 @@ func MergeGallery(cx gallery.Handle, format string, upload io.Reader, maxFileSiz
 			break
 		}
 		if isLight {
-			res, mergeErr = mergeFromLightJSON(cx, tmpPath, maxFileSizeMB)
+			res, mergeErr = mergeFromLightJSON(ctx, cx, tmpPath, maxFileSizeMB, progress)
 		} else {
-			res, mergeErr = mergeFromJSON(cx, tmpPath, maxFileSizeMB)
+			res, mergeErr = mergeFromJSON(ctx, cx, tmpPath, maxFileSizeMB, progress)
 		}
 	case "zip":
-		res, mergeErr = mergeFromZip(cx, tmpPath, maxFileSizeMB)
+		res, mergeErr = mergeFromZip(ctx, cx, tmpPath, maxFileSizeMB, progress)
 	default:
 		mergeErr = fmt.Errorf("unknown merge format %q", format)
 	}
@@ -433,12 +470,12 @@ func (r MergeResult) Summary() string {
 	return strings.Join(parts, ", ")
 }
 
-func mergeFromDB(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (MergeResult, error) {
+func mergeFromDB(ctx context.Context, cx *library.Gallery, tmpPath string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
 	records, err := readDBRecordsFromFile(tmpPath, "uploaded file is not a valid monbooru database")
 	if err != nil {
 		return MergeResult{}, err
 	}
-	return applyMergeRecords(cx, records, ImportSourceNative, maxFileSizeMB), nil
+	return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
 }
 
 func readDBRecordsFromFile(path, invalidMsg string) ([]mergeRecord, error) {
@@ -453,26 +490,21 @@ func readDBRecordsFromFile(path, invalidMsg string) ([]mergeRecord, error) {
 	return readDBMergeRecords(src)
 }
 
-func mergeFromJSON(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (MergeResult, error) {
+func mergeFromJSON(ctx context.Context, cx *library.Gallery, tmpPath string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
 	f, err := os.Open(tmpPath)
 	if err != nil {
 		return MergeResult{}, fmt.Errorf("open json: %w", err)
 	}
 	defer func() { _ = f.Close() }()
-	exp, err := DecodeExport(f)
+	records, err := readExportMergeRecords(f)
 	if err != nil {
 		return MergeResult{}, err
 	}
-	return applyMergeRecords(cx, readExportMergeRecords(exp), ImportSourceNative, maxFileSizeMB), nil
+	return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
 }
 
-func mergeFromLightJSON(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (MergeResult, error) {
-	f, err := os.Open(tmpPath)
-	if err != nil {
-		return MergeResult{}, fmt.Errorf("open tags.json: %w", err)
-	}
-	mf, err := decodeLightManifest(f)
-	_ = f.Close()
+func mergeFromLightJSON(ctx context.Context, cx *library.Gallery, tmpPath string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
+	mf, err := readLightManifest(tmpPath)
 	if err != nil {
 		return MergeResult{}, err
 	}
@@ -480,11 +512,10 @@ func mergeFromLightJSON(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (M
 	for _, img := range mf.Images {
 		records = append(records, mergeRecord{SHA256: img.SHA256, Tags: img.Tags})
 	}
-	return applyMergeRecords(cx, records, ImportSourceNative, maxFileSizeMB), nil
+	return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
 }
 
-func mergeFromZip(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (MergeResult, error) {
-	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
+func mergeFromZip(ctx context.Context, cx *library.Gallery, tmpPath string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
 	zr, err := zip.OpenReader(tmpPath)
 	if err != nil {
 		return MergeResult{}, fmt.Errorf("open zip: %w", err)
@@ -494,20 +525,15 @@ func mergeFromZip(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (MergeRe
 	innerDB, innerJSON, innerLight, inGallery := classifyArchive(zr.File)
 	// Keyed by the path under gallery/, which is what a light manifest names.
 	galleryFiles := make(map[string]*zip.File, len(inGallery))
-	for _, f := range inGallery {
-		galleryFiles[strings.TrimPrefix(f.Name, "gallery/")] = f
+	for _, tf := range inGallery {
+		galleryFiles[tf.rel] = tf.file
 	}
 
 	var records []mergeRecord
 	dataDir := filepath.Dir(cx.DBPath)
 	switch {
 	case innerLight != nil && innerDB == nil && innerJSON == nil:
-		rc, err := innerLight.Open()
-		if err != nil {
-			return MergeResult{}, fmt.Errorf("open tags.json: %w", err)
-		}
-		mf, err := decodeLightManifest(rc)
-		_ = rc.Close()
+		mf, err := extractLightManifest(innerLight, dataDir)
 		if err != nil {
 			return MergeResult{}, err
 		}
@@ -515,7 +541,7 @@ func mergeFromZip(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (MergeRe
 			records = append(records, mergeRecord{SHA256: img.SHA256, Tags: img.Tags, SourcePath: img.Path})
 		}
 	case innerDB != nil:
-		inner, err := extractZipEntryToTemp(innerDB, dataDir, maxBytes)
+		inner, err := extractZipEntryToTemp(innerDB, dataDir)
 		if err != nil {
 			return MergeResult{}, err
 		}
@@ -525,41 +551,45 @@ func mergeFromZip(cx gallery.Handle, tmpPath string, maxFileSizeMB int) (MergeRe
 			return MergeResult{}, err
 		}
 	case innerJSON != nil:
-		rc, err := innerJSON.Open()
+		inner, err := extractZipEntryToTemp(innerJSON, dataDir)
 		if err != nil {
 			return MergeResult{}, err
 		}
-		exp, err := DecodeExport(rc)
-		_ = rc.Close()
+		defer func() { _ = os.Remove(inner) }()
+		f, err := os.Open(inner)
 		if err != nil {
 			return MergeResult{}, err
 		}
-		records = readExportMergeRecords(exp)
+		records, err = readExportMergeRecords(f)
+		_ = f.Close()
+		if err != nil {
+			return MergeResult{}, err
+		}
 	default:
 		if format := detectCompatFormat(zr.File); format != "" {
-			return mergeFromCompatArchive(cx, zr.File, format, maxFileSizeMB)
+			return mergeFromCompatArchive(ctx, cx, zr.File, format, maxFileSizeMB, progress)
 		}
 		return MergeResult{}, fmt.Errorf("archive missing monbooru.db, monbooru.json, or tags.json")
 	}
 
 	for i := range records {
-		if rel := records[i].SourcePath; rel != "" {
-			if entry, ok := galleryFiles[rel]; ok {
-				records[i].zipEntry = entry
-			}
-		}
+		records[i].zipEntry = galleryFiles[records[i].SourcePath]
 	}
-	return applyMergeRecords(cx, records, ImportSourceNative, maxFileSizeMB), nil
+	return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
 }
 
-func applyMergeRecords(cx gallery.Handle, records []mergeRecord, source string, maxFileSizeMB int) MergeResult {
+func applyMergeRecords(ctx context.Context, cx *library.Gallery, records []mergeRecord, source string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
 	var res MergeResult
 	generalID := LookupCategoryID(cx.DB, "general")
 	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
-	bound := cx.Boundary()
-	for _, r := range records {
-		var imgID int64
-		err := cx.DB.Read.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, r.SHA256).Scan(&imgID)
+	for i, r := range records {
+		if progress != nil {
+			progress(i, len(records))
+		}
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		imgID, err := gallery.ImageIDBySHA(cx.DB.Read, r.SHA256)
 		if err == nil {
 			applyImportTagsToImage(cx.DB, cx.TagSvc, imgID, r.Tags, generalID, source)
 			res.Tagged++
@@ -580,45 +610,28 @@ func applyMergeRecords(cx gallery.Handle, records []mergeRecord, source string, 
 			res.Skipped++
 			continue
 		}
-		if bound.Check(safeBase) != nil {
-			res.LeftOut++
-			continue
-		}
 		// Suffix collisions within the entry's folder, not the root.
-		dst := gallery.UniqueDestPath(filepath.Dir(safeBase), filepath.Base(safeBase))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			logx.Warnf("merge: mkdir for %q: %v", r.SourcePath, err)
-			res.Skipped++
-			continue
-		}
-		if err := copyZipFile(r.zipEntry, dst, maxBytes); err != nil {
-			logx.Warnf("merge: extract %q: %v", r.SourcePath, err)
-			res.Skipped++
-			continue
-		}
-		if _, err := gallery.DetectFileType(dst); err != nil {
-			logx.Warnf("merge: unsupported file %q: %v", r.SourcePath, err)
-			_ = os.Remove(dst)
-			res.Skipped++
-			continue
-		}
-		img, isDup, err := gallery.Ingest(cx.DB, cx.GalleryPath, cx.ThumbnailsPath, dst, source)
+		entry := r.zipEntry
+		landed, err := cx.Land(context.Background(), filepath.Dir(safeBase), filepath.Base(safeBase),
+			func(dst string) error { return copyZipFile(entry, dst, maxBytes) }, library.LandSpec{Origin: source})
 		if err != nil {
-			logx.Warnf("merge: ingest %q: %v", r.SourcePath, err)
-			_ = os.Remove(dst)
-			res.Skipped++
+			if library.LandStageOf(err) == library.LandPlace {
+				res.LeftOut++
+			} else {
+				logx.Warnf("merge: land %q: %v", r.SourcePath, err)
+				res.Skipped++
+			}
 			continue
 		}
-		applyImportTagsToImage(cx.DB, cx.TagSvc, img.ID, r.Tags, generalID, source)
+		applyImportTagsToImage(cx.DB, cx.TagSvc, landed.Image.ID, r.Tags, generalID, source)
 		// A record without a sha finds its image only once extracted.
-		if isDup {
-			gallery.DropDuplicateCopy(cx.DB, img.ID, dst, "merge")
+		if landed.Duplicate {
 			res.Tagged++
 			continue
 		}
 		res.Added++
 	}
-	return res
+	return res, nil
 }
 
 // A missing row brings its tags but no file: a gallery made inside
@@ -637,33 +650,72 @@ func readDBMergeRecords(src *db.DB) ([]mergeRecord, error) {
 	return recs, nil
 }
 
-func readExportMergeRecords(exp Export) []mergeRecord {
+func readExportMergeRecords(r io.Reader) ([]mergeRecord, error) {
+	type tagRef struct {
+		categoryID int64
+		name       string
+	}
+	version := 0
 	catByID := map[int64]string{}
-	for _, c := range exp.TagCategories {
-		catByID[c.ID] = c.Name
-	}
-	tagTokens := map[int64]string{}
-	for _, t := range exp.Tags {
-		if t.IsAlias == 1 {
-			continue
-		}
-		tagTokens[t.ID] = tagToken(catByID[t.CategoryID], t.Name)
-	}
-	byImg := map[int64][]string{}
-	for _, it := range exp.ImageTags {
-		if tok, ok := tagTokens[it.TagID]; ok {
-			byImg[it.ImageID] = append(byImg[it.ImageID], tok)
-		}
-	}
+	tagByID := map[int64]tagRef{}
+	tagsOf := map[int64][]int64{}
 	var recs []mergeRecord
-	for _, img := range exp.Images {
-		rec := mergeRecord{SHA256: img.SHA256, Tags: byImg[img.ID]}
-		if img.IsMissing == 0 {
-			rec.SourcePath = filepath.ToSlash(filepath.Join(img.FolderPath, storedBasename(img.CanonicalPath)))
+	var imageIDs []int64
+	err := decodeSections(r, func(key string, dec *json.Decoder) error {
+		switch key {
+		case "version":
+			if err := decodeValue(dec, &version); err != nil {
+				return err
+			}
+			return checkExportVersion(version)
+		case "tag_categories":
+			return streamArray(dec, func(c TagCategoryRow) error {
+				catByID[c.ID] = c.Name
+				return nil
+			})
+		case "tags":
+			return streamArray(dec, func(t TagRow) error {
+				if t.IsAlias != 1 {
+					tagByID[t.ID] = tagRef{t.CategoryID, t.Name}
+				}
+				return nil
+			})
+		case "images":
+			return streamArray(dec, func(img ImageRow) error {
+				rec := mergeRecord{SHA256: img.SHA256}
+				if img.IsMissing == 0 {
+					rec.SourcePath = filepath.ToSlash(filepath.Join(img.FolderPath, storedBasename(img.CanonicalPath)))
+				}
+				recs = append(recs, rec)
+				imageIDs = append(imageIDs, img.ID)
+				return nil
+			})
+		case "image_tags":
+			return streamArray(dec, func(it ImageTagRow) error {
+				tagsOf[it.ImageID] = append(tagsOf[it.ImageID], it.TagID)
+				return nil
+			})
 		}
-		recs = append(recs, rec)
+		return skipValue(dec)
+	})
+	if err != nil {
+		return nil, err
 	}
-	return recs
+	if err := checkExportVersion(version); err != nil {
+		return nil, err
+	}
+	tokens := make(map[int64]string, len(tagByID))
+	for id, t := range tagByID {
+		tokens[id] = tagToken(catByID[t.categoryID], t.name)
+	}
+	for i, id := range imageIDs {
+		for _, tagID := range tagsOf[id] {
+			if tok, ok := tokens[tagID]; ok {
+				recs[i].Tags = append(recs[i].Tags, tok)
+			}
+		}
+	}
+	return recs, nil
 }
 
 // Merged tags go through the tag service so aliases resolve and usage
@@ -688,8 +740,11 @@ func resolveTokenTagIDsConf(database *db.DB, tagSvc *tags.Service, tokens []stri
 		if token == "" {
 			continue
 		}
-		catID, bareName := resolveImportTag(database, token, generalID, dropUnknownNamespace)
-		t, err := tagSvc.GetOrCreateTagFrom(bareName, catID, origin)
+		catID, bareName, err := resolveImportTag(database, token, generalID, dropUnknownNamespace)
+		var t *models.Tag
+		if err == nil {
+			t, err = tagSvc.GetOrCreateTagFrom(bareName, catID, origin)
+		}
 		if err != nil {
 			logx.Warnf("import tag %q: %v", token, err)
 			continue
@@ -706,8 +761,7 @@ func resolveTokenTagIDsConf(database *db.DB, tagSvc *tags.Service, tokens []stri
 func applyTransferTags(database *db.DB, tagSvc *tags.Service, imageID int64, groups []transferTagGroup, generalID int64) error {
 	for _, g := range groups {
 		// An unlabelled group was a UI add on the source side, hence "user".
-		origin := g.taggerName
-		origin = cmp.Or(origin, "user")
+		origin := cmp.Or(g.taggerName, "user")
 		tagIDs, confs := resolveTokenTagIDsConf(database, tagSvc, g.tokens, g.confs, generalID, false, origin)
 		if err := tagSvc.AddTagsToImageFromTaggerConf(imageID, tagIDs, confs, g.isAuto, g.taggerName); err != nil {
 			return fmt.Errorf("transfer tags to image %d: %w", imageID, err)
@@ -716,16 +770,17 @@ func applyTransferTags(database *db.DB, tagSvc *tags.Service, imageID int64, gro
 	return nil
 }
 
-func resolveImportTag(database *db.DB, token string, generalID int64, dropUnknownNamespace bool) (int64, string) {
-	if idx := strings.Index(token, ":"); idx > 0 {
-		if catID, ok, err := tags.CategoryIDByName(database, token[:idx]); ok && err == nil {
-			return catID, token[idx+1:]
-		}
-		if dropUnknownNamespace {
-			return generalID, token[idx+1:]
-		}
+func resolveImportTag(database *db.DB, token string, generalID int64, dropUnknownNamespace bool) (int64, string, error) {
+	f, err := tags.SplitForm(database, token)
+	switch {
+	case err != nil:
+		return 0, "", err
+	case f.CategoryID != 0:
+		return f.CategoryID, f.Name, nil
+	case dropUnknownNamespace && f.Namespace != "":
+		return generalID, f.Name[len(f.Namespace)+1:], nil
 	}
-	return generalID, token
+	return generalID, f.Name, nil
 }
 
 func LookupCategoryID(database *db.DB, name string) int64 {
@@ -741,7 +796,7 @@ func LookupCategoryID(database *db.DB, name string) int64 {
 func copyZipEntry(dst io.Writer, f *zip.File, maxBytes int64) error {
 	rc, err := f.Open()
 	if err != nil {
-		return err
+		return fmt.Errorf("archive entry %q: %w", f.Name, err)
 	}
 	defer func() { _ = rc.Close() }()
 	var src io.Reader = rc
@@ -750,7 +805,7 @@ func copyZipEntry(dst io.Writer, f *zip.File, maxBytes int64) error {
 	}
 	n, err := io.Copy(dst, src)
 	if err != nil {
-		return err
+		return fmt.Errorf("archive entry %q: %w", f.Name, err)
 	}
 	if maxBytes > 0 && n > maxBytes {
 		return entryTooLarge(f.Name, maxBytes)
@@ -783,12 +838,21 @@ func copyZipFile(f *zip.File, dst string, maxBytes int64) error {
 	return err
 }
 
-func extractZipEntryToTemp(f *zip.File, dataDir string, maxBytes int64) (string, error) {
+func extractLightManifest(f *zip.File, dataDir string) (LightManifest, error) {
+	path, err := extractZipEntryToTemp(f, dataDir)
+	if err != nil {
+		return LightManifest{}, err
+	}
+	defer func() { _ = os.Remove(path) }()
+	return readLightManifest(path)
+}
+
+func extractZipEntryToTemp(f *zip.File, dataDir string) (string, error) {
 	tmp, err := os.CreateTemp(dataDir, "merge-inner-*")
 	if err != nil {
 		return "", err
 	}
-	copyErr := copyZipEntry(tmp, f, maxBytes)
+	copyErr := copyZipEntry(tmp, f, MaxImportBytes)
 	_ = tmp.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp.Name())

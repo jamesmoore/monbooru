@@ -34,11 +34,9 @@ func (s *Service) ScanFoldedDuplicates() (int, error) {
 		name string
 		cat  int64
 	}
-	all, err := db.QueryAll(s.db.Read, func(rows *sql.Rows) (tagRow, error) {
-		var tr tagRow
-		err := rows.Scan(&tr.id, &tr.name, &tr.cat)
-		return tr, err
-	}, `SELECT id, name, category_id FROM tags WHERE is_alias = 0`)
+	all, err := db.QueryAll(s.db.Read, db.ScanRow(func(tr *tagRow) []any {
+		return []any{&tr.id, &tr.name, &tr.cat}
+	}), `SELECT id, name, category_id FROM tags WHERE is_alias = 0`)
 	if err != nil {
 		return 0, err
 	}
@@ -140,7 +138,9 @@ func (s *Service) MergeFolded(ctx context.Context, oldIDs []int64) (FoldedMergeR
 			res.addRefusal(e)
 			continue
 		}
-		_, _ = s.db.Write.Exec(`DELETE FROM folded_tag_pairs WHERE old_id = ?`, oldID)
+		if _, err := s.db.Write.Exec(`DELETE FROM folded_tag_pairs WHERE old_id = ?`, oldID); err == nil {
+			s.changed()
+		}
 		res.Merged++
 	}
 	return res, nil

@@ -2,6 +2,7 @@ package relations
 
 import (
 	"database/sql"
+	"errors"
 	"slices"
 
 	"github.com/monbooru/monbooru/internal/db"
@@ -24,22 +25,9 @@ type DupGroupSummary struct {
 }
 
 func (r *ImageRelations) HasAny() bool {
-	if r == nil {
-		return false
-	}
-	if r.DupGroup != nil {
-		return true
-	}
-	if len(r.AltGroupMembers) > 0 {
-		return true
-	}
-	if r.VersionParent != nil || r.VersionChild != nil {
-		return true
-	}
-	if len(r.DerivativeSources) > 0 || len(r.Derivatives) > 0 {
-		return true
-	}
-	return false
+	return r != nil && (r.DupGroup != nil || len(r.AltGroupMembers) > 0 ||
+		r.VersionParent != nil || r.VersionChild != nil ||
+		len(r.DerivativeSources) > 0 || len(r.Derivatives) > 0)
 }
 
 // CommonDerivativeAncestor searches the whole ancestry, not just direct
@@ -81,18 +69,13 @@ func HasDerivativeSource(database *db.DB, imageID int64) (bool, error) {
 func LoadImageRelations(database *db.DB, imageID int64) (*ImageRelations, error) {
 	out := &ImageRelations{}
 
-	var dupGroupID sql.NullInt64
-	if err := database.Read.QueryRow(
-		`SELECT group_id FROM dup_group_members WHERE image_id = ?`, imageID,
-	).Scan(&dupGroupID); err != nil && err != sql.ErrNoRows {
+	dupGroupID, err := optionalID(database.Read, `SELECT group_id FROM dup_group_members WHERE image_id = ?`, imageID)
+	if err != nil {
 		return nil, err
 	}
 	if dupGroupID.Valid {
-		var dg DupGroupSummary
-		dg.ID = dupGroupID.Int64
-		if err := database.Read.QueryRow(
-			`SELECT original_image_id FROM dup_groups WHERE id = ?`, dg.ID,
-		).Scan(&dg.Original); err != nil {
+		dg := DupGroupSummary{ID: dupGroupID.Int64}
+		if dg.Original, err = GroupOriginal(database.Read, dg.ID); err != nil {
 			return nil, err
 		}
 		members, err := db.QueryIDs(database.Read,
@@ -105,10 +88,8 @@ func LoadImageRelations(database *db.DB, imageID int64) (*ImageRelations, error)
 		out.DupGroup = &dg
 	}
 
-	var altGroupID sql.NullInt64
-	if err := database.Read.QueryRow(
-		`SELECT group_id FROM alt_group_members WHERE image_id = ?`, imageID,
-	).Scan(&altGroupID); err != nil && err != sql.ErrNoRows {
+	altGroupID, err := optionalID(database.Read, `SELECT group_id FROM alt_group_members WHERE image_id = ?`, imageID)
+	if err != nil {
 		return nil, err
 	}
 	if altGroupID.Valid {
@@ -123,19 +104,15 @@ func LoadImageRelations(database *db.DB, imageID int64) (*ImageRelations, error)
 		out.AltGroupMembers = members
 	}
 
-	var parentID sql.NullInt64
-	if err := database.Read.QueryRow(
-		`SELECT parent_image_id FROM version_edges WHERE child_image_id = ?`, imageID,
-	).Scan(&parentID); err != nil && err != sql.ErrNoRows {
+	parentID, err := optionalID(database.Read, `SELECT parent_image_id FROM version_edges WHERE child_image_id = ?`, imageID)
+	if err != nil {
 		return nil, err
 	}
 	if parentID.Valid {
 		out.VersionParent = &parentID.Int64
 	}
-	var childID sql.NullInt64
-	if err := database.Read.QueryRow(
-		`SELECT child_image_id FROM version_edges WHERE parent_image_id = ?`, imageID,
-	).Scan(&childID); err != nil && err != sql.ErrNoRows {
+	childID, err := optionalID(database.Read, `SELECT child_image_id FROM version_edges WHERE parent_image_id = ?`, imageID)
+	if err != nil {
 		return nil, err
 	}
 	if childID.Valid {
@@ -157,4 +134,20 @@ func LoadImageRelations(database *db.DB, imageID int64) (*ImageRelations, error)
 	}
 	out.Derivatives = derivatives
 	return out, nil
+}
+
+// No row reads as a NULL id.
+func optionalID(q db.RowQuerier, query string, arg int64) (sql.NullInt64, error) {
+	var id sql.NullInt64
+	err := q.QueryRow(query, arg).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return id, nil
+	}
+	return id, err
+}
+
+func GroupOriginal(q db.RowQuerier, groupID int64) (int64, error) {
+	var original int64
+	err := q.QueryRow(`SELECT original_image_id FROM dup_groups WHERE id = ?`, groupID).Scan(&original)
+	return original, err
 }

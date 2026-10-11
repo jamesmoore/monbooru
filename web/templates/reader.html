@@ -12,6 +12,7 @@
 {{$pagesHref := printf "/images/%d/pages%s#page-%d" .Image.ID .BackQS .Page}}
 <body class="reader-body" data-gallery="{{.ActiveGallery}}">
   <main id="reader" data-image-id="{{.Image.ID}}" data-page="{{.Page}}" data-total="{{.PageCount}}" data-detail-url="{{$detailHref}}">
+    <div id="page-notice" class="degraded-banner" hidden></div>
     <div class="reader-stage">
       <a href="/images/{{.Image.ID}}/page/{{.Page}}" target="_blank" rel="noopener" class="reader-page-link" title="Zoom page (v)" onclick="return openLightbox(event, this.href)">
         <img src="/images/{{.Image.ID}}/page/{{.Page}}" alt="Page {{.Page}}" class="reader-img">
@@ -39,7 +40,7 @@
       <span class="reader-nav reader-disabled" aria-hidden="true">|&lt;</span>
       <span class="reader-nav reader-disabled" aria-hidden="true">&lt;</span>
       {{end}}
-      <button type="button" class="reader-counter" id="reader-counter" title="Jump to page (p)">{{.Page}} / {{.PageCount}}</button>
+      <button type="button" class="reader-counter" id="reader-counter" title="Jump to page (p)" onclick="openReaderJumpDialog()">{{.Page}} / {{.PageCount}}</button>
       {{if lt .Page .PageCount}}
       <a class="reader-nav reader-next" href="/images/{{.Image.ID}}/read?page={{add .Page 1}}{{.BackKVQS}}" title="Next page (→)">&gt;</a>
       <a class="reader-nav reader-last" href="/images/{{.Image.ID}}/read?page={{.PageCount}}{{.BackKVQS}}" title="Last page (End)">&gt;|</a>
@@ -47,7 +48,8 @@
       <span class="reader-nav reader-disabled" aria-hidden="true">&gt;</span>
       <span class="reader-nav reader-disabled" aria-hidden="true">&gt;|</span>
       {{end}}
-      <form class="reader-extract" method="POST" action="/images/{{.Image.ID}}/page/{{.Page}}/extract">
+      <form class="reader-extract" method="POST" action="/images/{{.Image.ID}}/page/{{.Page}}/extract"
+            onsubmit="event.preventDefault(); extractReaderPage(this)">
         <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
         <input type="hidden" name="_gallery" value="{{.ActiveGallery}}">
         <button type="submit" title="Extract page as image (e)">Extract</button>

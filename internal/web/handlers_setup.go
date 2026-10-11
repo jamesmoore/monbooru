@@ -25,6 +25,7 @@ type setupData struct {
 	Menu         bool
 	Autostart    bool
 	Port         string
+	BindPinned   string
 	Integration  desktopIntegration
 }
 
@@ -74,14 +75,14 @@ func setupExempt(path string) bool {
 }
 
 func (s *Server) setupPage(w http.ResponseWriter, r *http.Request) {
-	if !s.desktop {
+	if !s.setupPending() {
 		s.notFoundHandler(w, r)
 		return
 	}
 	s.cfgMu.RLock()
 	galleryPath := ""
-	if len(s.cfg.Galleries) > 0 {
-		galleryPath = s.cfg.Galleries[0].GalleryPath
+	if g := s.cfg.FindGallery(s.cfg.DefaultGallery); g != nil {
+		galleryPath = g.GalleryPath
 	}
 	bind := s.cfg.Server.BindAddress
 	s.cfgMu.RUnlock()
@@ -107,6 +108,7 @@ func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, d setupData
 	d.BooruFavicon = s.booruFaviconURL()
 	d.Theme = s.activeTheme().Path != ""
 	d.Port = port
+	d.BindPinned = s.envPinned("server.bind_address")
 	d.Integration = s.desktopIntegration()
 	s.renderTemplate(w, "setup.html", d)
 }
@@ -114,7 +116,7 @@ func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, d setupData
 // The gallery goes first, the one input that can fail; SetupDone is saved
 // with the address, so a submit that fails midway leaves the wizard up.
 func (s *Server) setupPost(w http.ResponseWriter, r *http.Request) {
-	if !s.desktop {
+	if !s.setupPending() || !s.desktopLocal(r) {
 		http.NotFound(w, r)
 		return
 	}
@@ -132,16 +134,20 @@ func (s *Server) setupPost(w http.ResponseWriter, r *http.Request) {
 		s.renderSetup(w, r, form)
 		return
 	}
+	var bind string
 	err := s.withConfig(func(c *config.Config) error {
-		_, port, splitErr := net.SplitHostPort(c.Server.BindAddress)
-		if splitErr != nil {
-			return fmt.Errorf("server.bind_address %q is not a host:port", c.Server.BindAddress)
+		if c.EnvPinned("server.bind_address") == "" {
+			_, port, splitErr := net.SplitHostPort(c.Server.BindAddress)
+			if splitErr != nil {
+				return fmt.Errorf("server.bind_address %q is not a host:port", c.Server.BindAddress)
+			}
+			host := "127.0.0.1"
+			if form.LAN {
+				host = "0.0.0.0"
+			}
+			c.Server.BindAddress = net.JoinHostPort(host, port)
 		}
-		host := "127.0.0.1"
-		if form.LAN {
-			host = "0.0.0.0"
-		}
-		c.Server.BindAddress = net.JoinHostPort(host, port)
+		bind = c.Server.BindAddress
 		c.SetupDone = true
 		return nil
 	})
@@ -161,6 +167,6 @@ func (s *Server) setupPost(w http.ResponseWriter, r *http.Request) {
 			logx.Warnf("setup: could not write start at login: %v", err)
 		}
 	}
-	logx.Infof("setup: done, reachable from %s", map[bool]string{true: "the network", false: "this computer"}[form.LAN])
+	logx.Infof("setup: done, reachable from %s", map[bool]string{true: "the network", false: "this computer"}[!desktop.IsLoopbackAddr(bind)])
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

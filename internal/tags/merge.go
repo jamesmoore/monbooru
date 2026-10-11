@@ -1,6 +1,7 @@
 package tags
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,7 +10,13 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-var ErrAliasNameInUse = errors.New("a tag with this name already has image_tags rows; merge it instead")
+var (
+	ErrAliasNameInUse = errors.New("a tag with this name already has image_tags rows; merge it instead")
+	ErrAliasToAlias   = errors.New("cannot alias to a tag that is itself an alias")
+	ErrAliasToItself  = errors.New("cannot alias a tag to itself")
+	ErrMergeIntoSelf  = errors.New("cannot merge a tag into itself")
+	ErrMergeIntoAlias = errors.New("cannot merge into a tag that is itself an alias")
+)
 
 func (s *Service) CreateAlias(name string, categoryID, canonicalID int64) (*models.Tag, error) {
 	return s.CreateAliasFrom(name, categoryID, canonicalID, "user")
@@ -18,6 +25,26 @@ func (s *Service) CreateAlias(name string, categoryID, canonicalID int64) (*mode
 // CreateAliasFrom stamps origin only on a fresh insert; a repointed or
 // upgraded row keeps its creator.
 func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, origin string) (*models.Tag, error) {
+	return s.createAlias(name, categoryID, origin, func(*sql.Tx) (int64, error) { return canonicalID, nil })
+}
+
+// CreateAliasToNewTag creates the canonical in the alias's transaction, so
+// a refused alias leaves no new tag behind.
+func (s *Service) CreateAliasToNewTag(name string, categoryID int64, canonName string, canonCategoryID int64) (*models.Tag, error) {
+	canonName, err := s.validateTagIn(canonName, canonCategoryID)
+	if err != nil {
+		return nil, err
+	}
+	return s.createAlias(name, categoryID, "user", func(tx *sql.Tx) (int64, error) {
+		canon, err := getOrCreateTagTx(tx, canonName, canonCategoryID, "user")
+		if err != nil {
+			return 0, err
+		}
+		return canon.ID, nil
+	})
+}
+
+func (s *Service) createAlias(name string, categoryID int64, origin string, canonical func(*sql.Tx) (int64, error)) (*models.Tag, error) {
 	normalized, err := ValidateTagName(name)
 	if err != nil {
 		return nil, err
@@ -26,9 +53,14 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 		return nil, ErrRatingCategoryClosed
 	}
 
-	var resultID int64
+	var resultID, canonicalID int64
 	var gained bool
 	err = s.inWriteTx(func(tx *sql.Tx) error {
+		id, err := canonical(tx)
+		if err != nil {
+			return err
+		}
+		canonicalID = id
 		var canonIsAlias int
 		if err := tx.QueryRow(`SELECT is_alias FROM tags WHERE id = ?`, canonicalID).Scan(&canonIsAlias); err == sql.ErrNoRows {
 			return ErrTagNotFound
@@ -36,7 +68,7 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 			return err
 		}
 		if canonIsAlias == 1 {
-			return fmt.Errorf("cannot alias to a tag that is itself an alias")
+			return ErrAliasToAlias
 		}
 
 		// Test for image_tags rows, not usage_count: a tag whose images
@@ -44,7 +76,7 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 		// would strand.
 		var existingID int64
 		var existingIsAlias, existingCarried int
-		err := tx.QueryRow(
+		err = tx.QueryRow(
 			`SELECT id, is_alias, EXISTS (SELECT 1 FROM image_tags WHERE tag_id = tags.id)
 			 FROM tags WHERE name = ? AND category_id = ?`,
 			normalized, categoryID,
@@ -64,7 +96,7 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 			return err
 		}
 		if existingID == canonicalID {
-			return fmt.Errorf("cannot alias a tag to itself")
+			return ErrAliasToItself
 		}
 		if existingIsAlias == 1 {
 			if _, err := tx.Exec(
@@ -101,7 +133,7 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 		return nil, err
 	}
 	if gained {
-		if err := s.fanOutCarriersOf(canonicalID); err != nil {
+		if _, err := s.PropagateImplication(context.Background(), canonicalID, nil); err != nil {
 			return nil, err
 		}
 	}
@@ -110,7 +142,7 @@ func (s *Service) CreateAliasFrom(name string, categoryID, canonicalID int64, or
 
 func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 	if aliasID == canonicalID {
-		return fmt.Errorf("cannot merge a tag into itself")
+		return ErrMergeIntoSelf
 	}
 	if s.isLockedRatingTag(aliasID) {
 		return ErrRatingTagImmutable
@@ -119,12 +151,20 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 
 	var gained bool
 	err := s.inWriteTx(func(tx *sql.Tx) error {
+		var aliasExists bool
+		if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM tags WHERE id = ?)`, aliasID).Scan(&aliasExists); err != nil {
+			return err
+		} else if !aliasExists {
+			return ErrTagNotFound
+		}
 		var targetIsAlias int
-		if err := tx.QueryRow(`SELECT is_alias FROM tags WHERE id = ?`, canonicalID).Scan(&targetIsAlias); err != nil {
-			return fmt.Errorf("target tag not found")
+		if err := tx.QueryRow(`SELECT is_alias FROM tags WHERE id = ?`, canonicalID).Scan(&targetIsAlias); err == sql.ErrNoRows {
+			return ErrTagNotFound
+		} else if err != nil {
+			return err
 		}
 		if targetIsAlias == 1 {
-			return fmt.Errorf("cannot merge into a tag that is itself an alias")
+			return ErrMergeIntoAlias
 		}
 
 		// Images that gain the canonical here need its implications
@@ -209,7 +249,7 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 		}
 
 		if len(newCarriers) > 0 {
-			impliedClosure, err := TransitiveImpliedTx(tx, []int64{canonicalID})
+			impliedClosure, err := transitiveImpliedTx(tx, []int64{canonicalID})
 			if err != nil {
 				return fmt.Errorf("merge resolve canonical closure: %w", err)
 			}
@@ -220,7 +260,7 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 				// Highest wins here: a merge must never lower a rating
 				// and expose an image the ceiling hides.
 				if ratingTarget {
-					if err := PruneLowerRatingsTx(tx, s.ratingCatID, c.imageID); err != nil {
+					if err := pruneLowerRatingsTx(tx, s.ratingCatID, c.imageID); err != nil {
 						return fmt.Errorf("merge prune ratings on image %d: %w", c.imageID, err)
 					}
 				}
@@ -232,7 +272,8 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 	if err != nil || !gained {
 		return err
 	}
-	return s.fanOutCarriersOf(canonicalID)
+	_, err = s.PropagateImplication(context.Background(), canonicalID, nil)
+	return err
 }
 
 // An alias left in tag_implications would never fire, stranding the rows
@@ -279,35 +320,6 @@ func scanCarrier(rows *sql.Rows) (carrier, error) {
 	var c carrier
 	err := rows.Scan(&c.imageID, &c.isAuto)
 	return c, err
-}
-
-// Each chunk rereads its rows: an image may have lost the tag meanwhile.
-func (s *Service) fanOutCarriersOf(tagID int64) error {
-	ids, err := db.QueryIDs(s.db.Read, `SELECT image_id FROM image_tags WHERE tag_id = ?`, tagID)
-	if err != nil {
-		return err
-	}
-	return db.Chunked(ids, 500, func(chunk []int64) error {
-		return s.inWriteTx(func(tx *sql.Tx) error {
-			closure, err := TransitiveImpliedTx(tx, []int64{tagID})
-			if err != nil {
-				return err
-			}
-			placeholders, args := db.InPlaceholders(chunk)
-			carriers, err := db.QueryAll(tx, scanCarrier,
-				`SELECT image_id, is_auto FROM image_tags WHERE tag_id = ? AND image_id IN (`+placeholders+`)`,
-				append([]any{tagID}, args...)...)
-			if err != nil {
-				return err
-			}
-			for _, c := range carriers {
-				if err := applyImpliedClosureTx(tx, c.imageID, closure, s.ratingCatID, c.isAuto); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	})
 }
 
 // The graph was acyclic, so a new cycle runs through one alias edge.

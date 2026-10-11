@@ -34,7 +34,6 @@
             hx-on:sync-started="document.getElementById('job-status').setAttribute('hx-trigger','every 2s');htmx.process('#job-status')"
             hx-on:htmx:response-error="document.getElementById('sync-flash').innerHTML=event.detail.xhr.responseText;refreshJobStatus();setTimeout(function(){var el=document.getElementById('sync-flash');if(el)el.innerHTML='';},5000)"
             style="display:inline">
-        <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
         <button type="submit" class="topbar-action" title="Sync gallery">[⟳ sync]</button>
       </form>
       {{end}}
@@ -54,6 +53,12 @@
   <div id="page-notice" class="degraded-banner" hidden></div>
   <div id="main-layout"{{if .SidebarCollapsed}} class="sidebar-collapsed"{{end}}>
     <aside id="sidebar">
+{{end}}
+
+{{define "layout_head_bare"}}
+{{template "layout_head" .}}
+<div id="sidebar-inner"></div>
+{{template "layout_mid" .}}
 {{end}}
 
 {{define "layout_mid"}}
@@ -82,7 +87,7 @@
       {{if .Degraded}}<span class="footer-sep">·</span><span class="footer-degraded">degraded</span>{{end}}
       <span class="footer-sep-strong">::</span>
       <span class="footer-rating-label">rating:</span>
-      {{$active := .ActiveRating}}{{$csrf := .CSRFToken}}{{range $i, $lv := .RatingLevels}}{{if $i}}<span class="footer-sep">·</span>{{end}}{{if eq $lv.Value $active}}<span class="footer-rating-active">[{{$lv.Label}}]</span>{{else}}<form hx-post="/internal/rating-ceiling?level={{$lv.Value}}" hx-swap="none" hx-on::after-request="clearSelection(); window.location.reload()" style="display:inline"><input type="hidden" name="_csrf" value="{{$csrf}}"><button type="submit" class="footer-rating-link">{{$lv.Label}}</button></form>{{end}}{{end}}
+      {{$active := .ActiveRating}}{{range $i, $lv := .RatingLevels}}{{if $i}}<span class="footer-sep">·</span>{{end}}{{if eq $lv.Value $active}}<span class="footer-rating-active">[{{$lv.Label}}]</span>{{else}}<form hx-post="/internal/rating-ceiling?level={{$lv.Value}}" hx-swap="none" hx-on::after-request="clearSelection(); window.location.reload()" style="display:inline"><button type="submit" class="footer-rating-link">{{$lv.Label}}</button></form>{{end}}{{end}}
       <span id="footer-hidden" class="footer-hidden">{{with .HiddenByCeiling}}<span class="footer-sep-strong">::</span>{{.}} hidden {{plural . "image" "images"}} in the current search{{end}}</span>
     </div>
     <div id="footer-right">
@@ -147,18 +152,18 @@
       <section data-surface="selection">
         <h4>Selection active</h4>
         <ul>
-          <li><kbd>a</kbd><span>Add tags</span></li>
-          <li><kbd>r</kbd><span>Remove tags</span></li>
-          <li data-when=".btn-autotag"><kbd>t</kbd><span>Auto-tag</span></li>
-          <li><kbd>m</kbd><span>Rename / move</span></li>
-          <li><kbd>i</kbd><span>Toggle archive</span></li>
-          <li><kbd>f</kbd><span>Toggle favorite</span></li>
-          <li><kbd>c</kbd><span>Set collection</span></li>
-          <li><kbd>d</kbd><span>Download as a zip</span></li>
-          <li data-when="#batch-transfer"><kbd>T</kbd><span>Transfer</span></li>
+          <li data-when="#batch-bar.visible"><kbd>a</kbd><span>Add tags</span></li>
+          <li data-when="#batch-bar.visible"><kbd>r</kbd><span>Remove tags</span></li>
+          <li data-when="#batch-bar.visible .btn-autotag:not([disabled])"><kbd>t</kbd><span>Auto-tag</span></li>
+          <li data-when="#batch-bar.visible"><kbd>m</kbd><span>Rename / move</span></li>
+          <li data-when="#batch-bar.visible"><kbd>i</kbd><span>Toggle archive</span></li>
+          <li data-when="#batch-bar.visible"><kbd>f</kbd><span>Toggle favorite</span></li>
+          <li data-when="#batch-bar.visible"><kbd>c</kbd><span>Set collection</span></li>
+          <li data-when="#batch-bar.visible"><kbd>d</kbd><span>Download as a zip</span></li>
+          <li data-when="#batch-bar.visible #batch-transfer"><kbd>T</kbd><span>Transfer</span></li>
           <li data-when="#batch-invert"><kbd>I</kbd><span>Invert</span></li>
-          <li data-when="#batch-bar .monloader-accent"><kbd>L</kbd><span>Find tags (monloader)</span></li>
-          <li><kbd>Delete</kbd><span>Delete</span></li>
+          <li data-when="#batch-bar.visible .monloader-accent:not([disabled])"><kbd>L</kbd><span>Find tags (monloader)</span></li>
+          <li data-when="#batch-bar.visible"><kbd>Delete</kbd><span>Delete</span></li>
           <li><kbd>Shift</kbd>+<kbd>click</kbd><span>Extend the selection</span></li>
           <li data-when=".plugin-card .plugin-btn, #plugin-batch-bar.visible .plugin-btn"><kbd>x</kbd><kbd>1-9</kbd><span>Run Nth plugin</span></li>
           <li><kbd>Esc</kbd><span>Clear selection</span></li>
@@ -174,7 +179,7 @@
           <li data-when=".tag-mode-toggle"><kbd>B</kbd><span>Group tags by...</span></li>
           <li><kbd>a</kbd><span>Focus tag input</span></li>
           <li><kbd>r</kbd><span>Tag-focus mode</span></li>
-          <li data-when=".btn-autotag"><kbd>t</kbd><span>Auto-tag dialog</span></li>
+          <li data-when=".btn-autotag:not([disabled])"><kbd>t</kbd><span>Auto-tag dialog</span></li>
           <li><kbd>f</kbd><kbd>i</kbd><span>Toggle fav / inbox</span></li>
           <li><kbd>m</kbd><span>Rename / move dialog</span></li>
           <li><kbd>Delete</kbd><span>Delete image</span></li>
@@ -313,7 +318,6 @@
           <form hx-post="/internal/gallery/switch"
                 hx-target="#gallery-switch-flash" hx-swap="innerHTML"
                 style="display:inline">
-            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
             <input type="hidden" name="name" value="{{.Name}}">
             <button type="submit">{{.Name}}</button>
           </form>

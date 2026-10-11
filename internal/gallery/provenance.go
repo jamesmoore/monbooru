@@ -1,6 +1,7 @@
 package gallery
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -20,13 +21,13 @@ func writeSourceProvenance(database *db.DB, imageID int64, source, postID, url, 
 	if err := AddSourceMembership(database, imageID, source, postID, url); err != nil {
 		return err
 	}
-	if err := setSourceMD5(database, imageID, source, postID, md5); err != nil {
+	if err := setSourceFieldIfSet(database, imageID, source, postID, "md5", md5); err != nil {
 		return err
 	}
 	if err := setSourcePostFile(database, imageID, source, postID, post); err != nil {
 		return err
 	}
-	return setSourceParentURL(database, imageID, source, postID, parentURL)
+	return setSourceFieldIfSet(database, imageID, source, postID, "parent_url", parentURL)
 }
 
 // ApplySourceProvenance skips empty values; on failure the string names
@@ -98,8 +99,11 @@ func MergeSource(database *db.DB, tagSvc *tags.Service, imageID int64, source, p
 	}
 	var warnings []string
 	if source != "" && len(rawTags) > 0 {
-		tagIDs, warns := ResolveTagNames(database, tagSvc, rawTags, source)
+		tagIDs, warns, err := ResolveTagNames(database, tagSvc, rawTags, source)
 		warnings = warns
+		if err != nil {
+			return sum, warnings, err
+		}
 		// Every post of a site shares the site's tag slice, so the
 		// reconcile runs only for a site's sole origin; beside a sibling
 		// post the merge is add-only.
@@ -123,37 +127,41 @@ func ApplyPTRTags(database *db.DB, tagSvc *tags.Service, imageID int64, tagNames
 	return err
 }
 
-func ResolveTagNames(database *db.DB, tagSvc *tags.Service, rawTags []string, origin string) ([]int64, []string) {
+// ResolveTagNames warns about a name the tag rules refuse and skips it;
+// any other error fails the whole call.
+func ResolveTagNames(database *db.DB, tagSvc *tags.Service, rawTags []string, origin string) ([]int64, []string, error) {
 	var warnings []string
 	tagIDs := make([]int64, 0, len(rawTags))
 	for _, tagName := range rawTags {
+		var tag *models.Tag
 		catID, bareName, err := resolveCategoryTag(database, tagName)
-		if err != nil {
+		if err == nil {
+			tag, err = tagSvc.GetOrCreateTagFrom(bareName, catID, origin)
+		}
+		if errors.Is(err, tags.ErrInvalidTagName) || errors.Is(err, tags.ErrNonCanonicalRating) || errors.Is(err, tags.ErrEmptyFormName) {
 			warnings = append(warnings, "tag "+tagName+": "+err.Error())
 			continue
 		}
-		tag, err := tagSvc.GetOrCreateTagFrom(bareName, catID, origin)
 		if err != nil {
-			warnings = append(warnings, "tag "+tagName+": "+err.Error())
-			continue
+			return nil, warnings, err
 		}
 		tagIDs = append(tagIDs, tag.ID)
 	}
-	return tagIDs, warnings
+	return tagIDs, warnings, nil
 }
 
 // An unknown prefix keeps the whole name in general, so names like
 // "nier:automata" or ":3" round-trip.
 func resolveCategoryTag(database *db.DB, input string) (int64, string, error) {
-	input = strings.TrimSpace(input)
-	if idx := strings.Index(input, ":"); idx > 0 {
-		catID, ok, err := tags.CategoryIDByName(database, input[:idx])
-		if err != nil {
-			return 0, "", err
+	f, err := tags.SplitForm(database, input)
+	if err != nil {
+		return 0, "", err
+	}
+	if f.CategoryID != 0 {
+		if f.Name == "" {
+			return 0, "", tags.ErrEmptyFormName
 		}
-		if ok {
-			return catID, input[idx+1:], nil
-		}
+		return f.CategoryID, f.Name, nil
 	}
 	catID, ok, err := tags.CategoryIDByName(database, "general")
 	if err != nil {
@@ -162,5 +170,5 @@ func resolveCategoryTag(database *db.DB, input string) (int64, string, error) {
 	if !ok {
 		return 0, "", fmt.Errorf("unknown category %q", "general")
 	}
-	return catID, input, nil
+	return catID, f.Name, nil
 }

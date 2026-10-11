@@ -270,13 +270,9 @@ func (b *Boundary) Fenced() []Exclusion {
 		if f.name == "" {
 			continue
 		}
-		nested := false
-		for _, g := range b.fences {
-			if g.name != "" && g.name != f.name && PathInside(g.name, f.name) {
-				nested = true
-				break
-			}
-		}
+		nested := slices.ContainsFunc(b.fences, func(g fence) bool {
+			return g.name != "" && g.name != f.name && PathInside(g.name, f.name)
+		})
 		if !nested {
 			out = append(out, b.exclusion(f, f.name, false))
 		}
@@ -326,17 +322,8 @@ func (b *Boundary) skips(name, real string) bool {
 }
 
 func (b *Boundary) leadsOut(target string) bool {
-	for _, f := range b.fences {
-		if PathInside(f.real, target) {
-			return true
-		}
-	}
-	for _, f := range b.others {
-		if PathInside(f.real, target) {
-			return true
-		}
-	}
-	return false
+	holds := func(f fence) bool { return PathInside(f.real, target) }
+	return slices.ContainsFunc(b.fences, holds) || slices.ContainsFunc(b.others, holds)
 }
 
 // RemoveOwned keeps what b skips and every folder on the way to it. Links

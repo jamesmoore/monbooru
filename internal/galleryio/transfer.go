@@ -1,143 +1,134 @@
 package galleryio
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
-	"github.com/monbooru/monbooru/internal/tags"
 )
 
 // TransferOneImage merges into a target row with the same sha, else
-// copies and ingests the file; removeAfter then deletes the source.
-func TransferOneImage(srcCx, dstCx gallery.Handle, id int64, removeAfter bool, maxFileSizeMB int, onDelete func(*sql.Tx, int64) error) error {
+// copies and ingests the file; removeAfter then deletes the source, whose
+// files changed since indexing it keeps and counts.
+func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool) (kept int, err error) {
 	var sha, canonPath, folderPath, origin, note, originalSource string
 	var isFav, isMissing int
 	if err := srcCx.DB.Read.QueryRow(
 		`SELECT sha256, canonical_path, folder_path, origin, note, original_source, is_favorited, is_missing FROM images WHERE id = ?`, id,
 	).Scan(&sha, &canonPath, &folderPath, &origin, &note, &originalSource, &isFav, &isMissing); err != nil {
-		return fmt.Errorf("load image %d: %w", id, err)
+		return 0, fmt.Errorf("load image %d: %w", id, err)
 	}
 	if isMissing == 1 {
-		return fmt.Errorf("file missing from disk")
+		return 0, fmt.Errorf("file missing from disk")
 	}
 
-	groups, err := transferTagGroups(srcCx, dstCx, id)
+	groups, err := transferTagGroups(srcCx.Handle, dstCx.Handle, id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	generalID := LookupCategoryID(dstCx.DB, "general")
 
 	var dstID int64
 	var dstMissing int
 	var dstCanon string
-	err = dstCx.DB.Read.QueryRow(`SELECT id, is_missing, canonical_path FROM images WHERE sha256 = ?`, sha).Scan(&dstID, &dstMissing, &dstCanon)
-	switch err {
-	case nil:
-		restore := dstMissing == 1
-		if !restore {
-			// The flag trails the disk until the next sync.
-			if _, statErr := os.Stat(dstCanon); os.IsNotExist(statErr) {
-				restore = true
+	lookupErr := dstCx.DB.Read.QueryRow(`SELECT id, is_missing, canonical_path FROM images WHERE sha256 = ?`, sha).Scan(&dstID, &dstMissing, &dstCanon)
+	if lookupErr != nil && lookupErr != sql.ErrNoRows {
+		return 0, fmt.Errorf("target sha lookup: %w", lookupErr)
+	}
+	// The provenance is written outside the landing and the tag service.
+	if err := dstCx.Edit(func(*db.DB) error {
+		switch lookupErr {
+		case nil:
+			same := sameFile(canonPath, dstCanon)
+			if same && removeAfter {
+				return errSameFileMove
 			}
-		}
-		// Restore a missing file, or the merge passes on an unviewable row.
-		if restore {
-			if !gallery.NamedInside(dstCx.GalleryPath, dstCanon) {
-				return fmt.Errorf("refusing to restore %q outside gallery root %q", dstCanon, dstCx.GalleryPath)
+			// Copying a file onto itself truncates it before the copy reads it.
+			restore := dstMissing == 1 && !same
+			if !restore {
+				// The flag trails the disk until the next sync.
+				if _, statErr := os.Stat(dstCanon); os.IsNotExist(statErr) {
+					restore = true
+				}
 			}
-			if err := dstCx.Boundary().Check(dstCanon); err != nil {
-				return fmt.Errorf("refusing to restore %q: %w", dstCanon, err)
+			// Restore a missing file, or the merge passes on an unviewable row.
+			if restore {
+				if !gallery.NamedInside(dstCx.GalleryPath, dstCanon) {
+					return fmt.Errorf("refusing to restore %q outside gallery root %q", dstCanon, dstCx.GalleryPath)
+				}
+				if err := dstCx.Boundary().Check(dstCanon); err != nil {
+					return fmt.Errorf("refusing to restore %q: %w", dstCanon, err)
+				}
+				if err := os.MkdirAll(filepath.Dir(dstCanon), 0o755); err != nil {
+					return fmt.Errorf("mkdir dest: %w", err)
+				}
+				if err := gallery.CopyFileContents(canonPath, dstCanon); err != nil {
+					return fmt.Errorf("restore file: %w", err)
+				}
+				if _, err := gallery.SetMissing(dstCx.DB, dstID, false); err != nil {
+					return err
+				}
 			}
-			if err := os.MkdirAll(filepath.Dir(dstCanon), 0o755); err != nil {
-				return fmt.Errorf("mkdir dest: %w", err)
-			}
-			if err := gallery.CopyFileContents(canonPath, dstCanon); err != nil {
-				return fmt.Errorf("restore file: %w", err)
-			}
-			if err := unmarkMissing(dstCx.DB, dstID); err != nil {
+		case sql.ErrNoRows:
+			rel := filepath.ToSlash(filepath.Join(folderPath, filepath.Base(canonPath)))
+			safeBase, err := SafeArchiveDest(dstCx.GalleryPath, rel)
+			if err != nil {
 				return err
 			}
+			var landed library.LandResult
+			if sameFile(canonPath, safeBase) {
+				// Both galleries read this folder: a copy beside it would be
+				// a second file both of them index.
+				if removeAfter {
+					return errSameFileMove
+				}
+				landed, err = dstCx.LandInPlace(context.Background(), safeBase, library.LandSpec{Origin: origin})
+			} else {
+				landed, err = dstCx.Land(context.Background(), filepath.Dir(safeBase), filepath.Base(safeBase),
+					library.FromFile(canonPath), library.LandSpec{Origin: origin})
+			}
+			if err != nil {
+				return err
+			}
+			// The new row stays in the inbox even on a move: relations and
+			// collections don't travel.
+			dstID = landed.Image.ID
 		}
 		if err := applyTransferTags(dstCx.DB, dstCx.TagSvc, dstID, groups, generalID); err != nil {
 			return err
 		}
-		if err := transferProvenance(srcCx, dstCx, id, dstID, note, originalSource, isFav); err != nil {
-			return err
-		}
-	case sql.ErrNoRows:
-		rel := filepath.ToSlash(filepath.Join(folderPath, filepath.Base(canonPath)))
-		safeBase, err := SafeArchiveDest(dstCx.GalleryPath, rel)
-		if err != nil {
-			return err
-		}
-		if err := dstCx.Boundary().Check(safeBase); err != nil {
-			return err
-		}
-		dst := gallery.UniqueDestPath(filepath.Dir(safeBase), filepath.Base(safeBase))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return fmt.Errorf("mkdir dest: %w", err)
-		}
-		if err := gallery.CopyFileContents(canonPath, dst); err != nil {
-			return fmt.Errorf("copy file: %w", err)
-		}
-		if _, err := gallery.DetectFileType(dst); err != nil {
-			_ = os.Remove(dst)
-			return fmt.Errorf("unsupported file: %w", err)
-		}
-		img, _, err := gallery.Ingest(dstCx.DB, dstCx.GalleryPath, dstCx.ThumbnailsPath, dst, origin)
-		if err != nil {
-			_ = os.Remove(dst)
-			return fmt.Errorf("ingest: %w", err)
-		}
-		if err := applyTransferTags(dstCx.DB, dstCx.TagSvc, img.ID, groups, generalID); err != nil {
-			return err
-		}
-		if err := transferProvenance(srcCx, dstCx, id, img.ID, note, originalSource, isFav); err != nil {
-			return err
-		}
-		// The new row stays in the inbox even on a move: relations and
-		// collections don't travel.
-	default:
-		return fmt.Errorf("target sha lookup: %w", err)
+		return transferProvenance(srcCx.Handle, dstCx.Handle, id, dstID, note, originalSource, isFav)
+	}); err != nil {
+		return 0, err
 	}
 
 	if removeAfter {
-		if _, err := gallery.DeleteImage(srcCx.DB, srcCx.Boundary(), srcCx.ThumbnailsPath, id,
-			tags.RemoveAllTagsFromImageTx, onDelete); err != nil {
-			return fmt.Errorf("remove source: %w", err)
+		res, err := srcCx.DeleteImages(context.Background(), []int64{id}, library.DeleteOptions{}, nil)
+		if err != nil {
+			return 0, fmt.Errorf("remove source: %w", err)
 		}
+		return res.Changed, nil
 	}
-	return nil
+	return 0, nil
 }
 
-// usage_count counts visible images, so the row's tags get back the slot
-// the missing mark took.
-func unmarkMissing(database *db.DB, id int64) error {
-	tx, err := database.Write.Begin()
+var errSameFileMove = errors.New("the target gallery reads this same file: moving it would delete it")
+
+func sameFile(a, b string) bool {
+	ai, err := os.Stat(a)
 	if err != nil {
-		return err
+		return false
 	}
-	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`UPDATE images SET is_missing = 0 WHERE id = ? AND is_missing = 1`, id)
-	if err != nil {
-		return err
-	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
-		return err
-	}
-	if _, err := tx.Exec(
-		`UPDATE tags SET usage_count = usage_count + 1
-		 WHERE id IN (SELECT tag_id FROM image_tags WHERE image_id = ?)`, id,
-	); err != nil {
-		return err
-	}
-	return tx.Commit()
+	bi, err := os.Stat(b)
+	return err == nil && os.SameFile(ai, bi)
 }
 
 type transferTagGroup struct {
@@ -214,20 +205,8 @@ func transferProvenance(srcCx, dstCx gallery.Handle, srcID, dstID int64, note, o
 		if err := gallery.SetSourceSimilarity(dstCx.DB, dstID, src.Site, src.PostID, src.Similarity); err != nil {
 			return err
 		}
-		if src.Commentary != "" && src.Site != "" {
-			if err := gallery.SetSourceCommentary(dstCx.DB, dstID, src.Site, src.PostID, src.Commentary); err != nil {
-				return err
-			}
-		}
-		if src.CommentaryTranslated != "" && src.Site != "" {
-			if err := gallery.SetSourceCommentaryTranslated(dstCx.DB, dstID, src.Site, src.PostID, src.CommentaryTranslated); err != nil {
-				return err
-			}
-		}
-		if src.Original != "" && src.Site != "" {
-			if err := gallery.SetSourceOriginal(dstCx.DB, dstID, src.Site, src.PostID, src.Original); err != nil {
-				return err
-			}
+		if _, err := gallery.ApplySourceProvenance(dstCx.DB, dstID, src.Site, src.PostID, src.Commentary, src.CommentaryTranslated, src.Original, nil); err != nil {
+			return err
 		}
 	}
 

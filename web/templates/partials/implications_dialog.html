@@ -2,14 +2,13 @@
 <p>Tags implied by <strong style="color:{{catColor .Parent.CategoryColor}}">{{.Parent.Name}}</strong>:</p>
 {{if .Implications}}
 {{range groupImplicationsByOrigin .Implications}}
-{{if $.OriginKinds}}{{template "partials/implication_group_header.html" (dict "Group" . "OriginKinds" $.OriginKinds "CSRFToken" $.CSRFToken "BaseURL" (printf "/tags/%d/implications/group" $.Parent.ID))}}{{end}}
+{{if $.OriginKinds}}{{template "partials/implication_group_header.html" (dict "Group" . "OriginKinds" $.OriginKinds "BaseURL" (printf "/tags/%d/implications/group" $.Parent.ID))}}{{end}}
 <ul class="tag-list">
   {{range .Implications}}
   <li class="tag-item" style="color:{{catColor .ImpliedCategoryColor}}">
     <a href="/tags/{{.ImpliedID}}" class="tag-chip-name" title="Tag details">{{.ImpliedName}}</a>
     <button class="tag-remove-btn"
             hx-delete="/tags/{{.ParentID}}/implications/{{.ImpliedID}}"
-            hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
             hx-confirm="Remove the implication that {{$.Parent.Name}} implies {{.ImpliedName}}?"
             data-confirm-ok="Remove"
             hx-on::after-request="if(event.detail.successful){pruneRelationRow(this)}"
@@ -26,7 +25,6 @@
       hx-target="#implication-add-flash"
       hx-swap="innerHTML"
       hx-on::after-request="handleImplicationAdded(event)">
-  <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
   <div class="add-tag-input-wrap">
     {{template "multi_tag_suggest_input" dict "Name" "implied_id" "InputID" "implication-add-input" "SuggestID" "implication-add-suggest" "Placeholder" "Imply tag(s)..." "Required" true "ValsKey" "q"}}
   </div>

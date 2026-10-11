@@ -1,7 +1,6 @@
 package web
 
 import (
-	"database/sql"
 	"fmt"
 	"net/http"
 	"strings"
@@ -9,14 +8,14 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
 // Image ids are per gallery, so a write from a page rendered for another
 // gallery would act on different images; the page says which one it shows.
 func pageGalleryStale(w http.ResponseWriter, r *http.Request, active string) bool {
-	if r.Method == http.MethodGet || r.Method == http.MethodHead || strings.HasPrefix(r.URL.Path, "/api/") {
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && !isHTMXRequest(r) || strings.HasPrefix(r.URL.Path, "/api/") {
 		return false
 	}
 	page := r.Header.Get("X-Monbooru-Gallery")
@@ -31,7 +30,7 @@ func pageGalleryStale(w http.ResponseWriter, r *http.Request, active string) boo
 	return true
 }
 
-func (s *Server) requireActive(w http.ResponseWriter) (*galleryCtx, bool) {
+func (s *Server) requireActive(w http.ResponseWriter) (*library.Gallery, bool) {
 	cx := s.active()
 	if cx == nil || cx.DB == nil {
 		http.Error(w, "no gallery", http.StatusServiceUnavailable)
@@ -48,6 +47,13 @@ func (s *Server) db() *db.DB {
 		return cx.DB
 	}
 	return nil
+}
+
+func (s *Server) source() search.Source {
+	if cx := s.active(); cx != nil {
+		return cx.Source()
+	}
+	return search.Source{}
 }
 
 func (s *Server) tagSvc() *tags.Service {
@@ -85,29 +91,6 @@ func (s *Server) boundary() *gallery.Boundary {
 	return gallery.NewBoundary("", nil, nil)
 }
 
-func (s *Server) relationsSvc() *relations.Service {
-	if cx := s.active(); cx != nil {
-		return cx.RelationsSvc
-	}
-	return nil
-}
-
-func (s *Server) onImageDeleteCallback() func(*sql.Tx, int64) error {
-	svc := s.relationsSvc()
-	if svc == nil {
-		return nil
-	}
-	return svc.OnImageDeleteTx
-}
-
-func (s *Server) onImagesDeleteCallback() func(*sql.Tx, []int64) error {
-	svc := s.relationsSvc()
-	if svc == nil {
-		return nil
-	}
-	return svc.OnImagesDeleteTx
-}
-
 func (s *Server) thumbnailsPath() string {
 	if cx := s.active(); cx != nil {
 		return cx.ThumbnailsPath
@@ -121,7 +104,5 @@ func (s *Server) dbPath() string {
 	}
 	return ""
 }
-
-type galleryCtx = library.Gallery
 
 type Ceiling = library.Ceiling

@@ -39,13 +39,11 @@ func updateSourceField(database *db.DB, imageID int64, site, postID, col string,
 // its site or url, runs in sourceTx.
 
 func SourcesForImage(database *db.DB, imageID int64) ([]models.ImageSource, error) {
-	return db.QueryAll(database.Read, func(rows *sql.Rows) (models.ImageSource, error) {
-		var s models.ImageSource
-		err := rows.Scan(&s.Site, &s.PostID, &s.URL, &s.Commentary, &s.CommentaryTranslated, &s.Original,
+	return db.QueryAll(database.Read, db.ScanRow(func(s *models.ImageSource) []any {
+		return []any{&s.Site, &s.PostID, &s.URL, &s.Commentary, &s.CommentaryTranslated, &s.Original,
 			&s.Similarity, &s.MD5, &s.MD5Match,
-			&s.UpgradeKept, &s.PostWidth, &s.PostHeight, &s.PostSize, &s.PostExt)
-		return s, err
-	},
+			&s.UpgradeKept, &s.PostWidth, &s.PostHeight, &s.PostSize, &s.PostExt}
+	}),
 		`SELECT site, post_id, url, commentary, commentary_translated, original, similarity, md5, md5_match,
 		        upgrade_kept, post_width, post_height, post_size, post_ext
 		 FROM image_sources WHERE image_id = ? ORDER BY rowid`, imageID)
@@ -80,20 +78,47 @@ func AddSourceMembership(database *db.DB, imageID int64, site, postID, url strin
 	})
 }
 
-func setSourceMD5(database *db.DB, imageID int64, site, postID, md5 string) error {
-	md5 = strings.TrimSpace(md5)
-	if md5 == "" {
+func setSourceFieldIfSet(database *db.DB, imageID int64, site, postID, col, val string) error {
+	val = strings.TrimSpace(val)
+	if val == "" {
 		return nil
 	}
-	return updateSourceField(database, imageID, site, postID, "md5", md5)
+	return updateSourceField(database, imageID, site, postID, col, val)
 }
 
-func setSourceParentURL(database *db.DB, imageID int64, site, postID, parentURL string) error {
-	parentURL = strings.TrimSpace(parentURL)
-	if parentURL == "" {
-		return nil
-	}
-	return updateSourceField(database, imageID, site, postID, "parent_url", parentURL)
+func ImageSHAAndType(q db.RowQuerier, id int64) (sha, fileType string, err error) {
+	err = q.QueryRow(`SELECT sha256, file_type FROM images WHERE id = ?`, id).Scan(&sha, &fileType)
+	return sha, fileType, err
+}
+
+// FileTypes leaves out the ids with no row.
+func FileTypes(database *db.DB, ids []int64) (map[int64]string, error) {
+	types := make(map[int64]string, len(ids))
+	err := db.Chunked(ids, 500, func(chunk []int64) error {
+		in, args := db.InPlaceholders(chunk)
+		rows, err := database.Read.Query(`SELECT id, file_type FROM images WHERE id IN (`+in+`)`, args...)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var id int64
+			var fileType string
+			if err := rows.Scan(&id, &fileType); err != nil {
+				return err
+			}
+			types[id] = fileType
+		}
+		return rows.Err()
+	})
+	return types, err
+}
+
+// ImageIDBySHA answers sql.ErrNoRows when no row holds the bytes.
+func ImageIDBySHA(q db.RowQuerier, sha string) (int64, error) {
+	var id int64
+	err := q.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, sha).Scan(&id)
+	return id, err
 }
 
 func ImageIDBySourceURL(database *db.DB, url string) (int64, bool) {
@@ -179,13 +204,7 @@ func SetSourceUpgradeKept(database *db.DB, imageID int64, site, postID string, k
 	res, err := database.Write.Exec(
 		`UPDATE image_sources SET upgrade_kept = ? WHERE image_id = ? AND site = ? AND post_id = ?`,
 		kept, imageID, strings.TrimSpace(site), strings.TrimSpace(postID))
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrSourceNotFound
-	}
-	return nil
+	return requireAffected(res, err, ErrSourceNotFound)
 }
 
 func SourceSimilarityMatched(database *db.DB, imageID int64, site, postID string) bool {
@@ -267,11 +286,8 @@ func RemoveSourceMembership(database *db.DB, imageID int64, site, postID string)
 	return sourceTx(database, imageID, func(tx *sql.Tx) error {
 		res, err := tx.Exec(`DELETE FROM image_sources WHERE image_id = ? AND site = ? AND post_id = ?`,
 			imageID, site, postID)
-		if err != nil {
+		if err := requireAffected(res, err, ErrSourceNotFound); err != nil {
 			return err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return ErrSourceNotFound
 		}
 		return deletePulledAnnotationsTx(tx, imageID, site, postID)
 	})
@@ -375,13 +391,7 @@ func MakeSourcePrimary(database *db.DB, imageID int64, site, postID string) erro
 			`UPDATE image_sources SET rowid = (SELECT MIN(rowid) - 1 FROM image_sources)
 			 WHERE image_id = ? AND site = ? AND post_id = ?`,
 			imageID, site, postID)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return ErrSourceNotFound
-		}
-		return nil
+		return requireAffected(res, err, ErrSourceNotFound)
 	})
 }
 

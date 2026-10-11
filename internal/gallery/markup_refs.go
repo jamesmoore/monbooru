@@ -1,9 +1,6 @@
 package gallery
 
 import (
-	"database/sql"
-	"strings"
-
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -21,26 +18,27 @@ type tagRefRow struct {
 }
 
 // ResolveTagRefs gives an alias its canonical row's colour, so the swatch
-// matches where the link lands.
+// matches where the link lands. A category prefix is read first, then the
+// whole ref as a name in any category.
 func ResolveTagRefs(database *db.DB, refs []string) map[string]TagRefTarget {
 	out := make(map[string]TagRefTarget, len(refs))
+	forms := make([]tags.Form, len(refs))
 	var names []string
-	for _, ref := range refs {
+	for i, ref := range refs {
 		out[ref] = TagRefTarget{}
 		names = append(names, tags.NormalizeTagName(ref))
-		if cat, name, ok := strings.Cut(ref, ":"); ok && cat != "" && name != "" {
-			names = append(names, tags.NormalizeTagName(name))
+		if f, err := tags.SplitForm(database, ref); err == nil && f.CategoryID != 0 && f.Name != "" {
+			forms[i] = f
+			names = append(names, tags.NormalizeTagName(f.Name))
 		}
 	}
 	placeholders, args := db.InPlaceholders(names)
 	if placeholders == "" {
 		return out
 	}
-	rows, err := db.QueryAll(database.Read, func(rows *sql.Rows) (tagRefRow, error) {
-		var r tagRefRow
-		err := rows.Scan(&r.name, &r.category, &r.color, &r.usage)
-		return r, err
-	}, `SELECT t.name, tc.name, COALESCE(cc.color, tc.color), COALESCE(ct.usage_count, t.usage_count)
+	rows, err := db.QueryAll(database.Read, db.ScanRow(func(r *tagRefRow) []any {
+		return []any{&r.name, &r.category, &r.color, &r.usage}
+	}), `SELECT t.name, tc.name, COALESCE(cc.color, tc.color), COALESCE(ct.usage_count, t.usage_count)
 	    FROM tags t
 	    JOIN tag_categories tc ON tc.id = t.category_id
 	    LEFT JOIN tags ct ON ct.id = t.canonical_tag_id
@@ -49,14 +47,15 @@ func ResolveTagRefs(database *db.DB, refs []string) map[string]TagRefTarget {
 	if err != nil {
 		return out
 	}
-	for _, ref := range refs {
-		cat, name, qualified := strings.Cut(ref, ":")
+	for i, ref := range refs {
+		if f := forms[i]; f.CategoryID != 0 {
+			if best, ok := pickTagRef(rows, tags.NormalizeTagName(f.Name), f.Category); ok {
+				out[ref] = best
+				continue
+			}
+		}
 		if best, ok := pickTagRef(rows, tags.NormalizeTagName(ref), ""); ok {
 			out[ref] = best
-		} else if qualified && cat != "" && name != "" {
-			if best, ok := pickTagRef(rows, tags.NormalizeTagName(name), cat); ok {
-				out[ref] = best
-			}
 		}
 	}
 	return out
@@ -101,11 +100,9 @@ func ImageIDsBySourceURL(database *db.DB, urls []string) map[string]int64 {
 		url string
 		id  int64
 	}
-	hits, err := db.QueryAll(database.Read, func(rows *sql.Rows) (hit, error) {
-		var h hit
-		err := rows.Scan(&h.url, &h.id)
-		return h, err
-	}, `SELECT url, MIN(image_id) FROM image_sources WHERE url IN (`+placeholders+`) GROUP BY url`, args...)
+	hits, err := db.QueryAll(database.Read, db.ScanRow(func(h *hit) []any {
+		return []any{&h.url, &h.id}
+	}), `SELECT url, MIN(image_id) FROM image_sources WHERE url IN (`+placeholders+`) GROUP BY url`, args...)
 	if err != nil {
 		return out
 	}
