@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,11 +71,7 @@ func init() {
 		SetBackend(defaultBackend)
 		return
 	}
-	if b, err := newIPCBackend(); err == nil {
-		SetBackend(b)
-		return
-	}
-	SetBackend(defaultBackend)
+	SetBackend(&ipcBackend{})
 }
 
 // Caller must hold b.mu.
@@ -101,10 +99,11 @@ func (b *inprocBackend) satisfies(modelPath string, taggers []TaggerStatus, prov
 }
 
 // Caller must hold b.mu.
-func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provider string) error {
+func (b *inprocBackend) ensure(req RunRequest) (err error) {
+	taggers := req.Taggers
 	// Before the signature check, so "" matches a warm "cpu" cache.
-	provider = cmp.Or(provider, "cpu")
-	if b.satisfies(cfg.Paths.ModelPath, taggers, provider) {
+	provider := cmp.Or(req.Provider, "cpu")
+	if b.satisfies(req.ModelPath, taggers, provider) {
 		logx.Infof("tagger: reusing warm cache (%d session(s))", len(b.sessions))
 		return nil
 	}
@@ -123,7 +122,7 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 	// loses on restart; keep them under the data path unless
 	// CUDA_CACHE_PATH is already set.
 	if provider == "cuda" && os.Getenv("CUDA_CACHE_PATH") == "" {
-		cacheDir := filepath.Join(cfg.Paths.DataPath, ".nv-cache")
+		cacheDir := filepath.Join(req.DataPath, ".nv-cache")
 		if err := os.MkdirAll(cacheDir, 0o755); err == nil {
 			_ = os.Setenv("CUDA_CACHE_PATH", cacheDir)
 		}
@@ -134,10 +133,14 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 		return fmt.Errorf("ort init: %w", err)
 	}
 	b.initialized = true
+	defer func() {
+		if err != nil {
+			b.teardownLocked()
+		}
+	}()
 
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
-		b.teardownLocked()
 		return fmt.Errorf("ort session options: %w", err)
 	}
 	b.sessionOpts = opts
@@ -145,18 +148,16 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 	// ORT gives each session every core by default; with parallel workers
 	// that oversubscribes the CPU, so the cores are split between them
 	// and inter-op stays at 1.
-	parallel := max(1, cfg.Tagger.Parallel)
+	parallel := max(1, req.SessionParallel)
 	if provider == "directml" {
 		// Run serialises directml, so its one worker gets every core.
 		parallel = 1
 	}
 	intra := max(1, runtime.NumCPU()/parallel)
 	if err := opts.SetIntraOpNumThreads(intra); err != nil {
-		b.teardownLocked()
 		return fmt.Errorf("set intra-op threads: %w", err)
 	}
 	if err := opts.SetInterOpNumThreads(1); err != nil {
-		b.teardownLocked()
 		return fmt.Errorf("set inter-op threads: %w", err)
 	}
 
@@ -164,7 +165,7 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 	// container restart.
 	epCacheDir := ""
 	if provider == "openvino" {
-		dir := filepath.Join(cfg.Paths.DataPath, ".openvino-cache")
+		dir := filepath.Join(req.DataPath, ".openvino-cache")
 		if err := os.MkdirAll(dir, 0o755); err == nil {
 			epCacheDir = dir
 		}
@@ -174,7 +175,6 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 		if cleanup != nil {
 			cleanup()
 		}
-		b.teardownLocked()
 		return fmt.Errorf("append execution provider %q: %w", provider, err)
 	}
 	b.epCleanup = cleanup
@@ -182,44 +182,37 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 
 	b.sessions = make(map[string]*loadedSession, len(taggers))
 	for _, t := range taggers {
-		onnxPath := filepath.Join(cfg.Paths.ModelPath, t.Name, t.ModelFile)
-		tagsPath := filepath.Join(cfg.Paths.ModelPath, t.Name, t.TagsFile)
-		profile, err := ResolveProfile(cfg.Paths.ModelPath, t.Name, t.TagsFile)
+		onnxPath := filepath.Join(req.ModelPath, t.Name, t.ModelFile)
+		tagsPath := filepath.Join(req.ModelPath, t.Name, t.TagsFile)
+		profile, err := ResolveProfile(req.ModelPath, t.Name, t.TagsFile)
 		if err != nil {
-			b.teardownLocked()
 			return fmt.Errorf("resolve profile for %q: %w", t.Name, err)
 		}
 		labels, err := loadLabels(tagsPath, profile)
 		if err != nil {
-			b.teardownLocked()
 			return fmt.Errorf("load labels for %q: %w", t.Name, err)
 		}
 		inputs, outputs, err := ort.GetInputOutputInfo(onnxPath)
 		if err != nil {
-			b.teardownLocked()
 			return fmt.Errorf("inspect ort model for %q: %w", t.Name, err)
 		}
 		if len(inputs) == 0 || len(outputs) == 0 {
-			b.teardownLocked()
 			return fmt.Errorf("ort model for %q has no input/output", t.Name)
 		}
 		outIdx := profile.OutputIndex
 		if outIdx < 0 || outIdx >= len(outputs) {
-			b.teardownLocked()
 			return fmt.Errorf("ort model for %q: profile output_index %d out of range (have %d)", t.Name, outIdx, len(outputs))
 		}
 		inputSize := profile.InputSize
 		if inputSize == 0 {
 			inputSize = inferInputSize(inputs[0].Dimensions, profile.Layout)
 			if inputSize <= 0 {
-				b.teardownLocked()
 				return fmt.Errorf("ort model for %q: cannot infer input size from dimensions %v", t.Name, inputs[0].Dimensions)
 			}
 		}
 		session, err := ort.NewDynamicAdvancedSession(onnxPath,
 			[]string{inputs[0].Name}, []string{outputs[outIdx].Name}, b.sessionOpts)
 		if err != nil {
-			b.teardownLocked()
 			return fmt.Errorf("create ort session for %q: %w", t.Name, err)
 		}
 		b.sessions[t.Name] = &loadedSession{
@@ -233,6 +226,35 @@ func (b *inprocBackend) ensure(cfg *config.Config, taggers []TaggerStatus, provi
 		}
 	}
 	logx.Infof("tagger: cache ready in %s", time.Since(loadStart).Round(10*time.Millisecond))
+	return nil
+}
+
+// A second InitializeEnvironment fails while one is held, so a probe
+// reuses the live environment and leaves it up.
+func (b *inprocBackend) probeProvider(provider string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.initialized {
+		ort.SetSharedLibraryPath(sharedLibPath())
+		if err := ort.InitializeEnvironment(); err != nil {
+			return fmt.Errorf("ort init: %w", err)
+		}
+		defer func() { _ = ort.DestroyEnvironment() }()
+	}
+
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return fmt.Errorf("ort session options: %w", err)
+	}
+	defer func() { _ = opts.Destroy() }()
+
+	cleanup, err := appendExecutionProvider(opts, provider, "")
+	if cleanup != nil {
+		cleanup()
+	}
+	if err != nil {
+		return fmt.Errorf("libonnxruntime does not support %s: %w", provider, err)
+	}
 	return nil
 }
 
@@ -420,12 +442,8 @@ func (b *inprocBackend) Status() CacheStatus {
 		Provider: b.provider,
 		InUse:    b.inUse,
 		LastUsed: b.lastUsed,
-		Sessions: make([]string, 0, len(b.sessions)),
+		Sessions: slices.Sorted(maps.Keys(b.sessions)),
 	}
-	for name := range b.sessions {
-		out.Sessions = append(out.Sessions, name)
-	}
-	sort.Strings(out.Sessions)
 	return out
 }
 
@@ -435,7 +453,7 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 	}
 
 	b.mu.Lock()
-	if err := b.ensure(req.Cfg, req.Taggers, req.Provider); err != nil {
+	if err := b.ensure(req); err != nil {
 		b.mu.Unlock()
 		return RunResponse{}, err
 	}
@@ -448,7 +466,7 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 			labels:    s.labels,
 			profile:   s.profile,
 			inputSize: s.inputSize,
-			dispatch:  LoadDispatch(req.Cfg.Paths.ModelPath, t.Name, req.CatIDs),
+			dispatch:  LoadDispatch(req.ModelPath, t.Name, req.CatIDs),
 		}
 	}
 	b.inUse = true
@@ -458,7 +476,7 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 		b.mu.Lock()
 		b.inUse = false
 		b.lastUsed = time.Now()
-		if req.Cfg.Tagger.IdleReleaseAfterMinutes <= 0 {
+		if req.IdleReleaseMinutes <= 0 {
 			b.teardownLocked()
 		}
 		b.mu.Unlock()
@@ -532,33 +550,36 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 		merged := map[TagKey]Scored{}
 		anyInferred := false
 		minHits := ResolveMinHits(req.MinHitFraction, len(im.FramePaths))
-		for tIdx, lt := range loaded {
+		perFrame := make([][][]float32, len(loaded))
+		for fIdx, fp := range im.FramePaths {
 			if ctx.Err() != nil {
 				return
 			}
-			perFrame := make([][]float32, 0, len(im.FramePaths))
-			for fIdx, fp := range im.FramePaths {
+			if im.MangaProgress && req.OnProgress != nil {
+				req.OnProgress(workerIdx, fmt.Sprintf("image %d: page %d/%d", im.ID, fIdx+1, len(im.FramePaths)))
+			}
+			inputs, err := prepareInputs(fp, loaded)
+			if err != nil {
+				logx.Warnf("tagger: read frame failed: image %d frame %d/%d (%s): %v",
+					im.ID, fIdx+1, len(im.FramePaths), fp, err)
+				continue
+			}
+			for tIdx, lt := range loaded {
 				if ctx.Err() != nil {
 					return
 				}
-				if im.MangaProgress && req.OnProgress != nil {
-					msg := fmt.Sprintf("image %d: page %d/%d", im.ID, fIdx+1, len(im.FramePaths))
-					if len(loaded) > 1 {
-						msg = fmt.Sprintf("%s (tagger %d/%d)", msg, tIdx+1, len(loaded))
-					}
-					req.OnProgress(workerIdx, msg)
-				}
-				scores, err := inferImage(lt, fp)
+				scores, err := inferImage(lt, inputs[tIdx])
 				if err != nil {
 					logx.Warnf("tagger: inference failed: image %d via %q frame %d/%d (%s): %v",
 						im.ID, lt.cfg.Name, fIdx+1, len(im.FramePaths), fp, err)
 					continue
 				}
 				anyInferred = true
-				perFrame = append(perFrame, scores)
+				perFrame[tIdx] = append(perFrame[tIdx], scores)
 			}
-
-			cands := AggregateInferenceScores(perFrame, lt.candidates, AggregateOpts{
+		}
+		for tIdx, lt := range loaded {
+			cands := AggregateInferenceScores(perFrame[tIdx], lt.candidates, AggregateOpts{
 				MinHits:            minHits,
 				GlobalThreshold:    float32(lt.cfg.ConfidenceThreshold),
 				CategoryThresholds: lt.cfg.CategoryThresholds,
@@ -583,10 +604,8 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 
 	queue := make(chan int, parallel)
 	var wg sync.WaitGroup
-	for i := 0; i < parallel; i++ {
-		wg.Add(1)
-		go func(workerIdx int) {
-			defer wg.Done()
+	for workerIdx := range parallel {
+		wg.Go(func() {
 			for idx := range queue {
 				if ctx.Err() != nil {
 					continue
@@ -600,7 +619,7 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 					req.OnProgress(workerIdx, "")
 				}
 			}
-		}(i)
+		})
 	}
 
 	for idx := range req.Images {
@@ -615,7 +634,9 @@ func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, e
 	return RunResponse{Results: results}, ctx.Err()
 }
 
-func inferImage(lt loadedTagger, path string) ([]float32, error) {
+// prepareInputs decodes the frame once and pads it once per distinct
+// input shape; the decoded frame is dropped before any inference runs.
+func prepareInputs(path string, loaded []loadedTagger) ([]*image.RGBA, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -627,7 +648,24 @@ func inferImage(lt loadedTagger, path string) ([]float32, error) {
 		return nil, err
 	}
 
-	processed := padAndResize(img, lt.inputSize, lt.profile)
+	type padKey struct {
+		size int
+		pad  string
+		fill [3]uint8
+	}
+	padded := make(map[padKey]*image.RGBA, len(loaded))
+	inputs := make([]*image.RGBA, len(loaded))
+	for i, lt := range loaded {
+		k := padKey{lt.inputSize, lt.profile.Pad, lt.profile.FillColor}
+		if padded[k] == nil {
+			padded[k] = padAndResize(img, lt.inputSize, lt.profile)
+		}
+		inputs[i] = padded[k]
+	}
+	return inputs, nil
+}
+
+func inferImage(lt loadedTagger, processed *image.RGBA) ([]float32, error) {
 	tensor := acquireTensor(lt.inputSize)
 	inputShape, err := buildTensor(processed, tensor, lt.inputSize, lt.profile)
 	if err != nil {

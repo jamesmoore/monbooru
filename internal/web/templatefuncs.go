@@ -6,11 +6,13 @@ import (
 	"html/template"
 	"math"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/tags"
 	"github.com/monbooru/monbooru/internal/upgrade"
@@ -68,6 +70,8 @@ func templateFuncs() template.FuncMap {
 		"deref":    derefOr[int],
 		"deref64":  derefOr[int64],
 		"deref64f": derefOr[float64],
+		// A seed past MaxInt64 is stored as its two's-complement int64.
+		"seedText": func(p *int64) string { return strconv.FormatUint(uint64(*p), 10) },
 		"elideHash": func(h string) string {
 			if len(h) <= 19 {
 				return h
@@ -87,15 +91,17 @@ func templateFuncs() template.FuncMap {
 		},
 		"groupTagsByOrigin": func(list []models.Tag) []originTagGroup {
 			return groupByOriginStale(list,
-				func(t models.Tag) (string, bool) { return t.Origin, t.Stale },
-				func(t models.Tag) originTagGroup { return originTagGroup{Origin: t.Origin, Stale: t.Stale} },
+				func(t models.Tag) string { return t.Origin },
+				func(t models.Tag) bool { return t.Stale },
+				func(t models.Tag) *originTagGroup { return &originTagGroup{Origin: t.Origin, Stale: t.Stale} },
 				func(g *originTagGroup, t models.Tag) { g.Tags = append(g.Tags, t) })
 		},
 		"groupImplicationsByOrigin": func(list []models.Implication) []originImplicationGroup {
 			return groupByOriginStale(list,
-				func(im models.Implication) (string, bool) { return im.Origin, im.Stale },
-				func(im models.Implication) originImplicationGroup {
-					return originImplicationGroup{Origin: im.Origin, Stale: im.Stale}
+				func(im models.Implication) string { return im.Origin },
+				func(im models.Implication) bool { return im.Stale },
+				func(im models.Implication) *originImplicationGroup {
+					return &originImplicationGroup{Origin: im.Origin, Stale: im.Stale}
 				},
 				func(g *originImplicationGroup, im models.Implication) { g.Implications = append(g.Implications, im) })
 		},
@@ -174,12 +180,7 @@ func templateFuncs() template.FuncMap {
 		},
 		"truncate": truncateRunes,
 		"hasFavFilter": func(query string) bool {
-			for _, tok := range strings.Fields(query) {
-				if strings.EqualFold(tok, "fav:true") {
-					return true
-				}
-			}
-			return false
+			return slices.ContainsFunc(strings.Fields(query), func(tok string) bool { return strings.EqualFold(tok, "fav:true") })
 		},
 		"pageLoadMs": func(t time.Time) int64 {
 			if t.IsZero() {
@@ -209,6 +210,7 @@ var cancelTitles = map[string]string{
 	"move":            "Stop moving",
 	"tag":             "Stop tagging",
 	"transfer":        "Stop the transfer",
+	"merge":           "Stop the merge",
 	"check":           "Stop the check",
 }
 
@@ -230,6 +232,7 @@ var runningJobNames = map[string]string{
 	"move":            "A move",
 	"tag":             "A tagging job",
 	"transfer":        "A transfer",
+	"merge":           "A merge",
 	"vacuum":          "A vacuum",
 	"free-memory":     "A memory reclaim",
 	"fold":            "A fold",
@@ -249,8 +252,8 @@ var browseSortLabels = map[string]string{
 func browseSortLabel(s string) string { return cmp.Or(browseSortLabels[s], s) }
 
 var monloaderOffReasons = map[string]string{
-	"paused":   "monloader is paused",
-	"rejected": "monloader rejected the token",
+	peer.ConnPaused:   "monloader is paused",
+	peer.ConnRejected: "monloader rejected the token",
 }
 
 func monloaderOffReason(conn string) string {
@@ -277,34 +280,9 @@ func abbrevUnit(n, div int, suffix string) string {
 	return fmt.Sprintf("%d%s", (n+div/2)/div, suffix)
 }
 
-func groupByOriginStale[T, G any](items []T, key func(T) (string, bool), newGroup func(T) G, add func(*G, T)) []G {
-	idx := map[string]int{}
-	var groups []G
-	var isStale []bool
-	for _, it := range items {
-		origin, stale := key(it)
-		k := origin
-		if stale {
-			k += "\x00stale"
-		}
-		i, ok := idx[k]
-		if !ok {
-			i = len(groups)
-			idx[k] = i
-			groups = append(groups, newGroup(it))
-			isStale = append(isStale, stale)
-		}
-		add(&groups[i], it)
-	}
-	out := make([]G, 0, len(groups))
-	for _, want := range []bool{false, true} {
-		for i, g := range groups {
-			if isStale[i] == want {
-				out = append(out, g)
-			}
-		}
-	}
-	return out
+func groupByOriginStale[T, G any](items []T, origin func(T) string, stale func(T) bool, newGroup func(T) *G, add func(*G, T)) []G {
+	fresh := func(it T) bool { return !stale(it) }
+	return append(groupOrdered(items, stale, origin, newGroup, add), groupOrdered(items, fresh, origin, newGroup, add)...)
 }
 
 // The result carries its own separator: a bare space when the post
@@ -314,10 +292,7 @@ func upgradeCompare(s models.ImageSource, img models.Image) string {
 	if post == "" {
 		return " "
 	}
-	label := s.Site
-	if label == "" {
-		label = "the post"
-	}
+	label := cmp.Or(s.Site, "the post")
 	pad := max(len("yours"), len(label)) + 2
 	return fmt.Sprintf("\n\n%-*s%s\n%-*s%s\n\n",
 		pad, "yours", fileFacts(derefOr(img.Width), derefOr(img.Height), strings.ToLower(img.FileType), img.FileSize),

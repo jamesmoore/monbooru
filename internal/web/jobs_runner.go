@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"errors"
 	"net/http"
 )
 
@@ -15,29 +14,24 @@ func (s *Server) startJob(w http.ResponseWriter, jobType string, others ...strin
 	return true
 }
 
-// A cancel outranks the error: a cancelled worker returns
-// context.Canceled, which is not a failure.
-func (s *Server) settleJob(ctx context.Context, err error, cancelMsg, doneMsg string) error {
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-		s.jobs.Complete(cancelMsg)
-		return nil
+// goJob answers with the started flash once work runs on the job context.
+func (s *Server) goJob(w http.ResponseWriter, jobType, started string, work func(ctx context.Context)) {
+	if !s.startJob(w, jobType) {
+		return
 	}
-	if err != nil {
-		s.jobs.Fail(err.Error())
-		return err
-	}
-	s.jobs.Complete(doneMsg)
-	return nil
+	go work(s.jobs.Context())
+	writeInlineFlash(w, "ok", started)
 }
 
-func (s *Server) finishJob(err error, cancelled bool, cancelMsg, doneMsg string) {
-	if err != nil {
-		s.jobs.Fail(err.Error())
+// No ids answers 202 with nothing started.
+func (s *Server) startIDsJob(w http.ResponseWriter, jobType string, ids []int64, run func([]int64), others ...string) {
+	if len(ids) == 0 {
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	if cancelled {
-		s.jobs.Complete(cancelMsg)
+	if !s.startJob(w, jobType, others...) {
 		return
 	}
-	s.jobs.Complete(doneMsg)
+	go run(ids)
+	w.WriteHeader(http.StatusAccepted)
 }

@@ -2,6 +2,7 @@ package web
 
 import (
 	"runtime"
+	"slices"
 	"strconv"
 	"time"
 
@@ -82,7 +83,6 @@ func (s *Server) gatherStats() statsData {
 
 	type mountAcc struct {
 		galleries []string
-		seenInRow map[string]bool
 		stats     mountStats
 	}
 	byKey := map[string]*mountAcc{}
@@ -102,15 +102,13 @@ func (s *Server) gatherStats() statsData {
 			key = "path:" + path
 		}
 		if acc, ok := byKey[key]; ok {
-			if !acc.seenInRow[galleryName] {
-				acc.seenInRow[galleryName] = true
+			if !slices.Contains(acc.galleries, galleryName) {
 				acc.galleries = append(acc.galleries, galleryName)
 			}
 			return
 		}
 		acc := &mountAcc{
 			galleries: []string{galleryName},
-			seenInRow: map[string]bool{galleryName: true},
 			stats:     st,
 		}
 		byKey[key] = acc
@@ -131,13 +129,8 @@ func (s *Server) gatherStats() statsData {
 		st.Labels = m.galleries
 		key := sizeKey{st.TotalSize, st.FreeSize, st.UsedSize}
 		if idx, ok := bySize[key]; ok {
-			seen := map[string]bool{}
-			for _, name := range out.Mounts[idx].Labels {
-				seen[name] = true
-			}
 			for _, name := range st.Labels {
-				if !seen[name] {
-					seen[name] = true
+				if !slices.Contains(out.Mounts[idx].Labels, name) {
 					out.Mounts[idx].Labels = append(out.Mounts[idx].Labels, name)
 				}
 			}

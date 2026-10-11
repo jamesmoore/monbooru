@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/counts"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/searchkw"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -12,45 +11,67 @@ import (
 
 // fastTagTotal answers exactly or with an upper bound, never under: an
 // over-count only leaves empty trailing pages.
-func fastTagTotal(database *db.DB, expr Expr) (int, bool) {
-	if n, ok := fastCountCeiling(database, expr); ok {
+func fastTagTotal(src Source, expr Expr) (int, bool) {
+	if n, ok := fastCountCeiling(src, expr); ok {
 		return n, true
 	}
 	switch e := expr.(type) {
 	case TagExpr:
-		return fastCountTag(database, e)
+		return fastCountTag(src, e)
 	case NotExpr:
-		return fastCountNot(database, e)
+		return fastCountNot(src, e)
 	case AndExpr:
-		return fastCountAnd(database, e)
+		return fastCountAnd(src, e)
 	case OrExpr:
-		return fastCountOr(database, e)
+		return fastCountOr(src, e)
 	case FilterExpr:
-		return fastCountFilter(database, e)
+		return fastCountFilter(src, e)
 	}
 	return 0, false
 }
 
+// Whether an answer fastTagTotal gave is exact rather than a bound.
+func fastTotalExact(expr Expr) bool {
+	if user, _, ok := extractCeilingShape(expr); ok && user == nil {
+		return true
+	}
+	switch e := expr.(type) {
+	case TagExpr:
+		return e.Wildcard == ""
+	case NotExpr:
+		return true
+	case FilterExpr:
+		switch e.Key {
+		case "cat":
+			return false
+		case "rating":
+			return strings.EqualFold(e.Val, tags.RatingLevels[len(tags.RatingLevels)-1])
+		}
+		return true
+	}
+	return false
+}
+
 // Unlike fastTagTotal, AND and OR are not gated here: the bucket decision
 // needs exactly the small intersections that gate hides.
-func adjacencyTotalEstimate(database *db.DB, expr Expr) (int, bool) {
+func adjacencyTotalEstimate(src Source, expr Expr) (int, bool) {
 	switch e := expr.(type) {
 	case AndExpr:
-		return fastCountBinary(database, e.Left, e.Right, adjacencyTotalEstimate, minInt)
+		return fastCountBinary(src, e.Left, e.Right, adjacencyTotalEstimate, minInt)
 	case OrExpr:
-		sum, ok := fastCountBinary(database, e.Left, e.Right, adjacencyTotalEstimate, addInts)
+		sum, ok := fastCountBinary(src, e.Left, e.Right, adjacencyTotalEstimate, addInts)
 		if !ok {
 			return 0, false
 		}
-		return capToVisible(database, sum)
+		return capToVisible(src, sum)
 	}
-	return fastTagTotal(database, expr)
+	return fastTagTotal(src, expr)
 }
 
 // Counts rating_rank, exact for an image with several rating tags, which
-// subtracting usage_counts would take out once per level. A user search
-// ANDed on gets the exact COUNT: a bound would advertise phantom pages.
-func fastCountCeiling(database *db.DB, expr Expr) (int, bool) {
+// subtracting usage_counts takes out once per level. A lone tag ANDed on
+// counts exactly in Execute: fastCountAnd's min would advertise phantom pages.
+func fastCountCeiling(src Source, expr Expr) (int, bool) {
 	user, rank, ok := extractCeilingShape(expr)
 	if !ok || user != nil {
 		return 0, false
@@ -58,14 +79,73 @@ func fastCountCeiling(database *db.DB, expr Expr) (int, bool) {
 	// Pinned: rating_rank has five values, which the sampled sqlite_stat1
 	// underestimates, and unpinned the planner counts through
 	// idx_images_missing, reading every visible row.
-	var total int
-	if err := database.Read.QueryRow(
+	return countRow(src,
 		`SELECT COUNT(*) FROM images INDEXED BY idx_images_rating_rank_visible
 		 WHERE is_missing = 0 AND rating_rank <= ?`, rank,
-	).Scan(&total); err != nil {
-		return 0, false
+	)
+}
+
+// extractCeilingShape turns this chain back into one rating_rank comparison,
+// so it must keep excluding every level above the ceiling.
+func ApplyCeiling(expr Expr, level string) Expr {
+	rank := tags.RatingRank(level)
+	if rank < 0 || rank >= len(tags.RatingLevels)-1 {
+		return expr
 	}
-	return total, true
+	var ce Expr
+	for i := rank + 1; i < len(tags.RatingLevels); i++ {
+		not := NotExpr{Expr: FilterExpr{Key: "rating", Val: tags.RatingLevels[i]}}
+		if ce == nil {
+			ce = not
+		} else {
+			ce = AndExpr{Left: ce, Right: not}
+		}
+	}
+	if expr == nil {
+		return ce
+	}
+	return AndExpr{Left: expr, Right: ce}
+}
+
+// HiddenByCeiling counts exactly the images expr matches that level hides.
+func HiddenByCeiling(src Source, expr Expr, level string) (int, error) {
+	rank := tags.RatingRank(level)
+	if rank < 0 || rank >= len(tags.RatingLevels)-1 {
+		return 0, nil
+	}
+	where, args := exactCountWhere(src, expr)
+	var n int
+	err := src.DB.Read.QueryRow(
+		"SELECT COUNT(*) FROM images i WHERE "+where+" AND i.rating_rank > ?",
+		append(args, rank)...,
+	).Scan(&n)
+	return n, err
+}
+
+// A lone literal drives from image_tags rather than walking every visible
+// row with an EXISTS.
+func exactCountWhere(src Source, expr Expr) (string, []any) {
+	driverLegs, _ := pickAndDriverTag(src.DB, expr, true)
+	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(expr, src, driverLegs)
+	where, args = applyAndDriver(where, args, driverLegs)
+	return andDefaultVisible(where, hasMissingFilter), args
+}
+
+// Only a lone literal tag, bare or category-qualified, counts exactly on
+// its own; a wildcard or an AND is already a bound without the ceiling,
+// and its exact COUNT can take seconds.
+func ceilingWrapsLoneLiteral(expr Expr) bool {
+	user, _, ok := extractCeilingShape(expr)
+	if !ok {
+		return false
+	}
+	switch u := user.(type) {
+	case TagExpr:
+		return u.Wildcard == ""
+	case FilterExpr:
+		return u.Val != "" && !strings.ContainsRune(u.Val, '*') && !searchkw.IsKeyword(u.Key)
+	}
+	return false
 }
 
 // Only negations excluding every level above some rank equal rating_rank
@@ -133,7 +213,7 @@ const fastApproxThreshold = 50000
 // page is already right.
 const rankInQueryMaxRank = 200
 
-func fastCountTag(database *db.DB, t TagExpr) (int, bool) {
+func fastCountTag(src Source, t TagExpr) (int, bool) {
 	if t.Tag == "" {
 		return 0, false
 	}
@@ -141,7 +221,7 @@ func fastCountTag(database *db.DB, t TagExpr) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	canonIDs, err := db.QueryIDs(database.Read,
+	canonIDs, err := db.QueryIDs(src.DB.Read,
 		`SELECT DISTINCT COALESCE(canonical_tag_id, id) FROM tags WHERE `+pred,
 		arg,
 	)
@@ -152,56 +232,48 @@ func fastCountTag(database *db.DB, t TagExpr) (int, bool) {
 		return 0, true
 	}
 	if len(canonIDs) == 1 {
-		var n int
-		if err := database.Read.QueryRow(
-			`SELECT usage_count FROM tags WHERE id = ?`, canonIDs[0],
-		).Scan(&n); err != nil {
-			return 0, false
-		}
-		return n, true
+		return countRow(src, `SELECT usage_count FROM tags WHERE id = ?`, canonIDs[0])
 	}
 	// Same name in two categories: a sum over-counts, and an exact name
 	// wants an exact count.
 	if t.Wildcard == "" {
 		return 0, false
 	}
-	var n int
-	if err := database.Read.QueryRow(
-		`SELECT COALESCE(SUM(usage_count), 0) FROM tags WHERE id IN (` + inlineIDs(canonIDs) + `)`,
-	).Scan(&n); err != nil {
+	n, ok := countRow(src, `SELECT COALESCE(SUM(usage_count), 0) FROM tags WHERE id IN (`+inlineIDs(canonIDs)+`)`)
+	if !ok {
 		return 0, false
 	}
 	if n < fastApproxThreshold {
 		return 0, false
 	}
 	// Summed per tag, a broad pattern can total several times the library.
-	return capToVisible(database, n)
+	return capToVisible(src, n)
 }
 
 // Exact counts only: visible minus an upper bound would under-count and
 // hide real pages.
-func fastCountNot(database *db.DB, e NotExpr) (int, bool) {
+func fastCountNot(src Source, e NotExpr) (int, bool) {
 	inner, ok := e.Expr.(TagExpr)
 	if !ok || inner.Wildcard != "" || inner.Tag == "" {
 		return 0, false
 	}
-	used, ok := fastCountTag(database, inner)
+	used, ok := fastCountTag(src, inner)
 	if !ok {
 		return 0, false
 	}
-	visible, ok := fastVisibleCount(database)
+	visible, ok := fastVisibleCount(src)
 	if !ok {
 		return 0, false
 	}
 	return max(visible-used, 0), true
 }
 
-func fastCountBinary(database *db.DB, l, r Expr, recurse func(*db.DB, Expr) (int, bool), combine func(int, int) int) (int, bool) {
-	lv, ok := recurse(database, l)
+func fastCountBinary(src Source, l, r Expr, recurse func(Source, Expr) (int, bool), combine func(int, int) int) (int, bool) {
+	lv, ok := recurse(src, l)
 	if !ok {
 		return 0, false
 	}
-	rv, ok := recurse(database, r)
+	rv, ok := recurse(src, r)
 	if !ok {
 		return 0, false
 	}
@@ -212,31 +284,31 @@ func addInts(a, b int) int { return a + b }
 
 func minInt(a, b int) int { return min(a, b) }
 
-func capToVisible(database *db.DB, sum int) (int, bool) {
-	v, ok := fastVisibleCount(database)
+func capToVisible(src Source, sum int) (int, bool) {
+	v, ok := fastVisibleCount(src)
 	if !ok {
 		return 0, false
 	}
 	return min(sum, v), true
 }
 
-func fastCountAnd(database *db.DB, e AndExpr) (int, bool) {
-	minN, ok := fastCountBinary(database, e.Left, e.Right, fastTagTotal, minInt)
+func fastCountAnd(src Source, e AndExpr) (int, bool) {
+	minN, ok := fastCountBinary(src, e.Left, e.Right, fastTagTotal, minInt)
 	if !ok || minN < fastApproxThreshold {
 		return 0, false
 	}
 	return minN, true
 }
 
-func fastCountOr(database *db.DB, e OrExpr) (int, bool) {
-	sum, ok := fastCountBinary(database, e.Left, e.Right, fastTagTotal, addInts)
+func fastCountOr(src Source, e OrExpr) (int, bool) {
+	sum, ok := fastCountBinary(src, e.Left, e.Right, fastTagTotal, addInts)
 	if !ok || sum < fastApproxThreshold {
 		return 0, false
 	}
-	return capToVisible(database, sum)
+	return capToVisible(src, sum)
 }
 
-var fastCountFilters = map[string]func(*db.DB, FilterExpr) (int, bool){
+var fastCountFilters = map[string]func(Source, FilterExpr) (int, bool){
 	"cat":        fastCountCat,
 	"generated":  fastCountGenerated,
 	"rating":     fastCountRating,
@@ -251,32 +323,32 @@ var fastCountFilters = map[string]func(*db.DB, FilterExpr) (int, bool){
 // lookup:never is visible minus looked-up: its NOT EXISTS walks the whole
 // library on a gallery that never ran a lookup. The other values' EXISTS
 // is already selective.
-func fastCountLookup(database *db.DB, e FilterExpr) (int, bool) {
+func fastCountLookup(src Source, e FilterExpr) (int, bool) {
 	if strings.ToLower(e.Val) != "never" {
 		return 0, false
 	}
-	visible, ok := fastVisibleCount(database)
+	visible, ok := fastVisibleCount(src)
 	if !ok {
 		return 0, false
 	}
-	var recorded int
-	if err := database.Read.QueryRow(
+	recorded, ok := countRow(src,
 		`SELECT COUNT(*) FROM (SELECT DISTINCT image_id FROM image_lookups) l
 		 JOIN images i ON i.id = l.image_id AND i.is_missing = 0`,
-	).Scan(&recorded); err != nil {
+	)
+	if !ok {
 		return 0, false
 	}
 	return max(visible-recorded, 0), true
 }
 
-func fastCountCat(database *db.DB, e FilterExpr) (int, bool) {
-	var n int
-	if err := database.Read.QueryRow(
+func fastCountCat(src Source, e FilterExpr) (int, bool) {
+	n, ok := countRow(src,
 		`SELECT COALESCE(SUM(usage_count), 0) FROM tags
 		 WHERE is_alias = 0
 		   AND category_id = (SELECT id FROM tag_categories WHERE name = ?)`,
-		e.Val,
-	).Scan(&n); err != nil {
+		strings.ToLower(e.Val),
+	)
+	if !ok {
 		return 0, false
 	}
 	if n < fastApproxThreshold {
@@ -285,22 +357,22 @@ func fastCountCat(database *db.DB, e FilterExpr) (int, bool) {
 	return n, true
 }
 
-func fastCountFilter(database *db.DB, e FilterExpr) (int, bool) {
+func fastCountFilter(src Source, e FilterExpr) (int, bool) {
 	if e.Val == "" {
 		return 0, false
 	}
 	if fn, ok := fastCountFilters[e.Key]; ok {
-		return fn(database, e)
+		return fn(src, e)
 	}
 	if searchkw.IsKeyword(e.Key) {
 		return 0, false
 	}
-	catID, ok, err := tags.CategoryIDByName(database, e.Key)
+	catID, ok, err := tags.CategoryIDByName(src.DB, e.Key)
 	if !ok || err != nil {
 		return 0, false
 	}
 	var n int
-	err = database.Read.QueryRow(
+	err = src.DB.Read.QueryRow(
 		`SELECT canon.usage_count FROM tags t
 		 JOIN tags canon ON canon.id = COALESCE(t.canonical_tag_id, t.id)
 		 WHERE t.name = ? AND t.category_id = ?
@@ -318,14 +390,14 @@ func fastCountFilter(database *db.DB, e FilterExpr) (int, bool) {
 
 // usage_count bounds rating:X from above, exactly for the top level; an
 // image carrying two ratings only over-counts.
-func fastCountRating(database *db.DB, e FilterExpr) (int, bool) {
+func fastCountRating(src Source, e FilterExpr) (int, bool) {
 	level := strings.ToLower(e.Val)
 	rank := tags.RatingRank(level)
 	if rank < 0 {
 		return 0, true
 	}
 	var n int
-	err := database.Read.QueryRow(
+	err := src.DB.Read.QueryRow(
 		`SELECT t.usage_count FROM tags t
 		 JOIN tag_categories tc ON tc.id = t.category_id
 		 WHERE tc.name = 'rating' AND t.is_alias = 0 AND t.name = ?`,
@@ -349,11 +421,10 @@ func fastCountRating(database *db.DB, e FilterExpr) (int, bool) {
 }
 
 // '0' sorts right after '/', so [X/, X0) holds exactly the paths under X.
-func fastCountFolder(database *db.DB, e FilterExpr) (int, bool) {
+func fastCountFolder(src Source, e FilterExpr) (int, bool) {
 	rangeLo := e.Val + "/"
 	rangeHi := e.Val + "0"
-	var n int
-	if err := database.Read.QueryRow(
+	return countRow(src,
 		`SELECT (
 		     (SELECT COUNT(*) FROM images
 		        WHERE folder_path = ? COLLATE NOCASE AND is_missing = 0)
@@ -363,15 +434,12 @@ func fastCountFolder(database *db.DB, e FilterExpr) (int, bool) {
 		          AND is_missing = 0)
 		 )`,
 		e.Val, rangeLo, rangeHi,
-	).Scan(&n); err != nil {
-		return 0, false
-	}
-	return n, true
+	)
 }
 
 // The LIKE-OR matches no index, so the few distinct source_type values
 // are matched in Go and the count takes an IN over them.
-func fastCountAI(database *db.DB, e FilterExpr) (int, bool) {
+func fastCountAI(src Source, e FilterExpr) (int, bool) {
 	val := strings.ToLower(e.Val)
 	if val == "sd" {
 		val = "a1111"
@@ -382,7 +450,7 @@ func fastCountAI(database *db.DB, e FilterExpr) (int, bool) {
 	if !strings.Contains(val, ",") {
 		return 0, false
 	}
-	present, err := db.QueryStrings(database.Read, `SELECT DISTINCT source_type FROM images`)
+	present, err := db.QueryStrings(src.DB.Read, `SELECT DISTINCT source_type FROM images`)
 	if err != nil {
 		return 0, false
 	}
@@ -404,44 +472,30 @@ func fastCountAI(database *db.DB, e FilterExpr) (int, bool) {
 		return 0, true
 	}
 	placeholders, args := db.InPlaceholders(matching)
-	var n int
-	if err := database.Read.QueryRow(
+	return countRow(src,
 		`SELECT COUNT(*) FROM images WHERE source_type IN (`+placeholders+`) AND is_missing = 0`,
 		args...,
-	).Scan(&n); err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
-func parseBoolVal(v string) (bool, bool) {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "true", "yes", "y", "on", "1":
-		return true, true
-	case "false", "no", "n", "off", "0":
-		return false, true
-	}
-	return false, false
+	)
 }
 
 // Visible minus the cached untagged count; the NOT EXISTS behind it is
 // too slow to run per search.
-func fastCountTagged(database *db.DB, e FilterExpr) (int, bool) {
+func fastCountTagged(src Source, e FilterExpr) (int, bool) {
 	if e.Val != "" {
-		val, ok := parseBoolVal(e.Val)
+		val, ok := searchkw.ParseBool(e.Val)
 		if !ok || !val {
 			return 0, false
 		}
 	}
-	visible, ok := fastVisibleCount(database)
+	visible, ok := fastVisibleCount(src)
 	if !ok {
 		return 0, false
 	}
 	var untagged int
 	if e.Key == "autotagged" {
-		untagged, ok = counts.AutoUntaggedVisibleCount(database)
+		untagged, ok = src.Tallies.AutoUntaggedVisibleCount()
 	} else {
-		untagged, ok = counts.UntaggedVisibleCount(database)
+		untagged, ok = src.Tallies.UntaggedVisibleCount()
 	}
 	if !ok {
 		return 0, false
@@ -450,8 +504,8 @@ func fastCountTagged(database *db.DB, e FilterExpr) (int, bool) {
 }
 
 // Ungated: idx_images_inbox_visible is exact at any size.
-func fastCountInbox(database *db.DB, e FilterExpr) (int, bool) {
-	val, ok := parseBoolVal(e.Val)
+func fastCountInbox(src Source, e FilterExpr) (int, bool) {
+	val, ok := searchkw.ParseBool(e.Val)
 	if !ok {
 		// The filter emits 1=0 for a non-boolean, so zero is exact.
 		return 0, true
@@ -460,20 +514,13 @@ func fastCountInbox(database *db.DB, e FilterExpr) (int, bool) {
 	if val {
 		target = 1
 	}
-	var n int
-	if err := database.Read.QueryRow(
-		`SELECT COUNT(*) FROM images WHERE is_missing = 0 AND is_inbox = ?`, target,
-	).Scan(&n); err != nil {
-		return 0, false
-	}
-	return n, true
+	return countRow(src, `SELECT COUNT(*) FROM images WHERE is_missing = 0 AND is_inbox = ?`, target)
 }
 
 // Seeks the genhash indexes instead of an EXISTS per visible image.
 // UNION, not UNION ALL: an image can carry both metadata kinds.
-func fastCountGenerated(database *db.DB, e FilterExpr) (int, bool) {
-	var n int
-	if err := database.Read.QueryRow(
+func fastCountGenerated(src Source, e FilterExpr) (int, bool) {
+	return countRow(src,
 		`SELECT COUNT(*) FROM (
 		     SELECT sm.image_id FROM sd_metadata sm
 		       JOIN images i ON i.id = sm.image_id
@@ -484,10 +531,15 @@ func fastCountGenerated(database *db.DB, e FilterExpr) (int, bool) {
 		       WHERE cm.generation_hash = ? AND i.is_missing = 0
 		 )`,
 		e.Val, e.Val,
-	).Scan(&n); err != nil {
+	)
+}
+
+func countRow(src Source, query string, args ...any) (int, bool) {
+	var n int
+	if err := src.DB.Read.QueryRow(query, args...).Scan(&n); err != nil {
 		return 0, false
 	}
 	return n, true
 }
 
-func fastVisibleCount(database *db.DB) (int, bool) { return counts.VisibleCount(database) }
+func fastVisibleCount(src Source) (int, bool) { return src.Tallies.VisibleCount() }

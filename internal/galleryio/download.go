@@ -58,12 +58,7 @@ func addDownloadFile(zw *zip.Writer, e DownloadEntry) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// Media is already compressed; a deflate pass would spend CPU for nothing.
-	entry, err := zw.CreateHeader(&zip.FileHeader{Name: e.Name, Method: zip.Store, Modified: info.ModTime()})
-	if err != nil {
-		return false, err
-	}
-	if _, err := io.Copy(entry, f); err != nil {
+	if err := storeEntry(zw, f, e.Name, info); err != nil {
 		return false, err
 	}
 	return true, nil

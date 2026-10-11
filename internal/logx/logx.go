@@ -31,6 +31,17 @@ func Set(name string) {
 	level.Store(int32(l))
 }
 
+// Get returns the level's name in the form Set takes.
+func Get() string {
+	switch Level(level.Load()) {
+	case LevelDebug:
+		return "debug"
+	case LevelInfo:
+		return "info"
+	}
+	return "warn"
+}
+
 func Enabled(l Level) bool { return l >= Level(level.Load()) }
 
 func Debugf(format string, a ...any) {

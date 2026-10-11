@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"mime"
 	"os"
 	"path/filepath"
@@ -82,24 +83,41 @@ var ErrUnsupportedType = errors.New("unsupported file type")
 // maps no type to them does not hide those files.
 const SupportedMIMETypes = "image/jpeg,image/png,image/webp,image/avif,image/jxl,.avif,.jxl,image/gif,video/mp4,video/webm,application/vnd.comicbook+zip,application/zip,application/x-cbz"
 
-// UniqueDestPath's stat check is racy: a caller that must not clobber a
-// file opens with O_CREATE|O_EXCL.
-func UniqueDestPath(destDir, filename string) string {
-	return uniquePathBy(destDir, filename, uploadSuffix)
+// CreateUnique creates an empty file under filename, suffixed while the
+// name is taken, and returns its path: the caller writes over its own
+// reservation, so two writers never share one name.
+func CreateUnique(dir, filename string) (string, error) {
+	return createUniqueBy(dir, filename, uploadSuffix)
+}
+
+func createUniqueBy(dir, filename string, nameNth func(stem, ext string, i int) string) (string, error) {
+	ext := filepath.Ext(filename)
+	stem := strings.TrimSuffix(filename, ext)
+	p := filepath.Join(dir, filename)
+	for i := 1; ; i++ {
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		if err == nil {
+			if err := f.Close(); err != nil {
+				_ = os.Remove(p)
+				return "", err
+			}
+			return p, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+		p = filepath.Join(dir, nameNth(stem, ext, i))
+	}
 }
 
 func uploadSuffix(stem, ext string, i int) string { return fmt.Sprintf("%s_%d%s", stem, i, ext) }
 
-func uniquePathBy(dir, filename string, nameNth func(stem, ext string, i int) string) string {
-	return uniquePathIn(dir, filename, nil, nameNth)
-}
-
-func uniquePathIn(dir, filename string, claimed map[string]struct{}, nameNth func(stem, ext string, i int) string) string {
+func uniquePathIn(dir, filename string, planned map[string]bool, nameNth func(stem, ext string, i int) string) string {
 	// Any stat error counts as free: a name the filesystem refuses would
 	// be refused at every suffix, and the loop would never end.
 	free := func(p string) bool {
-		if _, taken := claimed[p]; taken {
-			return false
+		if taken, ok := planned[p]; ok {
+			return !taken
 		}
 		_, err := os.Stat(p)
 		return err != nil
@@ -223,29 +241,25 @@ func detectMagic(buf []byte) (string, error) {
 		return "", ErrUnsupportedType
 	}
 
-	if buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF {
+	if bytes.HasPrefix(buf, []byte{0xFF, 0xD8, 0xFF}) {
 		return models.FileTypeJPEG, nil
 	}
-	if len(buf) >= 8 &&
-		buf[0] == 0x89 && buf[1] == 0x50 && buf[2] == 0x4E && buf[3] == 0x47 &&
-		buf[4] == 0x0D && buf[5] == 0x0A && buf[6] == 0x1A && buf[7] == 0x0A {
+	if bytes.HasPrefix(buf, []byte("\x89PNG\r\n\x1a\n")) {
 		return models.FileTypePNG, nil
 	}
-	if buf[0] == 0x47 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x38 {
+	if bytes.HasPrefix(buf, []byte("GIF8")) {
 		return models.FileTypeGIF, nil
 	}
-	if len(buf) >= 12 &&
-		buf[0] == 0x52 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x46 &&
-		buf[8] == 0x57 && buf[9] == 0x45 && buf[10] == 0x42 && buf[11] == 0x50 {
+	if len(buf) >= 12 && string(buf[:4]) == "RIFF" && string(buf[8:12]) == "WEBP" {
 		return models.FileTypeWEBP, nil
 	}
-	if (buf[0] == 0xFF && buf[1] == 0x0A) || bytes.HasPrefix(buf, jxlContainer) {
+	if bytes.HasPrefix(buf, []byte{0xFF, 0x0A}) || bytes.HasPrefix(buf, jxlContainer) {
 		return models.FileTypeJXL, nil
 	}
 	// Brands, not the bare ftyp box: .mov, .heic and .3gp would pass as
 	// MP4 and fail in the browser. AVIF is asked first, by its own
 	// brands: the mif1 it also lists is HEIC's too.
-	if len(buf) >= 12 && buf[4] == 0x66 && buf[5] == 0x74 && buf[6] == 0x79 && buf[7] == 0x70 {
+	if len(buf) >= 12 && string(buf[4:8]) == "ftyp" {
 		if hasFtypBrand(buf, "avif", "avis") {
 			return models.FileTypeAVIF, nil
 		}
@@ -253,11 +267,10 @@ func detectMagic(buf []byte) (string, error) {
 			return models.FileTypeMP4, nil
 		}
 	}
-	if buf[0] == 0x1A && buf[1] == 0x45 && buf[2] == 0xDF && buf[3] == 0xA3 {
+	if bytes.HasPrefix(buf, []byte{0x1A, 0x45, 0xDF, 0xA3}) {
 		return models.FileTypeWEBM, nil
 	}
-	if buf[0] == 0x50 && buf[1] == 0x4B &&
-		(buf[2] == 0x03 && buf[3] == 0x04 || buf[2] == 0x05 && buf[3] == 0x06) {
+	if bytes.HasPrefix(buf, []byte("PK\x03\x04")) || bytes.HasPrefix(buf, []byte("PK\x05\x06")) {
 		return models.FileTypeCBZ, nil
 	}
 

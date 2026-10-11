@@ -115,7 +115,6 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 		writeRelationError(w, err)
 		return
 	}
-	g.invalidate()
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -154,10 +153,19 @@ func (h *Handler) removeRelation(w http.ResponseWriter, r *http.Request) {
 		}
 		err = g.RelationsSvc.RemoveAltMember(body.ImageID)
 	case "version":
+		if !requireID(w, body.A, "a") || !requireID(w, body.B, "b") {
+			return
+		}
 		err = g.RelationsSvc.RemoveVersionEdge(body.A, body.B)
 	case "derivative":
+		if !requireID(w, body.A, "a") || !requireID(w, body.B, "b") {
+			return
+		}
 		err = g.RelationsSvc.RemoveDerivativeEdge(body.A, body.B)
 	case "not_related":
+		if !requireID(w, body.A, "a") || !requireID(w, body.B, "b") {
+			return
+		}
 		err = g.RelationsSvc.RemoveNotRelated(body.A, body.B)
 	case "dissolve_dup":
 		if !requireID(w, body.GroupID, "group_id") {
@@ -192,7 +200,6 @@ func (h *Handler) removeRelation(w http.ResponseWriter, r *http.Request) {
 		writeRelationError(w, err)
 		return
 	}
-	g.invalidate()
 	w.WriteHeader(http.StatusNoContent)
 }
 

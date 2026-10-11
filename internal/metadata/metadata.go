@@ -4,7 +4,9 @@
 package metadata
 
 import (
+	"maps"
 	"os"
+	"slices"
 	"sort"
 
 	"github.com/monbooru/monbooru/internal/models"
@@ -50,17 +52,12 @@ func genericFromPNG(path string) []models.SDParam {
 	if err != nil {
 		return nil
 	}
-	skip := map[string]bool{"parameters": true, "prompt": true, "workflow": true}
-	keys := make([]string, 0, len(chunks))
-	for k := range chunks {
-		if skip[k] {
+	out := make([]models.SDParam, 0, len(chunks))
+	for _, k := range slices.Sorted(maps.Keys(chunks)) {
+		switch k {
+		case "parameters", "prompt", "workflow":
 			continue
 		}
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([]models.SDParam, 0, len(keys))
-	for _, k := range keys {
 		out = append(out, models.SDParam{Key: k, Val: chunks[k]})
 	}
 	return out
@@ -76,12 +73,11 @@ func genericFromEXIF(path string) []models.SDParam {
 
 func collectEXIFTags(x *exifData) []models.SDParam {
 	out := make([]models.SDParam, 0, len(x.tags))
-	x.walk(func(name string, tag *exifTag) {
-		if name == userCommentField {
-			return
+	for name, tag := range x.tags {
+		if name != userCommentField {
+			out = append(out, models.SDParam{Key: name, Val: tag.String()})
 		}
-		out = append(out, models.SDParam{Key: name, Val: tag.String()})
-	})
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }
@@ -97,7 +93,7 @@ func EXIFOrientation(path, fileType string) (int, bool) {
 	if x == nil {
 		return 0, false
 	}
-	tag, ok := x.get("Orientation")
+	tag, ok := x.tags["Orientation"]
 	if !ok {
 		return 0, false
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/schedule"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -51,12 +52,12 @@ type settingsData struct {
 	Config             *config.Config
 	Taggers            []tagger.TaggerStatus
 	TaggerRows         []taggerRow
-	ScheduleStatus     ScheduleStatus
+	ScheduleStatus     schedule.Status
 	ScheduleScope      scheduleScope
 	Stats              statsData
 	ExecutionProviders []executionProviderRow
 	ScheduleModes      []scheduleModeRow
-	PluginPending      []pairReq
+	PluginPending      []pendingOffer
 	PluginPaired       int
 	PluginRows         []pluginRowView
 	PluginsDir         string
@@ -70,7 +71,7 @@ type settingsData struct {
 
 func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	base := s.base(r, "settings", "Settings - "+s.booruName())
-	s.disableUnavailableTaggers()
+	s.disableMissingTaggers()
 	s.persistNewlyDiscoveredTaggers()
 	taggers := tagger.AvailableTaggers(s.cfgSnapshot())
 	modelPath := s.modelPath()
@@ -84,26 +85,16 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	catalogNames := map[string]bool{}
 	for _, e := range catalog {
 		catalogNames[e.Name] = true
+		row := taggerRow{Name: e.Name, Files: e.Files, TargetDir: filepath.Join(modelPath, e.Name)}
 		if t, installed := taggerByName[e.Name]; installed {
-			row := s.installedTaggerRow(t, totalGalleries, modelPath)
-			row.Supported = true
-			row.Description = e.Description
-			row.Gated = e.Gated
-			row.HostCommand = e.HostCommand()
-			row.DockerCommand = e.DockerCommand("monbooru")
-			supportedRows = append(supportedRows, row)
-		} else {
-			supportedRows = append(supportedRows, taggerRow{
-				Name:          e.Name,
-				Description:   e.Description,
-				Supported:     true,
-				Gated:         e.Gated,
-				HostCommand:   e.HostCommand(),
-				DockerCommand: e.DockerCommand("monbooru"),
-				Files:         e.Files,
-				TargetDir:     filepath.Join(modelPath, e.Name),
-			})
+			row = s.installedTaggerRow(t, totalGalleries, modelPath)
 		}
+		row.Supported = true
+		row.Description = e.Description
+		row.Gated = e.Gated
+		row.HostCommand = e.HostCommand()
+		row.DockerCommand = e.DockerCommand("monbooru")
+		supportedRows = append(supportedRows, row)
 	}
 	for _, t := range taggers {
 		if catalogNames[t.Name] {
@@ -118,12 +109,12 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		Config:             s.cfgSnapshot(),
 		Taggers:            taggers,
 		TaggerRows:         taggerRows,
-		ScheduleStatus:     s.scheduleStatus(),
+		ScheduleStatus:     s.sched.Status(),
 		ScheduleScope:      scheduleScopeView(s.cfgSnapshot(), base.MonloaderPaired),
 		Stats:              s.gatherStats(),
 		ExecutionProviders: executionProviderRows(),
 		ScheduleModes:      scheduleModeRows(),
-		PluginPending:      s.pairs.listPending(),
+		PluginPending:      s.pendingOffers(),
 		PluginPaired:       s.pairedPeerCount(),
 		PluginRows:         s.pluginRows(),
 		PluginsDir:         s.pluginsDir(),
@@ -140,8 +131,7 @@ func (s *Server) settingsSchedulePost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	timeVal := strings.TrimSpace(r.FormValue("time"))
-	timeVal = cmp.Or(timeVal, "01:00")
+	timeVal := cmp.Or(strings.TrimSpace(r.FormValue("time")), "01:00")
 	if err := config.ValidateScheduleTime(timeVal); err != nil {
 		writeInlineFlash(w, "err", err.Error())
 		return
@@ -169,11 +159,11 @@ func (s *Server) settingsSchedulePost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
-	s.sched.requestReload()
+	s.sched.RequestReload()
 	logx.Infof("settings: schedule updated (time=%s mode=%s)", timeVal, mode)
 	writeInlineFlash(w, "ok", "Saved.")
 	s.renderTemplate(w, "partials/schedule_status.html", map[string]any{
-		"Status": s.scheduleStatus(),
+		"Status": s.sched.Status(),
 		"OOB":    true,
 	})
 }
@@ -281,7 +271,7 @@ func (s *Server) settingsScheduleRunPost(w http.ResponseWriter, r *http.Request)
 		writeInlineFlash(w, "err", "A job is already running.")
 		return
 	}
-	go s.runScheduledActions()
+	go s.sched.RunNow()
 	writeInlineFlash(w, "ok", "Started. Watch the job status bar.")
 }
 
@@ -323,14 +313,18 @@ func (s *Server) settingsGeneralPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfgMu.Lock()
-	s.cfg.Gallery.WatchEnabled = r.FormValue("watch_enabled") == "on"
-	if n, err := strconv.Atoi(r.FormValue("max_file_size_mb")); err == nil && n >= 0 {
+	if s.cfg.EnvPinned("gallery.watch_enabled") == "" {
+		s.cfg.Gallery.WatchEnabled = r.FormValue("watch_enabled") == "on"
+	}
+	if n, err := strconv.Atoi(r.FormValue("max_file_size_mb")); err == nil && n >= 0 && s.cfg.EnvPinned("gallery.max_file_size_mb") == "" {
 		s.cfg.Gallery.MaxFileSizeMB = n
 	}
 	s.cfg.Gallery.DefaultUploadFolder = uploadFolder
 	s.cfg.Gallery.DefaultUploadName = uploadName
 	s.cfg.Gallery.RenameOnIngest = r.FormValue("rename_on_ingest") == "on"
-	s.cfg.Gallery.AutoMetaTags = r.FormValue("auto_meta_tags") == "on"
+	if s.cfg.EnvPinned("gallery.auto_meta_tags") == "" {
+		s.cfg.Gallery.AutoMetaTags = r.FormValue("auto_meta_tags") == "on"
+	}
 	if n, err := strconv.Atoi(r.FormValue("page_size")); err == nil && n > 0 {
 		s.cfg.UI.PageSize = min(n, config.MaxPageSize)
 	}
@@ -359,7 +353,7 @@ func (s *Server) settingsIgnorePost(w http.ResponseWriter, r *http.Request) {
 	}
 	uploadFolder := s.cfgSnapshot().Gallery.DefaultUploadFolder
 	if tmpl, err := gallery.ParseNameTemplate(uploadFolder, gallery.ScopeUploadFolder); err == nil && !tmpl.HasTokens() {
-		if _, err := s.drawBoundaries(ignore)[s.activeGallery()].ResolveSubdir(uploadFolder); err != nil {
+		if _, err := s.set.Draw(ignore)[s.activeGallery()].ResolveSubdir(uploadFolder); err != nil {
 			writeInlineFlash(w, "err", "Received files go to a folder this list leaves out: "+err.Error()+".")
 			return
 		}
@@ -374,7 +368,7 @@ func (s *Server) settingsIgnorePost(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := "Saved."
 	if changed {
-		s.rebuildBoundaries()
+		s.set.Redraw()
 		msg = "Saved. A sync applies the ignore list to what is already indexed."
 	}
 	logx.Infof("settings: ignore list updated")
@@ -387,8 +381,12 @@ func (s *Server) settingsMonloaderPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfgMu.Lock()
-	s.cfg.Server.MonloaderURL = strings.TrimSpace(r.FormValue("monloader_url"))
-	s.cfg.Monloader.APIURL = strings.TrimSpace(r.FormValue("api_url"))
+	if s.cfg.EnvPinned("server.monloader_url") == "" {
+		s.cfg.Server.MonloaderURL = strings.TrimSpace(r.FormValue("monloader_url"))
+	}
+	if s.cfg.EnvPinned("monloader.api_url") == "" {
+		s.cfg.Monloader.APIURL = strings.TrimSpace(r.FormValue("api_url"))
+	}
 	s.cfgMu.Unlock()
 	if err := s.saveConfig(); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
@@ -400,6 +398,10 @@ func (s *Server) settingsMonloaderPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
+		return
+	}
+	if v := s.passwordPinned(); v != "" {
+		writeInlineFlash(w, "err", "The password is set by "+v+" in the environment.")
 		return
 	}
 	currentPass := r.FormValue("current_password")
@@ -463,12 +465,8 @@ func (s *Server) settingsTokenCreate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) tokenPaired(id string) bool {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
-	for _, t := range s.cfg.Auth.Tokens {
-		if t.ID == id {
-			return t.Paired != ""
-		}
-	}
-	return false
+	i := slices.IndexFunc(s.cfg.Auth.Tokens, func(t config.Token) bool { return t.ID == id })
+	return i >= 0 && s.cfg.Auth.Tokens[i].Paired != ""
 }
 
 func (s *Server) settingsTokenRevoke(w http.ResponseWriter, r *http.Request) {
@@ -499,9 +497,8 @@ func (s *Server) renderAuthTokensOOB(w http.ResponseWriter, r *http.Request) {
 	tokens := slices.Clone(s.cfg.Auth.Tokens)
 	s.cfgMu.Unlock()
 	s.renderTemplate(w, "partials/auth_tokens.html", map[string]any{
-		"Tokens":    tokens,
-		"CSRFToken": s.csrfToken(sessionFromContext(r.Context())),
-		"OOB":       true,
+		"Tokens": tokens,
+		"OOB":    true,
 	})
 }
 
@@ -515,17 +512,14 @@ func (s *Server) settingsTokenPrivilegesGet(w http.ResponseWriter, r *http.Reque
 	id := r.PathValue("id")
 	s.cfgMu.Lock()
 	var scopes []string
-	var found, paired bool
-	for _, t := range s.cfg.Auth.Tokens {
-		if t.ID == id {
-			scopes = slices.Clone(t.Scopes)
-			paired = t.Paired != ""
-			found = true
-			break
-		}
+	var paired bool
+	i := slices.IndexFunc(s.cfg.Auth.Tokens, func(t config.Token) bool { return t.ID == id })
+	if i >= 0 {
+		scopes = slices.Clone(s.cfg.Auth.Tokens[i].Scopes)
+		paired = s.cfg.Auth.Tokens[i].Paired != ""
 	}
 	s.cfgMu.Unlock()
-	if !found {
+	if i < 0 {
 		http.Error(w, "token not found", http.StatusNotFound)
 		return
 	}
@@ -539,10 +533,9 @@ func (s *Server) settingsTokenPrivilegesGet(w http.ResponseWriter, r *http.Reque
 		rows = append(rows, tokenScopeRow{Name: sc, Desc: descs[sc], Checked: slices.Contains(scopes, sc)})
 	}
 	s.renderTemplate(w, "partials/token_privileges_dialog.html", map[string]any{
-		"ID":        id,
-		"Scopes":    rows,
-		"CSRFToken": s.csrfToken(sessionFromContext(r.Context())),
-		"Paired":    paired,
+		"ID":     id,
+		"Scopes": rows,
+		"Paired": paired,
 	})
 }
 
@@ -555,7 +548,7 @@ func (s *Server) settingsTokenPrivilegesPost(w http.ResponseWriter, r *http.Requ
 		writeInlineFlash(w, "err", "This token is managed by a pairing; its privileges can't be changed.")
 		return
 	}
-	scopes := filterScopes(r.Form["scope"])
+	scopes := config.FilterScopes(r.Form["scope"])
 	var found bool
 	if err := s.withConfig(func(c *config.Config) error {
 		found = c.SetTokenScopes(id, scopes)
@@ -573,18 +566,12 @@ func (s *Server) settingsTokenPrivilegesPost(w http.ResponseWriter, r *http.Requ
 	writeOOBSummaryFlash(w, "token-scopes-"+id, strings.Join(scopes, " "), "flash-auth", "Token privileges saved.")
 }
 
-func filterScopes(in []string) []string {
-	var out []string
-	for _, sc := range config.AllScopes {
-		if slices.Contains(in, sc) {
-			out = append(out, sc)
-		}
-	}
-	return out
-}
-
 func (s *Server) settingsRemovePasswordPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
+		return
+	}
+	if v := s.passwordPinned(); v != "" {
+		writeInlineFlash(w, "err", "The password is set by "+v+" in the environment.")
 		return
 	}
 	// Whenever a hash is set, even with the password turned off in the

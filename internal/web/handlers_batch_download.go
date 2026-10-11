@@ -1,6 +1,7 @@
 package web
 
 import (
+	"cmp"
 	"database/sql"
 	"io"
 	"mime"
@@ -14,6 +15,7 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/galleryio"
+	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/search"
 )
@@ -59,8 +61,8 @@ func (s *Server) batchDownload(w http.ResponseWriter, r *http.Request) {
 // by path only, and a switch queued behind a long download would stall
 // every request after it.
 func (s *Server) planDownload(w http.ResponseWriter, r *http.Request) (*activeDownload, *downloadPlan, bool) {
-	s.ctxMu.RLock()
-	defer s.ctxMu.RUnlock()
+	s.set.RLock()
+	defer s.set.RUnlock()
 	if pageGalleryStale(w, r, s.activeGallery()) {
 		return nil, nil, false
 	}
@@ -165,7 +167,7 @@ func scanDownloadRow(r *sql.Rows) (downloadRow, error) {
 }
 
 // A path outside the gallery root is left out, as the byte routes refuse it.
-func downloadable(cx *galleryCtx, ids []int64, rows map[int64]downloadRow) (kept []downloadRow, left int) {
+func downloadable(cx *library.Gallery, ids []int64, rows map[int64]downloadRow) (kept []downloadRow, left int) {
 	for _, id := range ids {
 		row, found := rows[id]
 		if !found || row.missing || !gallery.NamedInside(cx.GalleryPath, row.path) {
@@ -178,10 +180,7 @@ func downloadable(cx *galleryCtx, ids []int64, rows map[int64]downloadRow) (kept
 }
 
 func downloadZipName(q, galleryName string) string {
-	label := galleryName
-	if pinned := search.PinnedCollectionName(search.Parse(q)); pinned != "" {
-		label = pinned
-	}
+	label := cmp.Or(search.PinnedCollectionName(search.Parse(q)), galleryName)
 	return time.Now().Format("20060102-150405") + "-" + sanitizeCollectionFilename(label) + ".zip"
 }
 

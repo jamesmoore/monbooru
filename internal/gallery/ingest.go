@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -35,13 +36,28 @@ func FolderPath(galleryPath, filePath string) string {
 
 // Ingest's bool reports a duplicate of an existing image; an empty origin
 // records OriginIngest.
-func Ingest(database *db.DB, galleryPath, thumbnailsPath, path, origin string) (*models.Image, bool, error) {
+func Ingest(h Handle, path, origin string) (*models.Image, bool, error) {
+	img, out, err := ingestPath(h, path, origin)
+	return img, out == ingestDuplicate, err
+}
+
+type ingestOutcome int
+
+const (
+	ingestCreated ingestOutcome = iota
+	ingestDuplicate
+	ingestMoved
+	ingestRestored
+	ingestEdited
+)
+
+func ingestPath(h Handle, path, origin string) (*models.Image, ingestOutcome, error) {
 	hash, sum, err := hashFileDigests(path)
 	if err != nil {
-		return nil, false, fmt.Errorf("hashing file: %w", err)
+		return nil, ingestCreated, fmt.Errorf("hashing file: %w", err)
 	}
-	claimOwnership(galleryPath, path)
-	return ingestWithHash(database, galleryPath, thumbnailsPath, path, hash, sum, origin)
+	claimOwnership(h.GalleryPath, path)
+	return ingestWithHash(h, path, hash, sum, origin)
 }
 
 func decodeImageDimensions(path string) (w, h *int) {
@@ -69,12 +85,32 @@ func stillDimensions(path, fileType string) (w, h *int) {
 }
 
 // The caller supplies path's digests and claims its ownership.
-func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, sum, origin string) (*models.Image, bool, error) {
+func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, ingestOutcome, error) {
+	database, galleryPath, thumbnailsPath := h.DB, h.GalleryPath, h.ThumbnailsPath
 	origin = cmp.Or(origin, models.OriginIngest)
-	var existingID int64
-	err := database.Read.QueryRow(
-		`SELECT id FROM images WHERE sha256 = ?`, hash,
-	).Scan(&existingID)
+
+	// The path's own row decides first: by SHA alone, a file renamed over
+	// another would read as a move of that other image onto this path.
+	var prevID int64
+	var prevCanonical int
+	var prevSHA string
+	switch pathErr := database.Read.QueryRow(
+		`SELECT ip.image_id, ip.is_canonical, i.sha256 FROM image_paths ip JOIN images i ON i.id = ip.image_id WHERE ip.path = ?`, path,
+	).Scan(&prevID, &prevCanonical, &prevSHA); {
+	case pathErr == sql.ErrNoRows, pathErr == nil && prevSHA == hash:
+	case pathErr != nil:
+		return nil, ingestCreated, fmt.Errorf("checking image_paths: %w", pathErr)
+	case prevCanonical == 1:
+		return ingestInPlaceEdit(h, path, hash, sum, prevID)
+	default:
+		// A rewritten alias: the image keeps its own file, and this path
+		// is classified afresh.
+		if _, delErr := database.Write.Exec(`DELETE FROM image_paths WHERE path = ? AND is_canonical = 0`, path); delErr != nil {
+			return nil, ingestCreated, fmt.Errorf("dropping stale alias path: %w", delErr)
+		}
+	}
+
+	existingID, err := ImageIDBySHA(database.Read, hash)
 
 	if err == nil {
 		var img models.Image
@@ -84,7 +120,7 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			existingID,
 		).Scan(&img.ID, &img.SHA256, &img.CanonicalPath, &img.FolderPath, &img.FileType, &img.FileSize, &isMissingInt)
 		if scanErr != nil {
-			return nil, true, fmt.Errorf("looking up duplicate image %d: %w", existingID, scanErr)
+			return nil, ingestDuplicate, fmt.Errorf("looking up duplicate image %d: %w", existingID, scanErr)
 		}
 		img.IsMissing = isMissingInt == 1
 
@@ -92,33 +128,24 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			newFolder := FolderPath(galleryPath, path)
 			tx, txErr := database.Write.Begin()
 			if txErr != nil {
-				return nil, false, fmt.Errorf("begin reactivation tx: %w", txErr)
+				return nil, ingestCreated, fmt.Errorf("begin reactivation tx: %w", txErr)
 			}
 			defer func() { _ = tx.Rollback() }()
 			if err := repointCanonical(tx, existingID, path, newFolder, ""); err != nil {
-				return nil, false, fmt.Errorf("reactivate image: %w", err)
+				return nil, ingestCreated, fmt.Errorf("reactivate image: %w", err)
 			}
 			if _, err := tx.Exec(`UPDATE images SET md5 = ? WHERE id = ?`, sum, existingID); err != nil {
-				return nil, false, fmt.Errorf("reactivate image md5: %w", err)
-			}
-			// usage_count counts visible images, so every tag still
-			// attached gets back the slot the missing mark took.
-			if _, err := tx.Exec(
-				`UPDATE tags SET usage_count = usage_count + 1
-				 WHERE id IN (SELECT tag_id FROM image_tags WHERE image_id = ?)`,
-				existingID,
-			); err != nil {
-				return nil, false, fmt.Errorf("restore usage counts: %w", err)
+				return nil, ingestCreated, fmt.Errorf("reactivate image md5: %w", err)
 			}
 			if err := tx.Commit(); err != nil {
-				return nil, false, fmt.Errorf("commit reactivation: %w", err)
+				return nil, ingestCreated, fmt.Errorf("commit reactivation: %w", err)
 			}
-			_ = Generate(path, thumbnailsPath, existingID, img.FileType)
+			_ = generate(path, thumbnailsPath, existingID, img.FileType)
 			img.IsMissing = false
 			img.CanonicalPath = path
 			img.FolderPath = newFolder
 			logx.Infof("ingest: reactivated previously missing image id=%d path=%q", existingID, path)
-			return &img, false, nil
+			return &img, ingestRestored, nil
 		}
 
 		// The old canonical is gone, so this is a move: the old path kept
@@ -127,19 +154,19 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			newFolder := FolderPath(galleryPath, path)
 			tx, txErr := database.Write.Begin()
 			if txErr != nil {
-				return nil, false, fmt.Errorf("begin promote tx: %w", txErr)
+				return nil, ingestCreated, fmt.Errorf("begin promote tx: %w", txErr)
 			}
 			defer func() { _ = tx.Rollback() }()
 			if err := repointCanonical(tx, existingID, path, newFolder, img.CanonicalPath); err != nil {
-				return nil, false, fmt.Errorf("promote canonical path: %w", err)
+				return nil, ingestCreated, fmt.Errorf("promote canonical path: %w", err)
 			}
 			if err := tx.Commit(); err != nil {
-				return nil, false, fmt.Errorf("commit promote: %w", err)
+				return nil, ingestCreated, fmt.Errorf("commit promote: %w", err)
 			}
 			img.CanonicalPath = path
 			img.FolderPath = newFolder
 			logx.Infof("ingest: promoted alias to canonical for image id=%d (old path gone) %q", existingID, path)
-			return &img, false, nil
+			return &img, ingestMoved, nil
 		}
 
 		_, aliasErr := database.Write.Exec(
@@ -149,10 +176,10 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		if aliasErr != nil {
 			logx.Warnf("ingest alias: %v", aliasErr)
 		}
-		return &img, true, nil
+		return &img, ingestDuplicate, nil
 	}
 	if err != sql.ErrNoRows {
-		return nil, false, fmt.Errorf("checking sha256: %w", err)
+		return nil, ingestCreated, fmt.Errorf("checking sha256: %w", err)
 	}
 
 	// The walk trusts extensions, so the signature decides here whether
@@ -160,42 +187,15 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 	fileType, err := detectMagicType(path)
 	if err != nil {
 		logx.Warnf("ingest: skip %q: contents are not a supported media type", path)
-		return nil, false, fmt.Errorf("ingest %q: %w", path, err)
+		return nil, ingestCreated, fmt.Errorf("ingest %q: %w", path, err)
 	}
 
 	fi, err := os.Stat(path)
 	if err != nil {
-		return nil, false, fmt.Errorf("stat file: %w", err)
+		return nil, ingestCreated, fmt.Errorf("stat file: %w", err)
 	}
 
 	folderPath := FolderPath(galleryPath, path)
-
-	// A path registered under another SHA was rewritten in place;
-	// image_paths.path is UNIQUE, so the insert below would fail.
-	var prevID int64
-	var prevCanonical int
-	switch pathErr := database.Read.QueryRow(
-		`SELECT image_id, is_canonical FROM image_paths WHERE path = ?`, path,
-	).Scan(&prevID, &prevCanonical); {
-	case pathErr == nil && prevCanonical == 1:
-		phash, editErr := applyInPlaceEdit(database, thumbnailsPath, path, hash, sum,
-			fi.ModTime().Unix(), fi.ModTime().UnixNano(), fi.Size())
-		if editErr != nil {
-			return nil, false, editErr
-		}
-		return &models.Image{
-			ID: prevID, SHA256: hash, MD5: sum, CanonicalPath: path, FolderPath: folderPath,
-			FileType: fileType, FileSize: fi.Size(), Phash: phash,
-		}, false, nil
-	case pathErr == nil:
-		// A rewritten alias: the image keeps its own file, and this path
-		// becomes a new image.
-		if _, delErr := database.Write.Exec(`DELETE FROM image_paths WHERE path = ?`, path); delErr != nil {
-			return nil, false, fmt.Errorf("dropping stale alias path: %w", delErr)
-		}
-	case pathErr != sql.ErrNoRows:
-		return nil, false, fmt.Errorf("checking image_paths: %w", pathErr)
-	}
 
 	var imgWidth, imgHeight *int
 	var pageCount *int
@@ -214,7 +214,7 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		archive, openErr := OpenManga(path)
 		if openErr != nil {
 			logx.Warnf("ingest: skip manga %q: %v", path, openErr)
-			return nil, false, fmt.Errorf("ingest manga: %w", openErr)
+			return nil, ingestCreated, fmt.Errorf("ingest manga: %w", openErr)
 		}
 		w, h, dimErr := archive.coverDimensions()
 		if dimErr == nil {
@@ -242,7 +242,7 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 	// SHA since the read-pool check.
 	tx, err := database.Write.Begin()
 	if err != nil {
-		return nil, false, err
+		return nil, ingestCreated, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -252,22 +252,22 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(sha256) DO NOTHING
 		 RETURNING id`,
-		hash, sum, path, folderPath, fileType, toNullInt(imgWidth), toNullInt(imgHeight), fi.Size(), sourceType, origin, toNullInt(pageCount), prefilledSeries, toNullFloat(durationSec),
+		hash, sum, path, folderPath, fileType, imgWidth, imgHeight, fi.Size(), sourceType, origin, pageCount, prefilledSeries, durationSec,
 	).Scan(&imgID)
 
 	if insertErr == sql.ErrNoRows {
-		var existingID int64
-		if err := tx.QueryRow(`SELECT id FROM images WHERE sha256 = ?`, hash).Scan(&existingID); err != nil {
-			return nil, false, fmt.Errorf("race: fetch existing sha: %w", err)
+		existingID, err := ImageIDBySHA(tx, hash)
+		if err != nil {
+			return nil, ingestCreated, fmt.Errorf("race: fetch existing sha: %w", err)
 		}
 		if _, err := tx.Exec(
 			`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 0)`,
 			existingID, path,
 		); err != nil {
-			return nil, false, fmt.Errorf("race: insert alias path: %w", err)
+			return nil, ingestCreated, fmt.Errorf("race: insert alias path: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
-			return nil, false, fmt.Errorf("race: commit alias: %w", err)
+			return nil, ingestCreated, fmt.Errorf("race: commit alias: %w", err)
 		}
 		var img models.Image
 		var isMissingInt int
@@ -275,38 +275,29 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			`SELECT id, sha256, canonical_path, folder_path, file_type, file_size, is_missing FROM images WHERE id = ?`,
 			existingID,
 		).Scan(&img.ID, &img.SHA256, &img.CanonicalPath, &img.FolderPath, &img.FileType, &img.FileSize, &isMissingInt); err != nil {
-			return nil, true, fmt.Errorf("race: reload existing image %d: %w", existingID, err)
+			return nil, ingestDuplicate, fmt.Errorf("race: reload existing image %d: %w", existingID, err)
 		}
 		img.IsMissing = isMissingInt == 1
-		return &img, true, nil
+		return &img, ingestDuplicate, nil
 	}
 	if insertErr != nil {
-		return nil, false, fmt.Errorf("inserting image: %w", insertErr)
+		return nil, ingestCreated, fmt.Errorf("inserting image: %w", insertErr)
 	}
 
 	if _, err := tx.Exec(
 		`INSERT INTO image_paths (image_id, path, is_canonical, mtime_unix, mtime_nsec) VALUES (?, ?, 1, ?, ?)`,
 		imgID, path, fi.ModTime().Unix(), fi.ModTime().UnixNano(),
 	); err != nil {
-		return nil, false, fmt.Errorf("inserting image_path: %w", err)
+		return nil, ingestCreated, fmt.Errorf("inserting image_path: %w", err)
 	}
 
-	if sdMeta != nil {
-		sdMeta.ImageID = imgID
-		if err := insertSDMeta(context.Background(), tx, sdMeta); err != nil {
-			return nil, false, fmt.Errorf("inserting sd_metadata: %w", err)
-		}
-	}
-	if comfyMeta != nil {
-		comfyMeta.ImageID = imgID
-		if err := insertComfyMeta(context.Background(), tx, comfyMeta); err != nil {
-			return nil, false, fmt.Errorf("inserting comfyui_metadata: %w", err)
-		}
+	if err := insertGenerationMetadata(context.Background(), tx, imgID, sdMeta, comfyMeta); err != nil {
+		return nil, ingestCreated, err
 	}
 	if mangaMeta != nil {
 		mangaMeta.ImageID = imgID
 		if err := insertMangaMeta(tx, mangaMeta); err != nil {
-			return nil, false, fmt.Errorf("inserting manga_metadata: %w", err)
+			return nil, ingestCreated, fmt.Errorf("inserting manga_metadata: %w", err)
 		}
 	}
 	if prefilledSeries != "" {
@@ -314,17 +305,17 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 			`INSERT OR IGNORE INTO image_collections (image_id, name, position) VALUES (?, ?, NULL)`,
 			imgID, prefilledSeries,
 		); err != nil {
-			return nil, false, fmt.Errorf("inserting image_collection: %w", err)
+			return nil, ingestCreated, fmt.Errorf("inserting image_collection: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, false, fmt.Errorf("committing ingest: %w", err)
+		return nil, ingestCreated, fmt.Errorf("committing ingest: %w", err)
 	}
 
 	phash := regenerateDerived(database, thumbnailsPath, path, imgID, fileType, "ingest")
 	// After the thumbnail, which is what the greyscale probe reads.
-	if err := ApplyMetaTags(database, thumbnailsPath, imgID); err != nil {
+	if err := ApplyMetaTags(h, imgID); err != nil {
 		logx.Warnf("ingest: meta tags for %q: %v", path, err)
 	}
 
@@ -345,21 +336,41 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, su
 		Series:        prefilledSeries,
 		IngestedAt:    time.Now().UTC(),
 	}
-	return img, false, nil
+	return img, ingestCreated, nil
 }
 
-func toNullInt(v *int) interface{} {
-	if v == nil {
-		return nil
-	}
-	return *v
-}
+var ErrRewritten = errors.New("was rewritten with the bytes of image")
 
-func toNullFloat(v *float64) interface{} {
-	if v == nil {
-		return nil
+// images.sha256 is UNIQUE, and which row the operator meant when a file
+// takes another image's bytes is not ours to guess.
+func ingestInPlaceEdit(h Handle, path, hash, sum string, id int64) (*models.Image, ingestOutcome, error) {
+	var otherID int64
+	var otherPath string
+	switch err := h.DB.Read.QueryRow(
+		`SELECT id, canonical_path FROM images WHERE sha256 = ?`, hash,
+	).Scan(&otherID, &otherPath); {
+	case err == nil:
+		return nil, ingestCreated, fmt.Errorf("%q %w %d at %q; row left as it is", path, ErrRewritten, otherID, otherPath)
+	case err != sql.ErrNoRows:
+		return nil, ingestCreated, fmt.Errorf("checking sha256: %w", err)
 	}
-	return *v
+	fileType, err := detectMagicType(path)
+	if err != nil {
+		logx.Warnf("ingest: skip %q: contents are not a supported media type", path)
+		return nil, ingestCreated, fmt.Errorf("ingest %q: %w", path, err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, ingestCreated, fmt.Errorf("stat file: %w", err)
+	}
+	phash, err := applyInPlaceEdit(h, path, hash, sum, fi.ModTime().Unix(), fi.ModTime().UnixNano(), fi.Size())
+	if err != nil {
+		return nil, ingestCreated, err
+	}
+	return &models.Image{
+		ID: id, SHA256: hash, MD5: sum, CanonicalPath: path, FolderPath: FolderPath(h.GalleryPath, path),
+		FileType: fileType, FileSize: fi.Size(), Phash: phash,
+	}, ingestEdited, nil
 }
 
 // A path that rewrites a file's bytes must store all three.
@@ -376,15 +387,19 @@ func extractGenerationMeta(path, fileType string) (*models.SDMetadata, *models.C
 	return sd, comfy, models.SourceTypeNone
 }
 
-// ReplaceGenerationMetadata drops the old rows even when no new ones
+// replaceGenerationMetadata drops the old rows even when no new ones
 // arrive: a rewrite can strip a recipe.
-func ReplaceGenerationMetadata(ctx context.Context, tx *sql.Tx, imageID int64, sd *models.SDMetadata, comfy *models.ComfyUIMetadata) error {
+func replaceGenerationMetadata(ctx context.Context, tx *sql.Tx, imageID int64, sd *models.SDMetadata, comfy *models.ComfyUIMetadata) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sd_metadata WHERE image_id = ?`, imageID); err != nil {
 		return fmt.Errorf("clear sd_metadata: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM comfyui_metadata WHERE image_id = ?`, imageID); err != nil {
 		return fmt.Errorf("clear comfyui_metadata: %w", err)
 	}
+	return insertGenerationMetadata(ctx, tx, imageID, sd, comfy)
+}
+
+func insertGenerationMetadata(ctx context.Context, tx *sql.Tx, imageID int64, sd *models.SDMetadata, comfy *models.ComfyUIMetadata) error {
 	if sd != nil {
 		sd.ImageID = imageID
 		if err := insertSDMeta(ctx, tx, sd); err != nil {
@@ -417,7 +432,7 @@ func insertComfyMeta(ctx context.Context, tx *sql.Tx, comfy *models.ComfyUIMetad
 	); err != nil {
 		return err
 	}
-	return WriteComfyTerms(ctx, tx, comfy.ImageID, comfy.RawWorkflow)
+	return writeComfyTerms(ctx, tx, comfy.ImageID, comfy.RawWorkflow)
 }
 
 func insertMangaMeta(tx *sql.Tx, m *models.MangaMetadata) error {
@@ -429,11 +444,11 @@ func insertMangaMeta(tx *sql.Tx, m *models.MangaMetadata) error {
 		         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 		         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ImageID, m.Title, m.Series, m.Number, m.Volume,
-		toNullInt(m.Count), m.Summary, m.Notes,
-		toNullInt(m.Year), toNullInt(m.Month), toNullInt(m.Day),
+		m.Count, m.Summary, m.Notes,
+		m.Year, m.Month, m.Day,
 		m.Writer, m.Penciller, m.Inker, m.Colorist, m.Letterer, m.CoverArtist, m.Editor, m.Publisher,
 		m.Imprint, m.Genre, m.Web, m.LanguageISO, m.Format, m.Manga, m.AgeRating,
-		toNullFloat(m.CommunityRating), toNullInt(m.XMLPageCount), m.RawXML,
+		m.CommunityRating, m.XMLPageCount, m.RawXML,
 	)
 	return err
 }

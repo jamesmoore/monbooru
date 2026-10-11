@@ -7,6 +7,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/logx"
@@ -43,9 +44,9 @@ func (s *Server) collectionsHandler(w http.ResponseWriter, r *http.Request) {
 	if p, err := strconv.Atoi(q.Get("page")); err == nil && p > 0 {
 		page = p
 	}
-	excludeIDs := resolveCeiling(r, s.active()).ExcludedTagIDs()
+	ceiling := resolveCeiling(r, s.active()).RankFilter()
 
-	total, err := gallery.CountCollections(s.db(), prefix, excludeIDs)
+	total, err := gallery.CountCollections(s.db(), prefix, ceiling)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -55,7 +56,7 @@ func (s *Server) collectionsHandler(w http.ResponseWriter, r *http.Request) {
 		page = totalPages
 	}
 
-	list, err := gallery.ListCollections(s.db(), prefix, sortStr, collectionsPerPage, (page-1)*collectionsPerPage, excludeIDs)
+	list, err := gallery.ListCollections(s.db(), prefix, sortStr, collectionsPerPage, (page-1)*collectionsPerPage, ceiling)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -64,7 +65,7 @@ func (s *Server) collectionsHandler(w http.ResponseWriter, r *http.Request) {
 	for i := range list {
 		names[i] = list[i].Name
 	}
-	samples, err := gallery.CollectionSamples(s.db(), names, collectionPreviewSamples, excludeIDs)
+	samples, err := gallery.CollectionSamples(s.db(), names, collectionPreviewSamples, ceiling)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -117,7 +118,7 @@ func (s *Server) collectionFindRelationsPost(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	enabled := r.FormValue("enabled") == "1"
-	if err := gallery.SetCollectionFindRelations(s.db(), name, enabled); err != nil {
+	if err := s.active().Edit(func(d *db.DB) error { return gallery.SetCollectionFindRelations(d, name, enabled) }); err != nil {
 		flashStatus(w, http.StatusInternalServerError, "Could not update the collection.")
 		return
 	}
@@ -129,7 +130,6 @@ func (s *Server) collectionFindRelationsPost(w http.ResponseWriter, r *http.Requ
 	s.renderTemplate(w, "partials/collection_find_relations.html", map[string]any{
 		"Name":          name,
 		"FindRelations": enabled,
-		"CSRFToken":     s.csrfToken(sessionFromContext(r.Context())),
 	})
 }
 
@@ -147,8 +147,8 @@ func (s *Server) collectionOrderDialog(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
 		limit = n
 	}
-	excludeIDs := resolveCeiling(r, s.active()).ExcludedTagIDs()
-	members, err := gallery.CollectionMembers(s.db(), name, excludeIDs, limit+1, 0)
+	ceiling := resolveCeiling(r, s.active()).RankFilter()
+	members, err := gallery.CollectionMembers(s.db(), name, ceiling, limit+1, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -157,7 +157,7 @@ func (s *Server) collectionOrderDialog(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		members = members[:limit]
 	}
-	ceilingHidden, _ := gallery.CollectionCeilingHidden(s.db(), name, excludeIDs)
+	ceilingHidden, _ := gallery.CollectionCeilingHidden(s.db(), name, ceiling)
 	s.renderTemplate(w, "partials/collection_order.html", map[string]any{
 		"Name":          name,
 		"Members":       members,
@@ -177,11 +177,10 @@ func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.FormValue("mode") == "filename" {
-		if err := gallery.SortCollectionByFilename(s.db(), name); err != nil {
+		if err := s.active().Edit(func(d *db.DB) error { return gallery.SortCollectionByFilename(d, name) }); err != nil {
 			flashStatus(w, http.StatusInternalServerError, "Could not reorder the collection.")
 			return
 		}
-		s.active().InvalidateCaches()
 		writeInlineFlash(w, "ok", "Ordered by filename.")
 		return
 	}
@@ -201,17 +200,16 @@ func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 	clicked := len(ids)
 	// The dialog shows only what the ceiling lets through, so hidden members
 	// go after the clicked ones rather than losing their position.
-	hidden, err := gallery.CollectionHiddenOrderedIDs(s.db(), name, resolveCeiling(r, s.active()).ExcludedTagIDs())
+	hidden, err := gallery.CollectionHiddenOrderedIDs(s.db(), name, resolveCeiling(r, s.active()).RankFilter())
 	if err != nil {
 		flashStatus(w, http.StatusInternalServerError, "Could not reorder the collection.")
 		return
 	}
 	ids = append(ids, hidden...)
-	if err := gallery.ReorderCollection(s.db(), name, ids); err != nil {
+	if err := s.active().Edit(func(d *db.DB) error { return gallery.ReorderCollection(d, name, ids) }); err != nil {
 		flashStatus(w, http.StatusInternalServerError, "Could not reorder the collection.")
 		return
 	}
-	s.active().InvalidateCaches()
 	writeInlineFlash(w, "ok", fmt.Sprintf("Ordered %d image(s).", clicked))
 }
 
@@ -225,11 +223,7 @@ func (s *Server) startCollectionJob(w http.ResponseWriter, name string, run func
 		flashStatus(w, http.StatusBadRequest, "That collection no longer exists.")
 		return
 	}
-	if !s.startJob(w, models.JobTypeTag) {
-		return
-	}
-	go run(ids)
-	w.WriteHeader(http.StatusAccepted)
+	s.startIDsJob(w, models.JobTypeTag, ids, run)
 }
 
 func (s *Server) dissolveCollectionPost(w http.ResponseWriter, r *http.Request) {
@@ -243,8 +237,7 @@ func (s *Server) dissolveCollectionPost(w http.ResponseWriter, r *http.Request) 
 	s.startCollectionJob(w, name, func(ids []int64) {
 		s.runBatchCollection(ids, name, "remove")
 		// So a later collection reusing the label starts opted out.
-		if _, err := s.db().Write.Exec(
-			`DELETE FROM collection_find_relations WHERE name = ?`, name); err != nil {
+		if err := s.active().Edit(func(d *db.DB) error { return gallery.SetCollectionFindRelations(d, name, false) }); err != nil {
 			logx.Debugf("dissolve collection find-relations flag: %v", err)
 		}
 	})
@@ -269,22 +262,16 @@ func (s *Server) runRenameCollection(ids []int64, oldName, newName string) {
 		}
 	}
 
+	cx := s.active()
 	processed, cancelled, err := jobs.Chunked(ctx, s.jobs, ids, chunkSize, "renaming collection", func(chunk []int64) error {
-		return gallery.RenameCollectionForImages(s.db(), chunk, oldName, newName, posOffset, merging)
+		return cx.Edit(func(d *db.DB) error {
+			return gallery.RenameCollectionForImages(d, chunk, oldName, newName, posOffset, merging)
+		})
 	})
 	if err == nil {
-		// On a merge the target's own flag wins; the DELETE is merge-only,
-		// since on a case-only rename it would match the recased row.
-		if _, e := s.db().Write.Exec(
-			`UPDATE OR IGNORE collection_find_relations SET name = ? WHERE name = ?`, newName, oldName); e != nil {
+		if e := cx.Edit(func(d *db.DB) error { return gallery.RenameCollectionFindRelations(d, oldName, newName, merging) }); e != nil {
 			logx.Debugf("rename collection find-relations flag: %v", e)
-		} else if merging {
-			if _, e := s.db().Write.Exec(
-				`DELETE FROM collection_find_relations WHERE name = ?`, oldName); e != nil {
-				logx.Debugf("rename collection find-relations flag: %v", e)
-			}
 		}
-		s.active().InvalidateCaches()
 	}
-	s.finishJob(err, cancelled, fmt.Sprintf("rename cancelled (%d/%d processed)", processed, total), fmt.Sprintf("Renamed collection across %d image(s).", processed))
+	s.jobs.Finish(err, cancelled, fmt.Sprintf("rename cancelled (%d/%d processed)", processed, total), fmt.Sprintf("Renamed collection across %d image(s).", processed))
 }

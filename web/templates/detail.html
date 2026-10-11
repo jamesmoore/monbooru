@@ -29,10 +29,13 @@
     <button class="btn-danger btn-sm"
             hx-delete="/images/{{.Image.ID}}"
             hx-swap="none"
-            hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'
             hx-confirm="Remove this missing image from the library?"
             data-confirm-danger="Its tags, sources and notes go with the row."
             data-confirm-ok="Remove">Remove from library</button>
+  </div>
+  {{else if .RewrittenBy}}
+  <div class="missing-banner">
+    <span>⚠ This file now holds the bytes of <a href="/images/{{.RewrittenBy}}">image #{{.RewrittenBy}}</a>. Sync leaves both images as they are: delete this one and the next sync gives the file to #{{.RewrittenBy}}; the file stays on disk.</span>
   </div>
   {{end}}
 
@@ -71,7 +74,7 @@
       <div class="detail-actions">
         <form id="inbox-form" hx-post="/images/{{.Image.ID}}/inbox"
               hx-target="#inbox-btn" hx-swap="outerHTML"
-              hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}' style="display:inline">
+              style="display:inline">
           <button type="submit" id="inbox-btn" class="btn-inbox{{if .Image.IsInbox}} active{{end}}"
                   title="{{if .Image.IsInbox}}Archive (i){{else}}Send to inbox (i){{end}}">
             {{if .Image.IsInbox}}In inbox{{else}}Archived{{end}}
@@ -79,7 +82,7 @@
         </form>
         <form id="fav-form" hx-post="/images/{{.Image.ID}}/favorite"
               hx-target="#fav-btn" hx-swap="outerHTML"
-              hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}' style="display:inline">
+              style="display:inline">
           <button type="submit" id="fav-btn" class="btn-fav{{if .Image.IsFavorited}} active{{end}}"
                   title="{{if .Image.IsFavorited}}Unfavorite (f){{else}}Favorite (f){{end}}">
             {{if .Image.IsFavorited}}♥&#xFE0E;{{else}}♡{{end}}
@@ -94,7 +97,7 @@
     </div>
   </div>
 
-  {{template "partials/external_edit_dialog_head.html" dict "Stem" "source" "Action" "sources/set" "ImageID" .Image.ID "CSRFToken" .CSRFToken}}
+  {{template "partials/external_edit_dialog_head.html" dict "Stem" "source" "Action" "sources/set" "ImageID" .Image.ID}}
       <input type="hidden" id="source-has-prev" name="has_prev" value="">
       <input type="hidden" id="source-prev-site" name="prev_site" value="">
       <input type="hidden" id="source-prev-post" name="prev_post" value="">
@@ -110,7 +113,7 @@
       </div>
   {{template "partials/external_edit_dialog_tail.html" dict "Stem" "source"}}
 
-  {{template "partials/external_edit_dialog_head.html" dict "Stem" "collection" "Action" "collections/set" "ImageID" .Image.ID "CSRFToken" .CSRFToken}}
+  {{template "partials/external_edit_dialog_head.html" dict "Stem" "collection" "Action" "collections/set" "ImageID" .Image.ID}}
       <input type="hidden" id="collection-prev" name="prev" value="">
       <p>Collection: <strong id="collection-dialog-title">add</strong></p>
       <div class="field">
@@ -156,16 +159,14 @@
         flashId: 'generate-collection-error',
         failMsg: 'Generation failed.',
         catchMsg: 'Generation request failed.',
-        onOK: function() {
-          if (typeof refreshJobStatus === 'function') refreshJobStatus();
-        }
+        onOK: refreshJobStatus
       });
     });
     </script>
   </dialog>
   {{end}}
 
-  {{template "partials/external_edit_dialog_head.html" dict "Stem" "commentary" "Action" "commentary/set" "ImageID" .Image.ID "CSRFToken" .CSRFToken}}
+  {{template "partials/external_edit_dialog_head.html" dict "Stem" "commentary" "Action" "commentary/set" "ImageID" .Image.ID}}
       <input type="hidden" id="commentary-post" name="post_id" value="">
       <input type="hidden" id="commentary-site" name="site" value="">
       <p>Commentary: <strong id="commentary-dialog-site"></strong></p>
@@ -176,7 +177,7 @@
       </div>
   {{template "partials/external_edit_dialog_tail.html" dict "Stem" "commentary"}}
 
-  {{template "partials/external_edit_dialog_head.html" dict "Stem" "translation" "Action" "translation/set" "ImageID" .Image.ID "CSRFToken" .CSRFToken}}
+  {{template "partials/external_edit_dialog_head.html" dict "Stem" "translation" "Action" "translation/set" "ImageID" .Image.ID}}
       <input type="hidden" id="translation-post" name="post_id" value="">
       <input type="hidden" id="translation-site" name="site" value="">
       <p>Translation: <strong id="translation-dialog-site"></strong></p>
@@ -187,7 +188,7 @@
       </div>
   {{template "partials/external_edit_dialog_tail.html" dict "Stem" "translation"}}
 
-  {{template "partials/external_edit_dialog_head.html" dict "Stem" "original" "Action" "original/set" "ImageID" .Image.ID "CSRFToken" .CSRFToken}}
+  {{template "partials/external_edit_dialog_head.html" dict "Stem" "original" "Action" "original/set" "ImageID" .Image.ID}}
       <input type="hidden" id="original-post" name="post_id" value="">
       <input type="hidden" id="original-site" name="site" value="">
       <p>Original source: <strong id="original-dialog-site"></strong></p>
@@ -197,7 +198,7 @@
       </div>
   {{template "partials/external_edit_dialog_tail.html" dict "Stem" "original"}}
 
-  {{template "partials/external_edit_dialog_head.html" dict "Stem" "annotation" "Action" "annotations/set" "ImageID" .Image.ID "CSRFToken" .CSRFToken}}
+  {{template "partials/external_edit_dialog_head.html" dict "Stem" "annotation" "Action" "annotations/set" "ImageID" .Image.ID}}
       <input type="hidden" id="annotation-id" name="id" value="">
       <p><span id="annotation-dialog-title">Add</span> annotation</p>
       <p class="field-hint">Position and size in original-image pixels{{if .Image.Width}} (image is {{deref .Image.Width}} × {{deref .Image.Height}}){{end}}.</p>
@@ -217,7 +218,7 @@
       </div>
   {{template "partials/external_edit_dialog_tail.html" dict "Stem" "annotation"}}
 
-  {{template "partials/external_edit_dialog_head.html" dict "Stem" "note" "Action" "note" "ImageID" .Image.ID "CSRFToken" .CSRFToken}}
+  {{template "partials/external_edit_dialog_head.html" dict "Stem" "note" "Action" "note" "ImageID" .Image.ID}}
       <p>Note</p>
       <div class="field">
         <label>Your note (max 10000 chars)</label>
@@ -228,35 +229,17 @@
 
   <script>
   document.addEventListener('click', function(e) {
-    if (!e.target.closest) return;
-    var ec = e.target.closest('.btn-edit-commentary');
-    if (ec) {
-      document.getElementById('commentary-site').value = ec.dataset.site || '';
-      document.getElementById('commentary-dialog-site').textContent = ec.dataset.site || 'source';
-      document.getElementById('commentary-post').value = ec.dataset.post || '';
-      document.getElementById('commentary-body').value = ec.dataset.commentary || '';
-      clearSlots('commentary-error');
-      document.getElementById('commentary-dialog').showModal();
-      return;
-    }
-    var et = e.target.closest('.btn-edit-translation');
-    if (et) {
-      document.getElementById('translation-site').value = et.dataset.site || '';
-      document.getElementById('translation-dialog-site').textContent = et.dataset.site || 'source';
-      document.getElementById('translation-post').value = et.dataset.post || '';
-      document.getElementById('translation-body').value = et.dataset.translation || '';
-      clearSlots('translation-error');
-      document.getElementById('translation-dialog').showModal();
-      return;
-    }
-    var eo = e.target.closest('.btn-edit-original');
-    if (eo) {
-      document.getElementById('original-site').value = eo.dataset.site || '';
-      document.getElementById('original-dialog-site').textContent = eo.dataset.site || 'source';
-      document.getElementById('original-post').value = eo.dataset.post || '';
-      document.getElementById('original-body').value = eo.dataset.original || '';
-      clearSlots('original-error');
-      document.getElementById('original-dialog').showModal();
+    var stems = ['commentary', 'translation', 'original'];
+    for (var i = 0; i < stems.length; i++) {
+      var stem = stems[i];
+      var btn = e.target.closest('.btn-edit-' + stem);
+      if (!btn) continue;
+      document.getElementById(stem + '-site').value = btn.dataset.site || '';
+      document.getElementById(stem + '-dialog-site').textContent = btn.dataset.site || 'source';
+      document.getElementById(stem + '-post').value = btn.dataset.post || '';
+      document.getElementById(stem + '-body').value = btn.dataset[stem] || '';
+      clearSlots(stem + '-error');
+      document.getElementById(stem + '-dialog').showModal();
       return;
     }
     var en = e.target.closest('.btn-edit-note');
@@ -264,21 +247,31 @@
       document.getElementById('note-body').value = en.dataset.note || '';
       clearSlots('note-error');
       document.getElementById('note-dialog').showModal();
+      return;
     }
+    if (e.target.closest('.btn-add-source')) { openSourceDialog('', '', ''); return; }
+    var es = e.target.closest('.btn-edit-source');
+    if (es) { openSourceDialog(es.dataset.site, es.dataset.post, es.dataset.url); return; }
+    if (e.target.closest('.btn-add-collection')) { openCollectionDialog('', ''); return; }
+    var ec = e.target.closest('.btn-edit-collection');
+    if (ec) { openCollectionDialog(ec.dataset.name, ec.dataset.order); return; }
+    if (e.target.closest('.btn-add-annotation')) { openAnnotationDialog('', '', '', '', '', ''); return; }
+    var ea = e.target.closest('.btn-edit-annotation');
+    if (ea) openAnnotationDialog(ea.dataset.id, ea.dataset.x, ea.dataset.y, ea.dataset.w, ea.dataset.h, ea.dataset.body);
   });
   </script>
 
   {{if .EnabledTaggers}}
   <dialog id="autotag-dialog">
     <form hx-post="/images/{{.Image.ID}}/autotag"
-          hx-swap="none"
-          hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'
-          hx-on::after-request="if(event.detail.successful)document.getElementById('autotag-dialog').close()">
+          hx-target="#autotag-error"
+          hx-on::after-request="if(event.detail.xhr.status === 202)document.getElementById('autotag-dialog').close()">
       <p>Auto-tag this image. Pick which tagger to run.</p>
       <div class="field">
         <label style="display:block"><input type="radio" name="tagger_name" value="" checked> All enabled taggers</label>
         {{range .EnabledTaggers}}<label style="display:block"><input type="radio" name="tagger_name" value="{{.Name}}"> {{.Name}}</label>{{end}}
       </div>
+      <div id="autotag-error"></div>
       {{template "dialog_actions" dict "ID" "autotag-dialog" "Submit" "Auto-tag"}}
     </form>
   </dialog>
@@ -289,7 +282,6 @@
           hx-target="#relation-edit-error"
           hx-swap="innerHTML"
           hx-on::after-request="onRelationEditResponse(event)">
-      <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
       <input type="hidden" name="direction" id="relation-edit-direction" value="ab">
       <p>Declare a <strong>relation</strong> between this image and another.</p>
       <div class="relation-edit-grid" id="relation-edit-grid">
@@ -335,6 +327,50 @@
       </div>
     </form>
     <script>
+    function onRelationEditResponse(event) {
+      var src = document.getElementById('relation-edit-error');
+      if (!src) return;
+      var overwrite = document.getElementById('relation-edit-overwrite-btn');
+      // Added and refused both come back 200, so the slot's body tells them
+      // apart; a failed request swaps nothing and must not read the stale slot.
+      var answered = event && event.detail && event.detail.successful &&
+        src.querySelector('.flash-ok, .flash-err');
+      if (!answered) {
+        if (overwrite) overwrite.hidden = true;
+        src.innerHTML = '<div class="flash flash-err">The relation was not saved.</div>';
+        return;
+      }
+      var success = src.querySelector('.flash-ok');
+      if (!success) {
+        // Keyed on the server's conflict wording: rewording those errors
+        // hides the button.
+        var err = src.querySelector('.flash-err');
+        if (overwrite) {
+          var msg = err ? (err.textContent || '') : '';
+          if (/already has a different relation/i.test(msg)) {
+            overwrite.textContent = 'Overwrite existing relation';
+            overwrite.hidden = false;
+          } else if (/already has a version edge/i.test(msg)) {
+            overwrite.textContent = 'Replace existing version edge';
+            overwrite.hidden = false;
+          } else {
+            overwrite.hidden = true;
+          }
+        }
+        return;
+      }
+      if (overwrite) {
+        overwrite.hidden = true;
+        overwrite.textContent = 'Overwrite existing relation';
+      }
+      src.innerHTML = '';
+      var dlg = document.getElementById('relation-edit-dialog');
+      if (dlg) dlg.close();
+      if (window.htmx) {
+        var panel = document.getElementById('related-entries-panel');
+        if (panel) window.htmx.trigger(panel, 'relations-changed');
+      }
+    }
     (function() {
       var dlg = document.getElementById('relation-edit-dialog');
       if (!dlg) return;
@@ -434,6 +470,21 @@
         refreshOtherThumb();
         refreshSummary();
       };
+      document.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-relations-add]');
+        if (!btn) return;
+        e.preventDefault();
+        parentInput.value = btn.getAttribute('data-relations-add');
+        parentInput.readOnly = true;
+        otherInput.value = '';
+        otherInput.readOnly = false;
+        dlg.querySelector('input[name="type"][value="duplicate"]').checked = true;
+        clearSlots('relation-edit-error');
+        var overwrite = document.getElementById('relation-edit-overwrite-btn');
+        overwrite.hidden = true;
+        overwrite.textContent = 'Overwrite existing relation';
+        dlg.showModal();
+      });
     })();
     </script>
   </dialog>
@@ -514,12 +565,11 @@
       </section>
 
       <div class="tag-editor-section">
-        {{template "partials/tag_list.html" (dict "ImageID" .Image.ID "CSRFToken" .CSRFToken)}}
+        {{template "partials/tag_list.html" (dict "ImageID" .Image.ID)}}
         <form id="add-tag-form" class="add-tag-form"
               hx-post="/images/{{.Image.ID}}/tags"
               hx-target="#image-tags"
               hx-swap="outerHTML">
-          <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
           <div class="add-tag-input-wrap">
             <input type="text" name="tag" id="tag-input" placeholder="Add tag(s)..." autocomplete="off"
                    hx-get="/internal/tags/suggest"
@@ -535,20 +585,19 @@
           <button type="button" class="btn-autotag"
                   {{if .EnabledTaggers}}title="Auto-tag this image (t)"
                   {{else}}disabled title="{{.TaggerReason}}"
-                  {{end}}onclick="document.getElementById('autotag-dialog').showModal()">Auto-tag</button>
+                  {{end}}onclick="clearSlots('autotag-error'); document.getElementById('autotag-dialog').showModal()">Auto-tag</button>
           {{end}}
           {{if .MonloaderPaired}}
-          <button type="button" class="btn-hash-lookup monloader-accent"
+          <button type="button" class="btn-hash-lookup monloader-accent" data-ml-title="Find tags and sources for this file on online boorus via monloader"
                   {{if .MonloaderUsable}}title="Find tags and sources for this file on online boorus via monloader"
                   {{else}}disabled title="{{monloaderOffReason .MonloaderConn}}"
                   {{end}}hx-post="/images/{{.Image.ID}}/lookup" hx-vals='{"backend":"booru"}'
                   hx-target="#fetch-pending" hx-swap="innerHTML"
-                  hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'
                   hx-confirm="Find tags for this file on online boorus?"
                   data-confirm-ok="Lookup online boorus">Lookup online boorus</button>
           {{end}}
         </form>
-        {{if .MonloaderPaired}}{{template "partials/lookup_history.html" (dict "Lookup" .Lookup "CSRFToken" .CSRFToken)}}{{end}}
+        {{if .MonloaderPaired}}{{template "partials/lookup_history.html" (dict "Lookup" .Lookup)}}{{end}}
         {{if .MonloaderPaired}}<div id="fetch-pending" class="fetch-status"></div>{{end}}
       </div>
 
@@ -565,7 +614,7 @@
       </div>
       {{end}}
 
-      {{template "partials/detail_danger_zone.html" (dict "ImageID" .Image.ID "ImageTags" .ImageTags "HasUserTags" .HasUserTags "HasStaleTags" .HasStaleTags "ImageTaggers" .ImageTaggers "ImageSources" .ImageSources "CanTransfer" (gt (len .Galleries) 1) "CSRFToken" .CSRFToken "BackQuery" .BackQuery "BackSort" .BackSort "BackOrder" .BackOrder "BackPage" .BackPage "BackSeed" .BackSeed "Ref" .Ref "CurrentFolder" .Image.FolderPath "Filename" .Filename "ExtraPaths" .ExtraPaths)}}
+      {{template "partials/detail_danger_zone.html" (dict "ImageID" .Image.ID "ImageTags" .ImageTags "HasUserTags" .HasUserTags "HasStaleTags" .HasStaleTags "ImageTaggers" .ImageTaggers "ImageSources" .ImageSources "CanTransfer" (gt (len .Galleries) 1) "BackQuery" .BackQuery "BackSort" .BackSort "BackOrder" .BackOrder "BackPage" .BackPage "BackSeed" .BackSeed "Ref" .Ref "CurrentFolder" .Image.FolderPath "Filename" .Filename "ExtraPaths" .ExtraPaths)}}
       {{if gt (len .Galleries) 1}}
       <dialog id="transfer-image-dialog">
         <p>Transfer this image to another gallery:</p>
@@ -573,9 +622,7 @@
         <p class="field-hint" style="color:var(--error)">Relations and collections are not carried over.</p>
         <form id="transfer-image-form"
               hx-post="/images/{{.Image.ID}}/transfer"
-              hx-swap="none"
-              hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'>
-          <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+              hx-target="#transfer-image-error">
           <div class="field">
             <label>Target gallery</label>
             <select name="target" id="transfer-image-target" class="upload-wide-input">
@@ -585,6 +632,7 @@
           <div class="field">
             <label><input type="checkbox" name="remove_after" id="transfer-image-remove" value="1"> Remove from this gallery after transfer</label>
           </div>
+          <div id="transfer-image-error"></div>
           {{template "dialog_actions" dict "ID" "transfer-image-dialog" "Submit" "Transfer"}}
         </form>
       </dialog>
@@ -595,6 +643,7 @@
         if (!dlg) return;
         var rm = document.getElementById('transfer-image-remove');
         if (rm) rm.checked = false;
+        clearSlots('transfer-image-error');
         dlg.showModal();
       }
       function openRemoveTagsDialog() {
@@ -621,7 +670,7 @@
           case 'tagger': url = '/images/' + id + '/auto-tags?taggers=' + encodeURIComponent(document.getElementById('remove-tags-tagger').value); break;
           default:       url = '/images/' + id + '/tags';
         }
-        htmx.ajax('DELETE', url, {target: '#image-tags', swap: 'outerHTML', headers: {'X-CSRF-Token': dlg.dataset.csrf}});
+        htmx.ajax('DELETE', url, {target: '#image-tags', swap: 'outerHTML'});
         dlg.close();
       }
       function openPlaceImageDialog() {
@@ -652,12 +701,6 @@
         input.focus();
         input.select();
       }
-      document.addEventListener('click', function(e) {
-        if (!e.target.closest) return;
-        if (e.target.closest('.btn-add-source')) { openSourceDialog('', '', ''); return; }
-        var ed = e.target.closest('.btn-edit-source');
-        if (ed) openSourceDialog(ed.dataset.site, ed.dataset.post, ed.dataset.url);
-      });
       function openCollectionDialog(name, order) {
         var dlg = document.getElementById('collection-dialog');
         if (!dlg) return;
@@ -671,12 +714,6 @@
         input.focus();
         input.select();
       }
-      document.addEventListener('click', function(e) {
-        if (!e.target.closest) return;
-        if (e.target.closest('.btn-add-collection')) { openCollectionDialog('', ''); return; }
-        var ed = e.target.closest('.btn-edit-collection');
-        if (ed) openCollectionDialog(ed.dataset.name, ed.dataset.order);
-      });
       function openAnnotationDialog(id, x, y, w, h, body) {
         var dlg = document.getElementById('annotation-dialog');
         if (!dlg) return;
@@ -691,12 +728,6 @@
         dlg.showModal();
         document.getElementById('annotation-x').focus();
       }
-      document.addEventListener('click', function(e) {
-        if (!e.target.closest) return;
-        if (e.target.closest('.btn-add-annotation')) { openAnnotationDialog('', '', '', '', '', ''); return; }
-        var ed = e.target.closest('.btn-edit-annotation');
-        if (ed) openAnnotationDialog(ed.dataset.id, ed.dataset.x, ed.dataset.y, ed.dataset.w, ed.dataset.h, ed.dataset.body);
-      });
       function setAnnHighlight(id, on) {
         var box = document.querySelector('.annotation-box[data-ann-id="' + id + '"]');
         if (box) box.classList.toggle('ann-highlight', on);
@@ -777,7 +808,6 @@
                 <span class="field-hint">(not computed)</span>
                 {{if not .NoPreview}}
                 <form hx-post="/relations/phash/{{.Image.ID}}/recompute" hx-swap="none" style="display:inline">
-                  <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
                   <button type="submit" class="btn-link-accent">[backfill]</button>
                 </form>
                 {{end}}
@@ -811,8 +841,7 @@
                   <span class="source-actions">
                     <span class="source-verbs">
                       {{if gt $i 0}}<form method="POST" action="/images/{{$.Image.ID}}/sources/primary"
-                          hx-post="/images/{{$.Image.ID}}/sources/primary" hx-swap="none"
-                          hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
+                          hx-post="/images/{{$.Image.ID}}/sources/primary" hx-target="#detail-flash"
                           style="display:inline">
                       <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                       <input type="hidden" name="site" value="{{.Site}}">
@@ -825,33 +854,28 @@
                     <span class="source-verbs">
                       {{if and .URL $.MonloaderPaired}}<form hx-post="/images/{{$.Image.ID}}/sources/fetch"
                           hx-target="#fetch-status" hx-swap="innerHTML"
-                          hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}' style="display:inline">
-                      <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                          style="display:inline">
                       <input type="hidden" name="url" value="{{.URL}}">
-                      <button type="submit" class="btn-link-accent monloader-accent"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from this source via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
+                      <button type="submit" class="btn-link-accent monloader-accent" data-ml-title="Refresh tags from this source via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from this source via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
                     </form>{{else if and $.MonloaderPaired (isPTRSite .Site)}}<form hx-post="/images/{{$.Image.ID}}/lookup"
                           hx-target="#fetch-status" hx-swap="innerHTML"
-                          hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}' style="display:inline">
-                      <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+                          style="display:inline">
                       <input type="hidden" name="backend" value="ptr">
-                      <button type="submit" class="btn-link-accent monloader-accent"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from the Public Tag Repository via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
+                      <button type="submit" class="btn-link-accent monloader-accent" data-ml-title="Refresh tags from the Public Tag Repository via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from the Public Tag Repository via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
                     </form>{{end}}
                       {{if and $.MonloaderPaired (upgradable .)}}<form hx-post="/images/{{$.Image.ID}}/replace"
                           hx-target="#fetch-status" hx-swap="innerHTML"
-                          hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
                           hx-confirm="Replace the file with the {{if gt .Similarity 0.0}}original from {{if .Site}}{{.Site}}{{else}}this source{{end}} (~{{printf "%.0f" .Similarity}}% match){{else}}one {{if .Site}}{{.Site}}{{else}}this source{{end}} serves now{{end}}?{{upgradeCompare . $.Image}}"
                           data-confirm-danger="The current file is overwritten."
                           data-confirm-ok="Upgrade" data-confirm-alt="Keep local"
                           data-confirm-alt-url="/images/{{$.Image.ID}}/sources/keep" data-confirm-alt-value="keep=1"
                           style="display:inline">
-                      <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                       <input type="hidden" name="site" value="{{.Site}}">
                       <input type="hidden" name="post_id" value="{{.PostID}}">
-                      <button type="submit" class="btn-link-accent monloader-accent"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Replace the local file with the one this source serves via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[upgrade]</button>
+                      <button type="submit" class="btn-link-accent monloader-accent" data-ml-title="Replace the local file with the one this source serves via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Replace the local file with the one this source serves via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[upgrade]</button>
                     </form>{{end}}
                       {{if and $.MonloaderPaired .UpgradeKept}}<form method="POST" action="/images/{{$.Image.ID}}/sources/keep"
-                          hx-post="/images/{{$.Image.ID}}/sources/keep" hx-swap="none"
-                          hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
+                          hx-post="/images/{{$.Image.ID}}/sources/keep" hx-target="#detail-flash"
                           style="display:inline">
                       <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
                       <input type="hidden" name="site" value="{{.Site}}">
@@ -872,7 +896,7 @@
             </td></tr>
             {{if and .MonloaderPaired .Lookup.Candidate}}
             <tr><th>Scheduled</th><td>
-              {{template "partials/scheduled_lookup.html" (dict "Lookup" .Lookup "CSRFToken" .CSRFToken)}}
+              {{template "partials/scheduled_lookup.html" (dict "Lookup" .Lookup)}}
             </td></tr>
             {{end}}
             <tr><th>Collections</th><td>
@@ -883,8 +907,7 @@
                   <a href="/?q={{urlQ (printf "collection:\"%s\"" (qval .Name))}}" class="meta-source-value" title="Search this collection">{{.Name}}</a>{{if .Order}} <span class="series-pill-order">#{{deref .Order}}</span>{{end}}
                   <button type="button" class="btn-link-accent btn-edit-collection" data-name="{{.Name}}" data-order="{{if .Order}}{{deref .Order}}{{end}}" title="Edit">[edit]</button>
                   <form method="POST" action="/images/{{$.Image.ID}}/collections/remove"
-                        hx-post="/images/{{$.Image.ID}}/collections/remove" hx-swap="none"
-                        hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
+                        hx-post="/images/{{$.Image.ID}}/collections/remove" hx-target="#detail-flash"
                         hx-confirm="Remove this image from {{.Name}}?" data-confirm-ok="Remove"
                         style="display:inline">
                     <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
@@ -941,7 +964,7 @@
                 {{if .SDMeta.Model}}<tr><td class="node-param-name">Model</td><td class="node-param-value">
                   {{if isLongValue .SDMeta.Model}}<details class="long-value"><summary>{{truncate .SDMeta.Model 140}}…</summary><pre class="long-value-full">{{.SDMeta.Model}}</pre></details>{{else}}{{.SDMeta.Model}}{{end}}
                 </td></tr>{{end}}
-                {{if .SDMeta.Seed}}<tr><td class="node-param-name">Seed</td><td class="node-param-value">{{deref64 .SDMeta.Seed}}</td></tr>{{end}}
+                {{if .SDMeta.Seed}}<tr><td class="node-param-name">Seed</td><td class="node-param-value">{{seedText .SDMeta.Seed}}</td></tr>{{end}}
                 {{if .SDMeta.Sampler}}<tr><td class="node-param-name">Sampler</td><td class="node-param-value">{{.SDMeta.Sampler}}</td></tr>{{end}}
                 {{if .SDMeta.Steps}}<tr><td class="node-param-name">Steps</td><td class="node-param-value">{{deref .SDMeta.Steps}}</td></tr>{{end}}
                 {{if .SDMeta.CFGScale}}<tr><td class="node-param-name">CFG Scale</td><td class="node-param-value">{{printf "%.1f" (deref64f .SDMeta.CFGScale)}}</td></tr>{{end}}
@@ -1117,16 +1140,6 @@
 <li class="collection-item annotation-entry" data-ann-id="{{.Ann.ID}}">
   <span class="meta-annotation-body" title="{{.Ann.Text}}">{{if .Ann.Text}}{{.Ann.Text}}{{else}}(no text){{end}}</span>
   <button type="button" class="btn-link-accent btn-edit-annotation" data-id="{{.Ann.ID}}" data-x="{{.Ann.X}}" data-y="{{.Ann.Y}}" data-w="{{.Ann.W}}" data-h="{{.Ann.H}}" data-body="{{.Ann.Body}}" title="Edit">[edit]</button>
-  <form method="POST" action="/images/{{.ImageID}}/annotations/remove"
-        hx-post="/images/{{.ImageID}}/annotations/remove" hx-swap="none"
-        hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'
-        hx-confirm="Remove this annotation?"
-        data-confirm-danger="The box and its text go with it."
-        data-confirm-ok="Remove"
-        style="display:inline">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-    <input type="hidden" name="id" value="{{.Ann.ID}}">
-    <button type="submit" class="btn-link-accent" title="Remove annotation">[×]</button>
-  </form>
+  {{template "partials/source_remove_form.html" dict "ImageID" .ImageID "CSRFToken" .CSRFToken "AnnID" .Ann.ID "Action" "annotations/remove" "Confirm" "Remove this annotation?" "Danger" "The box and its text go with it." "Title" "Remove annotation"}}
 </li>
 {{end}}

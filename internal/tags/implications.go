@@ -15,7 +15,12 @@ import (
 // ten levels.
 const MaxImplicationDepth = 16
 
-var ErrImplicationCycle = errors.New("implication would form a cycle")
+var (
+	ErrImplicationCycle    = errors.New("implication would form a cycle")
+	ErrImplicationSelf     = errors.New("cannot imply a tag from itself")
+	ErrImplicationAlias    = errors.New("cannot involve an alias in an implication; use its canonical")
+	ErrImplicationNotFound = errors.New("implication not found")
+)
 
 func scanImplications(rows *sql.Rows, withImpliedCols bool) ([]models.Implication, error) {
 	var out []models.Implication
@@ -78,17 +83,14 @@ func (s *Service) ImpliedBy(tagID int64) ([]models.Implication, error) {
 }
 
 func (s *Service) SyncImplicationStaleness(parentID int64, origin string, fresh map[int64]bool) (int, error) {
-	flagged := 0
-	err := s.inWriteTx(func(tx *sql.Tx) error {
+	return writeTx(s, func(tx *sql.Tx) (int, error) {
 		type edgeRow struct{ impliedID, stale int64 }
-		present, err := db.QueryAll(tx, func(rows *sql.Rows) (edgeRow, error) {
-			var e edgeRow
-			err := rows.Scan(&e.impliedID, &e.stale)
-			return e, err
-		}, `SELECT implied_tag_id, stale FROM tag_implications
+		present, err := db.QueryAll(tx, db.ScanRow(func(e *edgeRow) []any {
+			return []any{&e.impliedID, &e.stale}
+		}), `SELECT implied_tag_id, stale FROM tag_implications
 			 WHERE parent_tag_id = ? AND origin = ?`, parentID, origin)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		var flag, clear []int64
 		for _, e := range present {
@@ -100,15 +102,13 @@ func (s *Service) SyncImplicationStaleness(parentID int64, origin string, fresh 
 			}
 		}
 		if err := setImplicationsStaleTx(tx, parentID, flag, 1); err != nil {
-			return err
+			return 0, err
 		}
 		if err := setImplicationsStaleTx(tx, parentID, clear, 0); err != nil {
-			return err
+			return 0, err
 		}
-		flagged = len(flag)
-		return nil
+		return len(flag), nil
 	})
-	return flagged, err
 }
 
 func setImplicationsStaleTx(tx *sql.Tx, parentID int64, impliedIDs []int64, stale int) error {
@@ -123,14 +123,12 @@ func (s *Service) ImplicationsForParents(parentIDs []int64) (map[int64][]models.
 	}
 	err := db.Chunked(parentIDs, 500, func(batch []int64) error {
 		placeholders, args := db.InPlaceholders(batch)
-		imps, err := db.QueryAll(s.db.Read, func(rows *sql.Rows) (models.Implication, error) {
-			var im models.Implication
-			err := rows.Scan(
+		imps, err := db.QueryAll(s.db.Read, db.ScanRow(func(im *models.Implication) []any {
+			return []any{
 				&im.ParentID, &im.ImpliedID,
 				&im.ImpliedName, &im.ImpliedCategoryName, &im.ImpliedCategoryColor,
-			)
-			return im, err
-		},
+			}
+		}),
 			`SELECT ti.parent_tag_id, ti.implied_tag_id,
 			        i.name, ic.name, ic.color
 			 FROM tag_implications ti
@@ -162,27 +160,26 @@ func (s *Service) AddImplication(parentID, impliedID int64) (bool, error) {
 // AddImplicationFrom stamps origin only on a new edge.
 func (s *Service) AddImplicationFrom(parentID, impliedID int64, origin string) (bool, error) {
 	if parentID == impliedID {
-		return false, fmt.Errorf("cannot imply a tag from itself")
+		return false, ErrImplicationSelf
 	}
 
-	var created bool
-	err := s.inWriteTx(func(tx *sql.Tx) error {
+	return writeTx(s, func(tx *sql.Tx) (bool, error) {
 		for _, id := range [2]int64{parentID, impliedID} {
 			var isAlias int
 			if err := tx.QueryRow(`SELECT is_alias FROM tags WHERE id = ?`, id).Scan(&isAlias); err == sql.ErrNoRows {
-				return ErrTagNotFound
+				return false, ErrTagNotFound
 			} else if err != nil {
-				return err
+				return false, err
 			}
 			if isAlias == 1 {
-				return fmt.Errorf("cannot involve an alias in an implication; use its canonical")
+				return false, ErrImplicationAlias
 			}
 		}
 
 		if reaches, err := implicationReachesTx(tx, impliedID, parentID); err != nil {
-			return err
+			return false, err
 		} else if reaches {
-			return ErrImplicationCycle
+			return false, ErrImplicationCycle
 		}
 
 		res, err := tx.Exec(
@@ -190,16 +187,11 @@ func (s *Service) AddImplicationFrom(parentID, impliedID int64, origin string) (
 			parentID, impliedID, origin,
 		)
 		if err != nil {
-			return err
+			return false, err
 		}
 		n, _ := res.RowsAffected()
-		created = n > 0
-		return nil
+		return n > 0, nil
 	})
-	if err != nil {
-		return false, err
-	}
-	return created, nil
 }
 
 // RemoveImplication leaves the rows the edge implied in place; sweeping
@@ -213,8 +205,9 @@ func (s *Service) RemoveImplication(parentID, impliedID int64) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("implication not found")
+		return ErrImplicationNotFound
 	}
+	s.changed()
 	return nil
 }
 
@@ -264,16 +257,8 @@ func implicationReachesTx(tx *sql.Tx, start, target int64) (bool, error) {
 
 // Implied rows take the parent's is_auto so the detail page groups them
 // by source.
-func ApplyImpliedFanoutTx(tx *sql.Tx, imageID, parentID, ratingCatID int64, isAuto bool) error {
-	isAutoInt := 0
-	if isAuto {
-		isAutoInt = 1
-	}
-	return fanOutImpliedTxImpl(tx, imageID, parentID, ratingCatID, isAutoInt)
-}
-
 func fanOutImpliedTxImpl(tx *sql.Tx, imageID, parentID, ratingCatID int64, isAutoInt int) error {
-	implied, err := TransitiveImpliedTx(tx, []int64{parentID})
+	implied, err := transitiveImpliedTx(tx, []int64{parentID})
 	if err != nil {
 		return err
 	}
@@ -294,7 +279,7 @@ func applyImpliedClosureTx(tx *sql.Tx, imageID int64, implied []int64, ratingCat
 		if n, _ := res.RowsAffected(); n == 0 {
 			continue
 		}
-		if err := BumpTagUsageTx(tx, id, imageID); err != nil {
+		if err := bumpTagUsageTx(tx, id, imageID); err != nil {
 			return err
 		}
 		if ratingCatID != 0 && !insertedRating {
@@ -305,7 +290,7 @@ func applyImpliedClosureTx(tx *sql.Tx, imageID int64, implied []int64, ratingCat
 		}
 	}
 	if insertedRating && ratingCatID != 0 {
-		if err := PruneLowerRatingsTx(tx, ratingCatID, imageID); err != nil {
+		if err := pruneLowerRatingsTx(tx, ratingCatID, imageID); err != nil {
 			return fmt.Errorf("prune lower ratings after implied fan-out: %w", err)
 		}
 	}
@@ -336,11 +321,9 @@ func impliedByParentOnImage(tx *sql.Tx, imageID, tagID int64) (bool, error) {
 		return false, err
 	}
 	type edge struct{ parent, child int64 }
-	edges, err := db.QueryAll(tx, func(rows *sql.Rows) (edge, error) {
-		var e edge
-		err := rows.Scan(&e.parent, &e.child)
-		return e, err
-	}, `SELECT ti.parent_tag_id, ti.implied_tag_id FROM tag_implications ti
+	edges, err := db.QueryAll(tx, db.ScanRow(func(e *edge) []any {
+		return []any{&e.parent, &e.child}
+	}), `SELECT ti.parent_tag_id, ti.implied_tag_id FROM tag_implications ti
 		 JOIN image_tags p ON p.image_id = ?1 AND p.tag_id = ti.parent_tag_id
 		 JOIN image_tags c ON c.image_id = ?1 AND c.tag_id = ti.implied_tag_id AND c.is_implied = 1`, imageID)
 	if err != nil {
@@ -378,11 +361,7 @@ func JustifiedImplied(imageTags []models.ImageTag, implied map[int64][]int64) ma
 }
 
 func implicationParentsOnImageExcluding(tx *sql.Tx, imageID, impliedID, excludeParent int64) ([]int64, error) {
-	return db.QueryAll(tx, func(rows *sql.Rows) (int64, error) {
-		var id int64
-		err := rows.Scan(&id)
-		return id, err
-	},
+	return db.QueryIDs(tx,
 		`SELECT ti.parent_tag_id
 		 FROM tag_implications ti
 		 JOIN image_tags it ON it.tag_id = ti.parent_tag_id

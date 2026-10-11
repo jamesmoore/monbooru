@@ -1,0 +1,207 @@
+package monloader
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/library"
+	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/lookup"
+	"github.com/monbooru/monbooru/internal/peer"
+)
+
+type BatchLookupOpts struct {
+	Mode       string
+	PTR, Booru bool
+	Unsourced  bool
+}
+
+// Hash lookups take the background lane, being bulk work, but no budget: the
+// operator asked for them, so the nightly budget must not refuse them.
+func (l *Link) BatchLookup(ctx context.Context, cx *library.Gallery, opts BatchLookupOpts, ids []int64) {
+	if opts.Mode == "hash" && opts.Unsourced {
+		ids = unsourcedOnly(cx, ids)
+	}
+
+	enqueued, skipped, matched := 0, 0, 0
+	ptrRefused := false
+	total := len(ids)
+	l.jobs.Update(0, total, "looking up…")
+	if opts.Mode == "hash" && opts.PTR {
+		var err error
+		if matched, err = l.batchPTRLookup(ctx, cx, ids); err != nil {
+			if !errors.Is(err, ErrPTRUnavailable) && !errors.Is(err, ErrPTRBatchUnsupported) {
+				l.jobs.Fail("monloader unreachable: " + err.Error())
+				return
+			}
+			ptrRefused = true
+		}
+	}
+	if opts.Booru || opts.Mode == "refresh" {
+		for i, id := range ids {
+			if ctx.Err() != nil {
+				l.jobs.Complete(fmt.Sprintf("Lookup cancelled after queueing %d.", enqueued))
+				return
+			}
+			if (i+1)%25 == 0 || i == total-1 {
+				l.jobs.Update(i+1, total, "looking up…")
+			}
+			var canonPath, sha, storedMD5 string
+			if err := cx.DB.Read.QueryRow(
+				`SELECT canonical_path, sha256, md5 FROM images WHERE id = ?`, id,
+			).Scan(&canonPath, &sha, &storedMD5); err != nil {
+				continue
+			}
+			var err error
+			switch opts.Mode {
+			case "refresh":
+				queued, qErr := l.enqueueSourceFetches(ctx, cx, id, sha)
+				if qErr != nil {
+					if peer.IsStatusError(qErr) {
+						skipped++
+						continue
+					}
+					l.jobs.Fail("monloader unreachable: " + qErr.Error())
+					return
+				}
+				if queued == 0 {
+					skipped++
+				} else {
+					enqueued += queued
+				}
+				continue
+			default:
+				md5, hashErr := LookupMD5(ctx, cx, id, storedMD5)
+				if hashErr != nil {
+					skipped++
+					continue
+				}
+				err = l.EnqueueLookup(ctx, cx, id, lookup.BackendBooru, md5, sha, true, false)
+			}
+			if err != nil {
+				if peer.IsStatusError(err) {
+					skipped++
+					continue
+				}
+				l.jobs.Fail("monloader unreachable: " + err.Error())
+				return
+			}
+			enqueued++
+		}
+	}
+	if opts.Mode == "refresh" {
+		l.jobs.Complete(fmt.Sprintf("Queued %d source fetch(es) on monloader; skipped %d without a fetchable source.", enqueued, skipped))
+		return
+	}
+	parts := []string{}
+	switch {
+	case ptrRefused:
+		parts = append(parts, "the PTR is unavailable on monloader")
+	case opts.PTR:
+		parts = append(parts, fmt.Sprintf("%d matched in the PTR", matched))
+	}
+	if opts.Booru {
+		parts = append(parts, fmt.Sprintf("%d queued on monloader", enqueued))
+	}
+	if skipped > 0 {
+		parts = append(parts, fmt.Sprintf("%d skipped", skipped))
+	}
+	l.jobs.Complete(fmt.Sprintf("Looked up %d image(s): %s.", total, strings.Join(parts, ", ")))
+}
+
+func unsourcedOnly(cx *library.Gallery, ids []int64) []int64 {
+	var out []int64
+	for start := 0; start < len(ids); start += 500 {
+		chunk := ids[start:min(start+500, len(ids))]
+		placeholders, args := db.InPlaceholders(chunk)
+		found, err := db.QueryIDs(cx.DB.Read,
+			`SELECT i.id FROM images i WHERE i.id IN (`+placeholders+`)
+			   AND NOT EXISTS (SELECT 1 FROM image_sources s WHERE s.image_id = i.id AND s.url <> '')`,
+			args...)
+		if err != nil {
+			logx.Warnf("batch lookup scope narrowing: %v", err)
+			return ids
+		}
+		out = append(out, found...)
+	}
+	return out
+}
+
+func (l *Link) batchPTRLookup(ctx context.Context, cx *library.Gallery, ids []int64) (int, error) {
+	matched := 0
+	for start := 0; start < len(ids) && ctx.Err() == nil; start += ptrLookupChunk {
+		chunk := ids[start:min(start+ptrLookupChunk, len(ids))]
+		placeholders, args := db.InPlaceholders(chunk)
+		hashes, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(v *PTRLookupImage) []any {
+			return []any{&v.ImageID, &v.SHA256}
+		}), `SELECT id, sha256 FROM images WHERE id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return matched, err
+		}
+		byHash := make(map[string]int64, len(hashes))
+		images := make([]PTRLookupImage, 0, len(hashes))
+		for _, h := range hashes {
+			byHash[h.SHA256] = h.ImageID
+			images = append(images, h)
+		}
+		if len(images) == 0 {
+			continue
+		}
+		results, cursor, err := l.PTRBatchLookup(ctx, cx.Name, false, images)
+		if err != nil {
+			return matched, err
+		}
+		// A record failure is logged inside and must not abort the batch.
+		hits, _, _ := applyPTRResults(cx, byHash, results, cursor)
+		matched += hits
+	}
+	return matched, nil
+}
+
+func (l *Link) enqueueSourceFetches(ctx context.Context, cx *library.Gallery, id int64, sha string) (int, error) {
+	galleryName := cx.Name
+	type origin struct{ site, url string }
+	// All or nothing: queueing what a partial read reached would go unreported.
+	origins, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(o *origin) []any {
+		return []any{&o.site, &o.url}
+	}), `SELECT site, url FROM image_sources WHERE image_id = ? ORDER BY rowid`, id)
+	if err != nil {
+		logx.Warnf("source fetch origins for image %d: %v", id, err)
+		return 0, nil
+	}
+
+	queued := 0
+	seenURL := map[string]bool{}
+	ptrDone := false
+	for _, o := range origins {
+		switch {
+		case strings.TrimSpace(o.url) != "":
+			u := strings.TrimSpace(o.url)
+			if seenURL[u] {
+				continue
+			}
+			seenURL[u] = true
+			if err := l.EnqueueMetadataFetch(ctx, id, galleryName, u); err != nil {
+				return queued, err
+			}
+		case strings.EqualFold(strings.TrimSpace(o.site), lookup.BackendPTR):
+			if ptrDone {
+				continue
+			}
+			ptrDone = true
+			if err := l.EnqueueLookup(ctx, cx, id, lookup.BackendPTR, "", sha, true, false); err != nil {
+				if errors.Is(err, ErrPTRUnavailable) {
+					continue
+				}
+				return queued, err
+			}
+		default:
+			continue
+		}
+		queued++
+	}
+	return queued, nil
+}

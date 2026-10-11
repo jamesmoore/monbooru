@@ -1,37 +1,17 @@
 package web
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
+	"cmp"
 	"fmt"
 	"net/http"
-	"slices"
 	"strconv"
-	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/plugins"
 )
-
-const (
-	// Bumps only on a breaking change to pluginRelayRequest.
-	pluginPayloadVersion = 1
-	// No retry: the peer may have committed the work, and a second call
-	// would repeat it.
-	pluginRelayTimeout = 10 * time.Second
-	pluginMessageMax   = 200
-)
-
-type pluginRelayRequest struct {
-	Payload  int     `json:"payload"`
-	Monbooru string  `json:"monbooru"`
-	Gallery  string  `json:"gallery"`
-	Slot     string  `json:"slot"`
-	Button   string  `json:"button"`
-	ImageIDs []int64 `json:"image_ids"`
-}
 
 // A 204 with a flash, not an error status: the click swaps nothing, and
 // htmx would discard an error body unseen.
@@ -40,31 +20,85 @@ func relayRefused(w http.ResponseWriter, msg string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type relayPlan struct {
+	plugin   config.PluginConfig
+	button   config.PluginButton
+	base     string
+	gallery  string
+	ids      []int64
+	narrowed string
+}
+
 func (s *Server) pluginRelay(w http.ResponseWriter, r *http.Request) {
-	if !parseFormOK(w, r) || pageGalleryStale(w, r, s.activeGallery()) {
+	plan, ok := s.planRelay(w, r)
+	if !ok {
 		return
+	}
+	name := plan.plugin.Name
+	answer, err := plugins.CallRelay(r.Context(), name, plan.base+plan.button.Path, plan.plugin.PeerToken, plugins.RelayRequest{
+		Payload:  plugins.PayloadVersion,
+		Monbooru: Version,
+		Gallery:  plan.gallery,
+		Slot:     plan.button.Slot,
+		Button:   plan.button.Label,
+		ImageIDs: plan.ids,
+	})
+	switch {
+	case err != nil && r.Context().Err() != nil:
+		return
+	case peer.IsStatusError(err):
+		logx.Warnf("plugin relay %s: %v", name, err)
+		relayRefused(w, err.Error())
+		return
+	case err != nil:
+		s.peers.MarkDown(name)
+		logx.Warnf("plugin relay %s: %v", name, err)
+		relayRefused(w, "plugin "+name+" did not answer")
+		return
+	}
+	message := truncateRunes(answer.Message, plugins.MessageMax)
+	if !answer.OK {
+		relayRefused(w, cmp.Or(message, "plugin "+name+" refused the request")+plan.narrowed)
+		return
+	}
+	setFlashHeader(w, message+plan.narrowed, "ok", nil)
+	if answer.Refresh {
+		w.Header().Set("HX-Refresh", "true")
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// The route is gallery-free so the peer call never runs under the set's
+// lock; the plan holds it so the stale check, the narrowing and the
+// payload's gallery all read one gallery.
+func (s *Server) planRelay(w http.ResponseWriter, r *http.Request) (*relayPlan, bool) {
+	s.set.RLock()
+	defer s.set.RUnlock()
+	galleryName := s.activeGallery()
+	if !parseFormOK(w, r) || pageGalleryStale(w, r, galleryName) {
+		return nil, false
 	}
 	name := r.FormValue("plugin")
 	p, ok := s.plugin(name)
-	if !ok || !s.pluginUsable(p) {
+	if !ok || !s.peers.Usable(p) {
 		relayRefused(w, "plugin "+name+" is not available")
-		return
+		return nil, false
 	}
 	idx, err := strconv.Atoi(r.FormValue("button"))
 	if err != nil || idx < 0 || idx >= len(p.Buttons) || p.Buttons[idx].Mode != config.ModeRelay {
 		relayRefused(w, "unknown plugin button")
-		return
+		return nil, false
 	}
 	ids := parseIDList(r.Form["ids"])
 	if len(ids) == 0 {
 		relayRefused(w, "no images selected")
-		return
+		return nil, false
 	}
 	button := p.Buttons[idx]
 	scoped := s.scopeForButton(button, ids)
 	if len(scoped) == 0 {
 		relayRefused(w, "nothing selected that "+name+" handles")
-		return
+		return nil, false
 	}
 	// The peer never hears of the rows its media excluded, so its message
 	// cannot account for them.
@@ -72,112 +106,20 @@ func (s *Server) pluginRelay(w http.ResponseWriter, r *http.Request) {
 	if n := len(ids) - len(scoped); n > 0 {
 		narrowed = fmt.Sprintf(" (%d of %d sent; %d not handled by %s)", len(scoped), len(ids), n, name)
 	}
-	ids = scoped
 	base := s.pluginBase(p)
 	if base == "" || p.PeerToken == "" {
 		relayRefused(w, "plugin "+name+" has no address to call")
-		return
+		return nil, false
 	}
-
-	// The route is gallery-free so the peer call never runs under ctxMu,
-	// hence the snapshot.
-	galleryName := s.activeGallery()
-
-	answer, err := s.callPluginRelay(r.Context(), p.Name, base+button.Path, p.PeerToken, pluginRelayRequest{
-		Payload:  pluginPayloadVersion,
-		Monbooru: Version,
-		Gallery:  galleryName,
-		Slot:     button.Slot,
-		Button:   button.Label,
-		ImageIDs: ids,
-	})
-	if err != nil {
-		s.peers.MarkDown(name)
-		logx.Warnf("plugin relay %s: %v", name, err)
-		relayRefused(w, "plugin "+name+" did not answer")
-		return
-	}
-	message := truncateRunes(answer.Message, pluginMessageMax)
-	if !answer.OK {
-		if message == "" {
-			message = "plugin " + name + " refused the request"
-		}
-		relayRefused(w, message+narrowed)
-		return
-	}
-	setFlashHeader(w, message+narrowed, "ok", nil)
-	if answer.Refresh {
-		w.Header().Set("HX-Refresh", "true")
-	}
-	w.WriteHeader(http.StatusNoContent)
+	return &relayPlan{plugin: p, button: button, base: base, gallery: galleryName, ids: scoped, narrowed: narrowed}, true
 }
 
 func (s *Server) scopeForButton(b config.PluginButton, ids []int64) []int64 {
-	if b.Media == "" {
-		return ids
-	}
 	d := s.db()
 	if d == nil {
 		return ids
 	}
-	handled := make(map[int64]bool, len(ids))
-	err := db.Chunked(ids, 500, func(chunk []int64) error {
-		in, args := db.InPlaceholders(chunk)
-		rows, err := d.Read.Query(`SELECT id, file_type FROM images WHERE id IN (`+in+`)`, args...)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = rows.Close() }()
-		for rows.Next() {
-			var id int64
-			var fileType string
-			if err := rows.Scan(&id, &fileType); err == nil && b.AppliesTo(fileType) {
-				handled[id] = true
-			}
-		}
-		return rows.Err()
-	})
-	// A partial read knows nothing of the rows it never reached; dropping
-	// them would quietly shrink the scope.
-	if err != nil {
-		logx.Warnf("plugin scope for %s: %v", b.Label, err)
-		return ids
-	}
-	return slices.DeleteFunc(ids, func(id int64) bool { return !handled[id] })
-}
-
-type pluginRelayAnswer struct {
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
-	Refresh bool   `json:"refresh"`
-}
-
-func (s *Server) callPluginRelay(ctx context.Context, peer, target, token string, payload pluginRelayRequest) (pluginRelayAnswer, error) {
-	ctx, cancel := context.WithTimeout(ctx, pluginRelayTimeout)
-	defer cancel()
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return pluginRelayAnswer{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
-	if err != nil {
-		return pluginRelayAnswer{}, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := pluginClient.Do(req)
-	if err != nil {
-		return pluginRelayAnswer{}, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return pluginRelayAnswer{}, peerStatusError{peer, resp.Status}
-	}
-	var answer pluginRelayAnswer
-	if err := json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 1<<16)).Decode(&answer); err != nil {
-		return pluginRelayAnswer{}, err
-	}
-	return answer, nil
+	return plugins.Scope(b, ids, func(ids []int64) (map[int64]string, error) { return gallery.FileTypes(d, ids) })
 }
 
 // Byte length bounds rune count, so a short string skips the conversion.

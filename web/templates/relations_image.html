@@ -21,7 +21,6 @@
       <span class="field-hint">(no phash computed)</span>
       <form hx-post="/relations/phash/{{.Image.ID}}/recompute" hx-swap="none"
             hx-on::after-request="if(event.detail.successful){window.location.reload()}" style="display:inline">
-        <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
         <button type="submit" class="btn-link-accent">[backfill phash]</button>
       </form>
     {{end}}
@@ -64,19 +63,19 @@
         {{if eq $id $.Self}}
           <span class="relations-inline-label">^ This image</span>
           {{if ne $id $.Relations.DupGroup.Original}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "promote-original" "GroupID" $.Relations.DupGroup.ID "ImageID" $id "Label" "[original]" "Title" "Promote this image to the group original")}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "promote-original" "GroupID" $.Relations.DupGroup.ID "ImageID" $id "Label" "[original]" "Title" "Promote this image to the group original")}}
           {{end}}
           {{if and (eq $id $.Relations.DupGroup.Original) $.NextOriginalIfOriginalUnlinked}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "duplicate" "ImageID" $id "Label" "[unlink]" "Title" "Unlink this image from the group" "Confirm" (printf "Unlink this image (the current original)? Image #%d will be promoted to the new original." $.NextOriginalIfOriginalUnlinked))}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "duplicate" "ImageID" $id "Label" "[unlink]" "Title" "Unlink this image from the group" "Confirm" (printf "Unlink this image (the current original)? Image #%d will be promoted to the new original." $.NextOriginalIfOriginalUnlinked))}}
           {{end}}
         {{else}}
           {{if and (eq $id $.Relations.DupGroup.Original) $.NextOriginalIfOriginalUnlinked}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "duplicate" "ImageID" $id "Label" "[unlink]" "Title" "Unlink this duplicate" "Confirm" (printf "Unlink image #%d (the current original)? Image #%d will be promoted to the new original." $id $.NextOriginalIfOriginalUnlinked))}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "duplicate" "ImageID" $id "Label" "[unlink]" "Title" "Unlink this duplicate" "Confirm" (printf "Unlink image #%d (the current original)? Image #%d will be promoted to the new original." $id $.NextOriginalIfOriginalUnlinked))}}
           {{else}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "duplicate" "ImageID" $id "Label" "[unlink]" "Title" "Unlink this duplicate")}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "duplicate" "ImageID" $id "Label" "[unlink]" "Title" "Unlink this duplicate")}}
           {{end}}
           {{if ne $id $.Relations.DupGroup.Original}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "promote-original" "GroupID" $.Relations.DupGroup.ID "ImageID" $id "Label" "[original]" "Title" "Make this the original")}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "promote-original" "GroupID" $.Relations.DupGroup.ID "ImageID" $id "Label" "[original]" "Title" "Make this the original")}}
           {{end}}
         {{end}}
         </div>
@@ -100,7 +99,7 @@
         {{if eq $id $.Self}}
           <span class="relations-inline-label">^ This image</span>
         {{else}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "alternate" "ImageID" $id "Label" "[unlink]")}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "alternate" "ImageID" $id "Label" "[unlink]")}}
         {{end}}
         </div>
       </li>
@@ -125,9 +124,11 @@
         {{if eq $action "this"}}
         <span class="relations-inline-label">^ This image</span>
         {{else if eq $action "earlier"}}
-        {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "version" "A" $id "B" $.Image.ID "Label" "[unlink earlier revision]" "ExtraClass" "relations-inline-action")}}
+        {{template "partials/relation_unlink_form.html" (dict "Type" "version" "A" $id "B" $.Image.ID "Label" "[unlink earlier revision]" "ExtraClass" "relations-inline-action")}}
+        {{template "partials/relation_unlink_form.html" (dict "URL" "/relations/reverse" "Type" "version" "A" $id "B" $.Image.ID "Label" "[reverse]" "Title" (printf "Make #%d the newer revision" $id) "Confirm" (printf "Reverse this edge so #%d becomes the newer revision?" $id) "ExtraClass" "relations-inline-action")}}
         {{else if eq $action "newer"}}
-        {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "version" "A" $.Image.ID "B" $id "Label" "[unlink newer revision]" "ExtraClass" "relations-inline-action")}}
+        {{template "partials/relation_unlink_form.html" (dict "Type" "version" "A" $.Image.ID "B" $id "Label" "[unlink newer revision]" "ExtraClass" "relations-inline-action")}}
+        {{template "partials/relation_unlink_form.html" (dict "URL" "/relations/reverse" "Type" "version" "A" $.Image.ID "B" $id "Label" "[reverse]" "Title" (printf "Make #%d the earlier revision" $id) "Confirm" (printf "Reverse this edge so #%d becomes the earlier revision?" $id) "ExtraClass" "relations-inline-action")}}
         {{end}}
       </div>
       {{end}}
@@ -153,9 +154,11 @@
           {{if eq $action "this"}}
           <span class="relations-inline-label">^ This image</span>
           {{else if eq $action "source"}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "derivative" "A" .ID "B" $.Image.ID "Label" (printf "[unlink source #%d]" .ID) "ExtraClass" "relations-inline-action" "Edge" (printf "%d-%d" .ID $.Image.ID))}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "derivative" "A" .ID "B" $.Image.ID "Label" (printf "[unlink source #%d]" .ID) "ExtraClass" "relations-inline-action" "Edge" (printf "%d-%d" .ID $.Image.ID))}}
+          {{template "partials/relation_unlink_form.html" (dict "URL" "/relations/reverse" "Type" "derivative" "A" .ID "B" $.Image.ID "Label" "[reverse]" "Title" (printf "Make #%d based on this image" .ID) "Confirm" (printf "Reverse this edge so #%d is based on this image?" .ID) "ExtraClass" "relations-inline-action")}}
           {{else if eq $action "derivative"}}
-          {{template "partials/relation_unlink_form.html" (dict "CSRFToken" $.CSRFToken "Type" "derivative" "A" $.Image.ID "B" .ID "Label" (printf "[unlink derivative #%d]" .ID) "ExtraClass" "relations-inline-action" "Edge" (printf "%d-%d" $.Image.ID .ID))}}
+          {{template "partials/relation_unlink_form.html" (dict "Type" "derivative" "A" $.Image.ID "B" .ID "Label" (printf "[unlink derivative #%d]" .ID) "ExtraClass" "relations-inline-action" "Edge" (printf "%d-%d" $.Image.ID .ID))}}
+          {{template "partials/relation_unlink_form.html" (dict "URL" "/relations/reverse" "Type" "derivative" "A" $.Image.ID "B" .ID "Label" "[reverse]" "Title" (printf "Make this image based on #%d" .ID) "Confirm" (printf "Reverse this edge so this image is based on #%d?" .ID) "ExtraClass" "relations-inline-action")}}
           {{end}}
         </div>
         {{end}}

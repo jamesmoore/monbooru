@@ -66,18 +66,6 @@ type exifData struct {
 	tags map[string]*exifTag
 }
 
-func (x *exifData) get(name string) (*exifTag, bool) {
-	t, ok := x.tags[name]
-	return t, ok
-}
-
-// Map order: a caller that renders the tags sorts them.
-func (x *exifData) walk(fn func(name string, t *exifTag)) {
-	for name, t := range x.tags {
-		fn(name, t)
-	}
-}
-
 // Every offset and length is checked against the block. Only the header
 // and IFD0 must parse: past them, what fails to decode is dropped, which
 // can lose tags but never surface a wrong one.
@@ -214,7 +202,7 @@ func (x *exifData) load(tags []*exifTag, names map[uint16]string) {
 }
 
 func (x *exifData) loadSubIFD(data []byte, order binary.ByteOrder, pointer string, names map[uint16]string) {
-	t, ok := x.get(pointer)
+	t, ok := x.tags[pointer]
 	if !ok {
 		return
 	}

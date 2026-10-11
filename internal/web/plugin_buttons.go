@@ -2,9 +2,7 @@ package web
 
 import (
 	"net/http"
-	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
@@ -42,49 +40,20 @@ func (v pluginSlotView) AnyOpen() bool {
 }
 
 func (s *Server) pluginSlot(r *http.Request, slot string, imageID int64, fileType string) pluginSlotView {
-	peers := s.plugins()
-	slices.SortFunc(peers, func(a, b config.PluginConfig) int { return strings.Compare(a.Name, b.Name) })
 	back, gallery := s.pageURL(r), s.activeGallery()
 	view := pluginSlotView{ImageID: imageID}
-	for _, p := range peers {
-		// pluginAddress, not pluginBase: a paused peer renders inert
-		// rather than vanishing, so a pause reads as a pause.
-		if s.pluginAddress(p) == "" {
-			continue
-		}
-		off := !s.pluginUsable(p)
-		g := pluginGroup{Peer: p.Name}
-		for i, b := range p.Buttons {
-			if b.Slot != slot {
-				continue
-			}
-			if fileType != "" && !b.AppliesTo(fileType) {
-				continue
-			}
-			v := pluginButtonView{Label: b.Label, Mode: b.Mode, Index: i, Off: off}
-			if off {
-				v.Why = p.Name + " is " + pluginOffState(p)
-			}
-			if b.Mode == config.ModeOpen {
-				// Through monbooru's mount, not the paired address: that
-				// one is reachable from the server, not the browser.
-				v.Href = substitutePluginVars(pluginMountBase(p.Name)+b.Path, imageID, gallery, back)
+	for _, sp := range s.peers.Slot(s.cfgSnapshot(), slot, imageID, fileType, gallery, back, pluginMountBase) {
+		g := pluginGroup{Peer: sp.Name}
+		for _, b := range sp.Buttons {
+			v := pluginButtonView{Label: b.Label, Mode: b.Mode, Href: b.Href, Index: b.Index, Off: sp.Off}
+			if sp.Off {
+				v.Why = sp.Name + " is " + sp.OffState
 			}
 			g.Buttons = append(g.Buttons, v)
 		}
-		if len(g.Buttons) > 0 {
-			view.Groups = append(view.Groups, g)
-		}
+		view.Groups = append(view.Groups, g)
 	}
 	return view
-}
-
-func substitutePluginVars(target string, imageID int64, gallery, backURL string) string {
-	return strings.NewReplacer(
-		"{image_id}", url.QueryEscape(strconv.FormatInt(imageID, 10)),
-		"{gallery}", url.QueryEscape(gallery),
-		"{back_url}", url.QueryEscape(backURL),
-	).Replace(target)
 }
 
 // The host is the one the browser reached: base_url defaults to

@@ -1,8 +1,6 @@
 {{define "partials/collection_find_relations.html"}}
 <form class="collection-find-relations" hx-post="/collections/find-relations"
-      hx-target="this" hx-swap="outerHTML"
-      hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'>
-  <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+      hx-target="this" hx-swap="outerHTML">
   <input type="hidden" name="collection" value="{{.Name}}">
   <input type="hidden" name="enabled" value="{{if .FindRelations}}0{{else}}1{{end}}">
   <span class="field-hint">find relations:</span>

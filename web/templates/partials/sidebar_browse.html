@@ -47,7 +47,6 @@
       <span class="sidebar-section-title">Saved Searches</span>
     </div>
     <ul class="saved-search-list-sidebar">
-      {{$csrf := $.CSRFToken}}
       {{range .SavedSearches}}
       <li class="saved-search-entry" id="ss-{{.ID}}">
         <a href="{{.HRef}}" class="saved-search-link" title="{{.Query}}">{{.Name}}</a>
@@ -55,7 +54,6 @@
                 hx-delete="/search/saved/{{.ID}}"
                 hx-target="#ss-{{.ID}}"
                 hx-swap="outerHTML"
-                hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
                 title="Remove saved search">×</button>
       </li>
       {{end}}

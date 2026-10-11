@@ -28,6 +28,7 @@
             <img src="/thumbnails/{{$.ActiveGallery}}/{{.OriginalID}}.jpg" alt="image {{.OriginalID}}" loading="lazy">
             <span class="relations-card-tag">original</span>
           </a>
+          {{if .OriginalMissing}}<span class="mono-small">(missing)</span>{{end}}
         </td>
         <td>
           <a href="/images/{{.DuplicateID}}" class="browse-thumb">
@@ -39,16 +40,18 @@
         <td>
           {{if .HasTagsToCopy}}
           <button type="button" class="btn-link-accent btn-copy-tags-preview"
-                  data-group-id="{{.GroupID}}">[copy tags]</button>
+                  hx-get="/relations/dup-group/{{.GroupID}}/copy-tags/preview" hx-target="#copy-tags-preview-body"
+                  onclick="openCopyTagsPreview()">[copy tags]</button>
           {{end}}
+          {{if not .OriginalMissing}}
           <form hx-post="/relations/duplicates/marked/delete-one" hx-target="#flash-walker-marked" hx-swap="innerHTML"
                 hx-confirm="Delete image {{.DuplicateID}} from the gallery?"
                 data-confirm-danger="Its file is removed from disk. This cannot be undone."
                 data-confirm-ok="Delete" style="display:inline">
-            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
             <input type="hidden" name="image_id" value="{{.DuplicateID}}">
             <button type="submit" class="btn-sm btn-danger">Delete</button>
           </form>
+          {{end}}
         </td>
       </tr>
       {{end}}
@@ -65,21 +68,11 @@
 </dialog>
 
 <script>
-document.querySelectorAll('.btn-copy-tags-preview').forEach(function(btn) {
-  btn.addEventListener('click', function() {
-    var gid = this.dataset.groupId;
-    var dlg = document.getElementById('copy-tags-preview-dialog');
-    var body = document.getElementById('copy-tags-preview-body');
-    if (!dlg || !body) return;
-    body.innerHTML = 'Loading...';
-    if (window.htmx) {
-      window.htmx.ajax('GET', '/relations/dup-group/' + gid + '/copy-tags/preview', {
-        target: '#copy-tags-preview-body', swap: 'innerHTML',
-      });
-    }
-    dlg.showModal();
-  });
-});
+// Runs before htmx's own click listener, so the reset precedes the swap.
+function openCopyTagsPreview() {
+  document.getElementById('copy-tags-preview-body').innerHTML = 'Loading...';
+  document.getElementById('copy-tags-preview-dialog').showModal();
+}
 </script>
 
 {{template "layout_end" .}}

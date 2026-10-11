@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -31,7 +32,6 @@ const (
 	ipcMethodRun ipcMethod = iota + 1
 	ipcMethodStatus
 	ipcMethodReleaseIdle
-	ipcMethodReleaseAll
 	ipcMethodShutdown
 )
 
@@ -45,10 +45,12 @@ type ipcRequest struct {
 // cmdline is world-readable.
 const ipcTokenEnv = "MONBOORU_TAGGER_IPC_TOKEN"
 
+const workerLogEnv = "MONBOORU_TAGGER_WORKER_LOG"
+
 const ipcHandshakeTimeout = 5 * time.Second
 
 // Any local process can reach the loopback listener, so a connection that
-// cannot echo the spawn secret is dropped before it sees the config.
+// cannot echo the spawn secret is dropped before it is sent frame paths.
 type ipcHello struct{ Token string }
 
 // A Stream frame is progress; the first frame without Stream is the reply.
@@ -115,8 +117,6 @@ type ipcBackend struct {
 	lastStatus  atomic.Pointer[CacheStatus]
 }
 
-func newIPCBackend() (*ipcBackend, error) { return &ipcBackend{}, nil }
-
 // Caller must hold b.mu.
 func (b *ipcBackend) ensureRunning() error {
 	if b.cmd != nil && b.conn != nil {
@@ -138,9 +138,11 @@ func (b *ipcBackend) ensureRunning() error {
 		return fmt.Errorf("resolve own executable: %w", err)
 	}
 	cmd := exec.Command(exe, "tagger-worker", "--addr="+addr)
-	cmd.Env = append(os.Environ(), ipcTokenEnv+"="+token)
+	cmd.Env = workerEnv(token)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// The parent's writer, so a desktop launch's log file gets the
+	// worker's lines too.
+	cmd.Stderr = log.Writer()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn tagger-worker: %w", err)
 	}
@@ -152,20 +154,8 @@ func (b *ipcBackend) ensureRunning() error {
 	}
 	accepted := make(chan acceptResult, 1)
 	go func() {
-		for {
-			c, err := listener.Accept()
-			if err != nil {
-				accepted <- acceptResult{nil, err}
-				return
-			}
-			if !ipcHandshakeOK(c, token) {
-				logx.Warnf("tagger-worker: dropped a connection that failed the handshake")
-				_ = c.Close()
-				continue
-			}
-			accepted <- acceptResult{c, nil}
-			return
-		}
+		c, err := acceptWorker(listener, token)
+		accepted <- acceptResult{c, err}
 	}()
 
 	select {
@@ -184,6 +174,28 @@ func (b *ipcBackend) ensureRunning() error {
 		_ = cmd.Wait()
 		return errors.New("tagger-worker did not connect within 15s")
 	}
+}
+
+func acceptWorker(l net.Listener, token string) (net.Conn, error) {
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if ipcHandshakeOK(c, token) {
+			return c, nil
+		}
+		logx.Warnf("tagger-worker: dropped a connection that failed the handshake")
+		_ = c.Close()
+	}
+}
+
+func workerEnv(token string) []string {
+	env := append(os.Environ(), ipcTokenEnv+"="+token)
+	if os.Getenv(workerLogEnv) == "" {
+		env = append(env, workerLogEnv+"="+logx.Get())
+	}
+	return env
 }
 
 func newIPCToken() (string, error) {
@@ -298,6 +310,13 @@ func (b *ipcBackend) call(ctx context.Context, req ipcRequest, onProgress func(i
 // that a wedged worker can't stall the reclaim ticker or shutdown.
 const shortCallTimeout = 30 * time.Second
 
+// Caller must hold b.mu.
+func (b *ipcBackend) shortCall(req ipcRequest) (ipcResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), shortCallTimeout)
+	defer cancel()
+	return b.call(ctx, req, nil)
+}
+
 func (b *ipcBackend) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
 	// gob cannot encode a func; progress comes back over the response
 	// stream instead.
@@ -316,6 +335,11 @@ func (b *ipcBackend) Run(ctx context.Context, req RunRequest) (RunResponse, erro
 	resp, err := b.call(ctx, ipcRequest{Method: ipcMethodRun, Run: &wire}, req.OnProgress)
 	if err != nil {
 		return RunResponse{}, err
+	}
+	// The child's own teardown at 0 frees the sessions but not the GPU
+	// libraries, which only its exit gives back.
+	if req.IdleReleaseMinutes <= 0 {
+		b.shutdownLocked()
 	}
 	if resp.Err != "" {
 		return RunResponse{}, errors.New(resp.Err)
@@ -345,9 +369,7 @@ func (b *ipcBackend) Status() CacheStatus {
 	if b.conn == nil {
 		return CacheStatus{}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), shortCallTimeout)
-	defer cancel()
-	resp, err := b.call(ctx, ipcRequest{Method: ipcMethodStatus}, nil)
+	resp, err := b.shortCall(ipcRequest{Method: ipcMethodStatus})
 	if err != nil {
 		return CacheStatus{}
 	}
@@ -365,9 +387,7 @@ func (b *ipcBackend) ReleaseIdle(after time.Duration) bool {
 	if b.conn == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), shortCallTimeout)
-	defer cancel()
-	resp, err := b.call(ctx, ipcRequest{Method: ipcMethodReleaseIdle, IdleAfter: after}, nil)
+	resp, err := b.shortCall(ipcRequest{Method: ipcMethodReleaseIdle, IdleAfter: after})
 	if err != nil {
 		return false
 	}
@@ -380,13 +400,15 @@ func (b *ipcBackend) ReleaseIdle(after time.Duration) bool {
 func (b *ipcBackend) ReleaseAll() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.shutdownLocked()
+}
+
+// Caller must hold b.mu.
+func (b *ipcBackend) shutdownLocked() {
 	if b.conn == nil {
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), shortCallTimeout)
-	defer cancel()
-	resp, err := b.call(ctx, ipcRequest{Method: ipcMethodShutdown}, nil)
+	resp, err := b.shortCall(ipcRequest{Method: ipcMethodShutdown})
 	if err != nil {
 		return
 	}

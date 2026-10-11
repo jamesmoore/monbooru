@@ -2,6 +2,7 @@ package gallery
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -20,17 +21,17 @@ import (
 )
 
 type Watcher struct {
-	fsw            *fsnotify.Watcher
-	galleryName    string
-	galleryPath    string
-	thumbnailsPath string
-	maxFileSizeMB  int
-	db             *db.DB
-	jobs           *jobs.Manager
-	OnEvent        func(msg string)
-	OnChange       func()
-	OnPhash        PhashSink
-	Naming         Naming
+	handle      Handle
+	fsw         *fsnotify.Watcher
+	galleryName string
+	galleryPath string
+	db          *db.DB
+	jobs        *jobs.Manager
+	OnEvent     func(msg string)
+	OnChange    func()
+	OnPhash     PhashSink
+	// Read at each ingest, so a Settings save reaches a running watcher.
+	Settings func() (maxFileSizeMB int, naming Naming)
 	// Read at every event, so a gallery added inside this one is left
 	// alone from the moment it exists.
 	boundary func() *Boundary
@@ -43,6 +44,11 @@ type Watcher struct {
 	closing   bool
 	stop      chan struct{}
 	timers    map[string]*debounceTimer
+	// Fired runs wait here for a slot rather than each in a goroutine of
+	// its own.
+	queue     []queuedRun
+	draining  int
+	ingesting int
 	wg        sync.WaitGroup
 }
 
@@ -57,13 +63,20 @@ const debounceDelay = 500 * time.Millisecond
 // or an in-place replace claims the row before the file is judged gone.
 const movedOutGrace = 2 * time.Second
 
+type queuedRun struct {
+	path   string
+	run    func(string)
+	ingest bool
+}
+
 type debounceTimer struct {
 	t        *time.Timer
 	deadline time.Time
 	run      func(string)
+	ingest   bool
 }
 
-func NewWatcher(h Handle, maxFileSizeMB int, jobManager *jobs.Manager) (*Watcher, error) {
+func NewWatcher(h Handle, jobManager *jobs.Manager) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -71,17 +84,16 @@ func NewWatcher(h Handle, maxFileSizeMB int, jobManager *jobs.Manager) (*Watcher
 	galleryPath := h.GalleryPath
 
 	w := &Watcher{
-		fsw:            fsw,
-		galleryName:    h.Name,
-		galleryPath:    galleryPath,
-		thumbnailsPath: h.ThumbnailsPath,
-		maxFileSizeMB:  maxFileSizeMB,
-		db:             h.DB,
-		jobs:           jobManager,
-		boundary:       h.Boundary,
-		timers:         map[string]*debounceTimer{},
-		selfMoved:      map[string]time.Time{},
-		stop:           make(chan struct{}),
+		handle:      h,
+		fsw:         fsw,
+		galleryName: h.Name,
+		galleryPath: galleryPath,
+		db:          h.DB,
+		jobs:        jobManager,
+		boundary:    h.Boundary,
+		timers:      map[string]*debounceTimer{},
+		selfMoved:   map[string]time.Time{},
+		stop:        make(chan struct{}),
 	}
 
 	if addErr := fsw.Add(galleryPath); addErr != nil {
@@ -145,7 +157,11 @@ func (w *Watcher) Run(ctx context.Context) error {
 				// A folder made meanwhile is still watched; the timers for its
 				// files check the job again when they fire.
 				if event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
-					if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+					info, err := os.Stat(event.Name)
+					switch {
+					case err != nil && event.Has(fsnotify.Rename):
+						w.unwatchUnder(event.Name)
+					case err == nil && info.IsDir():
 						w.registerTree(event.Name)
 					}
 				}
@@ -158,7 +174,8 @@ func (w *Watcher) Run(ctx context.Context) error {
 					// A Rename carries a move's source; if nothing claims the
 					// row within the grace, the file left the library.
 					if event.Has(fsnotify.Rename) {
-						w.schedule(event.Name, movedOutGrace, w.reconcileVanished)
+						w.unwatchUnder(event.Name)
+						w.schedule(event.Name, movedOutGrace, w.reconcileVanished, false)
 					}
 					continue
 				}
@@ -182,7 +199,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 			// row missing in between races the replace's commit.
 			if event.Has(fsnotify.Remove) {
 				_ = w.fsw.Remove(event.Name)
-				w.schedule(event.Name, movedOutGrace, w.reconcileVanished)
+				w.schedule(event.Name, movedOutGrace, w.reconcileVanished, false)
 			}
 
 		case err, ok := <-w.fsw.Errors:
@@ -207,7 +224,7 @@ func (w *Watcher) registerTree(dir string) {
 	if !w.linkWorthFollowing(dir) {
 		return
 	}
-	_ = WalkTreeUnder(dir, w.boundary(), func(path string, d os.DirEntry, err error) error {
+	_ = walkTreeUnder(dir, w.boundary(), func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -222,6 +239,19 @@ func (w *Watcher) registerTree(dir string) {
 	})
 }
 
+// fsnotify drops only a moved folder's own watch; its subfolders' watches
+// keep their old names, which the new name's registration would get back.
+func (w *Watcher) unwatchUnder(dir string) {
+	if w.fsw.Remove(dir) != nil {
+		return
+	}
+	for _, p := range w.fsw.WatchList() {
+		if PathInside(dir, p) {
+			_ = w.fsw.Remove(p)
+		}
+	}
+}
+
 // The walk's rule for links, applied here because registerTree starts at
 // the link rather than at the gallery root.
 func (w *Watcher) linkWorthFollowing(dir string) bool {
@@ -229,10 +259,7 @@ func (w *Watcher) linkWorthFollowing(dir string) bool {
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		return true
 	}
-	root, err := filepath.EvalSymlinks(w.galleryPath)
-	if err != nil {
-		root = filepath.Clean(w.galleryPath)
-	}
+	root := resolvePath(w.galleryPath)
 	target, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return false
@@ -254,7 +281,7 @@ func (w *Watcher) jobSuppressesIngest() bool {
 	// prune-dirs: every directory it unlinks fires a Remove with no row
 	// behind it.
 	switch st.JobType {
-	case "sync", "move", "transfer", "delete", "tag", "prune-dirs":
+	case "sync", "move", "transfer", "merge", "delete", "tag", "prune-dirs":
 		return len(st.Galleries) == 0 || slices.Contains(st.Galleries, w.galleryName)
 	}
 	return false
@@ -266,6 +293,7 @@ func (w *Watcher) shutdown() {
 	w.mu.Lock()
 	w.closing = true
 	close(w.stop)
+	w.queue = nil
 	for path, e := range w.timers {
 		e.t.Stop()
 		delete(w.timers, path)
@@ -276,7 +304,7 @@ func (w *Watcher) shutdown() {
 }
 
 func (w *Watcher) debounce(path string) {
-	w.schedule(path, debounceDelay, w.ingestFile)
+	w.schedule(path, debounceDelay, w.ingestFile, true)
 }
 
 // Outlasts both timers a self-rename can arm: the destination's ingest
@@ -301,7 +329,7 @@ func (w *Watcher) claimSelfMove(paths ...string) {
 	}
 }
 
-func (w *Watcher) schedule(path string, delay time.Duration, run func(string)) {
+func (w *Watcher) schedule(path string, delay time.Duration, run func(string), ingest bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -319,36 +347,66 @@ func (w *Watcher) schedule(path string, delay time.Duration, run func(string)) {
 	}
 	if e, ok := w.timers[path]; ok {
 		e.deadline = time.Now().Add(delay)
-		e.run = run
+		e.run, e.ingest = run, ingest
 		e.t.Reset(delay)
 		return
 	}
 
-	e := &debounceTimer{deadline: time.Now().Add(delay), run: run}
+	e := &debounceTimer{deadline: time.Now().Add(delay), run: run, ingest: ingest}
 	e.t = time.AfterFunc(delay, func() { w.onDebounceFired(path, e) })
 	w.timers[path] = e
 }
 
 // A Reset that raced this callback moved the deadline on, and that later
-// fire takes over. wg.Add runs under the lock so shutdown cannot miss an
-// ingest that passed the closing check.
+// fire takes over. wg.Add runs under the lock so shutdown cannot miss a
+// drainer started after the closing check.
 func (w *Watcher) onDebounceFired(path string, e *debounceTimer) {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.closing || w.timers[path] != e || time.Now().Before(e.deadline) {
-		w.mu.Unlock()
 		return
 	}
 	delete(w.timers, path)
-	run := e.run
-	w.wg.Add(1)
-	w.mu.Unlock()
-	defer w.wg.Done()
-
-	if !w.acquireSlot() {
-		return
+	w.queue = append(w.queue, queuedRun{path: path, run: e.run, ingest: e.ingest})
+	if w.draining < cap(watcherSlots) {
+		w.draining++
+		w.wg.Add(1)
+		go w.drain()
 	}
-	defer func() { <-watcherSlots }()
-	run(path)
+}
+
+// drain exits under the lock on an empty queue, so a run queued after
+// that check starts a drainer of its own.
+func (w *Watcher) drain() {
+	defer w.wg.Done()
+	for {
+		if !w.acquireSlot() {
+			w.mu.Lock()
+			w.draining--
+			w.mu.Unlock()
+			return
+		}
+		w.mu.Lock()
+		if len(w.queue) == 0 {
+			w.draining--
+			w.mu.Unlock()
+			<-watcherSlots
+			return
+		}
+		next := w.queue[0]
+		w.queue = w.queue[1:]
+		if next.ingest {
+			w.ingesting++
+		}
+		w.mu.Unlock()
+		next.run(next.path)
+		if next.ingest {
+			w.mu.Lock()
+			w.ingesting--
+			w.mu.Unlock()
+		}
+		<-watcherSlots
+	}
 }
 
 // acquireSlot is false once the watcher is closing, whether it was
@@ -368,6 +426,8 @@ func (w *Watcher) acquireSlot() bool {
 	}
 }
 
+// A file or folder moved inside the tree is repointed by the ingests of
+// its new paths, which a long walk or queue can hold past the grace.
 func (w *Watcher) reconcileVanished(path string) {
 	if w.jobSuppressesIngest() {
 		return
@@ -375,7 +435,26 @@ func (w *Watcher) reconcileVanished(path string) {
 	if _, err := os.Stat(path); err == nil {
 		return
 	}
+	if w.ingestsDue() {
+		w.schedule(path, movedOutGrace, w.reconcileVanished, false)
+		return
+	}
 	w.markFileMissing(path)
+	w.markFolderMissing(path)
+}
+
+func (w *Watcher) ingestsDue() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ingesting > 0 || slices.ContainsFunc(w.queue, func(q queuedRun) bool { return q.ingest }) {
+		return true
+	}
+	for _, e := range w.timers {
+		if e.ingest {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) ingestFile(path string) {
@@ -388,7 +467,12 @@ func (w *Watcher) ingestFile(path string) {
 		return
 	}
 
-	if maxMB := w.maxFileSizeMB; maxMB > 0 {
+	var maxMB int
+	var naming Naming
+	if w.Settings != nil {
+		maxMB, naming = w.Settings()
+	}
+	if maxMB > 0 {
 		if info, statErr := os.Stat(path); statErr == nil {
 			if info.Size() > int64(maxMB)*1024*1024 {
 				logx.Warnf("watcher: skipping %q (size %d exceeds %d MB)",
@@ -398,33 +482,52 @@ func (w *Watcher) ingestFile(path string) {
 		}
 	}
 
-	img, isDup, err := Ingest(w.db, w.galleryPath, w.thumbnailsPath, path, "")
-	if err != nil {
+	img, out, err := ingestPath(w.handle, path, "")
+	switch {
+	case err != nil:
 		logx.Warnf("watcher ingest %q: %v", path, err)
-	} else if isDup {
+		if errors.Is(err, ErrRewritten) && w.OnEvent != nil {
+			w.OnEvent(w.eventPrefix() + "conflict " + filepath.Base(path))
+		}
+		return
+	case out == ingestDuplicate:
 		logx.Infof("watcher: duplicate %q", path)
+		return
+	}
+	verb := "added"
+	switch out {
+	case ingestCreated:
+		if !naming.Empty() && img != nil {
+			path = w.renameIngested(naming, img.ID, path)
+		}
+	case ingestMoved:
+		verb = "moved"
+	case ingestRestored:
+		verb = "restored"
+	case ingestEdited:
+		verb = "re-read"
+	}
+	// A failed thumbnail after an edit leaves the phash NULL, and the
+	// index must drop the old bytes' entry too.
+	if out == ingestEdited {
+		w.OnPhash.Stored(img.ID, img.Phash)
 	} else {
-		if !w.Naming.Empty() && img != nil {
-			path = w.renameIngested(img.ID, path)
-		}
-		if img != nil {
-			w.OnPhash.Stored(img.ID, img.Phash)
-		}
-		logx.Infof("watcher: ingested %q", path)
-		if w.OnEvent != nil {
-			w.OnEvent(w.eventPrefix() + "added " + filepath.Base(path))
-		}
-		if w.OnChange != nil {
-			w.OnChange()
-		}
+		w.OnPhash.Landed(img)
+	}
+	logx.Infof("watcher: %s %q", verb, path)
+	if w.OnEvent != nil {
+		w.OnEvent(w.eventPrefix() + verb + " " + filepath.Base(path))
+	}
+	if w.OnChange != nil {
+		w.OnChange()
 	}
 }
 
-func (w *Watcher) renameIngested(id int64, path string) string {
+func (w *Watcher) renameIngested(naming Naming, id int64, path string) string {
 	w.claimSelfMove(path)
 	// Not cancellable, like the ingest before it: a rename cut short at
 	// shutdown would strand the file half-filed.
-	newPath, err := w.Naming.Apply(context.Background(), w.db, w.boundary(), id, "", "")
+	newPath, err := naming.Apply(context.Background(), w.db, w.boundary(), id, "", "")
 	if err != nil {
 		logx.Warnf("watcher: name %q: %v", path, err)
 		return path
@@ -449,19 +552,16 @@ func (w *Watcher) promoteSurvivingCopy(id int64, gonePath string) bool {
 		if w.boundary().Check(p) != nil {
 			continue
 		}
-		info, statErr := os.Stat(p)
-		if statErr != nil {
+		if _, err := os.Stat(p); err != nil {
 			continue
 		}
-		// A cheap stand-in for sync's re-hash: a copy overwritten while
-		// nothing watched would leave sha256, md5 and file_size
-		// describing other bytes.
-		if info.Size() != c.Size {
-			logx.Warnf("watcher promote copy %d: %q holds %d bytes, not the row's %d - left alone",
-				id, p, info.Size(), c.Size)
+		if err := changedSinceIndexed(p, c.Indexed); err != nil {
+			logx.Warnf("watcher promote copy %d: %q %v - left alone", id, p, err)
 			continue
 		}
-		if err := repointCanonical(w.db.Write, id, p, FolderPath(w.galleryPath, p), gonePath); err != nil {
+		if err := db.InWriteTx(w.db.Write, func(tx *sql.Tx) error {
+			return repointCanonical(tx, id, p, FolderPath(w.galleryPath, p), gonePath)
+		}); err != nil {
 			logx.Warnf("watcher promote copy %d: %v", id, err)
 			return false
 		}
@@ -474,23 +574,81 @@ func (w *Watcher) promoteSurvivingCopy(id int64, gonePath string) bool {
 	return false
 }
 
-// The raw decrement is deliberate: after is_missing = 1, DropTagUsageTx
-// would see a row it no longer counts and refuse.
+// A folder that leaves the tree reports only itself, so the files it held
+// are judged here, all at once, as a sync would judge them.
+func (w *Watcher) markFolderMissing(dir string) {
+	if dir == w.galleryPath || !NamedInside(w.galleryPath, dir) {
+		return
+	}
+	type entry struct {
+		pathID, imageID int64
+		path            string
+		canonical       bool
+	}
+	entries, err := db.QueryAll(w.db.Read, db.ScanRow(func(e *entry) []any {
+		return []any{&e.pathID, &e.imageID, &e.path, &e.canonical}
+	}), `SELECT ip.id, ip.image_id, ip.path, ip.is_canonical
+		FROM image_paths ip JOIN images i ON i.id = ip.image_id
+		WHERE ip.path >= ? AND ip.path < ? AND (ip.is_canonical = 0 OR i.is_missing = 0)`,
+		dir+string(filepath.Separator), dir+string(filepath.Separator+1))
+	if err != nil {
+		logx.Warnf("watcher: list %q: %v", dir, err)
+		return
+	}
+	var stalePaths []int64
+	var goneCanonicals []entry
+	for _, e := range entries {
+		if _, err := os.Stat(e.path); err == nil {
+			continue
+		}
+		if e.canonical {
+			goneCanonicals = append(goneCanonicals, e)
+		} else {
+			stalePaths = append(stalePaths, e.pathID)
+		}
+	}
+	if err := db.Chunked(stalePaths, 500, func(chunk []int64) error {
+		in, args := db.InPlaceholders(chunk)
+		_, err := w.db.Write.Exec(`DELETE FROM image_paths WHERE id IN (`+in+`)`, args...)
+		return err
+	}); err != nil {
+		logx.Warnf("watcher: drop paths under %q: %v", dir, err)
+		return
+	}
+	var gone []int64
+	for _, e := range goneCanonicals {
+		if !w.promoteSurvivingCopy(e.imageID, e.path) {
+			gone = append(gone, e.imageID)
+		}
+	}
+	if len(gone) == 0 && len(stalePaths) == 0 {
+		return
+	}
+	var marked int
+	if err := db.InWriteTx(w.db.Write, func(tx *sql.Tx) error {
+		var err error
+		marked, err = setMissingTx(tx, gone, true)
+		return err
+	}); err != nil {
+		logx.Warnf("watcher: mark missing under %q: %v", dir, err)
+		return
+	}
+	logx.Infof("watcher: %q left, marked %d image(s) missing", dir, marked)
+	if marked > 0 && w.OnEvent != nil {
+		w.OnEvent(fmt.Sprintf("%sremoved %d image(s) in %s", w.eventPrefix(), marked, filepath.Base(dir)))
+	}
+	if w.OnChange != nil {
+		w.OnChange()
+	}
+}
+
 func (w *Watcher) markFileMissing(path string) {
-	rootAbs, err := filepath.Abs(w.galleryPath)
-	if err != nil {
-		return
-	}
-	pathAbs, err := filepath.Abs(path)
-	if err != nil {
-		return
-	}
-	if !PathInside(rootAbs, pathAbs) {
+	if !NamedInside(w.galleryPath, path) {
 		return
 	}
 
 	var imgID int64
-	err = w.db.Read.QueryRow(
+	err := w.db.Read.QueryRow(
 		`SELECT id FROM images WHERE canonical_path = ? AND is_missing = 0`, path,
 	).Scan(&imgID)
 	if err != nil {
@@ -508,35 +666,8 @@ func (w *Watcher) markFileMissing(path string) {
 		return
 	}
 
-	tx, err := w.db.Write.Begin()
-	if err != nil {
-		logx.Warnf("watcher mark missing %q: begin tx: %v", path, err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.Exec(`UPDATE images SET is_missing = 1 WHERE id = ?`, imgID); err != nil {
+	if _, err := SetMissing(w.db, imgID, true); err != nil {
 		logx.Warnf("watcher mark missing %q: %v", path, err)
-		return
-	}
-
-	tagIDs, err := db.QueryIDs(tx, `SELECT tag_id FROM image_tags WHERE image_id = ?`, imgID)
-	if err != nil {
-		logx.Warnf("watcher mark missing %q: list tags: %v", path, err)
-		return
-	}
-
-	for _, tid := range tagIDs {
-		if _, err := tx.Exec(
-			`UPDATE tags SET usage_count = MAX(0, usage_count - 1) WHERE id = ?`, tid,
-		); err != nil {
-			logx.Warnf("watcher mark missing %q: decrement tag %d: %v", path, tid, err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		logx.Warnf("watcher mark missing %q: commit: %v", path, err)
 		return
 	}
 

@@ -126,7 +126,8 @@ func loadSDMeta(ctx context.Context, database *db.DB, id int64) *models.SDMetada
 	var m models.SDMetadata
 	var rawParams, genHash *string
 	err := database.Read.QueryRowContext(ctx,
-		`SELECT image_id, prompt, negative_prompt, model, seed, sampler, steps, cfg_scale, raw_params, generation_hash
+		`SELECT image_id, COALESCE(prompt, ''), COALESCE(negative_prompt, ''), COALESCE(model, ''), seed,
+		        COALESCE(sampler, ''), steps, cfg_scale, raw_params, generation_hash
 		 FROM sd_metadata WHERE image_id = ?`, id,
 	).Scan(&m.ImageID, &m.Prompt, &m.NegativePrompt, &m.Model, &m.Seed, &m.Sampler, &m.Steps, &m.CFGScale, &rawParams, &genHash)
 	if err != nil {
@@ -148,7 +149,8 @@ func loadComfyMeta(ctx context.Context, database *db.DB, id int64) *models.Comfy
 	var m models.ComfyUIMetadata
 	var genHash *string
 	err := database.Read.QueryRowContext(ctx,
-		`SELECT image_id, prompt, model_checkpoint, seed, sampler, steps, cfg_scale, raw_workflow, generation_hash
+		`SELECT image_id, COALESCE(prompt, ''), COALESCE(model_checkpoint, ''), seed, COALESCE(sampler, ''),
+		        steps, cfg_scale, COALESCE(raw_workflow, ''), generation_hash
 		 FROM comfyui_metadata WHERE image_id = ?`, id,
 	).Scan(&m.ImageID, &m.Prompt, &m.ModelCheckpoint, &m.Seed, &m.Sampler, &m.Steps, &m.CFGScale, &m.RawWorkflow, &genHash)
 	if err != nil {

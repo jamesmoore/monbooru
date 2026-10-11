@@ -47,15 +47,30 @@ type Config struct {
 	// `plugin = []` is written.
 	Plugins []PluginConfig `toml:"plugin,omitempty"`
 
-	// Unexported so the encoder never writes it.
+	// Unexported so the encoder never writes them.
 	portableBase string
+	envPins      map[string]envPin
 }
+
+type envPin struct {
+	variable string
+	restore  func(*Config)
+}
+
+// EnvPinned names the environment variable that overrode key (a dotted TOML
+// key) at load, or "" when the file's value stands.
+func (cfg *Config) EnvPinned(key string) string { return cfg.envPins[key].variable }
 
 // 0.85 keeps the tag-pair queue proportional to the library; below 0.7 it
 // offers more pairs than anyone can decide.
 const (
 	DefaultTagPairThreshold = 0.85
 	MinTagPairThreshold     = 0.7
+)
+
+const (
+	MaxPhashDistance           = 12
+	DefaultConfidenceThreshold = 0.4
 )
 
 func ClampTagPairThreshold(v float64) float64 {
@@ -121,12 +136,7 @@ func (b PluginButton) AppliesTo(fileType string) bool {
 		return true
 	}
 	kind := models.MediaKind(fileType)
-	for _, v := range strings.Split(b.Media, ",") {
-		if strings.TrimSpace(v) == kind {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(strings.Split(b.Media, ","), func(v string) bool { return strings.TrimSpace(v) == kind })
 }
 
 const (
@@ -142,7 +152,13 @@ const (
 	maxPluginSlotButton = 4
 )
 
-var PluginVars = []string{"{image_id}", "{gallery}", "{back_url}"}
+const (
+	PluginVarImageID = "{image_id}"
+	PluginVarGallery = "{gallery}"
+	PluginVarBackURL = "{back_url}"
+)
+
+var PluginVars = []string{PluginVarImageID, PluginVarGallery, PluginVarBackURL}
 
 var (
 	pluginNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
@@ -308,6 +324,16 @@ const (
 
 var AllScopes = []string{ScopeRead, ScopeWrite, ScopeDelete}
 
+func FilterScopes(in []string) []string {
+	var out []string
+	for _, sc := range AllScopes {
+		if slices.Contains(in, sc) {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
 type Token struct {
 	ID        string   `toml:"id"`
 	Name      string   `toml:"name"`
@@ -368,12 +394,7 @@ func GenerateToken(name string, scopes []string) (Token, string) {
 
 func (cfg *Config) TokenNameExists(name string) bool {
 	n := strings.ToLower(strings.TrimSpace(name))
-	for _, t := range cfg.Auth.Tokens {
-		if strings.ToLower(t.Name) == n {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(cfg.Auth.Tokens, func(t Token) bool { return strings.ToLower(t.Name) == n })
 }
 
 func (cfg *Config) FindTokenByHash(hash string) *Token {
@@ -386,12 +407,7 @@ func (cfg *Config) FindTokenByHash(hash string) *Token {
 }
 
 func (cfg *Config) findTokenIndex(id string) int {
-	for i := range cfg.Auth.Tokens {
-		if cfg.Auth.Tokens[i].ID == id {
-			return i
-		}
-	}
-	return -1
+	return slices.IndexFunc(cfg.Auth.Tokens, func(t Token) bool { return t.ID == id })
 }
 
 func (cfg *Config) RemoveToken(id string) bool {
@@ -531,9 +547,9 @@ func Default() *Config {
 		},
 		Tagger: TaggerConfig{
 			ExecutionProvider:       defaultExecutionProvider,
-			Parallel:                4,
-			IdleReleaseAfterMinutes: 15,
-			Aggregation:             TaggerAggregationCfg{MinHitFraction: 0.05},
+			Parallel:                defaultTaggerParallel,
+			IdleReleaseAfterMinutes: defaultIdleReleaseMinutes,
+			Aggregation:             TaggerAggregationCfg{MinHitFraction: defaultMinHitFraction},
 		},
 		Auth: AuthConfig{
 			SessionLifetimeDays: defaultSessionLifetimeDays,
@@ -557,7 +573,7 @@ func Default() *Config {
 			Tray: true,
 		},
 		Relations: RelationsConfig{
-			DefaultDistance:     4,
+			DefaultDistance:     defaultRelationsDistance,
 			DefaultSessionOrder: "smallest_distance_first",
 			IncrementalOnIngest: true,
 			TagPairs:            true,
@@ -624,15 +640,11 @@ func load(path, base string, seed func(*Config)) (*Config, error) {
 	}
 
 	migrateTaggerProvider(cfg)
+	applyEnvOverrides(cfg)
 	if err := validate(cfg); err != nil {
 		return nil, err
 	}
 	fillDerivedPaths(cfg)
-	applyEnvOverrides(cfg)
-	// Again, so env overrides get the same clamps as the file.
-	if err := validate(cfg); err != nil {
-		return nil, err
-	}
 	return cfg, nil
 }
 
@@ -709,8 +721,11 @@ func Save(cfg *Config, path string) error {
 		return fmt.Errorf("creating config directory: %w", err)
 	}
 	out := cfg
+	if len(cfg.envPins) > 0 {
+		out = fileForm(cfg)
+	}
 	if cfg.portableBase != "" {
-		out = portableForm(cfg)
+		out = portableForm(out)
 	}
 	if err := fsx.WriteAtomic(path, ".monbooru.toml.*", func(f *os.File) error {
 		if err := toml.NewEncoder(f).Encode(out); err != nil {
@@ -723,6 +738,15 @@ func Save(cfg *Config, path string) error {
 	}
 	fsx.SyncDir(dir)
 	return nil
+}
+
+// A copy with the file's own values under the keys the environment set.
+func fileForm(cfg *Config) *Config {
+	out := *cfg
+	for _, p := range cfg.envPins {
+		p.restore(&out)
+	}
+	return &out
 }
 
 // Works on a copy, galleries included: the running config keeps its
@@ -806,19 +830,20 @@ func (cfg *Config) DerivePaths(name string) (dbPath, thumbnailsPath string) {
 	return filepath.Join(dir, "monbooru.db"), filepath.Join(dir, "thumbnails")
 }
 
-var galleryNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var folderNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
-// ValidateGalleryName guards what becomes the folder under data_path that
-// removing the gallery deletes.
-func ValidateGalleryName(name string) error {
+// ValidateFolderName guards a name that becomes a folder a removal deletes.
+func ValidateFolderName(kind, name string) error {
 	if name == "" {
-		return fmt.Errorf("gallery name must not be empty")
+		return fmt.Errorf("%s name must not be empty", kind)
 	}
-	if !galleryNameRe.MatchString(name) {
-		return fmt.Errorf("gallery name %q must match [A-Za-z0-9_-]+", name)
+	if !folderNameRe.MatchString(name) {
+		return fmt.Errorf("%s name %q must match [A-Za-z0-9_-]+", kind, name)
 	}
 	return nil
 }
+
+func ValidateGalleryName(name string) error { return ValidateFolderName("gallery", name) }
 
 func fillDerivedPaths(cfg *Config) {
 	for i := range cfg.Galleries {
@@ -828,64 +853,60 @@ func fillDerivedPaths(cfg *Config) {
 	}
 }
 
-func envParse[T any](key string, cur T, parse func(string) (T, error)) T {
-	v := os.Getenv(key)
-	if v == "" {
-		return cur
+func envOverride[T any](cfg *Config, key string, field func(*Config) *T, parse func(string) (T, error)) {
+	variable := "MONBOORU_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+	raw := os.Getenv(variable)
+	if raw == "" {
+		return
 	}
-	parsed, err := parse(v)
+	v, err := parse(raw)
 	if err != nil {
-		logx.Warnf("config: ignoring %s=%q: %v", key, v, err)
-		return cur
+		logx.Warnf("config: ignoring %s=%q: %v", variable, raw, err)
+		return
 	}
-	return parsed
+	pinEnv(cfg, key, variable, field, v)
 }
 
-func envInt(key string, cur int) int { return envParse(key, cur, strconv.Atoi) }
-
-func envBool(key string, cur bool) bool { return envParse(key, cur, strconv.ParseBool) }
-
-func envStr(key, cur string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func pinEnv[T any](cfg *Config, key, variable string, field func(*Config) *T, v T) {
+	file := *field(cfg)
+	*field(cfg) = v
+	if cfg.envPins == nil {
+		cfg.envPins = map[string]envPin{}
 	}
-	return cur
+	cfg.envPins[key] = envPin{variable: variable, restore: func(c *Config) { *field(c) = file }}
 }
 
-func envList(key string, cur []string) []string {
-	v := os.Getenv(key)
-	if v == "" {
-		return cur
-	}
-	return strings.Split(v, ",")
-}
+func parseString(v string) (string, error) { return v, nil }
+
+func parseList(v string) ([]string, error) { return strings.Split(v, ","), nil }
 
 func applyEnvOverrides(cfg *Config) {
-	cfg.Server.BindAddress = envStr("MONBOORU_SERVER_BIND_ADDRESS", cfg.Server.BindAddress)
-	cfg.Server.BaseURL = envStr("MONBOORU_SERVER_BASE_URL", cfg.Server.BaseURL)
-	cfg.Server.CORSOrigins = envList("MONBOORU_SERVER_CORS_ORIGINS", cfg.Server.CORSOrigins)
-	cfg.Server.MonloaderURL = envStr("MONBOORU_SERVER_MONLOADER_URL", cfg.Server.MonloaderURL)
-	// DATA_PATH stays inline: setting it must also recompute the derived paths.
-	if v := os.Getenv("MONBOORU_PATHS_DATA_PATH"); v != "" {
-		cfg.Paths.DataPath = v
-		fillDerivedPaths(cfg)
-	}
-	cfg.Paths.ModelPath = envStr("MONBOORU_PATHS_MODEL_PATH", cfg.Paths.ModelPath)
-	cfg.Gallery.WatchEnabled = envBool("MONBOORU_GALLERY_WATCH_ENABLED", cfg.Gallery.WatchEnabled)
-	cfg.Gallery.MaxFileSizeMB = envInt("MONBOORU_GALLERY_MAX_FILE_SIZE_MB", cfg.Gallery.MaxFileSizeMB)
-	cfg.Gallery.AutoMetaTags = envBool("MONBOORU_GALLERY_AUTO_META_TAGS", cfg.Gallery.AutoMetaTags)
-	cfg.Tagger.ExecutionProvider = envStr("MONBOORU_TAGGER_EXECUTION_PROVIDER", cfg.Tagger.ExecutionProvider)
+	envOverride(cfg, "server.bind_address", func(c *Config) *string { return &c.Server.BindAddress }, parseString)
+	envOverride(cfg, "server.base_url", func(c *Config) *string { return &c.Server.BaseURL }, parseString)
+	envOverride(cfg, "server.cors_origins", func(c *Config) *[]string { return &c.Server.CORSOrigins }, parseList)
+	envOverride(cfg, "server.monloader_url", func(c *Config) *string { return &c.Server.MonloaderURL }, parseString)
+	envOverride(cfg, "paths.data_path", func(c *Config) *string { return &c.Paths.DataPath }, parseString)
+	envOverride(cfg, "paths.model_path", func(c *Config) *string { return &c.Paths.ModelPath }, parseString)
+	envOverride(cfg, "gallery.watch_enabled", func(c *Config) *bool { return &c.Gallery.WatchEnabled }, strconv.ParseBool)
+	envOverride(cfg, "gallery.max_file_size_mb", func(c *Config) *int { return &c.Gallery.MaxFileSizeMB }, strconv.Atoi)
+	envOverride(cfg, "gallery.auto_meta_tags", func(c *Config) *bool { return &c.Gallery.AutoMetaTags }, strconv.ParseBool)
+	provider := func(c *Config) *string { return &c.Tagger.ExecutionProvider }
+	envOverride(cfg, "tagger.execution_provider", provider, parseString)
 	// Deployments that still export the old MONBOORU_TAGGER_USE_CUDA keep
 	// the GPU.
-	if os.Getenv("MONBOORU_TAGGER_EXECUTION_PROVIDER") == "" && envBool("MONBOORU_TAGGER_USE_CUDA", false) {
-		cfg.Tagger.ExecutionProvider = "cuda"
+	if raw := os.Getenv("MONBOORU_TAGGER_USE_CUDA"); raw != "" && os.Getenv("MONBOORU_TAGGER_EXECUTION_PROVIDER") == "" {
+		if useCUDA, err := strconv.ParseBool(raw); err != nil {
+			logx.Warnf("config: ignoring MONBOORU_TAGGER_USE_CUDA=%q: %v", raw, err)
+		} else if useCUDA {
+			pinEnv(cfg, "tagger.execution_provider", "MONBOORU_TAGGER_USE_CUDA", provider, "cuda")
+		}
 	}
-	cfg.Auth.EnablePassword = envBool("MONBOORU_AUTH_ENABLE_PASSWORD", cfg.Auth.EnablePassword)
-	cfg.Auth.PasswordHash = envStr("MONBOORU_AUTH_PASSWORD_HASH", cfg.Auth.PasswordHash)
-	cfg.Auth.SessionLifetimeDays = envInt("MONBOORU_AUTH_SESSION_LIFETIME_DAYS", cfg.Auth.SessionLifetimeDays)
-	cfg.Monloader.APIURL = envStr("MONBOORU_MONLOADER_API_URL", cfg.Monloader.APIURL)
-	cfg.Monloader.APIToken = envStr("MONBOORU_MONLOADER_API_TOKEN", cfg.Monloader.APIToken)
-	cfg.Log.Level = envStr("MONBOORU_LOG_LEVEL", cfg.Log.Level)
+	envOverride(cfg, "auth.enable_password", func(c *Config) *bool { return &c.Auth.EnablePassword }, strconv.ParseBool)
+	envOverride(cfg, "auth.password_hash", func(c *Config) *string { return &c.Auth.PasswordHash }, parseString)
+	envOverride(cfg, "auth.session_lifetime_days", func(c *Config) *int { return &c.Auth.SessionLifetimeDays }, strconv.Atoi)
+	envOverride(cfg, "monloader.api_url", func(c *Config) *string { return &c.Monloader.APIURL }, parseString)
+	envOverride(cfg, "monloader.api_token", func(c *Config) *string { return &c.Monloader.APIToken }, parseString)
+	envOverride(cfg, "log.level", func(c *Config) *string { return &c.Log.Level }, parseString)
 }
 
 // MaxPageSize stays well under SQLite's 32766-variable limit: a page binds
@@ -898,6 +919,10 @@ const (
 	defaultPageSize            = 40
 	defaultThumbnailFit        = "natural"
 	defaultSessionLifetimeDays = 7
+	defaultTaggerParallel      = 4
+	defaultIdleReleaseMinutes  = 15
+	defaultMinHitFraction      = 0.05
+	defaultRelationsDistance   = 4
 )
 
 func validate(cfg *Config) error {
@@ -926,6 +951,17 @@ func validate(cfg *Config) error {
 	if cfg.Paths.DataPath == "" {
 		return fmt.Errorf("paths.data_path must not be empty")
 	}
+	// Absolute from load on, as the next save writes them: a later start
+	// from another folder opens the same paths.
+	var err error
+	if cfg.Paths.DataPath, err = filepath.Abs(cfg.Paths.DataPath); err != nil {
+		return fmt.Errorf("paths.data_path: %w", err)
+	}
+	if cfg.Paths.ModelPath != "" {
+		if cfg.Paths.ModelPath, err = filepath.Abs(cfg.Paths.ModelPath); err != nil {
+			return fmt.Errorf("paths.model_path: %w", err)
+		}
+	}
 	seen := map[string]bool{}
 	for i := range cfg.Galleries {
 		g := &cfg.Galleries[i]
@@ -940,8 +976,11 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("gallery %q has an empty gallery_path", g.Name)
 		}
 		// Downstream compares against paths the filesystem returns,
-		// cleaned and native; "C:/pics" would never match on Windows.
-		g.GalleryPath = filepath.Clean(g.GalleryPath)
+		// absolute, cleaned and native; "C:/pics" would never match on
+		// Windows.
+		if g.GalleryPath, err = filepath.Abs(g.GalleryPath); err != nil {
+			return fmt.Errorf("gallery %q: %w", g.Name, err)
+		}
 	}
 	if cfg.DefaultGallery == "" {
 		cfg.DefaultGallery = cfg.Galleries[0].Name
@@ -972,11 +1011,43 @@ func validate(cfg *Config) error {
 	if cfg.Auth.SessionLifetimeDays <= 0 {
 		cfg.Auth.SessionLifetimeDays = defaultSessionLifetimeDays
 	}
+	if cfg.Relations.DefaultDistance < 0 || cfg.Relations.DefaultDistance > MaxPhashDistance {
+		cfg.Relations.DefaultDistance = defaultRelationsDistance
+	}
+	if cfg.Tagger.Parallel < 1 {
+		cfg.Tagger.Parallel = defaultTaggerParallel
+	}
+	if cfg.Tagger.IdleReleaseAfterMinutes < 0 {
+		cfg.Tagger.IdleReleaseAfterMinutes = defaultIdleReleaseMinutes
+	}
+	if !isFraction(cfg.Tagger.Aggregation.MinHitFraction) {
+		cfg.Tagger.Aggregation.MinHitFraction = defaultMinHitFraction
+	}
+	normalizeTaggerThresholds(cfg)
 	dropInvalidPlugins(cfg)
 	dropInvalidCORSOrigins(cfg)
 	dropInvalidIgnorePatterns(cfg)
 	dropInvalidScheduleGalleries(cfg)
 	return nil
+}
+
+// Written as a range test so NaN fails it too.
+func isFraction(v float64) bool { return v >= 0 && v <= 1 }
+
+func normalizeTaggerThresholds(cfg *Config) {
+	for i := range cfg.Tagger.Taggers {
+		t := &cfg.Tagger.Taggers[i]
+		if !isFraction(t.ConfidenceThreshold) {
+			logx.Warnf("config: tagger %q confidence_threshold %v is not between 0 and 1, using %v", t.Name, t.ConfidenceThreshold, DefaultConfidenceThreshold)
+			t.ConfidenceThreshold = DefaultConfidenceThreshold
+		}
+		for cat, v := range t.CategoryThresholds {
+			if !isFraction(v) {
+				logx.Warnf("config: dropping tagger %q category_thresholds entry %q: %v is not between 0 and 1", t.Name, cat, v)
+				delete(t.CategoryThresholds, cat)
+			}
+		}
+	}
 }
 
 func dropInvalidScheduleGalleries(cfg *Config) {

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -23,31 +24,15 @@ func computeGenerationHash(prompt, negPrompt, model, sampler string, steps *int,
 		return ""
 	}
 
-	var b strings.Builder
-	b.WriteString("prompt=")
-	b.WriteString(prompt)
-	b.WriteByte('\n')
-	b.WriteString("negative=")
-	b.WriteString(negPrompt)
-	b.WriteByte('\n')
-	b.WriteString("model=")
-	b.WriteString(model)
-	b.WriteByte('\n')
-	b.WriteString("sampler=")
-	b.WriteString(sampler)
-	b.WriteByte('\n')
-	b.WriteString("steps=")
+	var stepsStr, cfgStr string
 	if steps != nil {
-		fmt.Fprintf(&b, "%d", *steps)
+		stepsStr = strconv.Itoa(*steps)
 	}
-	b.WriteByte('\n')
-	b.WriteString("cfg=")
 	if cfg != nil {
 		// Two decimals absorb float noise.
-		fmt.Fprintf(&b, "%.2f", *cfg)
+		cfgStr = fmt.Sprintf("%.2f", *cfg)
 	}
-	b.WriteByte('\n')
-
-	sum := sha256.Sum256([]byte(b.String()))
+	sum := sha256.Sum256(fmt.Appendf(nil, "prompt=%s\nnegative=%s\nmodel=%s\nsampler=%s\nsteps=%s\ncfg=%s\n",
+		prompt, negPrompt, model, sampler, stepsStr, cfgStr))
 	return hex.EncodeToString(sum[:])[:genHashLen]
 }

@@ -4,7 +4,6 @@
       hx-target="#flash-maintenance" hx-swap="innerHTML"
       hx-confirm="Remove the folders left checked?"
       data-confirm-ok="Remove">
-  <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
   <div class="empty-folders-head">
     <span><strong>{{len .Dirs}}</strong> empty folder{{plural (len .Dirs) "" "s"}} under the gallery root. Unchecked folders are kept.</span>
     <span class="empty-folders-tools">

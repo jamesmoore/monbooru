@@ -47,8 +47,6 @@ func LoopbackAddr(addr string) string {
 	return net.JoinHostPort(host, port)
 }
 
-// IsLoopbackAddr gates the filesystem and quit controls on the bind
-// address: a same-host reverse proxy makes every request look loopback.
 func IsLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {

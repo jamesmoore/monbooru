@@ -27,10 +27,11 @@
 
     <h2>Who can reach it?</h2>
     <div class="field">
-      <label><input type="radio" name="reach" value="local" {{if not .LAN}}checked{{end}}> Only this computer</label>
+      <label><input type="radio" name="reach" value="local" {{if not .LAN}}checked{{end}}{{if .BindPinned}} disabled{{end}}> Only this computer</label>
       <p class="field-hint">{{.BooruName}} answers at http://localhost:{{.Port}} and at no other address.</p>
-      <label><input type="radio" name="reach" value="lan" {{if .LAN}}checked{{end}}> Other devices on the LAN too</label>
+      <label><input type="radio" name="reach" value="lan" {{if .LAN}}checked{{end}}{{if .BindPinned}} disabled{{end}}> Other devices on the LAN too</label>
       <p class="field-hint">Another device on the same network opens it at this machine's address, port {{.Port}}. Takes effect when {{.BooruName}} restarts.</p>
+      {{if .BindPinned}}<p class="field-hint">Set by {{.BindPinned}} in the environment.</p>{{end}}
     </div>
 
     {{if .Integration.Supported}}

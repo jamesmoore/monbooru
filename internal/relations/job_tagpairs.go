@@ -47,10 +47,10 @@ type tagPairCandidate struct {
 
 // Scoring per seed in SQL is quadratic in tag usage, so the index is
 // loaded once and dies with the run.
-func findTagPairs(ctx context.Context, database *db.DB, threshold float64, progress FindPairsProgress) (int, error) {
+func findTagPairs(ctx context.Context, database *db.DB, visible int, threshold float64, progress FindPairsProgress) (added int, err error) {
 	// Counted tags never outnumber raw ones, so images under the floor
 	// are skipped at load.
-	corpus, err := tags.LoadSimilarityCorpus(database, tagPairMinShared)
+	corpus, err := tags.LoadSimilarityCorpus(database, tagPairMinShared, visible)
 	if err != nil {
 		return 0, fmt.Errorf("load tag-pair corpus: %w", err)
 	}
@@ -66,12 +66,11 @@ func findTagPairs(ctx context.Context, database *db.DB, threshold float64, progr
 		}
 		scorePairsFrom(corpus, postings, i, threshold, matches, scan)
 	}
-	added := 0
 	// One transaction per candidate would make a big fill thousands of
 	// tiny WAL writes.
 	const txChunk = 500
 	var pending []tagPairInsert
-	flush := func() error {
+	flush := func(ctx context.Context) error {
 		if len(pending) == 0 {
 			return nil
 		}
@@ -80,21 +79,30 @@ func findTagPairs(ctx context.Context, database *db.DB, threshold float64, progr
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
+		n := 0
 		for _, p := range pending {
 			landed, err := storeTagPairTx(tx, p)
 			if err != nil {
 				return err
 			}
 			if landed {
-				added++
+				n++
 			}
 		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		added += n
 		pending = pending[:0]
 		return nil
 	}
+	// A cancel or a failed probe keeps what was admitted: the cancelled
+	// ctx would refuse the transaction.
+	defer func() {
+		if flushErr := flush(context.WithoutCancel(ctx)); flushErr != nil && err == nil {
+			err = flushErr
+		}
+	}()
 
 	for i := range corpus {
 		for _, c := range matches[i] {
@@ -110,14 +118,11 @@ func findTagPairs(ctx context.Context, database *db.DB, threshold float64, progr
 			}
 			pending = append(pending, p)
 			if len(pending) >= txChunk {
-				if err := flush(); err != nil {
+				if err := flush(ctx); err != nil {
 					return added, err
 				}
 			}
 		}
-	}
-	if err := flush(); err != nil {
-		return added, err
 	}
 	if progress != nil {
 		progress(len(corpus), len(corpus), "tag probing")
@@ -392,23 +397,10 @@ func storeTagPairTx(tx *sql.Tx, p tagPairInsert) (bool, error) {
 // Dropped at admission, not just hidden: a collection's pages share
 // nearly every tag and would flood the table.
 func pairSharesPrivateCollection(ctx context.Context, database *db.DB, a, b int64) (bool, error) {
-	var excluded int
+	var hidden int
 	err := database.Read.QueryRowContext(ctx,
-		`SELECT `+collectionPairExclusion("?", "?"), b, a).Scan(&excluded)
-	if err != nil {
-		return false, err
-	}
-	return excluded == 0, nil
-}
-
-// Must match the collection_hidden triggers' verdict; this one runs at
-// admission, before a row exists.
-func collectionPairExclusion(aCol, bCol string) string {
-	return `NOT EXISTS (
-		SELECT 1 FROM image_collections ca
-		JOIN image_collections cb ON cb.name = ca.name AND cb.image_id = ` + bCol + `
-		WHERE ca.image_id = ` + aCol + `
-		  AND NOT EXISTS (SELECT 1 FROM collection_find_relations f WHERE f.name = ca.name))`
+		`SELECT `+db.PairHiddenProbe("?", "?"), b, a).Scan(&hidden)
+	return hidden != 0, err
 }
 
 // Leaves the queue out, so a pair the phash walk queued can still be upgraded.

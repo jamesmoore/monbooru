@@ -42,7 +42,7 @@ func (s *Server) syncTrigger(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		ctx := s.jobs.Context()
 		result, err := cx.Sync(ctx, maxFileSizeMB, s.ingestNaming(cx.Name), s.jobs.Update)
-		_ = s.settleJob(ctx, err, "sync cancelled", result.Summary())
+		_ = s.jobs.Settle(ctx, err, "sync cancelled", result.Summary())
 	}()
 
 	redirectTo := sameOriginReferer(r)

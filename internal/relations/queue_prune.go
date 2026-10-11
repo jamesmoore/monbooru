@@ -56,11 +56,9 @@ func demoteOverDistanceTx(ctx context.Context, tx *sql.Tx, distance int) error {
 		a, b  int64
 		score float64
 	}
-	pending, err := db.QueryAll(tx, func(rows *sql.Rows) (demotion, error) {
-		var d demotion
-		err := rows.Scan(&d.a, &d.b, &d.score)
-		return d, err
-	}, `SELECT a_image_id, b_image_id, COALESCE(score, 0)
+	pending, err := db.QueryAll(tx, db.ScanRow(func(d *demotion) []any {
+		return []any{&d.a, &d.b, &d.score}
+	}), `SELECT a_image_id, b_image_id, COALESCE(score, 0)
 		   FROM potential_relation_pairs WHERE source = ? AND distance > ?`,
 		SourceBoth, distance)
 	if err != nil {

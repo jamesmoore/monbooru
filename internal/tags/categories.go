@@ -24,6 +24,24 @@ func CategoryIDByName(database *db.DB, name string) (int64, bool, error) {
 	return id, true, nil
 }
 
+func CategoryIDsByName(q db.Querier) (map[string]int64, error) {
+	type catRow struct {
+		id   int64
+		name string
+	}
+	cats, err := db.QueryAll(q, db.ScanRow(func(c *catRow) []any {
+		return []any{&c.id, &c.name}
+	}), `SELECT id, name FROM tag_categories`)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(cats))
+	for _, c := range cats {
+		out[c.name] = c.id
+	}
+	return out, nil
+}
+
 func (s *Service) ListCategories() ([]models.TagCategory, error) {
 	return db.QueryAll(s.db.Read, func(rows *sql.Rows) (models.TagCategory, error) {
 		var c models.TagCategory
@@ -71,6 +89,7 @@ func (s *Service) CreateCategory(name, color string) (*models.TagCategory, error
 		}
 		return nil, fmt.Errorf("creating category: %w", err)
 	}
+	s.changed()
 	return &models.TagCategory{ID: id, Name: name, Color: color}, nil
 }
 
@@ -94,10 +113,13 @@ func (s *Service) UpdateCategoryColor(id int64, color string) error {
 	if !categoryColorRe.MatchString(color) {
 		return ErrInvalidCategoryColor
 	}
-	_, err := s.db.Write.Exec(
+	if _, err := s.db.Write.Exec(
 		`UPDATE tag_categories SET color = ? WHERE id = ?`, normalizeCategoryColor(color), id,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	s.changed()
+	return nil
 }
 
 func (s *Service) RenameCategory(id int64, newName string) error {
@@ -123,7 +145,11 @@ func (s *Service) RenameCategory(id int64, newName string) error {
 	if err != nil && isUniqueConstraintErr(err) {
 		return ErrCategoryExists
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	s.changed()
+	return nil
 }
 
 const collideNamesShown = 5
@@ -150,25 +176,35 @@ func collidingNames(tx *sql.Tx, id, targetID int64) ([]string, error) {
 }
 
 func isUniqueConstraintErr(err error) bool {
-	if err == nil {
-		return false
-	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-func (s *Service) GetCategoryTagCount(id int64) (int, error) {
-	var count int
+// CategoryCounts is what deleting a category takes: its tags and aliases,
+// and on delete_all the aliases elsewhere that resolve to its tags.
+type CategoryCounts struct {
+	Tags, Aliases, LinkedAliases int
+}
+
+func (s *Service) CategoryDeleteCounts(id int64) (CategoryCounts, error) {
+	var c CategoryCounts
 	err := s.db.Read.QueryRow(
-		`SELECT COUNT(*) FROM tags WHERE category_id = ? AND is_alias = 0`, id,
-	).Scan(&count)
-	return count, err
+		`SELECT
+		   (SELECT COUNT(*) FROM tags WHERE category_id = c.id AND is_alias = 0),
+		   (SELECT COUNT(*) FROM tags WHERE category_id = c.id AND is_alias = 1),
+		   (SELECT COUNT(*) FROM tags a JOIN tags t ON t.id = a.canonical_tag_id
+		     WHERE a.is_alias = 1 AND a.category_id <> c.id AND t.category_id = c.id)
+		 FROM tag_categories c WHERE c.id = ?`, id,
+	).Scan(&c.Tags, &c.Aliases, &c.LinkedAliases)
+	if errors.Is(err, sql.ErrNoRows) {
+		return c, ErrCategoryNotFound
+	}
+	return c, err
 }
 
 // DeleteCategoryMoveOrDelete deletes the tags on "delete_all" and
 // otherwise moves them to targetID, general when 0.
 func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID int64) error {
-	var swept []int64
-	err := s.inWriteTx(func(tx *sql.Tx) error {
+	return s.inWriteTx(func(tx *sql.Tx) error {
 		var isBuiltin int
 		if err := tx.QueryRow(
 			`SELECT is_builtin FROM tag_categories WHERE id = ?`, id,
@@ -187,8 +223,7 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 			if err != nil {
 				return err
 			}
-			swept, err = deleteTagsTx(tx, tagIDs)
-			if err != nil {
+			if err := deleteTagsTx(tx, tagIDs); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(`DELETE FROM tags WHERE category_id = ?`, id); err != nil {
@@ -238,11 +273,4 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	if len(swept) > 0 {
-		return s.RecalcIDs(swept)
-	}
-	return nil
 }

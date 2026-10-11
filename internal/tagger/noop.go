@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
 )
 
@@ -28,12 +28,14 @@ func AvailableTaggers(cfg *config.Config) []TaggerStatus {
 	list := DiscoverTaggers(cfg)
 	for i := range list {
 		list[i].Available = false
-		list[i].Reason = "inference disabled (built without -tags tagger)"
+		if !list[i].Malformed {
+			list[i].Reason = "inference disabled (built without -tags tagger)"
+		}
 	}
 	return list
 }
 
-func RunWithTaggers(_ context.Context, _ *db.DB, _ *config.Config, _ []int64, _ []TaggerStatus, _ *jobs.Manager, _ string, _ string) (int, error) {
+func RunWithTaggers(_ context.Context, _ gallery.Handle, _ *config.Config, _ []int64, _ []TaggerStatus, _ *jobs.Manager, _ string) (int, error) {
 	return 0, nil
 }
 

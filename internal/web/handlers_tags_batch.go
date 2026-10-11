@@ -1,8 +1,6 @@
 package web
 
 import (
-	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -51,7 +49,7 @@ func (s *Server) finishTagScopeJob(changed int, reasons skipReasons, cancelled b
 	if !cancelled && changed == 0 && reasons.any() {
 		failed = errors.New(summary)
 	}
-	s.finishJob(failed, cancelled, fmt.Sprintf("%s cancelled (%s)", noun, summary), summary)
+	s.jobs.Finish(failed, cancelled, fmt.Sprintf("%s cancelled (%s)", noun, summary), summary)
 }
 
 func (s *Server) resolveTagScope(r *http.Request) ([]int64, error) {
@@ -78,30 +76,13 @@ func (s *Server) resolveTagScope(r *http.Request) ([]int64, error) {
 	return s.tagSvc().ListTagIDs(filter)
 }
 
-// On false the response is already written.
-func (s *Server) startTagScopeJob(w http.ResponseWriter, r *http.Request) ([]int64, bool) {
+func (s *Server) startTagScopeRun(w http.ResponseWriter, r *http.Request, run func(ids []int64)) {
 	ids, err := s.resolveTagScope(r)
 	if err != nil {
 		flashStatus(w, http.StatusBadRequest, err.Error())
-		return nil, false
-	}
-	if len(ids) == 0 {
-		w.WriteHeader(http.StatusAccepted)
-		return nil, false
-	}
-	if !s.startJob(w, models.JobTypeTag) {
-		return nil, false
-	}
-	return ids, true
-}
-
-func (s *Server) startTagScopeRun(w http.ResponseWriter, r *http.Request, run func(ids []int64)) {
-	ids, ok := s.startTagScopeJob(w, r)
-	if !ok {
 		return
 	}
-	go run(ids)
-	w.WriteHeader(http.StatusAccepted)
+	s.startIDsJob(w, models.JobTypeTag, ids, run)
 }
 
 // op returns true for a changed row, false for a skip; an error is a refusal.
@@ -174,7 +155,6 @@ func (s *Server) runBatchTagCategory(ids []int64, catID int64, merge bool) {
 		return true, nil
 	})
 
-	s.active().InvalidateCaches()
 	summary := fmt.Sprintf("moved %d tag(s)", changed-mergedCount)
 	if mergedCount > 0 {
 		summary += fmt.Sprintf(", merged %d", mergedCount)
@@ -186,12 +166,19 @@ func (s *Server) batchTagAliasPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	canonID, msg := s.resolveCanonicalTagInput(r.FormValue("canonical_id"), true)
+	canon, msg := s.resolveCanonicalTagInput(r.FormValue("canonical_id"), true)
 	if msg != "" {
 		flashStatus(w, http.StatusBadRequest, msg)
 		return
 	}
-	s.startTagScopeRun(w, r, func(ids []int64) { s.runBatchTagAlias(ids, canonID) })
+	s.startTagScopeRun(w, r, func(ids []int64) {
+		canonID, err := s.canonicalID(canon)
+		if err != nil {
+			s.jobs.Fail(err.Error())
+			return
+		}
+		s.runBatchTagAlias(ids, canonID)
+	})
 }
 
 func (s *Server) runBatchTagAlias(ids []int64, canonID int64) {
@@ -207,7 +194,6 @@ func (s *Server) runBatchTagAlias(ids []int64, canonID int64) {
 		return true, nil
 	})
 
-	s.active().InvalidateCaches()
 	summary := skippedSuffix(fmt.Sprintf("aliased %d tag(s) to %s", aliased, s.qualifiedTagName(canonID)), skipped)
 	s.finishTagScopeJob(aliased, reasons, cancelled, "alias", summary)
 }
@@ -226,7 +212,6 @@ func (s *Server) runMergeFolded(ids []int64) {
 		s.jobs.Fail(err.Error())
 		return
 	}
-	s.active().InvalidateCaches()
 	var reasons skipReasons
 	for _, e := range res.Refused {
 		reasons.add(e)
@@ -240,12 +225,19 @@ func (s *Server) batchTagImplyPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	remove := r.FormValue("mode") == "remove"
-	targetID, msg := s.resolveCanonicalTagInput(r.FormValue("target"), !remove)
+	target, msg := s.resolveCanonicalTagInput(r.FormValue("target"), !remove)
 	if msg != "" {
 		flashStatus(w, http.StatusBadRequest, msg)
 		return
 	}
-	s.startTagScopeRun(w, r, func(ids []int64) { s.runBatchTagImply(ids, targetID, remove) })
+	s.startTagScopeRun(w, r, func(ids []int64) {
+		targetID, err := s.canonicalID(target)
+		if err != nil {
+			s.jobs.Fail(err.Error())
+			return
+		}
+		s.runBatchTagImply(ids, targetID, remove)
+	})
 }
 
 func (s *Server) runBatchTagImply(ids []int64, targetID int64, remove bool) {
@@ -258,13 +250,14 @@ func (s *Server) runBatchTagImply(ids []int64, targetID int64, remove bool) {
 	var removeClosure []int64
 	if remove {
 		var err error
-		removeClosure, err = s.resolveRemoveClosure(targetID)
+		removeClosure, err = s.tagSvc().ImplicationClosure(targetID)
 		if err != nil {
 			s.jobs.Fail(err.Error())
 			return
 		}
 	}
 
+	reapplied := 0
 	changed, skipped, reasons, cancelled := s.runTagScopeLoop(ids, verb, 10, func(parentID int64) (bool, error) {
 		if parentID == targetID {
 			return false, nil
@@ -273,7 +266,7 @@ func (s *Server) runBatchTagImply(ids []int64, targetID int64, remove bool) {
 			if err := s.tagSvc().RemoveImplication(parentID, targetID); err != nil {
 				return false, err
 			}
-			if err := s.sweepImplicationRemovalInline(ctx, parentID, removeClosure); err != nil {
+			if _, err := s.tagSvc().SweepImplicationRemoval(ctx, parentID, removeClosure, nil); err != nil {
 				logx.Warnf("batch imply sweep parent %d: %v", parentID, err)
 			}
 			return true, nil
@@ -284,29 +277,22 @@ func (s *Server) runBatchTagImply(ids []int64, targetID int64, remove bool) {
 			return false, err
 		}
 		if !created {
-			return false, nil
+			reapplied++
 		}
-		if err := s.fanOutImplicationsInline(ctx, parentID); err != nil {
+		if _, err := s.tagSvc().PropagateImplication(ctx, parentID, nil); err != nil {
 			logx.Warnf("batch imply fan-out parent %d: %v", parentID, err)
 		}
 		return true, nil
 	})
 
-	if err := s.tagSvc().RecalcIDs([]int64{targetID}); err != nil {
-		logx.Warnf("batch imply recalc: %v", err)
-	}
-	s.active().InvalidateCaches()
 	noun := "declared"
 	if remove {
 		noun = "removed"
 	}
-	summary := skippedSuffix(fmt.Sprintf("%s %d implication(s) of %s", noun, changed, s.qualifiedTagName(targetID)), skipped)
+	summary := fmt.Sprintf("%s %d implication(s) of %s", noun, changed-reapplied, s.qualifiedTagName(targetID))
+	if reapplied > 0 {
+		summary += fmt.Sprintf(", re-applied %d", reapplied)
+	}
+	summary = skippedSuffix(summary, skipped)
 	s.finishTagScopeJob(changed, reasons, cancelled, "implication batch", summary)
-}
-
-// closure is the removed target's transitive closure, target included.
-func (s *Server) sweepImplicationRemovalInline(ctx context.Context, parentID int64, closure []int64) error {
-	return s.chunkImageTagsByParent(ctx, parentID, func(tx *sql.Tx, imageID int64) error {
-		return propagateRemoveImplication(tx, imageID, closure)
-	})
 }

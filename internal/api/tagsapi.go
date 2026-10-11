@@ -52,8 +52,7 @@ func (h *Handler) listTags(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	prefix := q.Get("q")
 	catName := q.Get("category")
-	sortStr := q.Get("sort")
-	sortStr = cmp.Or(sortStr, "usage")
+	sortStr := cmp.Or(q.Get("sort"), "usage")
 
 	offset, limit := parsePage(r, 100, 500)
 
@@ -67,14 +66,20 @@ func (h *Handler) listTags(w http.ResponseWriter, r *http.Request) {
 		ShowZero:  q.Get("show_zero") != "0",
 	}
 
+	if filter.Type != "" && filter.Type != "tag" && filter.Type != "alias" {
+		writePage(w, offset/limit+1, limit, 0, []tagResponse{})
+		return
+	}
 	if catName != "" {
 		catID, ok, err := tags.CategoryIDByName(g.DB, catName)
 		if serverError(w, err) {
 			return
 		}
-		if ok {
-			filter.CategoryID = &catID
+		if !ok {
+			writePage(w, offset/limit+1, limit, 0, []tagResponse{})
+			return
 		}
+		filter.CategoryID = &catID
 	}
 
 	tagList, total, err := g.TagSvc.ListTags(filter)

@@ -1,5 +1,22 @@
 # Changelog
 
+## [v1.22.1] - 2026-10-11
+### Added
+- API clients can request full-size, lossless WebP images for AVIF and JPEG XL files.
+
+### Changed
+- Merge imports now show progress and can be stopped from the status bar.
+- PTR lookup and pull controls stay usable while monloader's completed index is paused or failing.
+- Relative gallery, data, and model paths stay anchored to the startup directory after configuration saves.
+
+### Fixed
+- Search handles negation before OR, case-insensitive categories, rating ceilings, and empty results correctly.
+- Auto-tagging preserves manually set ratings correctly.
+- API tag writes return accurate errors and never apply refused updates.
+- Generation metadata keeps quoted values, negative prompts, and seeds above signed 64-bit range.
+- Bundled FFmpeg avoids a crash when probing malformed IAMF metadata in MP4 files.
+- Failed edits and stale pages now show errors or request a reload before changing galleries.
+
 ## [v1.22.0] - 2026-09-28
 ### Added
 - Automatic meta tags like highres, lowres, animated... derived from each file. ([#66](https://github.com/monbooru/monbooru/issues/66))

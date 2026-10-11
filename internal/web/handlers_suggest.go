@@ -26,6 +26,14 @@ type suggestItem struct {
 	ShowCount   bool
 }
 
+func tagSuggestItems(ts []models.Tag, prefix string) []suggestItem {
+	items := make([]suggestItem, len(ts))
+	for i, t := range ts {
+		items[i] = suggestItem{Name: prefix + t.Name, Color: t.CategoryColor, UsageCount: t.UsageCount, ShowCount: true}
+	}
+	return items
+}
+
 // attr and onclick become HTMLAttr unescaped: only ever pass constants.
 func (s *Server) renderSuggestList(w http.ResponseWriter, attr, onclick string, items []suggestItem) {
 	s.renderTemplate(w, "partials/suggest_list.html", map[string]any{
@@ -303,12 +311,9 @@ func (s *Server) tagSuggest(w http.ResponseWriter, r *http.Request) {
 	prefix := cmp.Or(q.Get("q"), q.Get("tag"), q.Get("canonical_id"), q.Get("target"))
 
 	// Only a real category splits: "nier:automata" is one tag name.
-	var catName, tagPrefix string
-	if idx := strings.Index(prefix, ":"); idx > 0 && s.categoryExists(prefix[:idx]) {
-		catName = prefix[:idx]
-		tagPrefix = prefix[idx+1:]
-	} else {
-		tagPrefix = prefix
+	catName, tagPrefix := "", prefix
+	if f, err := tags.SplitForm(s.db(), prefix); err == nil && f.CategoryID != 0 {
+		catName, tagPrefix = f.Category, f.Name
 	}
 
 	var suggestions []models.Tag
@@ -337,16 +342,7 @@ func (s *Server) tagSuggest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	items := make([]suggestItem, len(suggestions))
-	for i, t := range suggestions {
-		items[i] = suggestItem{
-			Name:       t.Name,
-			Color:      t.CategoryColor,
-			UsageCount: t.UsageCount,
-			ShowCount:  true,
-		}
-	}
-	s.renderSuggestList(w, `data-tag-name`, `onclick="applyTagSuggest(this)"`, items)
+	s.renderSuggestList(w, `data-tag-name`, `onclick="applyTagSuggest(this)"`, tagSuggestItems(suggestions, ""))
 }
 
 // Beyond this the id list outgrows what a batch POST can usefully carry.
@@ -355,11 +351,10 @@ var searchIDsCap = 5000
 var errSearchIDsFull = errors.New("search ids: cap reached")
 
 func (s *Server) searchIDs(w http.ResponseWriter, r *http.Request) {
-	expr := search.Parse(r.URL.Query().Get("q"))
-	expr = resolveCeiling(r, s.active()).Apply(expr)
+	sc := search.NewScope(search.Parse(r.URL.Query().Get("q")), readRatingCookie(r))
 	ids := []int64{}
-	err := search.Scope{Expr: expr}.Stream(s.db(), func(t search.DeleteTarget) error {
-		ids = append(ids, t.ID)
+	err := sc.Stream(s.source(), func(id int64) error {
+		ids = append(ids, id)
 		if len(ids) >= searchIDsCap {
 			return errSearchIDsFull
 		}
@@ -435,7 +430,7 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 
 	contextExpr := search.Parse(strings.Join(contextTokens, " "))
 
-	suggestions, _ := search.SuggestTagsWithFilter(s.db(), contextExpr, prefix, catFilter, 10)
+	suggestions, _ := search.SuggestTagsWithFilter(s.source(), contextExpr, prefix, catFilter, 10)
 
 	for i := range suggestions {
 		if catFilter != "" {
@@ -456,16 +451,7 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 		suggestions = out
 	}
 
-	rows := make([]suggestItem, len(suggestions))
-	for i, t := range suggestions {
-		rows[i] = suggestItem{
-			Name:       t.Name,
-			Color:      t.CategoryColor,
-			UsageCount: t.UsageCount,
-			ShowCount:  true,
-		}
-	}
-	s.renderSearchSuggest(w, rows)
+	s.renderSearchSuggest(w, tagSuggestItems(suggestions, ""))
 }
 
 func (s *Server) renderSystemSuggest(w http.ResponseWriter, rest string) {
@@ -598,17 +584,8 @@ func (s *Server) systemSuggestLevel2(key, valPrefix string) []suggestItem {
 		return nil
 	}
 	if s.categoryExists(key) {
-		suggestions, _ := search.SuggestTagsWithFilter(s.db(), nil, valPrefix, key, 10)
-		rows := make([]suggestItem, 0, len(suggestions))
-		for _, t := range suggestions {
-			rows = append(rows, suggestItem{
-				Name:       key + ":" + t.Name,
-				Color:      t.CategoryColor,
-				UsageCount: t.UsageCount,
-				ShowCount:  true,
-			})
-		}
-		return rows
+		suggestions, _ := search.SuggestTagsWithFilter(s.source(), nil, valPrefix, key, 10)
+		return tagSuggestItems(suggestions, key+":")
 	}
 	return nil
 }

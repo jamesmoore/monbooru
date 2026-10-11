@@ -314,6 +314,7 @@ const (
 	JobTypeFold          = "fold"
 	JobTypeLookup        = "lookup"
 	JobTypeCheck         = "check"
+	JobTypeMerge         = "merge"
 )
 
 type JobState struct {
@@ -354,29 +355,19 @@ const ImageRowColumns = `i.id, i.sha256, i.md5, i.canonical_path, i.folder_path,
 func ScanImageRow(row RowScanner) (Image, error) {
 	var img Image
 	var isMissing, isFav, isInbox int
-	var width, height, pageCount, lastReadPage, seriesOrder *int
-	var durationSec *float64
 	var autoTaggedAt *string
-	var phash *int64
 	var ingestedAt string
 	if err := row.Scan(
 		&img.ID, &img.SHA256, &img.MD5, &img.CanonicalPath, &img.FolderPath, &img.FileType,
-		&width, &height, &img.FileSize, &isMissing, &isFav,
+		&img.Width, &img.Height, &img.FileSize, &isMissing, &isFav,
 		&isInbox, &autoTaggedAt, &img.SourceType, &img.Origin, &img.Source, &img.URL, &img.Note, &img.OriginalSource,
-		&pageCount, &lastReadPage, &durationSec, &img.Series, &seriesOrder, &phash, &ingestedAt, &img.UploadBatch,
+		&img.PageCount, &img.LastReadPage, &img.DurationSec, &img.Series, &img.SeriesOrder, &img.Phash, &ingestedAt, &img.UploadBatch,
 	); err != nil {
 		return Image{}, err
 	}
 	img.IsMissing = isMissing == 1
 	img.IsFavorited = isFav == 1
 	img.IsInbox = isInbox == 1
-	img.Width = width
-	img.Height = height
-	img.PageCount = pageCount
-	img.LastReadPage = lastReadPage
-	img.DurationSec = durationSec
-	img.SeriesOrder = seriesOrder
-	img.Phash = phash
 	if autoTaggedAt != nil {
 		t, _ := time.Parse(time.RFC3339, *autoTaggedAt)
 		img.AutoTaggedAt = &t

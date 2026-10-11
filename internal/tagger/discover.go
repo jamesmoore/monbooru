@@ -2,9 +2,9 @@ package tagger
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 
@@ -15,27 +15,22 @@ const (
 	DefaultModelFile           = "model.onnx"
 	DefaultTagsFile            = "tags.csv"
 	DefaultTextTagsFile        = "tags.txt"
-	DefaultConfidenceThreshold = 0.4
+	DefaultConfidenceThreshold = config.DefaultConfidenceThreshold
 )
 
 // The name becomes a TOML key and a folder under the model path, which the
 // settings delete hands to os.RemoveAll.
-var taggerNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-
-func ValidateTaggerName(name string) error {
-	if name == "" {
-		return fmt.Errorf("tagger name must not be empty")
-	}
-	if !taggerNameRe.MatchString(name) {
-		return fmt.Errorf("tagger name %q must match [A-Za-z0-9_-]+", name)
-	}
-	return nil
-}
+func ValidateTaggerName(name string) error { return config.ValidateFolderName("tagger", name) }
 
 type TaggerStatus struct {
 	config.TaggerInstance
 	Available bool
 	Reason    string
+	// Malformed rows have a folder name the routes refuse or no inference
+	// profile; only a change on disk makes them usable.
+	Malformed bool
+	// Set whichever Reason the row shows.
+	Missing bool
 }
 
 // DiscoverTaggers keeps a row for a configured tagger whose folder is gone.
@@ -54,7 +49,7 @@ func DiscoverTaggers(cfg *config.Config) []TaggerStatus {
 			if err != nil || !fi.IsDir() {
 				continue
 			}
-			if !hasTaggerFiles(filepath.Join(cfg.Paths.ModelPath, name)) {
+			if onnx, labels := listTaggerFiles(filepath.Join(cfg.Paths.ModelPath, name)); len(onnx)+len(labels) == 0 {
 				continue
 			}
 			byName[name] = SeedTaggerInstance(name, true, catalogDefaults[name])
@@ -83,16 +78,29 @@ func DiscoverTaggers(cfg *config.Config) []TaggerStatus {
 		status := TaggerStatus{TaggerInstance: t, Available: true}
 		onnxPath := filepath.Join(dir, t.ModelFile)
 		tagsPath := filepath.Join(dir, t.TagsFile)
+		missing := ""
 		switch {
+		case statMissing(onnxPath):
+			missing = "missing " + t.ModelFile
+		case statMissing(tagsPath):
+			missing = "missing " + t.TagsFile
+		}
+		status.Missing = missing != ""
+		switch {
+		case ValidateTaggerName(name) != nil:
+			status.Available, status.Malformed = false, true
+			status.Reason = "folder name must match [A-Za-z0-9_-]+; rename the folder"
 		case noLibrary != "":
 			status.Available = false
 			status.Reason = noLibrary
-		case statMissing(onnxPath):
+		case missing != "":
 			status.Available = false
-			status.Reason = "missing " + t.ModelFile
-		case statMissing(tagsPath):
-			status.Available = false
-			status.Reason = "missing " + t.TagsFile
+			status.Reason = missing
+		default:
+			if _, err := ResolveProfile(cfg.Paths.ModelPath, name, t.TagsFile); err != nil {
+				status.Available, status.Malformed = false, true
+				status.Reason = "no inference profile: " + err.Error() + "; add a tagger.json"
+			}
 		}
 		out = append(out, status)
 	}
@@ -156,34 +164,7 @@ func resolveTaggerFiles(dir, explicitModel, explicitTags string) (string, string
 	modelFile := explicitModel
 	tagsFile := explicitTags
 
-	var onnxFiles, labelFiles []string
-	hasTagsCSV, hasTagsTXT := false, false
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			n := e.Name()
-			switch strings.ToLower(filepath.Ext(n)) {
-			case ".onnx":
-				onnxFiles = append(onnxFiles, n)
-			case ".csv":
-				labelFiles = append(labelFiles, n)
-				if n == DefaultTagsFile {
-					hasTagsCSV = true
-				}
-			case ".txt":
-				labelFiles = append(labelFiles, n)
-				if n == DefaultTextTagsFile {
-					hasTagsTXT = true
-				}
-			case ".json":
-				if !isTaggerSidecar(n) {
-					labelFiles = append(labelFiles, n)
-				}
-			}
-		}
-	}
+	onnxFiles, labelFiles := listTaggerFiles(dir)
 
 	if modelFile == "" {
 		switch {
@@ -198,9 +179,9 @@ func resolveTaggerFiles(dir, explicitModel, explicitTags string) (string, string
 
 	if tagsFile == "" {
 		switch {
-		case hasTagsCSV:
+		case slices.Contains(labelFiles, DefaultTagsFile):
 			tagsFile = DefaultTagsFile
-		case hasTagsTXT:
+		case slices.Contains(labelFiles, DefaultTextTagsFile):
 			tagsFile = DefaultTextTagsFile
 		case len(labelFiles) == 1:
 			tagsFile = labelFiles[0]
@@ -214,10 +195,10 @@ func resolveTaggerFiles(dir, explicitModel, explicitTags string) (string, string
 
 func isTaggerSidecar(name string) bool { return name == "tagger.json" || name == "dispatch.json" }
 
-func hasTaggerFiles(dir string) bool {
+func listTaggerFiles(dir string) (onnx, labels []string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return false
+		return nil, nil
 	}
 	for _, e := range entries {
 		if e.IsDir() {
@@ -225,15 +206,17 @@ func hasTaggerFiles(dir string) bool {
 		}
 		n := e.Name()
 		switch strings.ToLower(filepath.Ext(n)) {
-		case ".onnx", ".csv", ".txt":
-			return true
+		case ".onnx":
+			onnx = append(onnx, n)
+		case ".csv", ".txt":
+			labels = append(labels, n)
 		case ".json":
 			if !isTaggerSidecar(n) {
-				return true
+				labels = append(labels, n)
 			}
 		}
 	}
-	return false
+	return onnx, labels
 }
 
 func SeedTaggerInstance(name string, enabled bool, catalog *CatalogEntry) config.TaggerInstance {
@@ -249,16 +232,10 @@ func SeedTaggerInstance(name string, enabled bool, catalog *CatalogEntry) config
 		t.ConfidenceThreshold = catalog.DefaultThreshold
 	}
 	if len(catalog.DefaultThresholds) > 0 {
-		t.CategoryThresholds = make(map[string]float64, len(catalog.DefaultThresholds))
-		for k, v := range catalog.DefaultThresholds {
-			t.CategoryThresholds[k] = v
-		}
+		t.CategoryThresholds = maps.Clone(catalog.DefaultThresholds)
 	}
 	if len(catalog.DefaultTopK) > 0 {
-		t.PerCategoryTopK = make(map[string]int, len(catalog.DefaultTopK))
-		for k, v := range catalog.DefaultTopK {
-			t.PerCategoryTopK[k] = v
-		}
+		t.PerCategoryTopK = maps.Clone(catalog.DefaultTopK)
 	}
 	return t
 }

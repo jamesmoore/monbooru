@@ -11,18 +11,11 @@ import (
 // no file under two names: it skips a directory link into the root, above it,
 // into a walked or fenced folder, and a real folder an earlier link walked.
 func WalkTree(b *Boundary, fn fs.WalkDirFunc) error {
-	return WalkTreeUnder(b.Root(), b, fn)
+	return walkTreeUnder(b.Root(), b, fn)
 }
 
-func WalkTreeUnder(root string, b *Boundary, fn fs.WalkDirFunc) error {
-	bound, err := filepath.EvalSymlinks(b.Root())
-	if err != nil {
-		bound = filepath.Clean(b.Root())
-	}
-	rootReal, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		rootReal = filepath.Clean(root)
-	}
+func walkTreeUnder(root string, b *Boundary, fn fs.WalkDirFunc) error {
+	bound, rootReal := resolvePath(b.Root()), resolvePath(root)
 	w := treeWalker{
 		rootReal: bound,
 		followed: map[string]struct{}{bound: {}, rootReal: {}},
@@ -33,7 +26,7 @@ func WalkTreeUnder(root string, b *Boundary, fn fs.WalkDirFunc) error {
 	if err != nil {
 		err = fn(root, nil, err)
 	} else {
-		err = w.walk(root, root, fs.FileInfoToDirEntry(info))
+		err = w.walk(rootReal, root, fs.FileInfoToDirEntry(info))
 	}
 	if errors.Is(err, fs.SkipAll) || errors.Is(err, fs.SkipDir) {
 		return nil

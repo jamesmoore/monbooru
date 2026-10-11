@@ -47,7 +47,7 @@
         <button type="button" class="btn-link-accent btn-reorder-collection" data-name="{{.Name}}">[reorder]</button>
         <button type="button" class="btn-link-accent btn-dissolve-collection" data-name="{{.Name}}">[dissolve]</button>
         <button type="button" class="btn-link-accent btn-generate-cbz" data-name="{{.Name}}" title="Pack this collection's images into a new .cbz item in the gallery">[generate cbz]</button>
-        {{template "partials/collection_find_relations.html" (dict "Name" .Name "FindRelations" .FindRelations "CSRFToken" $.CSRFToken)}}
+        {{template "partials/collection_find_relations.html" (dict "Name" .Name "FindRelations" .FindRelations)}}
       </div>
       <div class="collection-preview">
         {{range .Samples}}
@@ -77,7 +77,6 @@
 
 <dialog id="collection-rename-dialog">
   <form id="collection-rename-form">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" id="collection-rename-prev" name="prev" value="">
     <p>Rename <strong id="collection-rename-src"></strong></p>
     <div class="field">
@@ -376,7 +375,6 @@ function confirmGenerateCBZ(btn) {
 
 // Delegated: htmx swaps #collections-page on filters and the live search.
 document.addEventListener('click', function(e) {
-  if (!e.target.closest) return;
   var el = e.target.closest('.btn-rename-collection');
   if (el) { openCollectionRename(el); return; }
   el = e.target.closest('.btn-reorder-collection');

@@ -3,7 +3,6 @@ package web
 import (
 	"cmp"
 	"crypto/rand"
-	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"net/http"
@@ -14,7 +13,6 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
@@ -112,15 +110,9 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if randomSeed == 0 {
-			seedBytes := make([]byte, 8)
-			if _, err := rand.Read(seedBytes); err == nil {
-				randomSeed = int64(binary.BigEndian.Uint32(seedBytes) | 1)
-			} else {
-				randomSeed = time.Now().UnixNano() & 0x7FFFFFFF
-			}
-			if randomSeed < 0 {
-				randomSeed = -randomSeed
-			}
+			var seed [4]byte
+			_, _ = rand.Read(seed[:])
+			randomSeed = int64(binary.BigEndian.Uint32(seed[:]) | 1)
 			newQ := r.URL.Query()
 			newQ.Set("seed", strconv.FormatInt(randomSeed, 10))
 			if isHTMXRequest(r) {
@@ -138,13 +130,15 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 	expr = ceiling.Apply(expr)
 	pageSize := s.pageSize(r)
 	sq := search.Query{
-		Expr:       expr,
-		Sort:       sortStr,
-		Order:      orderStr,
-		RandomSeed: randomSeed,
-		Page:       page,
-		Limit:      pageSize,
-		CacheKey:   search.BuildAdjacencyCacheKey(s.activeGallery(), queryStr, sortStr, orderStr, randomSeed, ceiling.Level()),
+		Expr:         expr,
+		Sort:         sortStr,
+		Order:        orderStr,
+		RandomSeed:   randomSeed,
+		Page:         page,
+		Limit:        pageSize,
+		Cached:       true,
+		Text:         queryStr,
+		CeilingLevel: ceiling.Level(),
 	}
 	if sortStr == "order" {
 		sq.OrderCollection = pinnedCollection
@@ -161,7 +155,7 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 	htmxGridTarget := isHTMXRequest(r) && r.Header.Get("HX-Target") == "gallery-grid"
 
 	firstStart := time.Now()
-	result, err := search.Execute(s.db(), sq)
+	result, err := search.Execute(s.source(), sq)
 	if err != nil {
 		logx.Errorf("gallery search: %v", err)
 		http.Error(w, "search error", http.StatusInternalServerError)
@@ -178,7 +172,7 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 		if page > totalPages {
 			page = totalPages
 			sq.Page = page
-			result, err = search.Execute(s.db(), sq)
+			result, err = search.Execute(s.source(), sq)
 			if err != nil {
 				logx.Errorf("gallery search (clamped): %v", err)
 				http.Error(w, "search error", http.StatusInternalServerError)
@@ -202,31 +196,18 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 
 	hiddenByCeiling := 0
 	if ceiling.IsActive() {
-		rawTotal := -1
 		bareExpr := search.Parse(queryStr)
 		switch {
 		case bareExpr == nil:
 			if cx := s.active(); cx != nil {
-				if n, ok := cx.VisibleCount(); ok {
-					rawTotal = n
+				if n, ok := cx.VisibleCount(); ok && n > result.Total {
+					hiddenByCeiling = n - result.Total
 				}
 			}
 		case firstElapsed < galleryHiddenIndicatorBudget:
-			bareKey := search.BuildAdjacencyCacheKey(s.activeGallery(), queryStr, sortStr, orderStr, randomSeed, "")
-			if cachedIDs, ok := search.AdjacencyCacheGet(bareKey); ok {
-				rawTotal = len(cachedIDs)
-			} else {
-				rawResult, err := search.Execute(s.db(), search.Query{
-					Expr: bareExpr, Sort: sortStr, Order: orderStr,
-					RandomSeed: randomSeed, Page: 1, Limit: 1,
-				})
-				if err == nil {
-					rawTotal = rawResult.Total
-				}
+			if n, err := search.HiddenByCeiling(s.source(), bareExpr, ceiling.Level()); err == nil {
+				hiddenByCeiling = n
 			}
-		}
-		if rawTotal > result.Total {
-			hiddenByCeiling = rawTotal - result.Total
 		}
 	}
 
@@ -268,7 +249,8 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 		ActiveTagTerms:    computeActiveTagTerms(queryStr),
 	}
 	if seedID, ok := search.SimilaritySeedID(expr); ok {
-		scores, err := tags.OverlapPercentsAgainst(s.db(), seedID, ids)
+		visible, _ := s.active().VisibleCount()
+		scores, err := tags.OverlapPercentsAgainst(s.db(), seedID, ids, visible)
 		if err != nil {
 			logx.Debugf("gallery similarity scores: %v", err)
 		}
@@ -307,32 +289,20 @@ type sidebarBundle struct {
 	Saved        []models.SavedSearch
 }
 
-func (s *Server) loadSavedSearches(logLabel string) []models.SavedSearch {
-	out, err := db.QueryAll(s.db().Read, func(rows *sql.Rows) (models.SavedSearch, error) {
-		var ss models.SavedSearch
-		err := rows.Scan(&ss.ID, &ss.Name, &ss.Query, &ss.Sort, &ss.Order, &ss.Seed)
-		return ss, err
-	}, `SELECT id, name, query, sort, sort_order, seed FROM saved_searches ORDER BY name`)
-	if err != nil {
-		logx.Warnf("%s saved searches: %v", logLabel, err)
-	}
-	return out
-}
-
 // Only the reads that always hit the DB fan out: a goroutine per cached
 // cx read takes a read-pool slot and costs more than it saves.
 func (s *Server) sidebarLoad(pageImageIDs []int64, ceiling *Ceiling) sidebarBundle {
 	var sb sidebarBundle
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		sb.Tags, _ = search.SidebarTagsWithGlobalCount(s.db(), pageImageIDs)
-	}()
-	go func() {
-		defer wg.Done()
-		sb.Saved = s.loadSavedSearches("sidebar")
-	}()
+	wg.Go(func() {
+		sb.Tags, _ = search.SidebarTagsWithGlobalCount(s.source(), pageImageIDs)
+	})
+	wg.Go(func() {
+		var err error
+		if sb.Saved, err = search.SavedSearches(s.db()); err != nil {
+			logx.Warnf("sidebar saved searches: %v", err)
+		}
+	})
 	if cx := s.active(); cx != nil {
 		sb.Folders, _ = cx.FolderTreeUnder(ceiling)
 		sb.SourceLabels, _ = cx.SourceLabelCountsUnder(ceiling)
@@ -349,19 +319,10 @@ func (s *Server) gallerySidebar(w http.ResponseWriter, r *http.Request) {
 	// Empty ids is an empty page; only a missing ids param re-runs the search.
 	var ids []int64
 	if q.Has("ids") {
-		if raw := q.Get("ids"); raw != "" {
-			ids = make([]int64, 0, strings.Count(raw, ",")+1)
-			for _, s := range strings.Split(raw, ",") {
-				if id, err := strconv.ParseInt(s, 10, 64); err == nil {
-					ids = append(ids, id)
-				}
-			}
-		}
+		ids = parseIDList(q["ids"])
 	} else {
-		sortStr := q.Get("sort")
-		sortStr = cmp.Or(sortStr, "newest")
-		orderStr := q.Get("order")
-		orderStr = cmp.Or(orderStr, search.DefaultOrder(sortStr))
+		sortStr := cmp.Or(q.Get("sort"), "newest")
+		orderStr := cmp.Or(q.Get("order"), search.DefaultOrder(sortStr))
 		page := 1
 		if p, err := strconv.Atoi(q.Get("page")); err == nil && p > 0 {
 			page = p
@@ -383,7 +344,7 @@ func (s *Server) gallerySidebar(w http.ResponseWriter, r *http.Request) {
 			Limit:      s.pageSize(r),
 			SkipCount:  true,
 		}
-		result, err := search.Execute(s.db(), sq)
+		result, err := search.Execute(s.source(), sq)
 		if err != nil {
 			logx.Errorf("sidebar search: %v", err)
 			http.Error(w, "search error", http.StatusInternalServerError)
@@ -399,7 +360,6 @@ func (s *Server) gallerySidebar(w http.ResponseWriter, r *http.Request) {
 
 	s.renderTemplate(w, "partials/sidebar_content.html", map[string]any{
 		"Query":             queryStr,
-		"CSRFToken":         s.csrfToken(sessionFromContext(r.Context())),
 		"SidebarTags":       sb.Tags,
 		"FolderTree":        sb.Folders,
 		"SourceLabelCounts": sb.SourceLabels,
@@ -409,32 +369,12 @@ func (s *Server) gallerySidebar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sidebarBrowse(w http.ResponseWriter, r *http.Request) {
-	queryStr := r.URL.Query().Get("q")
-	ceiling := resolveCeiling(r, s.active())
-
-	var (
-		folders      []gallery.FolderNode
-		sourceLabels []gallery.SourceLabelCount
-		saved        []models.SavedSearch
-	)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		saved = s.loadSavedSearches("sidebar-browse")
-	}()
-	if cx := s.active(); cx != nil {
-		folders, _ = cx.FolderTreeUnder(ceiling)
-		sourceLabels, _ = cx.SourceLabelCountsUnder(ceiling)
-	}
-	wg.Wait()
-
+	sb := s.sidebarLoad(nil, resolveCeiling(r, s.active()))
 	s.renderTemplate(w, "partials/sidebar_browse.html", map[string]any{
-		"Query":             queryStr,
-		"CSRFToken":         s.csrfToken(sessionFromContext(r.Context())),
-		"FolderTree":        folders,
-		"SourceLabelCounts": sourceLabels,
-		"SavedSearches":     saved,
+		"Query":             r.URL.Query().Get("q"),
+		"FolderTree":        sb.Folders,
+		"SourceLabelCounts": sb.SourceLabels,
+		"SavedSearches":     sb.Saved,
 	})
 }
 
@@ -467,22 +407,7 @@ func (s *Server) pageSizeChoices(r *http.Request) []PageSizeChoice {
 }
 
 func buildSidebarURL(q, sort, order, page, seed string, ids []int64) string {
-	v := url.Values{}
-	if q != "" {
-		v.Set("q", q)
-	}
-	if sort != "" {
-		v.Set("sort", sort)
-	}
-	if order != "" {
-		v.Set("order", order)
-	}
-	if page != "" {
-		v.Set("page", page)
-	}
-	if seed != "" {
-		v.Set("seed", seed)
-	}
+	v := setNonEmpty(url.Values{}, "q", q, "sort", sort, "order", order, "page", page, "seed", seed)
 	var sb strings.Builder
 	for i, id := range ids {
 		if i > 0 {

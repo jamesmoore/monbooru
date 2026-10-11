@@ -14,14 +14,13 @@
             id="delete-image-btn"
             hx-delete="/images/{{.ImageID}}?back_q={{urlQ .BackQuery}}&back_sort={{.BackSort}}&back_order={{.BackOrder}}{{if .BackPage}}&back_page={{.BackPage}}{{end}}{{if .BackSeed}}&back_seed={{.BackSeed}}{{end}}{{if .Ref}}&ref={{.Ref}}{{end}}"
             hx-swap="none"
-            hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'
             hx-confirm="Delete this image?"
             data-confirm-danger="{{if .ExtraPaths}}Deletes {{add .ExtraPaths 1}} files: this one and {{.ExtraPaths}} identical cop{{if eq .ExtraPaths 1}}y{{else}}ies{{end}} filed elsewhere. {{end}}Files are permanently deleted from disk. This cannot be undone."
             data-confirm-ok="Delete">Delete image</button>
   </div>
 
   {{if .ImageTags}}
-  <dialog id="remove-tags-dialog" data-image-id="{{.ImageID}}" data-csrf="{{.CSRFToken}}">
+  <dialog id="remove-tags-dialog" data-image-id="{{.ImageID}}">
     <p>Remove tags from this image:</p>
     <form id="remove-tags-form" onsubmit="event.preventDefault(); confirmRemoveTags();">
       <div class="field">
@@ -54,32 +53,9 @@
     <p>Rename / move this image:</p>
     <form id="place-image-form"
           hx-post="/images/{{.ImageID}}/place"
-          hx-target="#place-image-error" hx-swap="innerHTML"
-          hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'>
-      <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+          hx-target="#place-image-error" hx-swap="innerHTML">
       <div class="field">
-        <div class="dest-row">
-          <div class="dest-part">
-            <label for="place-image-folder">folder</label>
-            <input type="text" name="folder" id="place-image-folder" autocomplete="off"
-                   hx-get="/internal/folders/suggest"
-                   hx-trigger="input changed delay:200ms"
-                   hx-target="#place-image-suggest"
-                   hx-swap="innerHTML"
-                   hx-vals='js:{prefix: document.getElementById("place-image-folder").value}'
-                   onkeydown="handleSuggestKey(event, 'place-image-suggest', 'place-image-folder')">
-            <div id="place-image-suggest" class="suggest-dropdown folder-suggest-dropdown"></div>
-          </div>
-          <span class="dest-sep" aria-hidden="true">/</span>
-          <div class="dest-part">
-            <label for="place-image-name">name</label>
-            <input type="text" name="name" id="place-image-name" autocomplete="off">
-          </div>
-        </div>
-        <div class="dest-hints">
-          <span class="field-hint">Blank = the gallery root.</span>
-          <span class="field-hint">The extension is kept.</span>
-        </div>
+        {{template "dest_row" dict "Prefix" "place-image" "NameHint" "The extension is kept."}}
         {{template "partials/name_tokens.html" (dict "Targets" "place-image-folder place-image-name" "Folder" true)}}
         <div id="place-image-preview"
              hx-get="/internal/name/preview"

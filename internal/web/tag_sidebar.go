@@ -61,7 +61,6 @@ const tagModeCookieName = "monbooru_tag_mode"
 
 type tagSidebar struct {
 	ImageID    int64
-	CSRFToken  string
 	Sections   []tagSidebarSection
 	StaleCount int
 	Mode       string
@@ -84,21 +83,14 @@ func readTagModeCookie(r *http.Request) string {
 
 func writeTagModeCookie(w http.ResponseWriter, mode string) {
 	if mode == tagModeSource {
-		http.SetCookie(w, &http.Cookie{
-			Name:     tagModeCookieName,
-			Value:    tagModeSource,
-			Path:     "/",
-			HttpOnly: true,
-			MaxAge:   31_536_000,
-			SameSite: http.SameSiteLaxMode,
-		})
+		setPrefCookie(w, tagModeCookieName, tagModeSource)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: tagModeCookieName, Value: "", Path: "/", MaxAge: -1})
+	setPrefCookie(w, tagModeCookieName, "")
 }
 
-func (s *Server) buildTagSidebar(imageID int64, csrfToken, mode string, imageTags []models.ImageTag) tagSidebar {
-	sb := tagSidebar{ImageID: imageID, CSRFToken: csrfToken, Mode: mode}
+func (s *Server) buildTagSidebar(imageID int64, mode string, imageTags []models.ImageTag) tagSidebar {
+	sb := tagSidebar{ImageID: imageID, Mode: mode}
 	if len(imageTags) == 0 {
 		return sb
 	}
@@ -248,15 +240,7 @@ func annotateTagRow(r *tagSidebarRow, sources []tags.TagSource, taggerNames []st
 }
 
 func autoOnly(t models.ImageTag, sources []tags.TagSource, taggerNames []string) bool {
-	if !t.IsAuto {
-		return false
-	}
-	for _, src := range sources {
-		if !slices.Contains(taggerNames, src.Source) {
-			return false
-		}
-	}
-	return true
+	return t.IsAuto && !slices.ContainsFunc(sources, func(src tags.TagSource) bool { return !slices.Contains(taggerNames, src.Source) })
 }
 
 func sourceHint(sources []tags.TagSource, taggerName string, confidence *float64) string {

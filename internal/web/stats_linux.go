@@ -11,12 +11,20 @@ import (
 	"syscall"
 )
 
-func readVmRSS() uint64 { return readSelfStatusKB("VmRSS:") }
+func readVmRSS() uint64 { return readStatusKB("self", "VmRSS:") }
 
-func readVmHWM() uint64 { return readSelfStatusKB("VmHWM:") }
+// pid is "self" or a process id.
+func readRSSOf(pid string) uint64 { return readStatusKB(pid, "VmRSS:") }
 
-func readSelfStatusKB(prefix string) uint64 {
-	f, err := os.Open("/proc/self/status")
+// readPeakRSS is the peak since the last resetPeakRSS, or since the start.
+func readPeakRSS(pid string) uint64 { return readStatusKB(pid, "VmHWM:") }
+
+func resetPeakRSS(pid string) {
+	_ = os.WriteFile("/proc/"+pid+"/clear_refs", []byte("5"), 0)
+}
+
+func readStatusKB(pid, prefix string) uint64 {
+	f, err := os.Open("/proc/" + pid + "/status")
 	if err != nil {
 		return 0
 	}
@@ -158,10 +166,7 @@ func mountUsage(path string) (mountStats, uint64, bool) {
 	total := st.Blocks * bsize
 	// Bavail, as df reports it: Bfree also counts the root-reserved blocks.
 	free := st.Bavail * bsize
-	used := uint64(0)
-	if total > free {
-		used = total - free
-	}
+	used := total - min(free, total)
 	pct := 0
 	if total > 0 {
 		pct = int((used * 100) / total)

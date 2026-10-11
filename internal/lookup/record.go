@@ -107,11 +107,9 @@ func RecordInFlight(database *db.DB, imageID int64, backend, result string, now 
 }
 
 func Waiting(database *db.DB, cutoff time.Time) ([]InFlight, error) {
-	return db.QueryAll(database.Read, func(rows *sql.Rows) (InFlight, error) {
-		var f InFlight
-		err := rows.Scan(&f.ImageID, &f.Backend, &f.JobID)
-		return f, err
-	}, `SELECT image_id, backend, COALESCE(job_id, 0) FROM image_lookups
+	return db.QueryAll(database.Read, db.ScanRow(func(f *InFlight) []any {
+		return []any{&f.ImageID, &f.Backend, &f.JobID}
+	}), `SELECT image_id, backend, COALESCE(job_id, 0) FROM image_lookups
 		 WHERE queued_at IS NOT NULL AND queued_at <= ?`, stamp(cutoff))
 }
 
@@ -124,12 +122,14 @@ func Reset(database *db.DB, imageID int64, backend string, now time.Time) error 
 	return err
 }
 
-// ResetMany is Reset on every backend for a set of images; whereIDs is
-// the placeholder list for image_id IN (...) and args its binds.
-func ResetMany(e db.Execer, whereIDs string, args []any, now time.Time) error {
+// ResetFor is Reset for a set of images and backends; whereIDs is the
+// placeholder list for image_id IN (...) and args its binds.
+func ResetFor(e db.Execer, whereIDs string, args []any, backends []string, now time.Time) error {
+	in, backendArgs := db.InPlaceholders(backends)
 	_, err := e.Exec(
 		`UPDATE image_lookups SET attempts = 0, next_due_at = ?, ptr_cursor = NULL
-		 WHERE image_id IN (`+whereIDs+`)`, append([]any{stamp(now)}, args...)...)
+		 WHERE image_id IN (`+whereIDs+`) AND backend IN (`+in+`)`,
+		append(append([]any{stamp(now)}, args...), backendArgs...)...)
 	return err
 }
 
@@ -168,13 +168,7 @@ func (r Row) Exhausted() bool {
 }
 
 func parseStamp(v sql.NullString) time.Time {
-	if !v.Valid {
-		return time.Time{}
-	}
-	t, err := time.Parse("2006-01-02T15:04:05Z", v.String)
-	if err != nil {
-		return time.Time{}
-	}
+	t, _ := time.Parse("2006-01-02T15:04:05Z", v.String)
 	return t
 }
 

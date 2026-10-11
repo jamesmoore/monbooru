@@ -10,7 +10,6 @@
   "PostURL" (printf "/images/%d/ptr-contrib" .ImageID)
   "HeadNote" (printf "image %d" .ImageID)
   "SHA256" .SHA256
-  "CSRFToken" .CSRFToken
   "Provisional" .Provisional
   "Actionable" .Actionable
   "HandledCount" (add (len .Queued) (len .Known))

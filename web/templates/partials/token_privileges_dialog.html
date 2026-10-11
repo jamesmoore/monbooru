@@ -1,7 +1,6 @@
 {{define "partials/token_privileges_dialog.html"}}
 <form hx-post="/settings/auth/tokens/{{.ID}}/privileges"
       hx-target="#flash-token-cfg-{{.ID}}" hx-swap="innerHTML">
-  <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
   <p class="field-hint">Privileges this token grants.</p>
   <ul class="tagger-gal-list">
     {{range .Scopes}}

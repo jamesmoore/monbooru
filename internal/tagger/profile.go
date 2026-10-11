@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/logx"
@@ -44,40 +45,21 @@ func (p Profile) fingerprint() string {
 }
 
 func (p Profile) validate() error {
-	switch p.Layout {
-	case "nhwc", "nchw":
-	default:
-		return fmt.Errorf("profile %q: bad layout %q", p.Name, p.Layout)
-	}
-	switch p.Channels {
-	case "rgb", "bgr":
-	default:
-		return fmt.Errorf("profile %q: bad channels %q", p.Name, p.Channels)
-	}
-	switch p.Normalize {
-	case "none", "div255", "imagenet", "clip":
-	default:
-		return fmt.Errorf("profile %q: bad normalize %q", p.Name, p.Normalize)
-	}
-	switch p.Pad {
-	case "white_square", "mean_color_aspect":
-	default:
-		return fmt.Errorf("profile %q: bad pad %q", p.Name, p.Pad)
-	}
-	switch p.Activation {
-	case "sigmoid_in_model", "logits":
-	default:
-		return fmt.Errorf("profile %q: bad activation %q", p.Name, p.Activation)
-	}
-	switch p.LabelFormat {
-	case "wd14_csv", "joytag_txt", "camie_json":
-	default:
-		return fmt.Errorf("profile %q: bad label_format %q", p.Name, p.LabelFormat)
-	}
-	switch p.CategoryScheme {
-	case "wd14_numeric", "single_general", "name_string":
-	default:
-		return fmt.Errorf("profile %q: bad category_scheme %q", p.Name, p.CategoryScheme)
+	for _, axis := range []struct {
+		key, value string
+		allowed    []string
+	}{
+		{"layout", p.Layout, []string{"nhwc", "nchw"}},
+		{"channels", p.Channels, []string{"rgb", "bgr"}},
+		{"normalize", p.Normalize, []string{"none", "div255", "imagenet", "clip"}},
+		{"pad", p.Pad, []string{"white_square", "mean_color_aspect"}},
+		{"activation", p.Activation, []string{"sigmoid_in_model", "logits"}},
+		{"label_format", p.LabelFormat, []string{"wd14_csv", "joytag_txt", "camie_json"}},
+		{"category_scheme", p.CategoryScheme, []string{"wd14_numeric", "single_general", "name_string"}},
+	} {
+		if !slices.Contains(axis.allowed, axis.value) {
+			return fmt.Errorf("profile %q: bad %s %q", p.Name, axis.key, axis.value)
+		}
 	}
 	return nil
 }
@@ -134,36 +116,34 @@ func heuristicProfile(tagsFile string) *Profile {
 	return nil
 }
 
+func setIf[T comparable](dst *T, v T) bool {
+	var zero T
+	if v == zero {
+		return false
+	}
+	*dst = v
+	return true
+}
+
+var profileAxes = []struct {
+	name  string
+	merge func(dst *Profile, src Profile) bool
+}{
+	{"input_size", func(d *Profile, s Profile) bool { return setIf(&d.InputSize, s.InputSize) }},
+	{"layout", func(d *Profile, s Profile) bool { return setIf(&d.Layout, s.Layout) }},
+	{"channels", func(d *Profile, s Profile) bool { return setIf(&d.Channels, s.Channels) }},
+	{"normalize", func(d *Profile, s Profile) bool { return setIf(&d.Normalize, s.Normalize) }},
+	{"pad", func(d *Profile, s Profile) bool { return setIf(&d.Pad, s.Pad) }},
+	{"fill_color", func(d *Profile, s Profile) bool { return setIf(&d.FillColor, s.FillColor) }},
+	{"activation", func(d *Profile, s Profile) bool { return setIf(&d.Activation, s.Activation) }},
+	{"label_format", func(d *Profile, s Profile) bool { return setIf(&d.LabelFormat, s.LabelFormat) }},
+	{"category_scheme", func(d *Profile, s Profile) bool { return setIf(&d.CategoryScheme, s.CategoryScheme) }},
+	{"output_index", func(d *Profile, s Profile) bool { return setIf(&d.OutputIndex, s.OutputIndex) }},
+}
+
 func mergeProfile(dst *Profile, src Profile) {
-	if src.InputSize != 0 {
-		dst.InputSize = src.InputSize
-	}
-	if src.Layout != "" {
-		dst.Layout = src.Layout
-	}
-	if src.Channels != "" {
-		dst.Channels = src.Channels
-	}
-	if src.Normalize != "" {
-		dst.Normalize = src.Normalize
-	}
-	if src.Pad != "" {
-		dst.Pad = src.Pad
-	}
-	if src.FillColor != ([3]uint8{}) {
-		dst.FillColor = src.FillColor
-	}
-	if src.Activation != "" {
-		dst.Activation = src.Activation
-	}
-	if src.LabelFormat != "" {
-		dst.LabelFormat = src.LabelFormat
-	}
-	if src.CategoryScheme != "" {
-		dst.CategoryScheme = src.CategoryScheme
-	}
-	if src.OutputIndex != 0 {
-		dst.OutputIndex = src.OutputIndex
+	for _, axis := range profileAxes {
+		axis.merge(dst, src)
 	}
 }
 
@@ -202,42 +182,16 @@ func parseProfileDoc(data []byte, source string) (Profile, bool) {
 	return doc.Profile, true
 }
 
-// SidecarProfileFields must test the same fields mergeProfile does.
 func SidecarProfileFields(modelPath, taggerName string) []string {
 	sidecar, ok := parseSidecarProfile(modelPath, taggerName)
 	if !ok {
 		return nil
 	}
 	var out []string
-	if sidecar.InputSize != 0 {
-		out = append(out, "input_size")
-	}
-	if sidecar.Layout != "" {
-		out = append(out, "layout")
-	}
-	if sidecar.Channels != "" {
-		out = append(out, "channels")
-	}
-	if sidecar.Normalize != "" {
-		out = append(out, "normalize")
-	}
-	if sidecar.Pad != "" {
-		out = append(out, "pad")
-	}
-	if sidecar.FillColor != ([3]uint8{}) {
-		out = append(out, "fill_color")
-	}
-	if sidecar.Activation != "" {
-		out = append(out, "activation")
-	}
-	if sidecar.LabelFormat != "" {
-		out = append(out, "label_format")
-	}
-	if sidecar.CategoryScheme != "" {
-		out = append(out, "category_scheme")
-	}
-	if sidecar.OutputIndex != 0 {
-		out = append(out, "output_index")
+	for _, axis := range profileAxes {
+		if axis.merge(&Profile{}, sidecar) {
+			out = append(out, axis.name)
+		}
 	}
 	return out
 }

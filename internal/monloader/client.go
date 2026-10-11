@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/monbooru/monbooru/internal/peer"
 )
 
 // App is the peer's name in pairing records and error text.
-const App = "monloader"
+const App = peer.Companion
 
 // A backstop for callers with an unbounded context: it must stay above every
 // per-call deadline, or it cuts off a send monloader may still commit.

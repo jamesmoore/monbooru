@@ -33,12 +33,11 @@
   <button id="batch-invert" onclick="invertSelection()">Invert</button>
   <button id="batch-cancel" onclick="clearSelection()">Cancel</button>
   <form id="batch-delete-form">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <span class="batch-bar-spacer"></span>
-    <button type="button" onclick="openTagSelectedDialog()">Add tags</button>
-    <button type="button" onclick="openStripSelectedDialog()">Remove tags</button>
+    <button type="button" onclick="openTagDialog('selection')">Add tags</button>
+    <button type="button" onclick="openStripDialog('selection')">Remove tags</button>
     {{if .TaggersPresent}}<button type="button" class="btn-autotag"{{if not .EnabledTaggers}} disabled title="{{.TaggerReason}}"{{end}} onclick="openBatchAutotagDialog('selection')">Auto-tag</button>{{end}}
-    {{if .MonloaderPaired}}<button type="button" class="monloader-accent"{{if not .MonloaderUsable}} disabled title="{{monloaderOffReason .MonloaderConn}}"{{end}} onclick="openBatchLookupDialog('selection')">Find tags</button>{{end}}
+    {{if .MonloaderPaired}}<button type="button" class="monloader-accent" data-ml-title=""{{if not .MonloaderUsable}} disabled title="{{monloaderOffReason .MonloaderConn}}"{{end}} onclick="openBatchLookupDialog('selection')">Find tags</button>{{end}}
     <span class="batch-bar-sep" aria-hidden="true"></span>
     <button type="button" onclick="openBatchInboxDialog('selection')">Inbox</button>
     <button type="button" onclick="openBatchFavoriteDialog('selection')">Favorite</button>
@@ -47,7 +46,7 @@
     <button type="button" id="batch-download" onclick="openBatchDownloadDialog('selection')">Download</button>
     {{if gt (len .Galleries) 1}}<button type="button" id="batch-transfer" onclick="openBatchTransferDialog('selection')">Transfer</button>{{end}}
     <button type="button" onclick="openBatchPlaceDialog('selection')">Rename</button>
-    <button type="button" class="btn-danger" onclick="batchDeleteSelected()">Delete</button>
+    <button type="button" class="btn-danger" onclick="openBatchDeleteDialog('selection')">Delete</button>
   </form>
 </div>
 
@@ -66,7 +65,6 @@
   <form hx-post="/search/saved"
         hx-target="#save-search-result"
         hx-swap="innerHTML">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" name="query" id="save-search-query" value="{{.Query}}">
     <input type="hidden" name="sort" id="save-search-sort" value="{{.Sort}}">
     <input type="hidden" name="order" id="save-search-order" value="{{.Order}}">
@@ -99,9 +97,7 @@
     <span id="batch-tag-noun"></span>:
   </p>
   <form id="batch-tag-form" onsubmit="event.preventDefault(); confirmBatchTag();">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" name="scope" id="batch-tag-scope">
-    <input type="hidden" name="op" value="add">
     <div class="field" style="position:relative">
       <label>Tags (space-separated, <code>category:name</code> for non-general)</label>
       {{template "multi_tag_suggest_input" dict "Name" "tags" "InputID" "batch-tag-input" "SuggestID" "batch-tag-suggest" "Placeholder" "Add tag(s)..." "Class" "upload-wide-input" "ValsKey" "tag"}}
@@ -117,7 +113,6 @@
     Auto-tag {{template "batch_count" "batch-autotag"}}. Pick which tagger to run.
   </p>
   <form id="batch-autotag-form" onsubmit="event.preventDefault(); confirmBatchAutotag();">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" id="batch-autotag-scope">
     <div class="field">
       <label style="display:block"><input type="radio" name="tagger_name" value="" checked> All enabled taggers</label>
@@ -135,9 +130,8 @@
     <span id="batch-strip-noun"></span>:
   </p>
   <form id="batch-strip-form" onsubmit="event.preventDefault(); confirmBatchStrip();">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" name="scope" id="batch-strip-scope">
-    <div class="field">
+    <div class="field" onchange="updateBatchStripRow()">
       <label style="display:block"><input type="radio" name="mode" value="specific" checked> Specific tags by name</label>
       <div class="field" style="position:relative; margin: 4px 0 8px 22px" id="batch-strip-specific-row">
         {{template "multi_tag_suggest_input" dict "Name" "tags" "InputID" "batch-strip-input" "SuggestID" "batch-strip-suggest" "Placeholder" "Tags to remove (space-separated, category:name)" "Class" "upload-wide-input" "ValsKey" "tag"}}
@@ -173,31 +167,9 @@
   <p>Rename / move {{template "batch_count" "batch-place"}}:</p>
   <p class="field-hint">A plain name numbers the scope in order: name01.ext, name02.ext, ... A template with tokens names each file on its own. Extensions are kept.</p>
   <form id="batch-place-form" onsubmit="event.preventDefault(); confirmBatchPlace();">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" id="batch-place-scope">
     <div class="field">
-      <div class="dest-row">
-        <div class="dest-part">
-          <label for="batch-place-folder">folder</label>
-          <input type="text" name="folder" id="batch-place-folder" autocomplete="off"
-                 hx-get="/internal/folders/suggest"
-                 hx-trigger="input changed delay:200ms"
-                 hx-target="#batch-place-suggest"
-                 hx-swap="innerHTML"
-                 hx-vals='js:{prefix: document.getElementById("batch-place-folder").value}'
-                 onkeydown="handleSuggestKey(event, 'batch-place-suggest', 'batch-place-folder')">
-          <div id="batch-place-suggest" class="suggest-dropdown folder-suggest-dropdown"></div>
-        </div>
-        <span class="dest-sep" aria-hidden="true">/</span>
-        <div class="dest-part">
-          <label for="batch-place-name">name</label>
-          <input type="text" name="name" id="batch-place-name" placeholder="(keep each name)" autocomplete="off">
-        </div>
-      </div>
-      <div class="dest-hints">
-        <span class="field-hint">Blank = the gallery root.</span>
-        <span class="field-hint">Blank = the name it has.</span>
-      </div>
+      {{template "dest_row" dict "Prefix" "batch-place" "NamePlaceholder" "(keep each name)" "NameHint" "Blank = the name it has."}}
       {{template "partials/name_tokens.html" (dict "Targets" "batch-place-folder batch-place-name" "Batch" true "Folder" true)}}
       <div id="batch-place-preview"
            hx-get="/internal/name/preview"
@@ -218,7 +190,6 @@
   <p class="field-hint">The image and its tags, sources and notes are copied into the target gallery.</p>
   <p class="field-hint" style="color:var(--error)">Relations and collections are not carried over.</p>
   <form id="batch-transfer-form" onsubmit="event.preventDefault(); confirmBatchTransfer();">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" id="batch-transfer-scope">
     <div class="field">
       <label>Target gallery</label>
@@ -252,38 +223,13 @@
 </dialog>
 <iframe name="batch-download-frame" id="batch-download-frame" hidden></iframe>
 
-<dialog id="batch-inbox-dialog">
-  <input type="hidden" id="batch-inbox-scope">
-  <p>
-    Archive or unarchive
-    {{template "batch_count" "batch-inbox"}}?
-  </p>
-  <p style="color:var(--fg-dim);font-size:12px">Inbox images become archived; archived become inbox.</p>
-  <div id="batch-inbox-flash"></div>
-  <div class="dialog-actions">
-    <button type="button" onclick="confirmBatchInbox()">Apply</button>
-    <button type="button" onclick="document.getElementById('batch-inbox-dialog').close()">Cancel</button>
-  </div>
-</dialog>
+{{template "batch_toggle_dialog" dict "Prefix" "batch-inbox" "Lead" "Archive or unarchive" "Hint" "Inbox images become archived; archived become inbox." "Endpoint" "/internal/batch-inbox" "FailMsg" "Inbox update failed."}}
 
-<dialog id="batch-fav-dialog">
-  <input type="hidden" id="batch-fav-scope">
-  <p>
-    Toggle favorite state for
-    {{template "batch_count" "batch-fav"}}?
-  </p>
-  <p style="color:var(--fg-dim);font-size:12px">Favorited images become unfavorited; unfavorited become favorited.</p>
-  <div id="batch-fav-flash"></div>
-  <div class="dialog-actions">
-    <button type="button" onclick="confirmBatchFavorite()">Apply</button>
-    <button type="button" onclick="document.getElementById('batch-fav-dialog').close()">Cancel</button>
-  </div>
-</dialog>
+{{template "batch_toggle_dialog" dict "Prefix" "batch-fav" "Lead" "Toggle favorite state for" "Hint" "Favorited images become unfavorited; unfavorited become favorited." "Endpoint" "/internal/batch-favorite" "FailMsg" "Favorite update failed."}}
 
 <dialog id="batch-collection-dialog">
   <p>Set collection for {{template "batch_count" "batch-collection"}}:</p>
   <form id="batch-collection-form" onsubmit="event.preventDefault(); confirmBatchCollection();">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
     <input type="hidden" id="batch-collection-scope">
     <div class="field">
       <div class="radio-row">
@@ -312,7 +258,7 @@
 
     <label class="batch-lookup-op"><input type="radio" name="batch-lookup-mode" value="hash" onchange="updateBatchLookupSummary()"> Look up by file hash</label>
     <div class="batch-lookup-sub">
-      <label><input type="checkbox" id="batch-lookup-ptr" checked onchange="updateBatchLookupSummary()"> Public Tag Repository <span class="field-hint">local index, no quota</span></label>
+      <label{{if not .MonloaderPTR}} title="{{if .MonloaderPTRSyncing}}the Public Tag Repository index is still syncing{{else if not .MonloaderUsable}}{{monloaderOffReason .MonloaderConn}}{{else}}the PTR index is off on monloader{{end}}"{{end}}><input type="checkbox" id="batch-lookup-ptr"{{if .MonloaderPTR}} checked{{else}} disabled{{end}} onchange="updateBatchLookupSummary()"> Public Tag Repository <span class="field-hint">local index, no quota</span></label>
       <label><input type="checkbox" id="batch-lookup-booru" checked onchange="updateBatchLookupSummary()"> Online boorus <span class="field-hint">spends site quota, one request per image</span></label>
       <label><input type="checkbox" id="batch-lookup-unsourced" checked onchange="updateBatchLookupSummary()"> Only images with no source <span class="field-hint" id="batch-lookup-unsourced-count"></span></label>
     </div>
@@ -342,16 +288,18 @@ function openBatchLookupDialog(scope) {
     beforeShow: function() {
       _batchLookupCounts = {total: 0, sourced: 0, unsourced: 0};
       updateBatchLookupSummary();
-      var params = ['_csrf=' + encodeURIComponent(getCSRFToken()), 'scope=' + encodeURIComponent(scope)]
+      var scope = document.getElementById('batch-lookup-scope').value;
+      var parts = ['scope=' + encodeURIComponent(scope)]
         .concat(scope === 'search' ? searchScopeParts() : (selectionScopeIds() || []));
-      fetch('/internal/batch-lookup/count', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRF-Token': getCSRFToken()},
-        body: params.join('&')
-      }).then(function(r) { return r.ok ? r.json() : null; }).then(function(c) {
-        if (c) _batchLookupCounts = c;
-        updateBatchLookupSummary();
-      }).catch(function() {});
+      postForm('/internal/batch-lookup/count', new URLSearchParams(parts.join('&')), {
+        flashId: 'batch-lookup-flash',
+        onOK: function(res) {
+          res.json().then(function(c) {
+            _batchLookupCounts = c;
+            updateBatchLookupSummary();
+          });
+        }
+      });
     }
   });
 }
@@ -415,20 +363,8 @@ function openBatchDeleteDialog(scope) {
 
 function confirmBatchDelete() {
   var scope = document.getElementById('batch-delete-scope').value;
-  if (scope === 'search') {
-    runBatchOp({endpoint: '/internal/delete-search', scope: 'search', params: searchScopeParts(),
-                dialogId: 'batch-delete-dialog', flashId: 'batch-delete-flash', failMsg: 'Delete failed.',
-                consumesScope: true});
-    return;
-  }
-  var ids = selectionScopeIds();
-  if (!ids) {
-    document.getElementById('batch-delete-flash').innerHTML = '<div class="flash flash-err">No images selected.</div>';
-    return;
-  }
-  runBatchOp({endpoint: '/internal/batch-delete', scope: 'selection', params: ids,
-              dialogId: 'batch-delete-dialog', flashId: 'batch-delete-flash', failMsg: 'Delete failed.',
-              consumesScope: true});
+  confirmBatchSimple('batch-delete', scope === 'search' ? '/internal/delete-search' : '/internal/batch-delete',
+    null, 'Delete failed.', true);
 }
 
 // {folder}, not blank: a blank folder means the gallery root, and a batch
@@ -486,8 +422,9 @@ function confirmBatchTransfer() {
     return;
   }
   var params = ['target=' + encodeURIComponent(target.value)];
-  if (document.getElementById('batch-transfer-remove').checked) params.push('remove_after=1');
-  confirmBatchSimple('batch-transfer', '/internal/batch-transfer', params, 'Transfer failed.');
+  var remove = document.getElementById('batch-transfer-remove').checked;
+  if (remove) params.push('remove_after=1');
+  confirmBatchSimple('batch-transfer', '/internal/batch-transfer', params, 'Transfer failed.', remove);
 }
 
 var _batchDownloadFiles = 0;
@@ -519,7 +456,9 @@ function countBatchDownload() {
   postForm('/internal/batch-download/count', new URLSearchParams(batchDownloadScope().join('&')), {
     onErr: function(body) {
       summary.textContent = '';
-      document.getElementById('batch-download-flash').innerHTML = body;
+      var flash = document.getElementById('batch-download-flash');
+      if (/class\s*=\s*"[^"]*flash\b/.test(body)) flash.innerHTML = body;
+      else setFlashText(flash, 'err', body);
     },
     onOK: function(res) {
       res.json().then(function(c) {
@@ -570,7 +509,6 @@ function confirmBatchDownload() {
 
 // beforeShow re-syncs the rows so showModal's initial focus does not
 // follow the last open's mode.
-function openStripSelectedDialog() { openStripDialog('selection'); }
 function openStripDialog(scope) {
   openBatchDialog('batch-strip', scope, {
     countId: 'batch-strip-count-display',
@@ -598,21 +536,11 @@ function toggleStripModeRow(id, inactive) {
   });
 }
 
-(function () {
-  var form = document.getElementById('batch-strip-form');
-  if (!form) return;
-  form.querySelectorAll('input[name="mode"]').forEach(function(r) {
-    r.addEventListener('change', updateBatchStripRow);
-  });
-})();
-
 function confirmBatchStrip() {
   var form = document.getElementById('batch-strip-form');
   if (!form) return;
-  var scope = document.getElementById('batch-strip-scope').value;
   var mode = (form.querySelector('input[name="mode"]:checked') || {}).value || 'specific';
   var flash = document.getElementById('batch-strip-flash');
-  if (flash) flash.innerHTML = '';
 
   // The server knows only the bare auto and source modes; the -specific
   // forms add a name filter.
@@ -649,11 +577,7 @@ function confirmBatchStrip() {
       params.push('source=' + encodeURIComponent(src));
     }
   }
-  var scoped = batchScopeParams(scope, flash);
-  if (!scoped) return;
-  params = params.concat(scoped);
-  runBatchOp({endpoint: url, scope: scope, params: params,
-              dialogId: 'batch-strip-dialog', flashId: 'batch-strip-flash', failMsg: 'Remove failed.'});
+  confirmBatchSimple('batch-strip', url, params, 'Remove failed.');
 }
 
 function openBatchAutotagDialog(scope) {
@@ -670,7 +594,6 @@ function confirmBatchAutotag() {
     ['tagger_name=' + encodeURIComponent(tagger)], 'Auto-tag failed.');
 }
 
-function openTagSelectedDialog() { openTagDialog('selection'); }
 function openTagDialog(scope) {
   openBatchDialog('batch-tag', scope, {
     countId: 'batch-tag-count-display',
@@ -680,21 +603,13 @@ function openTagDialog(scope) {
 }
 
 function confirmBatchTag() {
-  var form = document.getElementById('batch-tag-form');
-  if (!form) return;
-  var scope = document.getElementById('batch-tag-scope').value;
   var tags = (document.getElementById('batch-tag-input').value || '').trim();
-  var flash = document.getElementById('batch-tag-flash');
-  if (flash) flash.innerHTML = '';
   if (!tags) {
-    if (flash) flash.innerHTML = '<div class="flash flash-err">No tags provided.</div>';
+    document.getElementById('batch-tag-flash').innerHTML = '<div class="flash flash-err">No tags provided.</div>';
     return;
   }
-  var scoped = batchScopeParams(scope, flash);
-  if (!scoped) return;
-  var params = ['op=add', 'tags=' + encodeURIComponent(tags)].concat(scoped);
-  runBatchOp({endpoint: '/internal/batch-tag', scope: scope, params: params,
-              dialogId: 'batch-tag-dialog', flashId: 'batch-tag-flash', failMsg: 'Tag operation failed.'});
+  confirmBatchSimple('batch-tag', '/internal/batch-tag', ['op=add', 'tags=' + encodeURIComponent(tags)],
+    'Tag operation failed.');
 }
 
 function toggleFavFilter() {
@@ -702,29 +617,17 @@ function toggleFavFilter() {
   if (!si) return;
   var tokens = si.value.split(/\s+/).filter(function(t) { return t && t.toLowerCase() !== 'fav:true'; });
   var hadFav = tokens.length !== si.value.split(/\s+/).filter(Boolean).length;
-  if (hadFav) {
-    si.value = tokens.join(' ');
-  } else {
-    tokens.unshift('fav:true');
-    si.value = tokens.join(' ');
-  }
-  document.getElementById('search-form').dispatchEvent(new Event('submit', {bubbles:true}));
+  if (!hadFav) tokens.unshift('fav:true');
+  si.value = tokens.join(' ');
+  submitSearch();
 }
 
 function openBatchInboxDialog(scope) {
   openBatchDialog('batch-inbox', scope);
 }
 
-function confirmBatchInbox() {
-  confirmBatchSimple('batch-inbox', '/internal/batch-inbox', null, 'Inbox update failed.');
-}
-
 function openBatchFavoriteDialog(scope) {
   openBatchDialog('batch-fav', scope);
-}
-
-function confirmBatchFavorite() {
-  confirmBatchSimple('batch-fav', '/internal/batch-favorite', null, 'Favorite update failed.');
 }
 
 function openBatchLabeledDialog(prefix, scope) {

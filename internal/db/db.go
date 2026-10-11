@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	_ "embed"
+	"errors"
 	"fmt"
 	"math/bits"
 	"strings"
@@ -17,9 +18,6 @@ import (
 // Both separators: a Windows library's canonical_path has backslashes.
 // Indexes store the result, so changing it needs a REINDEX migration.
 func basenameSQL(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-	if len(args) != 1 || args[0] == nil {
-		return nil, nil
-	}
 	s, ok := args[0].(string)
 	if !ok {
 		return nil, nil
@@ -31,9 +29,6 @@ func basenameSQL(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, 
 }
 
 func hammingDistSQL(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-	if len(args) != 2 || args[0] == nil || args[1] == nil {
-		return nil, nil
-	}
 	a, aOk := args[0].(int64)
 	b, bOk := args[1].(int64)
 	if !aOk || !bOk {
@@ -43,9 +38,6 @@ func hammingDistSQL(_ *sqlite.FunctionContext, args []driver.Value) (driver.Valu
 }
 
 func randomKeySQL(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-	if len(args) != 2 || args[0] == nil || args[1] == nil {
-		return nil, nil
-	}
 	id, aOk := args[0].(int64)
 	seed, bOk := args[1].(int64)
 	if !aOk || !bOk {
@@ -163,6 +155,21 @@ func shrinkPool(ctx context.Context, pool *sql.DB) error {
 		if _, err := c.ExecContext(ctx, `PRAGMA shrink_memory`); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+var ErrCheckpoint = errors.New("wal checkpoint")
+
+// Vacuum's failed checkpoint wraps ErrCheckpoint: the vacuum itself is
+// done. In WAL mode VACUUM writes into the -wal file; only a truncating
+// checkpoint gives the space back.
+func (db *DB) Vacuum(ctx context.Context) error {
+	if _, err := db.Write.ExecContext(ctx, `VACUUM`); err != nil {
+		return err
+	}
+	if _, err := db.Write.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("%w: %v", ErrCheckpoint, err)
 	}
 	return nil
 }

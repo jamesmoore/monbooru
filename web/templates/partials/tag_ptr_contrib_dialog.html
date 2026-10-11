@@ -9,7 +9,6 @@
   "PetitionName" "pair_petition"
   "PostURL" (printf "/tags/%d/ptr-contrib" .TagID)
   "HeadNote" (printf "tag %s" .TagName)
-  "CSRFToken" .CSRFToken
   "Provisional" .Provisional
   "Actionable" .Actionable
   "HandledCount" (add (len .Pending) (len .InSync))

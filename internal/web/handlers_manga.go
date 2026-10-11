@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 )
@@ -19,7 +20,6 @@ import (
 type readerData struct {
 	baseData
 	Image       models.Image
-	Filename    string
 	Page        int
 	PageCount   int
 	NextPage    int
@@ -75,10 +75,7 @@ func (s *Server) readerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	pageCount := *img.PageCount
 	// A bare URL resumes; page 1 would clear the bookmark on every visit.
-	page := 1
-	if resume := resumePage(img); resume > 0 {
-		page = resume
-	}
+	page := max(resumePage(img), 1)
 	rawPage := ""
 	if v := r.URL.Query().Get("page"); v != "" {
 		rawPage = v
@@ -86,12 +83,7 @@ func (s *Server) readerHandler(w http.ResponseWriter, r *http.Request) {
 			page = n
 		}
 	}
-	if page < 1 {
-		page = 1
-	}
-	if page > pageCount {
-		page = pageCount
-	}
+	page = min(max(page, 1), pageCount)
 	// Redirect before recording, so only canonical URLs move the bookmark.
 	if rawPage != "" && rawPage != strconv.Itoa(page) {
 		q := r.URL.Query()
@@ -111,7 +103,6 @@ func (s *Server) readerHandler(w http.ResponseWriter, r *http.Request) {
 	data := readerData{
 		baseData:    s.base(r, "gallery", filepath.Base(img.CanonicalPath)+" - Reader - "+s.booruName()),
 		Image:       *img,
-		Filename:    filepath.Base(img.CanonicalPath),
 		Page:        page,
 		PageCount:   pageCount,
 		NextPage:    next,
@@ -128,20 +119,10 @@ func (s *Server) recordReaderPosition(img *models.Image, page, pageCount int) {
 	if page > 1 && page < pageCount {
 		next = page
 	}
-	stored := 0
-	if img.LastReadPage != nil {
-		stored = *img.LastReadPage
-	}
-	if next == stored {
+	if next == derefOr(img.LastReadPage) {
 		return
 	}
-	var value any
-	if next > 0 {
-		value = next
-	}
-	if _, err := s.db().Write.Exec(
-		`UPDATE images SET last_read_page = ? WHERE id = ?`, value, img.ID,
-	); err != nil {
+	if err := gallery.SetReadPage(s.db(), img.ID, next); err != nil {
 		logx.Warnf("record reader position for image %d: %v", img.ID, err)
 	}
 }
@@ -162,7 +143,7 @@ func (s *Server) pagesGridHandler(w http.ResponseWriter, r *http.Request) {
 		Filename:     filepath.Base(img.CanonicalPath),
 		PageCount:    *img.PageCount,
 		LastReadPage: resumePage(img),
-		TagSidebar:   s.buildTagSidebar(img.ID, base.CSRFToken, readTagModeCookie(r), imageTags),
+		TagSidebar:   s.buildTagSidebar(img.ID, readTagModeCookie(r), imageTags),
 		BackQuery:    back.Q,
 		BackQS:       backQS,
 		BackKVQS:     backKVQS,
@@ -201,18 +182,12 @@ func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stem := strings.TrimSuffix(filepath.Base(img.CanonicalPath), filepath.Ext(img.CanonicalPath))
-	pageID, filed, err := s.extractMangaPageToGallery(cx, img, n, destDir, stem+"_p")
+	pageID, _, err := s.extractMangaPageToGallery(r.Context(), cx, img, n, destDir, stem+"_p", naming)
 	if err != nil {
 		fail("extract", err)
 		return
 	}
-	if filed {
-		if _, err := naming.Apply(r.Context(), cx.DB, cx.Boundary(), pageID, "", ""); err != nil {
-			logx.Warnf("extract page %d of image %d: file: %v", n, img.ID, err)
-		}
-	}
-	cx.InvalidateCaches()
-	http.Redirect(w, r, fmt.Sprintf("/images/%d", pageID), http.StatusSeeOther)
+	hxRedirect(w, r, fmt.Sprintf("/images/%d", pageID))
 }
 
 func loadMangaMeta(ctx context.Context, database *db.DB, imageID int64) *models.MangaMetadata {
@@ -222,16 +197,14 @@ func loadMangaMeta(ctx context.Context, database *db.DB, imageID int64) *models.
 	var coverArtist, editor, publisher, imprint, genre sql.NullString
 	var web, languageISO, format, manga, ageRating sql.NullString
 	var rawXML sql.NullString
-	var count, year, month, day, xmlPageCount sql.NullInt64
-	var communityRating sql.NullFloat64
 	err := database.Read.QueryRowContext(ctx, `
 		SELECT image_id, title, series, number, volume, count, summary, notes,
 		       year, month, day, writer, penciller, inker, colorist, letterer, cover_artist, editor, publisher,
 		       imprint, genre, web, language_iso, format, manga, age_rating, community_rating, xml_page_count, raw_xml
 		FROM manga_metadata WHERE image_id = ?`, imageID,
-	).Scan(&m.ImageID, &title, &series, &number, &volume, &count, &summary, &notes,
-		&year, &month, &day, &writer, &penciller, &inker, &colorist, &letterer, &coverArtist, &editor, &publisher,
-		&imprint, &genre, &web, &languageISO, &format, &manga, &ageRating, &communityRating, &xmlPageCount, &rawXML)
+	).Scan(&m.ImageID, &title, &series, &number, &volume, &m.Count, &summary, &notes,
+		&m.Year, &m.Month, &m.Day, &writer, &penciller, &inker, &colorist, &letterer, &coverArtist, &editor, &publisher,
+		&imprint, &genre, &web, &languageISO, &format, &manga, &ageRating, &m.CommunityRating, &m.XMLPageCount, &rawXML)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -239,56 +212,27 @@ func loadMangaMeta(ctx context.Context, database *db.DB, imageID int64) *models.
 		logx.Debugf("loadMangaMeta: %v", err)
 		return nil
 	}
-	m.Title = nullToString(title)
-	m.Series = nullToString(series)
-	m.Number = nullToString(number)
-	m.Volume = nullToString(volume)
-	m.Summary = nullToString(summary)
-	m.Notes = nullToString(notes)
-	m.Writer = nullToString(writer)
-	m.Penciller = nullToString(penciller)
-	m.Inker = nullToString(inker)
-	m.Colorist = nullToString(colorist)
-	m.Letterer = nullToString(letterer)
-	m.CoverArtist = nullToString(coverArtist)
-	m.Editor = nullToString(editor)
-	m.Publisher = nullToString(publisher)
-	m.Imprint = nullToString(imprint)
-	m.Genre = nullToString(genre)
-	m.Web = nullToString(web)
-	m.LanguageISO = nullToString(languageISO)
-	m.Format = nullToString(format)
-	m.Manga = nullToString(manga)
-	m.AgeRating = nullToString(ageRating)
-	m.RawXML = nullToString(rawXML)
-	m.Count = nullToIntPtr(count)
-	m.Year = nullToIntPtr(year)
-	m.Month = nullToIntPtr(month)
-	m.Day = nullToIntPtr(day)
-	m.XMLPageCount = nullToIntPtr(xmlPageCount)
-	m.CommunityRating = nullToFloatPtr(communityRating)
+	m.Title = title.String
+	m.Series = series.String
+	m.Number = number.String
+	m.Volume = volume.String
+	m.Summary = summary.String
+	m.Notes = notes.String
+	m.Writer = writer.String
+	m.Penciller = penciller.String
+	m.Inker = inker.String
+	m.Colorist = colorist.String
+	m.Letterer = letterer.String
+	m.CoverArtist = coverArtist.String
+	m.Editor = editor.String
+	m.Publisher = publisher.String
+	m.Imprint = imprint.String
+	m.Genre = genre.String
+	m.Web = web.String
+	m.LanguageISO = languageISO.String
+	m.Format = format.String
+	m.Manga = manga.String
+	m.AgeRating = ageRating.String
+	m.RawXML = rawXML.String
 	return &m
-}
-
-func nullToString(n sql.NullString) string {
-	if n.Valid {
-		return n.String
-	}
-	return ""
-}
-
-func nullToIntPtr(n sql.NullInt64) *int {
-	if !n.Valid {
-		return nil
-	}
-	v := int(n.Int64)
-	return &v
-}
-
-func nullToFloatPtr(n sql.NullFloat64) *float64 {
-	if !n.Valid {
-		return nil
-	}
-	v := n.Float64
-	return &v
 }

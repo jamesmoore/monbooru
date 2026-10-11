@@ -9,9 +9,9 @@ import (
 	"github.com/monbooru/monbooru/internal/metadata"
 )
 
-// WriteComfyTerms must run in every transaction that writes a
+// writeComfyTerms must run in every transaction that writes a
 // comfyui_metadata row, or the terms index lags the workflow.
-func WriteComfyTerms(ctx context.Context, tx *sql.Tx, imageID int64, rawWorkflow string) error {
+func writeComfyTerms(ctx context.Context, tx *sql.Tx, imageID int64, rawWorkflow string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM comfyui_terms WHERE image_id = ?`, imageID); err != nil {
 		return fmt.Errorf("clear comfyui_terms: %w", err)
 	}
@@ -84,17 +84,15 @@ func backfillComfyTermsChunk(ctx context.Context, database *db.DB) (int, error) 
 		id  int64
 		raw string
 	}
-	rows, err := db.QueryAllContext(ctx, tx, func(r *sql.Rows) (pending, error) {
-		var p pending
-		err := r.Scan(&p.id, &p.raw)
-		return p, err
-	}, `SELECT image_id, COALESCE(raw_workflow, '') FROM comfyui_metadata WHERE terms_version < ? LIMIT ?`,
+	rows, err := db.QueryAllContext(ctx, tx, db.ScanRow(func(p *pending) []any {
+		return []any{&p.id, &p.raw}
+	}), `SELECT image_id, COALESCE(raw_workflow, '') FROM comfyui_metadata WHERE terms_version < ? LIMIT ?`,
 		metadata.ComfyTermsVersion, comfyTermsChunk)
 	if err != nil {
 		return 0, err
 	}
 	for _, p := range rows {
-		if err := WriteComfyTerms(ctx, tx, p.id, p.raw); err != nil {
+		if err := writeComfyTerms(ctx, tx, p.id, p.raw); err != nil {
 			return 0, err
 		}
 	}

@@ -1,5 +1,46 @@
 {{define "batch_count"}}<strong id="{{.}}-count">0</strong> <span id="{{.}}-noun">images</span>{{end}}
 
+{{define "batch_toggle_dialog"}}
+<dialog id="{{.Prefix}}-dialog">
+  <input type="hidden" id="{{.Prefix}}-scope">
+  <p>
+    {{.Lead}}
+    {{template "batch_count" .Prefix}}?
+  </p>
+  <p style="color:var(--fg-dim);font-size:12px">{{.Hint}}</p>
+  <div id="{{.Prefix}}-flash"></div>
+  <div class="dialog-actions">
+    <button type="button" onclick="confirmBatchSimple('{{.Prefix}}', '{{.Endpoint}}', null, '{{.FailMsg}}')">Apply</button>
+    <button type="button" onclick="document.getElementById('{{.Prefix}}-dialog').close()">Cancel</button>
+  </div>
+</dialog>
+{{end}}
+
+{{define "dest_row"}}
+      <div class="dest-row">
+        <div class="dest-part">
+          <label for="{{.Prefix}}-folder">folder</label>
+          <input type="text" name="folder" id="{{.Prefix}}-folder" autocomplete="off"
+                 hx-get="/internal/folders/suggest"
+                 hx-trigger="input changed delay:200ms"
+                 hx-target="#{{.Prefix}}-suggest"
+                 hx-swap="innerHTML"
+                 hx-vals='js:{prefix: document.getElementById("{{.Prefix}}-folder").value}'
+                 onkeydown="handleSuggestKey(event, '{{.Prefix}}-suggest', '{{.Prefix}}-folder')">
+          <div id="{{.Prefix}}-suggest" class="suggest-dropdown folder-suggest-dropdown"></div>
+        </div>
+        <span class="dest-sep" aria-hidden="true">/</span>
+        <div class="dest-part">
+          <label for="{{.Prefix}}-name">name</label>
+          <input type="text" name="name" id="{{.Prefix}}-name"{{with .NamePlaceholder}} placeholder="{{.}}"{{end}} autocomplete="off">
+        </div>
+      </div>
+      <div class="dest-hints">
+        <span class="field-hint">Blank = the gallery root.</span>
+        <span class="field-hint">{{.NameHint}}</span>
+      </div>
+{{end}}
+
 {{define "suggest_input"}}
       <div class="series-input-wrap">
         <input type="text" name="{{.Name}}" id="{{.InputID}}" maxlength="200"

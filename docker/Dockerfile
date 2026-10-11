@@ -1,4 +1,4 @@
-FROM golang:1.26.7-trixie AS build
+FROM golang:1.26.9-trixie AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -44,10 +44,10 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -f /tmp/ort.tgz
 
 # ffmpeg + ffprobe: the project's trimmed fully-static builds.
-ARG FFMPEG_BUILD=v8.1.2-mb4
-ARG FFMPEG_NAME=ffmpeg-8.1.2-mb4
-ARG FFMPEG_SHA256_LINUX64=66f8f4627e1cc9ad26caa9fcd9799e88db84711ef03c1565c923694804c11000
-ARG FFMPEG_SHA256_LINUXARM64=937a346aa931764d5bde26d70b51ec1f8720360777ff93d1cde66006a7a2241f
+ARG FFMPEG_BUILD=v8.1.3-mb1
+ARG FFMPEG_NAME=ffmpeg-8.1.3-mb1
+ARG FFMPEG_SHA256_LINUX64=2fc794c828a3f61836605f09f97bc9e59f906a52b971c6c170aaf480be63a216
+ARG FFMPEG_SHA256_LINUXARM64=2decca9ea2a50b25c138ccc9faa45bf9d1dc92ef176ccc5d58185a3503805d9e
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) FF_ARCH="linux64";    FF_SHA="${FFMPEG_SHA256_LINUX64}" ;; \

@@ -1,18 +1,25 @@
 package monloader
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
 
 type Status struct {
-	Conn          string // "" until the first probe, then "ok", "down" or "rejected"
+	Conn          string // "" until the first probe, then peer.ConnOK, ConnDown or ConnRejected
 	Version       string
 	PTR           bool
 	PTRSyncing    bool
 	Contrib       bool
 	ContribBanned bool
 	ContribFailed int
+}
+
+// Panels keys the fields the PTR panels render from, so a page can tell
+// when what it shows went stale.
+func (s Status) Panels() string {
+	return fmt.Sprintf("%t,%t,%t,%d", s.PTR, s.PTRSyncing, s.Contrib, s.ContribFailed)
 }
 
 type StatusCache struct {

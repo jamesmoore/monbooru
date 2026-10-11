@@ -45,8 +45,7 @@ func resolveCategory(profile Profile, label tagLabel, catIDs map[string]int64, d
 	}
 	switch profile.CategoryScheme {
 	case "wd14_numeric":
-		name := wd14Category[label.categoryID]
-		name = cmp.Or(name, "general")
+		name := cmp.Or(wd14Category[label.categoryID], "general")
 		return categoryResolution{catID: catIDs[name], catName: name}
 	case "single_general":
 		return categoryResolution{catID: catIDs["general"], catName: "general"}

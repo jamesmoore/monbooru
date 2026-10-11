@@ -24,11 +24,17 @@ type Manager struct {
 	timer  *time.Timer
 	ctx    context.Context
 	cancel context.CancelFunc
-	// Blocks Start where no job is running, such as between a scheduled
-	// run's phases.
-	scheduleHeld bool
-	viewed       bool
-	finished     uint64
+	// The exclusive lane: Start refuses while it is held, also where no
+	// job runs, such as between a scheduled run's phases.
+	lane     *Reservation
+	viewed   bool
+	finished uint64
+}
+
+// Reservation is a hold on the job lane; only its own Release frees it.
+type Reservation struct {
+	m         *Manager
+	cancelled bool
 }
 
 func NewManager() *Manager { return &Manager{} }
@@ -46,17 +52,9 @@ func (m *Manager) clearStateLocked() {
 func (m *Manager) Start(jobType string, galleries ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.scheduleHeld {
+	if m.lane != nil {
 		return ErrJobRunning
 	}
-	return m.startLocked(jobType, galleries)
-}
-
-// StartScheduled skips the reservation check; only the holder of
-// BeginSchedule may call it.
-func (m *Manager) StartScheduled(jobType string, galleries ...string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	return m.startLocked(jobType, galleries)
 }
 
@@ -80,31 +78,39 @@ func (m *Manager) startLocked(jobType string, galleries []string) error {
 	return nil
 }
 
-// BeginSchedule makes Start refuse until EndSchedule, which the caller
-// must defer.
-func (m *Manager) BeginSchedule() error {
+// Reserve makes Start refuse until the returned Reservation's Release,
+// which the caller must defer.
+func (m *Manager) Reserve() (*Reservation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.scheduleHeld {
-		return ErrJobRunning
+	if m.lane != nil || (m.state != nil && m.state.Running) {
+		return nil, ErrJobRunning
 	}
-	if m.state != nil && m.state.Running {
-		return ErrJobRunning
-	}
-	m.scheduleHeld = true
-	return nil
+	m.lane = &Reservation{m: m}
+	return m.lane, nil
 }
 
-func (m *Manager) EndSchedule() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.scheduleHeld = false
+func (r *Reservation) Release() {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	if r.m.lane == r {
+		r.m.lane = nil
+	}
 }
 
-func (m *Manager) IsScheduleHeld() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.scheduleHeld
+func (r *Reservation) Cancelled() bool {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	return r.cancelled
+}
+
+func (r *Reservation) Start(jobType string, galleries ...string) error {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	if r.m.lane != r {
+		return ErrJobRunning
+	}
+	return r.m.startLocked(jobType, galleries)
 }
 
 func (m *Manager) Context() context.Context {
@@ -116,15 +122,17 @@ func (m *Manager) Context() context.Context {
 	return m.ctx
 }
 
-// Cancel also drops the schedule reservation, so a scheduled run stops at
-// its next phase.
+// Cancel also marks the lane's reservation cancelled, so a scheduled run
+// stops at its next phase; the lane stays held until its holder releases it.
 func (m *Manager) Cancel() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.cancel != nil {
 		m.cancel()
 	}
-	m.scheduleHeld = false
+	if m.lane != nil {
+		m.lane.cancelled = true
+	}
 }
 
 func (m *Manager) Update(processed, total int, message string) {
@@ -140,22 +148,14 @@ func (m *Manager) Update(processed, total int, message string) {
 }
 
 func (m *Manager) Complete(summary string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.state == nil {
-		return
-	}
-	now := time.Now().UTC()
-	m.state.Running = false
-	m.state.FinishedAt = &now
-	m.state.Summary = summary
-	m.state.Message = ""
-	m.finished++
-	m.scheduleAutoDismiss()
+	m.end(func(st *models.JobState) { st.Summary, st.Message = summary, "" })
 }
 
 func (m *Manager) Fail(errMsg string) {
+	m.end(func(st *models.JobState) { st.Error = errMsg })
+}
+
+func (m *Manager) end(set func(*models.JobState)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -165,9 +165,9 @@ func (m *Manager) Fail(errMsg string) {
 	now := time.Now().UTC()
 	m.state.Running = false
 	m.state.FinishedAt = &now
-	m.state.Error = errMsg
+	set(m.state)
 	m.finished++
-	m.scheduleAutoDismiss()
+	m.armDismiss(dismissDelay)
 }
 
 func (m *Manager) Get() *models.JobState {
@@ -181,14 +181,11 @@ func (m *Manager) Get() *models.JobState {
 	return &copy
 }
 
-// IsRunning is also true while a schedule reservation is held.
+// IsRunning is also true while the lane is reserved.
 func (m *Manager) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.scheduleHeld {
-		return true
-	}
-	return m.state != nil && m.state.Running
+	return m.lane != nil || (m.state != nil && m.state.Running)
 }
 
 // Finished only grows, so a watcher sampling less often than the
@@ -235,11 +232,6 @@ func (m *Manager) SetWatcherMessage(msg string) {
 		Summary:    msg,
 		FinishedAt: &now,
 	}
-	m.scheduleAutoDismiss()
-}
-
-// Caller must hold m.mu.
-func (m *Manager) scheduleAutoDismiss() {
 	m.armDismiss(dismissDelay)
 }
 
@@ -248,12 +240,5 @@ func (m *Manager) armDismiss(d time.Duration) {
 	if m.timer != nil {
 		m.timer.Stop()
 	}
-	m.timer = time.AfterFunc(d, func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.state == nil || m.state.Running {
-			return
-		}
-		m.clearStateLocked()
-	})
+	m.timer = time.AfterFunc(d, m.Dismiss)
 }
