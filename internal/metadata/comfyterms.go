@@ -7,9 +7,10 @@ import (
 	"strings"
 )
 
-// ComfyTermsVersion must be bumped whenever WorkflowTerms changes its
-// output: the indexer re-derives every row stamped with an older one.
-const ComfyTermsVersion = 1
+// ComfyTermsVersion must be bumped whenever WorkflowTerms or the recipe
+// columns ReparseComfyWorkflow reads change their output: the indexer
+// re-derives every row stamped with an older one.
+const ComfyTermsVersion = 2
 
 // Keeps prompts out: nobody types one as an exact term, and prompt:
 // already searches them.
@@ -23,6 +24,9 @@ const comfyTermsPerImage = 512
 func WorkflowTerms(raw string) []string {
 	seen := make(map[string]struct{})
 	for _, node := range comfyGraphNodes(raw) {
+		if len(seen) >= comfyTermsPerImage {
+			break
+		}
 		for _, term := range comfyNodeTerms(node) {
 			if len(seen) >= comfyTermsPerImage {
 				break

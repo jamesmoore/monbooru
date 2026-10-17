@@ -3,7 +3,6 @@ package web
 import (
 	"cmp"
 	"io/fs"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,30 +12,15 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/desktop"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
 // The bind address is no condition: Restart must survive the wizard's network
-// choice. A forwarded hop is refused (behind a same-host proxy every peer is
-// loopback), as is a non-loopback Host (DNS rebinding). Callers 404 to hide it.
+// choice. Callers 404 to hide it.
 func (s *Server) desktopLocal(r *http.Request) bool {
-	if !s.desktop {
-		return false
-	}
-	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("Forwarded") != "" {
-		return false
-	}
-	if !desktop.IsLoopbackAddr(r.Host) {
-		return false
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return s.desktop && desktop.LocalRequest(r)
 }
 
 const maxBrowseEntries = 500
@@ -44,17 +28,12 @@ const maxBrowseEntries = 500
 // The value lands in an attribute the picker's script reads: identifiers only.
 var browseIntoRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-type browseEntry struct {
-	Name string
-	Path string
-}
-
 type browseData struct {
 	Into      string
 	Path      string
 	Parent    string
-	Entries   []browseEntry
-	Roots     []browseEntry
+	Entries   []desktop.Dir
+	Roots     []desktop.Dir
 	Sandboxed bool
 	Err       string
 	Truncated bool
@@ -73,7 +52,7 @@ func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
 	}
 	data := browseData{Into: into, Sandboxed: desktop.Sandboxed(), Limit: maxBrowseEntries}
 	for _, root := range desktop.Roots() {
-		data.Roots = append(data.Roots, browseEntry{Name: root, Path: root})
+		data.Roots = append(data.Roots, desktop.Dir{Name: root, Path: root})
 	}
 
 	home, _ := os.UserHomeDir()
@@ -83,33 +62,10 @@ func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
 		data.Parent = parent
 	}
 
-	entries, err := os.ReadDir(data.Path)
+	var err error
+	data.Entries, data.Truncated, err = desktop.ListDirs(data.Path, maxBrowseEntries)
 	if err != nil {
 		data.Err = "cannot read this folder"
-	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".") {
-			continue
-		}
-		full := filepath.Join(data.Path, e.Name())
-		// Only a symlink needs a stat; the dirent answers for a real directory.
-		if !e.IsDir() {
-			if e.Type()&fs.ModeSymlink == 0 {
-				continue
-			}
-			if fi, err := os.Stat(full); err != nil || !fi.IsDir() {
-				continue
-			}
-		}
-		data.Entries = append(data.Entries, browseEntry{Name: e.Name(), Path: full})
-	}
-	// Sorted before the cap, so the listing is the folder's alphabetical head.
-	slices.SortFunc(data.Entries, func(a, b browseEntry) int {
-		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
-	})
-	if len(data.Entries) > maxBrowseEntries {
-		data.Entries = data.Entries[:maxBrowseEntries]
-		data.Truncated = true
 	}
 	s.renderTemplate(w, "partials/dir_picker.html", data)
 }
@@ -198,41 +154,37 @@ func (s *Server) DesktopHook() desktop.Hook { return s.desktopHook() }
 func (s *Server) desktopHook() desktop.Hook {
 	icon, _ := fs.ReadFile(s.staticFS, "appicon.png")
 	return desktop.Hook{
-		App:     s.desktopApp,
-		Name:    s.booruName(),
-		Comment: "Lightweight and fast private booru",
-		Icon:    icon,
+		App:        s.desktopApp,
+		Name:       s.booruName(),
+		Comment:    "Lightweight and fast private booru",
+		Categories: "Graphics;2DGraphics;RasterGraphics;Viewer;",
+		Icon:       icon,
 	}
 }
 
-// Menu and autostart are read from disk so a hand-removed file shows as off.
-type desktopIntegration struct {
-	MenuSupported      bool
-	MenuEnabled        bool
-	AutostartSupported bool
-	AutostartEnabled   bool
-	TraySupported      bool
-	TrayEnabled        bool
-}
-
-func (d desktopIntegration) Supported() bool { return d.MenuSupported || d.AutostartSupported }
-
-func (s *Server) desktopIntegration() desktopIntegration {
-	h := s.desktopHook()
-	return desktopIntegration{
-		MenuSupported:      h.MenuSupported(),
-		MenuEnabled:        h.MenuEnabled(),
-		AutostartSupported: h.AutostartSupported(),
-		AutostartEnabled:   h.AutostartEnabled(),
-		TraySupported:      desktop.TrayAvailable(),
-		TrayEnabled:        s.TrayEnabled(),
-	}
+func (s *Server) desktopIntegration() desktop.Integration {
+	return s.desktopHook().Integration(s.TrayEnabled())
 }
 
 func (s *Server) TrayEnabled() bool {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	return s.cfg.Desktop.Tray
+}
+
+func applyDesktopHooks(h desktop.Hook, menu, autostart bool) []string {
+	var failures []string
+	if h.MenuSupported() {
+		if err := h.SetMenu(menu); err != nil {
+			failures = append(failures, "menu entry: "+err.Error())
+		}
+	}
+	if h.AutostartSupported() {
+		if err := h.SetAutostart(autostart); err != nil {
+			failures = append(failures, "start at login: "+err.Error())
+		}
+	}
+	return failures
 }
 
 func (s *Server) settingsDesktopPost(w http.ResponseWriter, r *http.Request) {
@@ -243,18 +195,7 @@ func (s *Server) settingsDesktopPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	h := s.desktopHook()
-	var failures []string
-	if h.MenuSupported() {
-		if err := h.SetMenu(r.FormValue("menu_entry") == "on"); err != nil {
-			failures = append(failures, "menu entry: "+err.Error())
-		}
-	}
-	if h.AutostartSupported() {
-		if err := h.SetAutostart(r.FormValue("start_at_login") == "on"); err != nil {
-			failures = append(failures, "start at login: "+err.Error())
-		}
-	}
+	failures := applyDesktopHooks(s.desktopHook(), r.FormValue("menu_entry") == "on", r.FormValue("start_at_login") == "on")
 	if desktop.TrayAvailable() {
 		tray := r.FormValue("tray") == "on"
 		if err := s.withConfig(func(c *config.Config) error {

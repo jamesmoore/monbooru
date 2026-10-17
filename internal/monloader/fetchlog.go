@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 type FetchEntry struct {
@@ -28,7 +30,7 @@ type FetchLog struct {
 	m  map[string]FetchEntry
 }
 
-func NewFetchLog() *FetchLog {
+func newFetchLog() *FetchLog {
 	return &FetchLog{m: map[string]FetchEntry{}}
 }
 
@@ -87,7 +89,7 @@ func (f *FetchLog) Clear(gallery string, id int64) {
 // backends', each in trail order.
 func SplitTrail(trail string) (ptr, online []string) {
 	for _, entry := range strings.Split(trail, "; ") {
-		if strings.HasPrefix(entry, PTRTrailName+":") {
+		if strings.HasPrefix(entry, contract.TrailPTR+":") {
 			ptr = append(ptr, entry)
 		} else {
 			online = append(online, entry)
@@ -99,6 +101,6 @@ func SplitTrail(trail string) (ptr, online []string) {
 func SimilarityRan(trail string) bool {
 	return slices.ContainsFunc(strings.Split(trail, "; "), func(entry string) bool {
 		name, reason, ok := strings.Cut(entry, ": ")
-		return ok && (name == TrailIQDB || name == TrailSauceNAO) && !strings.HasPrefix(reason, "skipped")
+		return ok && (name == contract.TrailIQDB || name == contract.TrailSauceNAO) && !strings.HasPrefix(reason, "skipped")
 	})
 }

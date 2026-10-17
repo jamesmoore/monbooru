@@ -2,14 +2,18 @@ package metadata
 
 import (
 	"cmp"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // Python's json writes NaN and Infinity, which encoding/json refuses;
@@ -85,13 +89,14 @@ func parseComfyPromptChunk(raw string) *models.ComfyUIMetadata {
 	meta := &models.ComfyUIMetadata{}
 	nodeIDs := comfyNodeIDs(parsedNodes)
 
-	// The KSampler's positive input says which CLIPTextEncode is the prompt.
+	table := comfyNodeTable()
+
+	// The first sampler's positive input says which text node is the prompt.
 	positiveNodeID := ""
 	for _, id := range nodeIDs {
 		node := parsedNodes[id]
-		nodeType := node.typeName()
-		if nodeType == "KSampler" || nodeType == "KSamplerAdvanced" {
-			if nid, ok := refNodeID(node.Inputs["positive"]); ok {
+		if roles := table[node.typeName()]; roles.Positive != "" {
+			if nid, ok := refNodeID(node.Inputs[roles.Positive]); ok {
 				positiveNodeID = nid
 			}
 			break
@@ -100,23 +105,20 @@ func parseComfyPromptChunk(raw string) *models.ComfyUIMetadata {
 
 	for _, id := range nodeIDs {
 		node := parsedNodes[id]
-		nodeType := node.typeName()
-		if nodeType == "CLIPTextEncode" {
-			if textRaw, ok := node.Inputs["text"]; ok {
-				text := resolveStringInput(textRaw, parsedNodes)
-				if text != "" {
-					if positiveNodeID != "" {
-						if id == positiveNodeID {
-							meta.Prompt = text
-						}
-					} else if meta.Prompt == "" {
+		roles := table[node.typeName()]
+		if textRaw, ok := node.Inputs[roles.Prompt]; ok && roles.Prompt != "" {
+			text := resolveStringInput(textRaw, parsedNodes)
+			if text != "" {
+				if positiveNodeID != "" {
+					if id == positiveNodeID {
 						meta.Prompt = text
 					}
+				} else if meta.Prompt == "" {
+					meta.Prompt = text
 				}
 			}
-			continue
 		}
-		applyComfyNodeInputs(nodeType, node.Inputs, meta, parsedNodes)
+		applyComfyNodeInputs(roles, node.Inputs, meta, parsedNodes)
 	}
 
 	if meta.Prompt == "" {
@@ -138,12 +140,17 @@ func parseComfyPromptChunk(raw string) *models.ComfyUIMetadata {
 		return nil
 	}
 	meta.RawWorkflow = raw
-	if meta.Prompt != "" || meta.ModelCheckpoint != "" || meta.Seed != nil {
-		meta.GenerationHash = computeGenerationHash(
-			meta.Prompt, "", meta.ModelCheckpoint, meta.Sampler, meta.Steps, meta.CFGScale,
-		)
-	}
+	setComfyHash(meta)
 	return meta
+}
+
+// ReparseComfyWorkflow reads the recipe columns back out of a stored
+// raw_workflow, which holds whichever of the two shapes ingest parsed.
+func ReparseComfyWorkflow(raw string) *models.ComfyUIMetadata {
+	if m := parseComfyPromptChunk(raw); m != nil {
+		return m
+	}
+	return parseComfyWorkflow(raw)
 }
 
 type comfyGraphNode struct {
@@ -223,15 +230,24 @@ func parseComfyWorkflow(raw string) *models.ComfyUIMetadata {
 		return nil
 	}
 	meta := &models.ComfyUIMetadata{RawWorkflow: sanitizeComfyJSON(strings.TrimSpace(raw))}
+	table := comfyNodeTable()
 	for _, node := range nodes {
-		applyComfyNodeInputs(node.ClassType, node.Inputs, meta, nil)
+		roles := table[node.ClassType]
+		if textRaw, ok := node.Inputs[roles.Prompt]; ok && roles.Prompt != "" && meta.Prompt == "" {
+			meta.Prompt = resolveStringInput(textRaw, nil)
+		}
+		applyComfyNodeInputs(roles, node.Inputs, meta, nil)
 	}
+	setComfyHash(meta)
+	return meta
+}
+
+func setComfyHash(meta *models.ComfyUIMetadata) {
 	if meta.Prompt != "" || meta.ModelCheckpoint != "" || meta.Seed != nil {
 		meta.GenerationHash = computeGenerationHash(
 			meta.Prompt, "", meta.ModelCheckpoint, meta.Sampler, meta.Steps, meta.CFGScale,
 		)
 	}
-	return meta
 }
 
 type comfyAPINode struct {
@@ -401,10 +417,11 @@ func parseIntKey(s string) int {
 	return n
 }
 
+// An empty key is a role the node class leaves unset.
 func nodeInput[T any](inputs map[string]json.RawMessage, key string) (T, bool) {
 	var v T
 	raw, ok := inputs[key]
-	if !ok {
+	if !ok || key == "" {
 		return v, false
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -413,55 +430,118 @@ func nodeInput[T any](inputs map[string]json.RawMessage, key string) (T, bool) {
 	return v, true
 }
 
-func applyComfyNodeInputs(nodeType string, inputs map[string]json.RawMessage, meta *models.ComfyUIMetadata, nodes map[string]comfyAPINode) {
-	switch nodeType {
-	case "CLIPTextEncode":
-		if textRaw, ok := inputs["text"]; ok && meta.Prompt == "" {
-			text := resolveStringInput(textRaw, nodes)
-			if text != "" {
-				meta.Prompt = text
-			}
+// comfyNodeRoles names, for one node class, the input each recipe column
+// reads. Lora with a %02d verb is a numbered stack of LoraCount slots.
+type comfyNodeRoles struct {
+	Prompt    string `json:"prompt,omitempty"`
+	Positive  string `json:"positive,omitempty"`
+	Seed      string `json:"seed,omitempty"`
+	Steps     string `json:"steps,omitempty"`
+	CFG       string `json:"cfg,omitempty"`
+	Sampler   string `json:"sampler,omitempty"`
+	Scheduler string `json:"scheduler,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Lora      string `json:"lora,omitempty"`
+	LoraCount int    `json:"lora_count,omitempty"`
+}
+
+//go:embed comfyui_nodes.json
+var defaultComfyNodesJSON []byte
+
+type comfyNodesDoc struct {
+	Version int                       `json:"version"`
+	Nodes   map[string]comfyNodeRoles `json:"nodes"`
+}
+
+var defaultComfyNodes = func() map[string]comfyNodeRoles {
+	var doc comfyNodesDoc
+	if err := json.Unmarshal(defaultComfyNodesJSON, &doc); err != nil {
+		panic("comfyui_nodes.json: " + err.Error())
+	}
+	return doc.Nodes
+}()
+
+var nodeOverlay struct {
+	sync.Mutex
+	path  string
+	stamp string
+	table map[string]comfyNodeRoles
+}
+
+// SetNodeOverlay names the operator's comfyui_nodes.json: its entries
+// replace the shipped ones for the same class and add new classes.
+func SetNodeOverlay(path string) {
+	nodeOverlay.Lock()
+	defer nodeOverlay.Unlock()
+	nodeOverlay.path, nodeOverlay.stamp, nodeOverlay.table = path, "", nil
+}
+
+// The overlay is stat'ed per call, so an edit reaches the next ingest; a
+// file that fails to parse is reported once per edit and ignored.
+func comfyNodeTable() map[string]comfyNodeRoles {
+	nodeOverlay.Lock()
+	defer nodeOverlay.Unlock()
+	fi, err := os.Stat(nodeOverlay.path)
+	if nodeOverlay.path == "" || err != nil {
+		return defaultComfyNodes
+	}
+	stamp := fi.ModTime().String() + "/" + strconv.FormatInt(fi.Size(), 10)
+	if stamp == nodeOverlay.stamp {
+		return nodeOverlay.table
+	}
+	nodeOverlay.stamp, nodeOverlay.table = stamp, defaultComfyNodes
+	data, err := os.ReadFile(nodeOverlay.path)
+	var doc comfyNodesDoc
+	if err == nil {
+		err = json.Unmarshal(data, &doc)
+	}
+	if err == nil && doc.Version != 1 {
+		err = fmt.Errorf("version %d, want 1", doc.Version)
+	}
+	if err != nil {
+		logx.Warnf("metadata: ignoring %s: %v", nodeOverlay.path, err)
+		return defaultComfyNodes
+	}
+	merged := maps.Clone(defaultComfyNodes)
+	maps.Copy(merged, doc.Nodes)
+	nodeOverlay.table = merged
+	return merged
+}
+
+// A column an earlier node filled is kept; loras accumulate.
+func applyComfyNodeInputs(roles comfyNodeRoles, inputs map[string]json.RawMessage, meta *models.ComfyUIMetadata, nodes map[string]comfyAPINode) {
+	if roles.Seed != "" && meta.Seed == nil {
+		if seed, ok := resolveSeedInput(inputs[roles.Seed], nodes); ok {
+			meta.Seed = &seed
 		}
-	case "KSampler", "KSamplerAdvanced", "KSamplerSelect":
-		if seedRaw, ok := inputs["seed"]; ok && meta.Seed == nil {
-			if seed, ok := resolveSeedInput(seedRaw, nodes); ok {
-				meta.Seed = &seed
-			}
-		}
-		if steps, ok := nodeInput[int](inputs, "steps"); ok && meta.Steps == nil {
-			meta.Steps = &steps
-		}
-		if cfg, ok := nodeInput[float64](inputs, "cfg"); ok && meta.CFGScale == nil {
-			meta.CFGScale = &cfg
-		}
-		if sampler, ok := nodeInput[string](inputs, "sampler_name"); ok && meta.Sampler == "" {
-			meta.Sampler = sampler
-		}
-		if scheduler, ok := nodeInput[string](inputs, "scheduler"); ok && scheduler != "" && meta.Sampler != "" {
+	}
+	if steps, ok := nodeInput[int](inputs, roles.Steps); ok && meta.Steps == nil {
+		meta.Steps = &steps
+	}
+	if cfg, ok := nodeInput[float64](inputs, roles.CFG); ok && meta.CFGScale == nil {
+		meta.CFGScale = &cfg
+	}
+	// The scheduler belongs to the sampler of its own node: a later
+	// sampler node keeps the column and must not append to it.
+	if sampler, ok := nodeInput[string](inputs, roles.Sampler); ok && meta.Sampler == "" {
+		meta.Sampler = sampler
+		if scheduler, ok := nodeInput[string](inputs, roles.Scheduler); ok && scheduler != "" && sampler != "" {
 			meta.Sampler += "/" + scheduler
 		}
-	case "CheckpointLoaderSimple", "CheckpointLoader", "unCLIPCheckpointLoader", "easy fullLoader", "easy a1111Loader":
-		if ckpt, ok := nodeInput[string](inputs, "ckpt_name"); ok && meta.ModelCheckpoint == "" {
-			meta.ModelCheckpoint = ckpt
+	}
+	if model, ok := nodeInput[string](inputs, roles.Model); ok && meta.ModelCheckpoint == "" {
+		meta.ModelCheckpoint = model
+	}
+	keys := []string{roles.Lora}
+	if roles.LoraCount > 0 {
+		keys = keys[:0]
+		for i := 1; i <= roles.LoraCount; i++ {
+			keys = append(keys, fmt.Sprintf(roles.Lora, i))
 		}
-	case "UNETLoader":
-		if unet, ok := nodeInput[string](inputs, "unet_name"); ok && meta.ModelCheckpoint == "" {
-			meta.ModelCheckpoint = unet
-		}
-	case "LoraLoader", "LoraLoaderModelOnly":
-		if lora, ok := nodeInput[string](inputs, "lora_name"); ok && lora != "" {
+	}
+	for _, key := range keys {
+		if lora, ok := nodeInput[string](inputs, key); ok && lora != "" && lora != "None" {
 			appendCheckpoint(meta, lora)
-		}
-	case "Lora Loader Stack (rgthree)":
-		for i := 1; i <= 10; i++ {
-			key := fmt.Sprintf("lora_%02d", i)
-			if lora, ok := nodeInput[string](inputs, key); ok && lora != "" && lora != "None" {
-				appendCheckpoint(meta, lora)
-			}
-		}
-	case "Seed (rgthree)", "SeedNode", "RandomSeed":
-		if seed, ok := resolveSeedInput(inputs["seed"], nil); ok && meta.Seed == nil {
-			meta.Seed = &seed
 		}
 	}
 }

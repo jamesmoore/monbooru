@@ -10,35 +10,19 @@ import (
 // Settle ends an autotag job; finished reports a run that went to the end,
 // whose peak memory the caller may log.
 func Settle(ctx context.Context, mgr *jobs.Manager, prefix, itemNoun string, total, skipped int, err error) (finished bool, _ error) {
-	if ctx.Err() != nil {
-		mgr.Complete(fmt.Sprintf("%sauto-tagging cancelled (%d image(s) queued)", prefix, total))
-		return false, nil
-	}
-	if err != nil {
-		mgr.Fail(err.Error())
-		return false, err
-	}
+	done := fmt.Sprintf("%sauto-tagged %d %simage(s)", prefix, total, itemNoun)
 	if skipped > 0 {
-		mgr.Complete(fmt.Sprintf("%sauto-tagged %d of %d %simage(s), %d skipped", prefix, total-skipped, total, itemNoun, skipped))
-		return true, nil
+		done = fmt.Sprintf("%sauto-tagged %d of %d %simage(s), %d skipped", prefix, total-skipped, total, itemNoun, skipped)
 	}
-	mgr.Complete(fmt.Sprintf("%sauto-tagged %d %simage(s)", prefix, total, itemNoun))
-	return true, nil
+	finished = ctx.Err() == nil && err == nil
+	return finished, mgr.Settle(ctx, err, fmt.Sprintf("%sauto-tagging cancelled (%d image(s) queued)", prefix, total), done)
 }
 
 func SettleImage(ctx context.Context, mgr *jobs.Manager, id int64, skipped int, err error) (finished bool, _ error) {
-	if ctx.Err() != nil {
-		mgr.Complete("auto-tagging cancelled")
-		return false, nil
-	}
-	if err != nil {
-		mgr.Fail(err.Error())
-		return false, err
-	}
+	done := fmt.Sprintf("auto-tagged image #%d", id)
 	if skipped > 0 {
-		mgr.Complete(fmt.Sprintf("auto-tagger skipped image #%d", id))
-		return true, nil
+		done = fmt.Sprintf("auto-tagger skipped image #%d", id)
 	}
-	mgr.Complete(fmt.Sprintf("auto-tagged image #%d", id))
-	return true, nil
+	finished = ctx.Err() == nil && err == nil
+	return finished, mgr.Settle(ctx, err, "auto-tagging cancelled", done)
 }

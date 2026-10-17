@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -17,8 +18,9 @@ const (
 	ConnPaused   = "paused"
 )
 
-// A backstop only: it must stay above every per-call deadline.
-var client = &http.Client{Timeout: 15 * time.Second}
+// A backstop for callers with an unbounded context: it must stay above every
+// per-call deadline, or it cuts off a send the peer may still commit.
+var Client = &http.Client{Timeout: 15 * time.Second}
 
 // A refused request, not a sign the peer is down, so a batch skips the
 // row. It carries the peer's name: a plugin's refusal must not read as
@@ -32,25 +34,47 @@ func IsStatusError(err error) bool {
 	return errors.As(err, &se)
 }
 
-// A 200 with any body passes; the version is optional.
-func Health(ctx context.Context, base string) (string, bool) {
+// APIVersion moves on any change to /api/v1 a paired peer would trip
+// over: a path or field gone, a status code or a vocabulary word changed.
+// MinPeerAPI is the oldest peer API this side still drives.
+const (
+	APIVersion = 2
+	MinPeerAPI = 1
+)
+
+type HealthInfo struct {
+	Version    string `json:"version"`
+	API        int    `json:"api"`
+	MinPeerAPI int    `json:"min_peer_api"`
+}
+
+// APIMismatch is empty when the two sides agree, and when the peer
+// predates the field.
+func (h HealthInfo) APIMismatch() string {
+	if h.API == 0 || (h.API >= MinPeerAPI && h.MinPeerAPI <= APIVersion) {
+		return ""
+	}
+	return fmt.Sprintf("api mismatch: it speaks api %d and drives %d or newer, this monbooru speaks %d and drives %d or newer",
+		h.API, h.MinPeerAPI, APIVersion, MinPeerAPI)
+}
+
+// A 200 with any body passes; every field is optional.
+func Health(ctx context.Context, base string) (HealthInfo, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/health", nil)
 	if err != nil {
-		return "", false
+		return HealthInfo{}, false
 	}
-	resp, err := client.Do(req)
+	resp, err := Client.Do(req)
 	if err != nil {
-		return "", false
+		return HealthInfo{}, false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return "", false
+		return HealthInfo{}, false
 	}
-	var h struct {
-		Version string `json:"version"`
-	}
+	var h HealthInfo
 	_ = json.NewDecoder(resp.Body).Decode(&h)
-	return h.Version, true
+	return h, true
 }
 
 func Reachable(ctx context.Context, base string) bool {
@@ -73,7 +97,7 @@ func NotifyTeardown(app, baseURL, token string) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := client.Do(req)
+	resp, err := Client.Do(req)
 	if err != nil {
 		return err
 	}

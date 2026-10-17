@@ -139,6 +139,7 @@
   </h2>
 
   <div id="tag-flash"></div>
+  <div id="tag-ptr-review"></div>
 
   <div id="tag-batch-bar" data-total="{{.Total}}" hidden>
     <button type="button" id="btn-batch-select-all" class="btn-sm">Select all</button>
@@ -213,7 +214,6 @@
                   hx-patch="/tags/{{.ID}}/category"
                   hx-trigger="change"
                   hx-target="#tag-flash"
-                  hx-swap="innerHTML"
                   hx-on::after-request="onTagCategoryPatch(event, this)"
                   onchange="updateTagColor(this)">
             {{range $cats}}{{if ne .Name "rating"}}
@@ -337,8 +337,7 @@
 
 <dialog id="tag-create-dialog">
   <form hx-post="/tags/new"
-        hx-target="#tag-create-error"
-        hx-swap="innerHTML">
+        hx-target="#tag-create-error">
     <p>Create a new tag.</p>
     <div class="field">
       <label>Tag name</label>
@@ -355,8 +354,7 @@
 
 <dialog id="alias-create-dialog">
   <form hx-post="/tags/aliases"
-        hx-target="#alias-create-error"
-        hx-swap="innerHTML">
+        hx-target="#alias-create-error">
     <p>Create an alias resolving to another tag.<br>The canonical tag is created if it doesn't exist yet.</p>
     <div class="field">
       <label>Alias name</label>
@@ -619,12 +617,12 @@ function confirmBatchCategory() {
 function openBatchMerge() {
   var flash = document.getElementById('tag-flash');
   if (tagSelectAllMatching) {
-    if (flash) flash.innerHTML = '<div class="flash flash-err">Merge needs an explicit selection: check the rows to merge.</div>';
+    setFlashText(flash, 'err', 'Merge needs an explicit selection: check the rows to merge.');
     return;
   }
   var boxes = document.querySelectorAll('.tag-select:checked');
   if (boxes.length < 2) {
-    if (flash) flash.innerHTML = '<div class="flash flash-err">Select at least two tags to merge.</div>';
+    setFlashText(flash, 'err', 'Select at least two tags to merge.');
     return;
   }
   clearSlots('batch-merge-flash');
@@ -672,32 +670,25 @@ function confirmBatchImply() {
 
 // Seconds precision, the shape created_at is stored in.
 function markPTRReviewStart() {
-  try {
-    sessionStorage.setItem('monbooru_ptr_review_from',
-      new Date().toISOString().replace(/\.\d+Z$/, 'Z'));
-  } catch (e) {}
+  writeStash('monbooru_ptr_review_from', {from: new Date().toISOString().replace(/\.\d+Z$/, 'Z')});
 }
 
-(function() {
-  var from = null;
-  try {
-    from = sessionStorage.getItem('monbooru_ptr_review_from');
-    if (from) sessionStorage.removeItem('monbooru_ptr_review_from');
-  } catch (e) {}
-  if (!from) return;
-  var el = document.getElementById('tag-flash');
+document.addEventListener('DOMContentLoaded', function() {
+  var stash = readStash('monbooru_ptr_review_from', Infinity, true);
+  if (!stash) return;
+  var el = document.getElementById('tag-ptr-review');
   if (!el) return;
   var link = document.createElement('a');
   // An explicit empty type=: the page's tags-only default would hide the
   // aliases the sweep made.
-  link.href = '/tags?origin=ptr&created_after=' + encodeURIComponent(from) + '&type=';
+  link.href = '/tags?origin=ptr&created_after=' + encodeURIComponent(stash.from) + '&type=';
   link.textContent = 'review what it created';
   var div = document.createElement('div');
   div.className = 'flash flash-ok';
   div.appendChild(document.createTextNode('PTR lookup finished - '));
   div.appendChild(link);
   el.appendChild(div);
-})();
+});
 
 function confirmPTRLookupSearch() {
   postTagBatch('ptr-lookup-search', '/tags/ptr-lookup-search', tagScopeParams(),

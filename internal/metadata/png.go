@@ -13,10 +13,6 @@ import (
 
 var errNotPNG = errors.New("not a PNG file")
 
-// Chunk lengths are attacker-controlled, up to 4 GiB; real parameter and
-// workflow chunks are kilobytes.
-const maxChunkBytes = 16 * 1024 * 1024
-
 // The text one PNG keeps, every chunk together: a file can hold any number
 // of chunks under the per-chunk cap.
 const maxPNGTextBytes = 16 * 1024 * 1024
@@ -131,33 +127,46 @@ func inflateText(b []byte, method byte, limit int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(zr, limit))
 }
 
-func extractFromPNG(path string) (*models.SDMetadata, *models.ComfyUIMetadata, error) {
+func extractFromPNG(path string) (*models.SDMetadata, *models.ComfyUIMetadata) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	defer func() { _ = f.Close() }()
 
 	chunks, err := readPNGTextChunks(f)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 
-	var sd *models.SDMetadata
-	var comfy *models.ComfyUIMetadata
-
-	if text, ok := chunks["parameters"]; ok {
-		sd = parseA1111Parameters(text)
+	var out generated
+	for _, p := range pngTextParsers {
+		if text, ok := chunks[p.Key]; ok {
+			p.Parse(text, &out)
+		}
 	}
+	return out.sd, out.comfy
+}
 
-	// ComfyUI's API-format "prompt" wins; the node-graph "workflow" is
-	// the fallback.
-	if raw, ok := chunks["prompt"]; ok {
-		comfy = parseComfyPromptChunk(raw)
-	}
-	if raw, ok := chunks["workflow"]; ok && comfy == nil {
-		comfy = parseComfyWorkflow(raw)
-	}
+type generated struct {
+	sd    *models.SDMetadata
+	comfy *models.ComfyUIMetadata
+}
 
-	return sd, comfy, nil
+// pngTextParsers reads each generator's text chunk, in order. A generator
+// monbooru does not read yet is one row and its parser; Source is its ai:
+// filter value.
+var pngTextParsers = []struct {
+	Key    string
+	Source string
+	Parse  func(text string, out *generated)
+}{
+	{"parameters", models.SourceTypeA1111, func(t string, out *generated) { out.sd = parseA1111Parameters(t) }},
+	{"prompt", models.SourceTypeComfyUI, func(t string, out *generated) { out.comfy = parseComfyPromptChunk(t) }},
+	// The node-graph workflow is the fallback to the API-format prompt.
+	{"workflow", models.SourceTypeComfyUI, func(t string, out *generated) {
+		if out.comfy == nil {
+			out.comfy = parseComfyWorkflow(t)
+		}
+	}},
 }

@@ -38,7 +38,7 @@ func (q Query) listKey() string {
 	return adjacencyKey(q.Text, q.Sort, q.Order, q.RandomSeed, q.CeilingLevel)
 }
 
-func Execute(src Source, q Query) (*models.SearchResult, error) {
+func Execute(ctx context.Context, src Source, q Query) (*models.SearchResult, error) {
 	database := src.DB
 	started := time.Now()
 	gen := src.Cache.gen()
@@ -54,7 +54,7 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 
 	if key != "" && !q.SkipCount && q.PresetTotal == nil {
 		if ids, ok := src.Cache.get(key); ok {
-			return executeFromCachedIDs(database, ids, page, limit)
+			return executeFromCachedIDs(ctx, database, ids, page, limit)
 		}
 	}
 
@@ -70,11 +70,11 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 		q.Order != "asc" &&
 		!containsMissingFilter(q.Expr) {
 		if total, ok := fastTagTotal(src, q.Expr); ok {
-			if visible, vOk := fastVisibleCount(src); vOk &&
+			if visible, vOk := src.Tallies.VisibleCount(); vOk &&
 				total*driverIDBoundDensityCutoff >= visible {
 				targetOffset := (page * limit) * driverIDBoundMargin
 				var bound int64
-				err := database.Read.QueryRow(
+				err := database.Read.QueryRowContext(ctx,
 					`SELECT id FROM images INDEXED BY idx_images_ingested_visible
 					 WHERE is_missing = 0
 					 ORDER BY ingested_at DESC, id DESC
@@ -93,17 +93,12 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 		}
 	}
 
-	where, args, hasMissingFilter, ceilingRewrote := buildWhereDBDriverFull(q.Expr, src, driverLegs)
-	where, args = applyAndDriver(where, args, driverLegs)
-
-	where = andDefaultVisible(where, hasMissingFilter)
+	where, args, hasMissingFilter, ceilingRewrote := visibleWhere(src, q.Expr, driverLegs)
 	unbound := func() {
 		for i := range driverLegs {
 			driverLegs[i].idBound = 0
 		}
-		where, args, _, _ = buildWhereDBDriverFull(q.Expr, src, driverLegs)
-		where, args = applyAndDriver(where, args, driverLegs)
-		where = andDefaultVisible(where, hasMissingFilter)
+		where, args, _, _ = visibleWhere(src, q.Expr, driverLegs)
 		idBounded = false
 	}
 
@@ -114,13 +109,13 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 	// page. An empty or capped fan falls through rather than guess a total.
 	if q.Sort == "similarity" && hasRankSeed && key != "" &&
 		!q.SkipCount && q.PresetTotal == nil && src.Cache.tryAcquireFan(key) {
-		ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started), 0))
-		ids := fanSimilarityIDs(ctx, src, rankSeed, q.Order, where, args)
+		fanCtx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started), 0))
+		ids := fanSimilarityIDs(fanCtx, src, rankSeed, q.Order, where, args)
 		cancel()
 		src.Cache.releaseFan(key)
 		if len(ids) > 0 && len(ids) < adjacencyCacheMaxIDs {
 			src.Cache.set(key, ids, gen)
-			return executeFromCachedIDs(database, ids, page, limit)
+			return executeFromCachedIDs(ctx, database, ids, page, limit)
 		}
 		src.Cache.markFanOverBudget(key)
 	}
@@ -149,7 +144,7 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 			countWhere, countArgs = exactCountWhere(src, q.Expr)
 		}
 		countSQL := "SELECT COUNT(*) FROM images i WHERE " + countWhere
-		if err := database.Read.QueryRow(countSQL, countArgs...).Scan(&total); err != nil {
+		if err := database.Read.QueryRowContext(ctx, countSQL, countArgs...).Scan(&total); err != nil {
 			return nil, fmt.Errorf("count query: %w", err)
 		}
 	}
@@ -178,7 +173,7 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 			dataHint, where, orderClause,
 		)
 		dataArgs := append(slices.Concat(args, orderArgs), limit, offset)
-		images, err := db.QueryAll(database.Read, scanImageRow, dataSQL, dataArgs...)
+		images, err := db.QueryAllContext(ctx, database.Read, scanImageRow, dataSQL, dataArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("data query: %w", err)
 		}
@@ -196,6 +191,10 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 		if images, err = readPage(); err != nil {
 			return nil, err
 		}
+	}
+	// A short first page holds every match, so it is the exact total.
+	if counted && totalIsBound && offset == 0 && len(images) < limit {
+		total = len(images)
 	}
 
 	// Page 1 fans synchronously: an async fan loses the race to the next
@@ -217,8 +216,8 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 			if totalIsBound {
 				budgetTotal = 0
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started), budgetTotal))
-			ids := fetchSortedMatchIDs(ctx, database, indexHint, where, args, orderClause, orderArgs, total)
+			fanCtx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started), budgetTotal))
+			ids := fetchSortedMatchIDs(fanCtx, database, indexHint, where, args, orderClause, orderArgs, total)
 			cancel()
 			if len(ids) > 0 {
 				src.Cache.set(key, ids, gen)
@@ -241,7 +240,7 @@ func Execute(src Source, q Query) (*models.SearchResult, error) {
 
 func scanImageRow(rows *sql.Rows) (models.Image, error) { return models.ScanImageRow(rows) }
 
-func executeFromCachedIDs(database *db.DB, ids []int64, page, limit int) (*models.SearchResult, error) {
+func executeFromCachedIDs(ctx context.Context, database *db.DB, ids []int64, page, limit int) (*models.SearchResult, error) {
 	total := len(ids)
 	offset := (page - 1) * limit
 	if offset >= total {
@@ -254,7 +253,7 @@ func executeFromCachedIDs(database *db.DB, ids []int64, page, limit int) (*model
 	sql := fmt.Sprintf(
 		"SELECT "+models.ImageRowColumns+" FROM images i WHERE i.id IN (%s)", placeholders,
 	)
-	images, err := db.QueryAll(database.Read, scanImageRow, sql, args...)
+	images, err := db.QueryAllContext(ctx, database.Read, scanImageRow, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("cached id fetch: %w", err)
 	}
@@ -568,7 +567,7 @@ func ExecuteAdjacent(ctx context.Context, src Source, q Query, currentID int64) 
 				p.indexHint, p.where, cursorCmp, sort)
 		}
 		var id int64
-		if err := database.Read.QueryRow(sql, qargs...).Scan(&id); err != nil {
+		if err := database.Read.QueryRowContext(ctx, sql, qargs...).Scan(&id); err != nil {
 			return nil
 		}
 		return &id
@@ -704,9 +703,7 @@ func (sc Scope) IDs(src Source) ([]int64, error) {
 func streamScope(src Source, expr Expr, orderBy string, orderArgs []any, visit func(id int64) error) error {
 	database := src.DB
 	driverLegs, _ := pickAndDriverTag(database, expr, false)
-	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(expr, src, driverLegs)
-	where, args = applyAndDriver(where, args, driverLegs)
-	where = andDefaultVisible(where, hasMissingFilter)
+	where, args, _, _ := visibleWhere(src, expr, driverLegs)
 
 	rows, err := database.Read.Query(
 		"SELECT i.id FROM images i WHERE "+where+" "+orderBy,

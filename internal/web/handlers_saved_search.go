@@ -4,9 +4,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 func (s *Server) deleteSavedSearch(w http.ResponseWriter, r *http.Request) {

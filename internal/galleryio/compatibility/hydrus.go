@@ -9,8 +9,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -26,7 +26,7 @@ func detectHydrus(entries []NormalizedEntry) bool {
 	hasImage, hasSidecar := false, false
 	for _, e := range entries {
 		switch {
-		case gallery.ExtFileType(e.Rel) != "":
+		case models.ExtFileType(e.Rel) != "":
 			hasImage = true
 		case strings.HasSuffix(strings.ToLower(e.Rel), ".txt"):
 			hasSidecar = true
@@ -42,14 +42,14 @@ func translateHydrus(entries []NormalizedEntry) (Result, error) {
 	images := map[string]*zip.File{}
 	sidecars := map[string]*zip.File{}
 	for _, e := range entries {
-		if gallery.ExtFileType(e.Rel) != "" {
+		if models.ExtFileType(e.Rel) != "" {
 			images[e.Rel] = e.File
 			continue
 		}
 		if strings.HasSuffix(strings.ToLower(e.Rel), ".txt") {
 			// Sliced by length: TrimSuffix would miss a .Txt suffix.
 			imgRel := e.Rel[:len(e.Rel)-len(".txt")]
-			if gallery.ExtFileType(imgRel) != "" {
+			if models.ExtFileType(imgRel) != "" {
 				sidecars[imgRel] = e.File
 			}
 		}

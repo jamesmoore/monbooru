@@ -47,11 +47,18 @@ var (
 // camieDefaultFill is the padding colour of Camie's onnx_inference.py.
 var camieDefaultFill = [3]uint8{124, 116, 104}
 
-func padAndResize(src image.Image, size int, profile Profile) *image.RGBA {
-	fill := [3]uint8{0xff, 0xff, 0xff}
-	if profile.Pad == "mean_color_aspect" {
-		fill = cmp.Or(profile.FillColor, camieDefaultFill)
+func padFill(profile Profile) [3]uint8 {
+	switch {
+	case profile.Pad == "white_square":
+		return [3]uint8{0xff, 0xff, 0xff}
+	case profile.FillColor != nil:
+		return *profile.FillColor
 	}
+	return camieDefaultFill
+}
+
+func padAndResize(src image.Image, size int, profile Profile) *image.RGBA {
+	fill := padFill(profile)
 	scaled, offX, offY := resizeAspect(src, size)
 
 	dst := image.NewRGBA(image.Rect(0, 0, size, size))
@@ -85,71 +92,69 @@ func resizeAspect(src image.Image, size int) (scaled *image.RGBA, offX, offY int
 	return scaled, (size - scaleW) / 2, (size - scaleH) / 2
 }
 
+var normalizePresets = map[string]struct {
+	scale     float32
+	mean, std [3]float32
+}{
+	"none":     {1, [3]float32{}, [3]float32{1, 1, 1}},
+	"div255":   {255, [3]float32{}, [3]float32{1, 1, 1}},
+	"imagenet": {255, imageNetMean, imageNetStd},
+	"clip":     {255, clipMean, clipStd},
+}
+
+// normalizeTable indexes by tensor channel and byte value. Each entry
+// is computed with the reference expression, so a preset's tensor is
+// bit-identical to its model's own preprocessing.
+func normalizeTable(profile Profile) *[3][256]float32 {
+	scale, mean, std := float32(1), [3]float32{}, [3]float32{1, 1, 1}
+	if p, ok := normalizePresets[profile.Normalize]; ok {
+		scale, mean, std = p.scale, p.mean, p.std
+	} else if profile.NormMean != nil && profile.NormStd != nil {
+		scale, mean, std = cmp.Or(profile.NormScale, 1), *profile.NormMean, *profile.NormStd
+	}
+	var t [3][256]float32
+	for c := range 3 {
+		for v := range 256 {
+			t[c][v] = (float32(v)/scale - mean[c]) / std[c]
+		}
+	}
+	return &t
+}
+
 // buildTensor overwrites every element: pooled buffers are not zeroed.
 func buildTensor(img *image.RGBA, tensor []float32, size int, profile Profile) (ort.Shape, error) {
 	pix := img.Pix
 	stride := img.Stride
+	norm := normalizeTable(profile)
+	r, b := 0, 2
+	if profile.Channels == "bgr" {
+		r, b = 2, 0
+	}
 
 	switch profile.Layout {
 	case "nhwc":
-		if profile.Normalize != "" && profile.Normalize != "none" {
-			return nil, fmt.Errorf("buildTensor: NHWC + normalize=%q is not implemented", profile.Normalize)
-		}
-		bgr := profile.Channels == "bgr"
 		for y := 0; y < size; y++ {
 			row := pix[y*stride:]
 			for x := 0; x < size; x++ {
 				src := x * 4
 				dst := (y*size + x) * 3
-				r, g, b := row[src+0], row[src+1], row[src+2]
-				if bgr {
-					tensor[dst+0] = float32(b)
-					tensor[dst+1] = float32(g)
-					tensor[dst+2] = float32(r)
-				} else {
-					tensor[dst+0] = float32(r)
-					tensor[dst+1] = float32(g)
-					tensor[dst+2] = float32(b)
-				}
+				tensor[dst+0] = norm[0][row[src+r]]
+				tensor[dst+1] = norm[1][row[src+1]]
+				tensor[dst+2] = norm[2][row[src+b]]
 			}
 		}
 		return ort.NewShape(1, int64(size), int64(size), 3), nil
 
 	case "nchw":
-		var mean, std [3]float32
-		switch profile.Normalize {
-		case "imagenet":
-			mean, std = imageNetMean, imageNetStd
-		case "clip":
-			mean, std = clipMean, clipStd
-		}
-		bgr := profile.Channels == "bgr"
 		plane := size * size
 		for y := 0; y < size; y++ {
 			row := pix[y*stride:]
 			for x := 0; x < size; x++ {
 				src := x * 4
 				off := y*size + x
-				r := float32(row[src+0])
-				g := float32(row[src+1])
-				b := float32(row[src+2])
-				if bgr {
-					r, b = b, r
-				}
-				switch profile.Normalize {
-				case "imagenet", "clip":
-					tensor[0*plane+off] = (r/255 - mean[0]) / std[0]
-					tensor[1*plane+off] = (g/255 - mean[1]) / std[1]
-					tensor[2*plane+off] = (b/255 - mean[2]) / std[2]
-				case "div255":
-					tensor[0*plane+off] = r / 255
-					tensor[1*plane+off] = g / 255
-					tensor[2*plane+off] = b / 255
-				default:
-					tensor[0*plane+off] = r
-					tensor[1*plane+off] = g
-					tensor[2*plane+off] = b
-				}
+				tensor[0*plane+off] = norm[0][row[src+r]]
+				tensor[1*plane+off] = norm[1][row[src+1]]
+				tensor[2*plane+off] = norm[2][row[src+b]]
 			}
 		}
 		return ort.NewShape(1, 3, int64(size), int64(size)), nil

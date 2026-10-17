@@ -2,11 +2,11 @@
 {{template "layout_head" .}}
 {{template "layout_mid" .}}
 
-<div id="relations-image-page" data-image-id="{{.Image.ID}}" data-esc-back="/images/{{.Image.ID}}?back_q={{urlQ .BackQ}}&back_sort={{.BackSort}}&back_order={{.BackOrder}}{{if .BackPage}}&back_page={{.BackPage}}{{end}}{{if .BackSeed}}&back_seed={{.BackSeed}}{{end}}">
+<div id="relations-image-page" data-image-id="{{.Image.ID}}" data-esc-back="/images/{{.Image.ID}}{{.BackQS}}">
   <div id="detail-flash"></div>
   <div class="detail-topbar">
     <div class="detail-nav-group">
-      <a href="/images/{{.Image.ID}}?back_q={{urlQ .BackQ}}&back_sort={{.BackSort}}&back_order={{.BackOrder}}{{if .BackPage}}&back_page={{.BackPage}}{{end}}{{if .BackSeed}}&back_seed={{.BackSeed}}{{end}}" class="back-link">‹ Image</a>
+      <a href="/images/{{.Image.ID}}{{.BackQS}}" class="back-link">‹ Image</a>
       <span class="detail-nav-sep">/</span>
       <span class="detail-filename mono-small">image {{.Image.ID}}</span>
     </div>
@@ -125,10 +125,14 @@
         <span class="relations-inline-label">^ This image</span>
         {{else if eq $action "earlier"}}
         {{template "partials/relation_unlink_form.html" (dict "Type" "version" "A" $id "B" $.Image.ID "Label" "[unlink earlier revision]" "ExtraClass" "relations-inline-action")}}
+        {{if eq (len $.VersionChainGens) 2}}
         {{template "partials/relation_unlink_form.html" (dict "URL" "/relations/reverse" "Type" "version" "A" $id "B" $.Image.ID "Label" "[reverse]" "Title" (printf "Make #%d the newer revision" $id) "Confirm" (printf "Reverse this edge so #%d becomes the newer revision?" $id) "ExtraClass" "relations-inline-action")}}
+        {{end}}
         {{else if eq $action "newer"}}
         {{template "partials/relation_unlink_form.html" (dict "Type" "version" "A" $.Image.ID "B" $id "Label" "[unlink newer revision]" "ExtraClass" "relations-inline-action")}}
+        {{if eq (len $.VersionChainGens) 2}}
         {{template "partials/relation_unlink_form.html" (dict "URL" "/relations/reverse" "Type" "version" "A" $.Image.ID "B" $id "Label" "[reverse]" "Title" (printf "Make #%d the earlier revision" $id) "Confirm" (printf "Reverse this edge so #%d becomes the earlier revision?" $id) "ExtraClass" "relations-inline-action")}}
+        {{end}}
         {{end}}
       </div>
       {{end}}
@@ -163,13 +167,7 @@
         </div>
         {{end}}
       </div>
-      {{if lt $r (len $g.Bands)}}
-      <div class="deriv-band">
-        <svg viewBox="0 0 {{$g.Width}} {{$g.BandH}}" preserveAspectRatio="none" aria-hidden="true">
-          {{range index $g.Bands $r}}<line data-edge="{{.From}}-{{.To}}" x1="{{.X1}}" y1="0" x2="{{.X2}}" y2="{{$g.BandH}}"/>{{end}}
-        </svg>
-      </div>
-      {{end}}
+      {{if lt $r (len $g.Bands)}}{{template "deriv_band" (dict "G" $g "R" $r)}}{{end}}
       {{end}}
     </div>
   </section>

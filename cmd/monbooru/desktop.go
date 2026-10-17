@@ -13,9 +13,8 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/desktop"
-	"github.com/monbooru/monbooru/internal/fsx"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	internalweb "github.com/monbooru/monbooru/internal/web"
 )
 
@@ -91,6 +90,15 @@ func claimPort(addr string, openBrowser bool) (string, bool) {
 	}
 	other := cmp.Or(inst.App, "another program")
 	return fmt.Sprintf("%s is already serving %s; free the port or set server.bind_address to another one", other, local), false
+}
+
+// bindFailure returns "" when the bind was lost to a running monbooru.
+func bindFailure(addr string, err error, openBrowser bool) string {
+	msg, proceed := claimPort(addr, openBrowser)
+	if msg == "" && proceed {
+		return fmt.Sprintf("could not listen on %s: %v; free the port or set server.bind_address to another one", addr, err)
+	}
+	return msg
 }
 
 // -no-browser is added: the page that asked for the restart reloads itself.
@@ -186,7 +194,7 @@ func trayIconPath() string {
 	if runtime.GOOS != "windows" {
 		return ""
 	}
-	dir := fsx.ExeDir()
+	dir := desktop.ExeDir()
 	if dir == "" {
 		return ""
 	}

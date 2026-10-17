@@ -2,8 +2,8 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/monbooru/monbooru/internal/monloader"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -213,7 +214,12 @@ func (s *Server) sendContribItems(w http.ResponseWriter, r *http.Request, scope 
 	defer cancel()
 	resp, err := s.ml.SendContrib(ctx, scope, items)
 	if err != nil {
-		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{"Err": "contributions unavailable"})
+		msg := "contributions unavailable"
+		var refused monloader.ContribRefused
+		if errors.As(err, &refused) {
+			msg = refused.Error()
+		}
+		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{"Err": msg})
 		return
 	}
 	s.renderContribReceipt(w, items, resp)

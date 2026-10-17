@@ -1,6 +1,7 @@
 package web
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -10,8 +11,8 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 const collectionsPerPage = 60
@@ -20,6 +21,8 @@ const collectionsPerPage = 60
 const collectionPreviewSamples = 16
 
 const collectionOrderWindow = 200
+
+const collectionOrderMax = 25 * collectionOrderWindow
 
 type collectionsPageData struct {
 	baseData
@@ -145,7 +148,7 @@ func (s *Server) collectionOrderDialog(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := collectionOrderWindow
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
-		limit = n
+		limit = min(n, collectionOrderMax)
 	}
 	ceiling := resolveCeiling(r, s.active()).RankFilter()
 	members, err := gallery.CollectionMembers(s.db(), name, ceiling, limit+1, 0)
@@ -163,6 +166,7 @@ func (s *Server) collectionOrderDialog(w http.ResponseWriter, r *http.Request) {
 		"Members":       members,
 		"Gallery":       s.activeGallery(),
 		"HasMore":       hasMore,
+		"CanGrow":       limit < collectionOrderMax,
 		"NextLimit":     limit + collectionOrderWindow,
 		"CeilingHidden": ceilingHidden,
 	})
@@ -198,8 +202,6 @@ func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, id)
 	}
 	clicked := len(ids)
-	// The dialog shows only what the ceiling lets through, so hidden members
-	// go after the clicked ones rather than losing their position.
 	hidden, err := gallery.CollectionHiddenOrderedIDs(s.db(), name, resolveCeiling(r, s.active()).RankFilter())
 	if err != nil {
 		flashStatus(w, http.StatusInternalServerError, "Could not reorder the collection.")
@@ -234,13 +236,7 @@ func (s *Server) dissolveCollectionPost(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	s.startCollectionJob(w, name, func(ids []int64) {
-		s.runBatchCollection(ids, name, "remove")
-		// So a later collection reusing the label starts opted out.
-		if err := s.active().Edit(func(d *db.DB) error { return gallery.SetCollectionFindRelations(d, name, false) }); err != nil {
-			logx.Debugf("dissolve collection find-relations flag: %v", err)
-		}
-	})
+	s.startCollectionJob(w, name, func(ids []int64) { s.runBatchCollection(ids, name, "remove", true) })
 }
 
 func (s *Server) runRenameCollection(ids []int64, oldName, newName string) {
@@ -255,10 +251,14 @@ func (s *Server) runRenameCollection(ids []int64, oldName, newName string) {
 	// renumbered, so the offset holds for the whole job.
 	var posOffset int
 	if merging {
+		var spelled sql.NullString
 		if err := s.db().Read.QueryRow(
-			`SELECT COALESCE(MAX(position), 0) FROM image_collections WHERE name = ?`, newName,
-		).Scan(&posOffset); err != nil {
+			`SELECT COALESCE(MAX(position), 0), MIN(name) FROM image_collections WHERE name = ?`, newName,
+		).Scan(&posOffset, &spelled); err != nil {
 			logx.Debugf("rename collection position offset: %v", err)
+		}
+		if spelled.Valid {
+			newName = spelled.String
 		}
 	}
 

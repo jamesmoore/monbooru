@@ -7,6 +7,13 @@
           {{end}}<button type="submit" class="btn-link-accent">[{{.Label}}]</button>
         </form>
 {{end}}
+{{define "deriv_band"}}
+<div class="deriv-band">
+  <svg viewBox="0 0 {{.G.Width}} {{.G.BandH}}" preserveAspectRatio="none" aria-hidden="true">
+    {{range index .G.Bands .R}}<line data-edge="{{.From}}-{{.To}}" x1="{{.X1}}" y1="0" x2="{{.X2}}" y2="{{$.G.BandH}}"/>{{end}}
+  </svg>
+</div>
+{{end}}
 {{define "relations_browse.html"}}
 {{template "layout_head_bare" .}}
 
@@ -162,13 +169,7 @@
             </div>
             {{end}}
           </div>
-          {{if lt $r (len $g.Bands)}}
-          <div class="deriv-band">
-            <svg viewBox="0 0 {{$g.Width}} {{$g.BandH}}" preserveAspectRatio="none" aria-hidden="true">
-              {{range index $g.Bands $r}}<line data-edge="{{.From}}-{{.To}}" x1="{{.X1}}" y1="0" x2="{{.X2}}" y2="{{$g.BandH}}"/>{{end}}
-            </svg>
-          </div>
-          {{end}}
+          {{if lt $r (len $g.Bands)}}{{template "deriv_band" (dict "G" $g "R" $r)}}{{end}}
           {{end}}
         </div>
         {{end}}
@@ -204,8 +205,7 @@
 </div>
 
 <dialog id="merge-dup-dialog">
-  <form id="merge-dup-form" method="post" action="/relations/browse-groups/merge?kind=dup">
-    <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+  <form id="merge-dup-form">
     <h4>Merge same-image groups</h4>
     <p class="field-hint">Which group's original wins on the merged row?</p>
     <ul id="merge-dup-choices" class="merge-dup-choices"></ul>

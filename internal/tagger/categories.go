@@ -1,6 +1,10 @@
 package tagger
 
-import "cmp"
+import (
+	"cmp"
+
+	"github.com/monbooru/monbooru/internal/tags"
+)
 
 // Category 9, WD14's rating family, is left out on purpose: the canonical
 // rating labels are routed by name, and any other label in 9 must fall to
@@ -11,12 +15,6 @@ var wd14Category = map[int]string{
 	3: "copyright",
 	4: "character",
 	5: "meta",
-}
-
-// Only the four canonical names: storeResults drops any other name routed
-// to rating.
-var wd14RatingTags = map[string]bool{
-	"general": true, "sensitive": true, "questionable": true, "explicit": true,
 }
 
 type categoryResolution struct {
@@ -37,24 +35,23 @@ func resolveCategory(profile Profile, label tagLabel, catIDs map[string]int64, d
 			override: true,
 		}
 	}
-	if wd14RatingTags[label.name] {
+	if tags.IsCanonicalRating(label.name) {
 		return categoryResolution{
 			catID:   catIDs["rating"],
 			catName: "rating",
 		}
 	}
-	switch profile.CategoryScheme {
-	case "wd14_numeric":
-		name := cmp.Or(wd14Category[label.categoryID], "general")
-		return categoryResolution{catID: catIDs[name], catName: name}
-	case "single_general":
-		return categoryResolution{catID: catIDs["general"], catName: "general"}
-	case "name_string":
-		name := label.categoryName
-		if _, ok := catIDs[name]; !ok {
-			name = "general"
-		}
-		return categoryResolution{catID: catIDs[name], catName: name}
+	name := "general"
+	switch {
+	case profile.CategoryScheme == "single_general":
+	case label.categoryName != "":
+		name = label.categoryName
+	case profile.CategoryScheme == "wd14_numeric":
+		name = cmp.Or(wd14Category[label.categoryID], "general")
 	}
-	return categoryResolution{catID: catIDs["general"], catName: "general"}
+	name = cmp.Or(profile.CategoryMap[name], name)
+	if _, ok := catIDs[name]; !ok {
+		name = "general"
+	}
+	return categoryResolution{catID: catIDs[name], catName: name}
 }

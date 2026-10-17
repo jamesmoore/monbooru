@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+
+	"github.com/monbooru/monbooru/internal/models"
 )
 
 func buildSpec(baseURL string) map[string]any {
@@ -15,7 +17,7 @@ func buildSpec(baseURL string) map[string]any {
 		"openapi": "3.0.3",
 		"info": map[string]any{
 			"title":       "Monbooru API",
-			"description": "REST API for monbooru image library. Any operation can answer 500 internal_error on a server-side failure.",
+			"description": "REST API for monbooru image library. Any operation can answer 500 internal_error on a server-side failure, and every authenticated one 503 api_disabled while no API token exists.",
 			"version":     "1.1.0",
 		},
 		"servers": []map[string]any{
@@ -86,8 +88,14 @@ func buildSpec(baseURL string) map[string]any {
 				"PaginatedImages": paginatedSchema("#/components/schemas/Image"),
 				"APIInfo": objectSchema(nil, map[string]any{
 					"api":     map[string]any{"type": "string"},
+					"version": map[string]any{"type": "string", "description": "monbooru version"},
 					"docs":    map[string]any{"type": "string"},
 					"openapi": map[string]any{"type": "string"},
+				}),
+				"DeleteImageResponse": objectSchema(nil, map[string]any{
+					"folder_deleted":     map[string]any{"type": "boolean", "description": "True when delete_empty_folder removed the emptied folder"},
+					"folder":             map[string]any{"type": "string", "description": "The removed folder, relative to the gallery root"},
+					"kept_changed_files": map[string]any{"type": "integer", "description": "The image's files kept on disk because they no longer hold its bytes"},
 				}),
 				"CreateImageResponse": map[string]any{
 					"type":        "object",
@@ -138,7 +146,7 @@ func buildSpec(baseURL string) map[string]any {
 					"md5":                  map[string]any{"type": "string", "description": "md5 of the stored file, \"\" until computed. The local digest, not the md5 an origin claims"},
 					"canonical_path":       map[string]any{"type": "string"},
 					"aliases":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-					"file_type":            map[string]any{"type": "string"},
+					"file_type":            map[string]any{"type": "string", "enum": fileTypeNames()},
 					"width":                map[string]any{"type": "integer", "nullable": true},
 					"height":               map[string]any{"type": "integer", "nullable": true},
 					"file_size":            map[string]any{"type": "integer"},
@@ -183,7 +191,7 @@ func buildSpec(baseURL string) map[string]any {
 							"commentary":            map[string]any{"type": "string", "description": "Artist commentary pulled from (or hand-entered for) this origin; omitted when empty."},
 							"commentary_translated": map[string]any{"type": "string", "description": "Translation of that commentary where the source published one; omitted when empty."},
 							"original":              map[string]any{"type": "string", "description": "Upstream artist source the post declared (usually a URL, newline-joined when several); omitted when empty."},
-							"similarity":            map[string]any{"type": "number", "description": "Best similarity-service score (0-100) a lookup matched this origin with; omitted for an exact or manual origin. A matched origin's refetches skip the md5 verify."},
+							"similarity":            map[string]any{"type": "number", "description": "The latest positive similarity-service score a lookup matched this origin with: a percentage as the service reports it (0-100), not range-checked. Omitted for an exact or manual origin. A matched origin's refetches skip the md5 verify."},
 						}),
 					},
 					"note":            map[string]any{"type": "string", "description": "Operator's freeform note. Never written by a push or enrich."},
@@ -261,9 +269,9 @@ func buildSpec(baseURL string) map[string]any {
 						"content": map[string]any{
 							"multipart/form-data": map[string]any{
 								"schema": objectSchema([]string{"file"}, map[string]any{
-									"file":                        map[string]any{"type": "string", "format": "binary", "description": "Image or video file"},
+									"file":                        map[string]any{"type": "string", "format": "binary", "description": "Image, video, or cbz/zip archive"},
 									"tags":                        map[string]any{"type": "string", "description": "JSON-encoded array of tag names"},
-									"folder":                      map[string]any{"type": "string", "description": "Destination subfolder under the gallery root; missing directories are created. Leave blank for the gallery root."},
+									"folder":                      map[string]any{"type": "string", "description": "Destination subfolder under the gallery root; missing directories are created. Blank uses gallery.default_upload_folder (the gallery root when that is unset)."},
 									"autotag":                     map[string]any{"type": "string", "description": "Set to \"true\" to kick off an auto-tag job on the new image"},
 									"tagger_name":                 map[string]any{"type": "string", "description": "Optional auto-tagger name; when set with autotag, restricts the job to that tagger"},
 									"via":                         map[string]any{"type": "string", "description": "Optional caller-supplied identifier (app name, URL...). Stored as images.origin and attached to each initial tag via image_tags.tagger_name, unless a non-empty source is sent, which takes the attribution instead so each source owns a prunable slice. Blank defaults images.origin to 'upload' for multipart mode."},
@@ -334,6 +342,7 @@ func buildSpec(baseURL string) map[string]any {
 						queryParam("seed", "Random-sort seed for stable pagination when sort=random"),
 						queryParam("page", "Page number (1-based)"),
 						queryParam("limit", "Results per page (max 200)"),
+						queryParam("page_size", "Synonym for limit"),
 					},
 					map[string]any{
 						"200": resp("Paginated image list", "#/components/schemas/PaginatedImages"),
@@ -345,12 +354,13 @@ func buildSpec(baseURL string) map[string]any {
 					map[string]any{
 						"200": resp("Image metadata", "#/components/schemas/Image"),
 						"404": resp("Not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 					}),
 				"patch": opBody("Edit image fields", "patchImage",
 					[]map[string]any{pathParam("id", "Image ID"), galleryParam()},
 					jsonBodySchema(true, map[string]any{
 						"type":        "object",
-						"description": "Any subset of the editable fields. An absent or null field is left unchanged; an empty string clears a text field. Clearing collection also clears collection_order unless one is supplied in the same request; to clear collection_order on its own, clear the collection.",
+						"description": "Any subset of the editable fields. An absent or null field is left unchanged; an empty string clears a text field. Clearing collection also clears collection_order, and collection_order sent with an empty collection is refused; to clear collection_order on its own, clear the collection.",
 						"properties": map[string]any{
 							"source":               map[string]any{"type": "string", "description": "Operator-edited provenance label (<=200 chars). Empty clears."},
 							"url":                  map[string]any{"type": "string", "description": "Canonical web URL (<=2048 chars, http:// or https://). Empty clears."},
@@ -366,6 +376,7 @@ func buildSpec(baseURL string) map[string]any {
 						"200": resp("Updated image", "#/components/schemas/Image"),
 						"400": resp("Invalid request (bad url, order without a collection, or no editable fields supplied)", "#/components/schemas/Error"),
 						"404": resp("Not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 						"409": resp("Relabel collides with another origin the image already carries", "#/components/schemas/Error"),
 					}),
 				"delete": op("Delete image from library", "deleteImage",
@@ -375,7 +386,7 @@ func buildSpec(baseURL string) map[string]any {
 						queryParam("delete_empty_folder", "Remove containing folder if empty after deletion"),
 					},
 					map[string]any{
-						"200": map[string]any{"description": "Deleted (folder also removed)"},
+						"200": resp("Deleted, with what else the delete did", "#/components/schemas/DeleteImageResponse"),
 						"204": map[string]any{"description": "Deleted"},
 						"404": resp("Not found", "#/components/schemas/Error"),
 						"500": resp("Delete failed server-side", "#/components/schemas/Error"),
@@ -390,6 +401,7 @@ func buildSpec(baseURL string) map[string]any {
 					"requestBody": jsonBodySchema(true, objectSchema(nil, map[string]any{
 						"tags":                        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 						"source":                      map[string]any{"type": "string", "description": "Site label of the origin being refetched"},
+						"post_id":                     map[string]any{"type": "string", "description": "Optional post id at that source, recorded on the origin row."},
 						"url":                         map[string]any{"type": "string"},
 						"source_md5":                  map[string]any{"type": "string", "description": "md5 the source claims (<=64 chars). Compared against the stored file when verify is set; recorded on the origin row."},
 						"parent_url":                  map[string]any{"type": "string", "description": "Canonical URL of the post this post declares as its parent. Recorded on the origin row; when both sides are in the gallery the pair is linked as a derivative relation. Empty keeps the stored value."},
@@ -398,7 +410,7 @@ func buildSpec(baseURL string) map[string]any {
 						"post_size":                   map[string]any{"type": "integer", "description": "Byte size the post declares. Used for the gain test when the post publishes no dimensions."},
 						"post_ext":                    map[string]any{"type": "string", "description": "File extension the post serves, no dot."},
 						"verify":                      map[string]any{"type": "boolean", "description": "When true and source_md5 is non-empty, the stored file is hashed and compared first; a mismatch applies nothing and returns 409 - unless the origin is similarity-matched, whose file differs by design."},
-						"similarity":                  map[string]any{"type": "number", "description": "Similarity-service score (0-100) when the post was found by image similarity rather than an exact hash. Recorded on the origin row; a matched origin's refetches skip the md5 verify. 0 or absent keeps the stored score."},
+						"similarity":                  map[string]any{"type": "number", "description": "Similarity-service score when the post was found by image similarity rather than an exact hash: a percentage as the service reports it (0-100), not range-checked. Recorded on the origin row over the stored score; a matched origin's refetches skip the md5 verify. 0, negative or absent keeps the stored score."},
 						"commentary":                  map[string]any{"type": "string"},
 						"commentary_translated":       map[string]any{"type": "string", "description": "Translation of the commentary. A non-empty value overwrites the stored one."},
 						"commentary_dtext":            map[string]any{"type": "string", "description": "The source's own DText for that commentary, converted to monbooru's markup on the way in and preferred over the plain rendering beside it. Same idea as a note's body_html."},
@@ -438,6 +450,7 @@ func buildSpec(baseURL string) map[string]any {
 					map[string]any{
 						"200": resp("Image tag list", "#/components/schemas/TagArray"),
 						"404": resp("Not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 					}),
 				"post": opBody("Add tags to image", "addImageTags",
 					[]map[string]any{pathParam("id", "Image ID"), galleryParam()},
@@ -455,6 +468,7 @@ func buildSpec(baseURL string) map[string]any {
 					map[string]any{
 						"400": resp("Invalid request (invalid JSON, no tags, or a malformed via)", "#/components/schemas/Error"),
 						"404": resp("Image not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 						"200": map[string]any{
 							"description": "Bare TagArray on success; wrapped in {tags, tag_warnings} when any tag failed validation.",
 							"content": map[string]any{
@@ -485,6 +499,7 @@ func buildSpec(baseURL string) map[string]any {
 						"200": resp("Updated tag list", "#/components/schemas/TagArray"),
 						"400": resp("Empty `tags`", "#/components/schemas/Error"),
 						"404": resp("Not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 						"409": resp("conflict for a name matching more than one tag on the image; tag_implied when another tag on the image implies the one being removed", "#/components/schemas/Error"),
 					}),
 			},
@@ -494,10 +509,11 @@ func buildSpec(baseURL string) map[string]any {
 					map[string]any{
 						"200": map[string]any{"description": "Original file bytes", "content": binaryContent("application/octet-stream")},
 						"404": resp("Not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 					}),
 				"post": map[string]any{
 					"summary":     "Replace the image's file in place",
-					"description": "The file-carrying sibling of enrich: the uploaded bytes replace the existing row's file while the row and everything attached to it survive. Content-derived state (sha256, dimensions, size, type, embedded metadata, thumbnail, phash) is re-derived, annotation boxes scale to the new dimensions, and the accompanying metadata fields land through the same merge as a push. The driving origin is marked exact (similarity reset, md5 refreshed). An upload whose sha256 matches the stored file applies the metadata only and answers replaced=false. Image and animated rows only.",
+					"description": "The file-carrying sibling of enrich: the uploaded bytes replace the existing row's file while the row and everything attached to it survive. Content-derived state (sha256, dimensions, size, type, embedded metadata, thumbnail, phash) is re-derived, annotation boxes scale to the new dimensions, and the accompanying metadata fields land through the same merge as a push. The driving origin is marked exact (similarity reset, md5 refreshed). An upload whose sha256 matches the stored file applies the metadata only and answers replaced=false. Still-image and GIF rows only; a video or archive row, or a video or archive upload, is 409 wrong_type.",
 					"operationId": "replaceImageFile",
 					"parameters":  []map[string]any{pathParam("id", "Image ID"), galleryParam()},
 					"requestBody": map[string]any{
@@ -546,6 +562,7 @@ func buildSpec(baseURL string) map[string]any {
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Image bytes: the original, or a lossless WebP for an AVIF or JPEG XL", "content": binaryContent("application/octet-stream")},
 						"404": resp("Not found, or a video or archive row", "#/components/schemas/Error"),
+						"500": resp("Database read failed, or the still could not be rendered", "#/components/schemas/Error"),
 					},
 				},
 			},
@@ -555,6 +572,7 @@ func buildSpec(baseURL string) map[string]any {
 					map[string]any{
 						"200": map[string]any{"description": "JPEG thumbnail", "content": binaryContent("image/jpeg")},
 						"404": resp("Image or thumbnail not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 					}),
 			},
 			"/images/{id}/page/{n}": map[string]any{
@@ -564,6 +582,7 @@ func buildSpec(baseURL string) map[string]any {
 						"200": map[string]any{"description": "Page bytes (lazily extracted from the archive)", "content": binaryContent("application/octet-stream")},
 						"400": resp("Invalid page number", "#/components/schemas/Error"),
 						"404": resp("Not a manga row, or page out of range", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 					}),
 			},
 			"/images/{id}/page/{n}/thumb": map[string]any{
@@ -573,6 +592,7 @@ func buildSpec(baseURL string) map[string]any {
 						"200": map[string]any{"description": "Page thumbnail (JPEG)", "content": binaryContent("image/jpeg")},
 						"400": resp("Invalid page number", "#/components/schemas/Error"),
 						"404": resp("Not a manga row, or page out of range", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 					}),
 			},
 			"/images/{id}/relations": map[string]any{
@@ -581,6 +601,7 @@ func buildSpec(baseURL string) map[string]any {
 					map[string]any{
 						"200": resp("Declared relations", "#/components/schemas/ImageRelations"),
 						"404": resp("Image not found", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 					}),
 			},
 			"/relations": map[string]any{
@@ -596,6 +617,7 @@ func buildSpec(baseURL string) map[string]any {
 						"201": map[string]any{"description": "Relation created"},
 						"400": resp("Invalid request (self-relation, unknown type, missing ids)", "#/components/schemas/Error"),
 						"404": resp("a or b names no image", "#/components/schemas/Error"),
+						"500": resp("Database read failed", "#/components/schemas/Error"),
 						"409": resp("Pair carries a conflicting relation already; remove it first.", "#/components/schemas/Error"),
 					}),
 				"delete": opBody("Remove a declared relation", "removeRelation",
@@ -622,6 +644,7 @@ func buildSpec(baseURL string) map[string]any {
 						queryParam("sort", "Sort field (usage, alpha)"),
 						queryParam("page", "Page number"),
 						queryParam("limit", "Results per page (default 100, max 500)"),
+						queryParam("page_size", "Synonym for limit"),
 						queryParam("show_zero", "Hide zero-usage non-alias tags ('0' to opt out). Default surfaces them so the API total matches the /tags page total."),
 						queryParam("origin", "Filter by stored creation origin ('user', a booru site, 'ptr', an auto-tagger name, ...). The legacy 'alias' value narrows to alias rows. Empty (default) returns every tag."),
 						queryParam("type", "Structural filter: 'tag' (non-alias rows), 'alias' (alias rows). Empty (default) returns both; any other value matches nothing."),
@@ -780,6 +803,7 @@ func buildSpec(baseURL string) map[string]any {
 					nil,
 					map[string]any{
 						"200": map[string]any{"description": "Galleries with counts and the active flag", "content": map[string]any{"application/json": map[string]any{"schema": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Gallery"}}}}},
+						"500": resp("A gallery's counts could not be read", "#/components/schemas/Error"),
 					}),
 			},
 		},
@@ -792,6 +816,10 @@ func declareRequestErrors(paths map[string]any) {
 	for _, item := range paths {
 		for _, raw := range item.(map[string]any) {
 			op := raw.(map[string]any)
+			body, _ := op["requestBody"].(map[string]any)
+			if content, _ := body["content"].(map[string]any); content["application/json"] != nil {
+				declareJSONBodyCap(op["responses"].(map[string]any))
+			}
 			params, _ := op["parameters"].([]map[string]any)
 			var reasons []string
 			scoped := false
@@ -818,6 +846,14 @@ func declareRequestErrors(paths map[string]any) {
 			}
 		}
 	}
+}
+
+func declareJSONBodyCap(responses map[string]any) {
+	if big, ok := responses["413"].(map[string]any); ok {
+		big["description"] = big["description"].(string) + "; also a JSON body over 16 MiB"
+		return
+	}
+	responses["413"] = resp("JSON body exceeds 16 MiB", "#/components/schemas/Error")
 }
 
 func opBody(summary, id string, params []map[string]any, body, responses map[string]any) map[string]any {
@@ -898,8 +934,7 @@ func galleryParam() map[string]any {
 
 func (h *Handler) openAPIJSON(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg()
-	if !SetCORS(w, r, cfg) {
-		apiError(w, http.StatusForbidden, "forbidden", "CORS: origin not allowed")
+	if !CORSOK(w, r, cfg) {
 		return
 	}
 	spec := buildSpec(cfg.Server.BaseURL)
@@ -910,8 +945,7 @@ func (h *Handler) openAPIJSON(w http.ResponseWriter, r *http.Request) {
 // No external assets, so the page works offline.
 func (h *Handler) openAPIDocs(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg()
-	if !SetCORS(w, r, cfg) {
-		apiError(w, http.StatusForbidden, "forbidden", "CORS: origin not allowed")
+	if !CORSOK(w, r, cfg) {
 		return
 	}
 	view := extractDocsView(buildSpec(cfg.Server.BaseURL))
@@ -1222,3 +1256,11 @@ var docsTemplate = template.Must(template.New("api-docs").Parse(`<!DOCTYPE html>
  {{end}}
 </body>
 </html>`))
+
+func fileTypeNames() []string {
+	names := make([]string, len(models.FileTypes))
+	for i, ft := range models.FileTypes {
+		names[i] = ft.Name
+	}
+	return names
+}

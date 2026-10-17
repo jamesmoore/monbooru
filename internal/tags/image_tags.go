@@ -290,14 +290,16 @@ func addSourceTagTx(tx *sql.Tx, imageID, tagID int64, site string) (bool, error)
 	return added > 0, nil
 }
 
-// ratingsReplaced counts images whose rating the add replaced.
-func (s *Service) BatchAddTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (added, ratingsReplaced int, err error) {
+// touched counts the images a row was added to, ratingsReplaced those
+// whose rating the add replaced.
+func (s *Service) BatchAddTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (added, touched, ratingsReplaced int, err error) {
 	for _, imageID := range imageIDs {
 		replaced := false
+		before := added
 		for _, tagID := range tagIDs {
 			a, _, displaced, err := addOneTagTx(tx, imageID, tagID, false, nil, "", s.ratingCatID)
 			if err != nil {
-				return added, ratingsReplaced, err
+				return added, touched, ratingsReplaced, err
 			}
 			if a {
 				added++
@@ -306,76 +308,100 @@ func (s *Service) BatchAddTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (
 				replaced = true
 			}
 		}
+		if added > before {
+			touched++
+		}
 		if replaced {
 			ratingsReplaced++
 		}
 	}
-	return added, ratingsReplaced, nil
+	return added, touched, ratingsReplaced, nil
 }
 
-// An implied row a parent still justifies is skipped and counted in
-// implied, not an error: a batch names tags, not rows.
-func batchRemoveTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (removed, implied int, err error) {
+// A row a parent still justifies is kept and counted, not an error: a
+// batch names tags, not rows.
+func batchRemoveTagsTx(tx *sql.Tx, imageIDs []int64, tagIDs []int64) (removed, touched, kept int, err error) {
 	for _, imageID := range imageIDs {
-		n, kept, err := removeTagsUnlessImpliedTx(tx, imageID, tagIDs)
+		n, implied, demoted, err := removeTagsUnlessImpliedTx(tx, imageID, tagIDs)
 		removed += n
-		implied += len(kept)
+		kept += len(implied) + demoted
+		if n > 0 {
+			touched++
+		}
 		if err != nil {
-			return removed, implied, err
+			return removed, touched, kept, err
 		}
 	}
-	return removed, implied, nil
+	return removed, touched, kept, nil
 }
 
-// A child named with its parent is only held until the parent goes, so
-// the held rows are checked again once the others are removed.
-func removeTagsUnlessImpliedTx(tx *sql.Tx, imageID int64, tagIDs []int64) (removed int, kept []int64, err error) {
-	pass := func(ids []int64) ([]int64, error) {
+// A row named with its parent is only held until the parent goes, so the
+// held rows are checked again once the others are removed; an owned one a
+// parent still implies is then demoted.
+func removeTagsUnlessImpliedTx(tx *sql.Tx, imageID int64, tagIDs []int64) (removed int, implied []int64, demoted int, err error) {
+	var demotedIDs []int64
+	pass := func(ids []int64, last bool) ([]int64, error) {
 		var held []int64
 		for _, tagID := range ids {
-			switch implied, err := impliedByParentOnImage(tx, imageID, tagID); {
+			switch justified, err := impliedByParentOnImage(tx, imageID, tagID); {
 			case err != nil:
 				return nil, err
-			case implied:
+			case justified:
 				held = append(held, tagID)
 				continue
 			}
-			n, err := removeTagFromImageTx(tx, imageID, tagID)
+			if !last {
+				parents, err := implicationParentsOnImageExcluding(tx, imageID, tagID, 0)
+				if err != nil {
+					return nil, err
+				}
+				if len(parents) > 0 {
+					held = append(held, tagID)
+					continue
+				}
+			}
+			n, wasDemoted, err := demoteOrRemoveTagTx(tx, imageID, tagID)
 			if err != nil {
 				return nil, err
+			}
+			if wasDemoted {
+				demotedIDs = append(demotedIDs, tagID)
 			}
 			removed += n
 		}
 		return held, nil
 	}
-	held, err := pass(tagIDs)
+	held, err := pass(tagIDs, false)
 	if err != nil || len(held) == 0 {
-		return removed, nil, err
+		return removed, nil, 0, err
 	}
-	kept, err = pass(held)
-	return removed, kept, err
+	if implied, err = pass(held, true); err != nil || len(demotedIDs) == 0 {
+		return removed, implied, 0, err
+	}
+	// A demoted row whose parent the same pass took went with the sweep.
+	in, args := db.InPlaceholders(demotedIDs)
+	err = tx.QueryRow(`SELECT COUNT(*) FROM image_tags WHERE image_id = ? AND tag_id IN (`+in+`)`,
+		append([]any{imageID}, args...)...).Scan(&demoted)
+	return removed, implied, demoted, err
 }
 
 func (s *Service) RemoveTagFromImage(imageID, tagID int64) (int, error) {
-	var removed int
-	err := s.inWriteTx(func(tx *sql.Tx) error {
+	return writeTx(s, func(tx *sql.Tx) (int, error) {
 		switch implied, err := impliedByParentOnImage(tx, imageID, tagID); {
 		case err != nil:
-			return err
+			return 0, err
 		case implied:
-			return ErrTagImplied
+			return 0, ErrTagImplied
 		}
-		n, err := removeTagFromImageTx(tx, imageID, tagID)
-		removed = n
-		return err
+		n, _, err := demoteOrRemoveTagTx(tx, imageID, tagID)
+		return n, err
 	})
-	return removed, err
 }
 
 func removeTagIDsFromImageTx(tx *sql.Tx, imageID int64, tagIDs []int64) (int, error) {
 	removed := 0
 	for _, tagID := range tagIDs {
-		n, err := removeTagFromImageTx(tx, imageID, tagID)
+		n, _, err := demoteOrRemoveTagTx(tx, imageID, tagID)
 		removed += n
 		if err != nil {
 			return removed, err
@@ -389,8 +415,8 @@ func (s *Service) RemoveTagsFromOneImage(imageID int64, tagIDs []int64) error {
 		return nil
 	}
 	return s.inWriteTx(func(tx *sql.Tx) error {
-		_, kept, err := removeTagsUnlessImpliedTx(tx, imageID, tagIDs)
-		if err == nil && len(kept) > 0 {
+		_, implied, _, err := removeTagsUnlessImpliedTx(tx, imageID, tagIDs)
+		if err == nil && len(implied) > 0 {
 			return ErrTagImplied
 		}
 		return err
@@ -432,6 +458,29 @@ func ImagesVisibilityChangedTx(tx *sql.Tx, imageIDs []int64, visible bool) error
 			WHERE tags.id = d.tag_id`, append([]any{delta}, args...)...)
 		return err
 	})
+}
+
+// parentOnImage holds for an image_tags row a tag on its image implies.
+const parentOnImage = `EXISTS (SELECT 1 FROM tag_implications ti
+	JOIN image_tags p ON p.image_id = image_tags.image_id AND p.tag_id = ti.parent_tag_id
+	WHERE ti.implied_tag_id = image_tags.tag_id)`
+
+// demoteOrRemoveTagTx turns an owned row a parent on the image still
+// implies into an implied one, keeping its usage and dropping its ledger,
+// and removes any other.
+func demoteOrRemoveTagTx(tx *sql.Tx, imageID, tagID int64) (removed int, demoted bool, err error) {
+	res, err := tx.Exec(
+		`UPDATE image_tags SET is_implied = 1, confidence = NULL, tagger_name = NULL, stale = 0
+		 WHERE image_id = ? AND tag_id = ? AND is_implied = 0 AND `+parentOnImage, imageID, tagID)
+	if err != nil {
+		return 0, false, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		_, err := tx.Exec(`DELETE FROM image_tag_sources WHERE image_id = ? AND tag_id = ?`, imageID, tagID)
+		return 0, true, err
+	}
+	removed, err = removeTagFromImageTx(tx, imageID, tagID)
+	return removed, false, err
 }
 
 func removeTagFromImageTx(tx *sql.Tx, imageID, tagID int64) (int, error) {
@@ -517,14 +566,12 @@ func (s *Service) removeMatchingTx(imageID int64, andWhere string, args ...any) 
 	})
 }
 
-// Implied rows have no tagger_name either, but they are not the operator's.
 func (s *Service) RemoveUserTagsFromImage(imageID int64) (int, error) {
-	return s.removeMatchingTx(imageID,
-		`AND is_auto = 0 AND is_implied = 0 AND (tagger_name IS NULL OR tagger_name = '')`)
+	return s.removeMatchingTx(imageID, userRowsPred)
 }
 
 func (s *Service) RemoveStaleTagsFromImage(imageID int64) (int, error) {
-	return s.removeMatchingTx(imageID, `AND stale = 1`)
+	return s.removeMatchingTx(imageID, staleRowsPred)
 }
 
 func (s *Service) RemoveSourceTagsFromImage(imageID int64, sources []string, stale string) (int, error) {
@@ -532,10 +579,10 @@ func (s *Service) RemoveSourceTagsFromImage(imageID int64, sources []string, sta
 		return 0, nil
 	}
 	placeholders, args := db.InPlaceholders(sources)
-	where := `AND is_auto = 0 AND tagger_name IN (` + placeholders + `)`
+	where := sourceRowsPred + ` AND tagger_name IN (` + placeholders + `)`
 	switch stale {
 	case "1":
-		where += ` AND stale = 1`
+		where += staleRowsPred
 	case "0":
 		where += ` AND stale = 0`
 	}
@@ -604,10 +651,10 @@ func (s *Service) DropSourceFromImageTags(imageID int64, source string, tagIDs [
 
 func (s *Service) RemoveAutoTagsFromImage(imageID int64, taggerNames []string) (int, error) {
 	if len(taggerNames) == 0 {
-		return s.removeMatchingTx(imageID, `AND is_auto = 1 AND is_implied = 0`)
+		return s.removeMatchingTx(imageID, autoRowsPred)
 	}
 	placeholders, args := db.InPlaceholders(taggerNames)
-	return s.removeMatchingTx(imageID, `AND is_auto = 1 AND is_implied = 0 AND tagger_name IN (`+placeholders+`)`, args...)
+	return s.removeMatchingTx(imageID, autoRowsPred+` AND tagger_name IN (`+placeholders+`)`, args...)
 }
 
 // Loops because a dropped row can be the only justification for another.
@@ -686,7 +733,10 @@ func pruneRatingsAfterAddTx(tx *sql.Tx, ratingCatID, imageID, tagID int64, isAut
 		return nil, nil
 	}
 	var catID int64
-	if err := tx.QueryRow(`SELECT category_id FROM tags WHERE id = ?`, tagID).Scan(&catID); err != nil || catID != ratingCatID {
+	if err := tx.QueryRow(`SELECT category_id FROM tags WHERE id = ?`, tagID).Scan(&catID); err != nil {
+		return nil, err
+	}
+	if catID != ratingCatID {
 		return nil, nil
 	}
 	if isAuto {

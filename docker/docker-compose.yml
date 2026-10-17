@@ -38,7 +38,7 @@ services:
       - DAC_OVERRIDE
 
     volumes:
-      - /path/to/your/models:/models:ro
+      - /path/to/your/models:/models
       - /path/to/your/gallery:/gallery
       # Additional galleries (need to be mounted in settings)
       # - /path/to/your/gallery2:/gallery2
@@ -47,8 +47,10 @@ services:
       - /path/to/monbooru/data:/data
     environment:
       - MONBOORU_SERVER_BIND_ADDRESS=0.0.0.0:8455
-      # Base URL (The one you use to reach monbooru from the browser)
+      # Monbooru browser URL (The one you use to reach monbooru from the browser)
       - MONBOORU_SERVER_BASE_URL=http://localhost:8455
+      # If Monloader enabled: how you reach monloader in the browser
+      # - MONBOORU_SERVER_MONLOADER_URL=http://localhost:8456
       # - TZ=Etc/UTC
     restart: unless-stopped
 

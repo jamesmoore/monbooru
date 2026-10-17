@@ -7,8 +7,8 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type lookupView struct {

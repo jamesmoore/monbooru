@@ -17,16 +17,16 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/upgrade"
 )
 
 func (s *Server) ratingCeilingPost(w http.ResponseWriter, r *http.Request) {
 	level := cmp.Or(r.URL.Query().Get("level"), r.FormValue("level"))
-	writeRatingCookie(w, level)
+	writeRatingCookie(w, r, level)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -38,14 +38,14 @@ func (s *Server) viewPrefsPost(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unknown page size", http.StatusBadRequest)
 			return
 		}
-		setPrefCookie(w, pageSizeCookieName, v)
+		setPrefCookie(w, r, pageSizeCookieName, v)
 	}
 	if v := r.FormValue("thumb"); v != "" {
 		if v != "s" && v != "m" && v != "l" {
 			http.Error(w, "unknown thumbnail size", http.StatusBadRequest)
 			return
 		}
-		setPrefCookie(w, thumbSizeCookieName, v)
+		setPrefCookie(w, r, thumbSizeCookieName, v)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -186,23 +186,24 @@ func (s *Server) promoteCanonical(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	newCanonical := r.FormValue("path")
-	if newCanonical == "" {
+	requested := r.FormValue("path")
+	if requested == "" {
 		fail("path required", http.StatusBadRequest)
 		return
 	}
 
 	// Tracked aliases only: any other path lets serveImageFile serve that file.
-	var aliasExists int
-	if err := s.db().Read.QueryRow(
-		`SELECT COUNT(*) FROM image_paths WHERE image_id = ? AND path = ?`,
-		id, newCanonical,
-	).Scan(&aliasExists); err != nil {
-		fail(err.Error(), http.StatusInternalServerError)
+	var newCanonical string
+	err := s.db().Read.QueryRow(
+		`SELECT path FROM image_paths WHERE image_id = ? AND path = ?`,
+		id, requested,
+	).Scan(&newCanonical)
+	if errors.Is(err, sql.ErrNoRows) {
+		fail("path is not an alias of this image", http.StatusBadRequest)
 		return
 	}
-	if aliasExists == 0 {
-		fail("path is not an alias of this image", http.StatusBadRequest)
+	if err != nil {
+		fail(err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if _, statErr := os.Stat(newCanonical); statErr != nil {
@@ -836,23 +837,3 @@ func placeVerbs(folder, name bool) (verb, gerund, past string) {
 }
 
 func titleCase(s string) string { return strings.ToUpper(s[:1]) + s[1:] }
-
-// Exclusive upper bound of prefix's BINARY range, for a >=, < scan in
-// place of LIKE 'prefix%'.
-func nextPrefix(prefix string) string {
-	b := []byte(prefix)
-	for i := len(b) - 1; i >= 0; i-- {
-		if b[i] < 0xFF {
-			b[i]++
-			return string(b[:i+1])
-		}
-	}
-	return prefix + "\xff"
-}
-
-// Lowercased first: NOCASE folds to lower case, so a bound built from "Z"
-// would exclude every lower-case continuation.
-func nocasePrefixRange(prefix string) (lo, hi string) {
-	lo = strings.ToLower(prefix)
-	return lo, nextPrefix(lo)
-}

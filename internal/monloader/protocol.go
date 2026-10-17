@@ -4,28 +4,58 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/contract"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
+
+// monloaderRoutes is every monloader route this package calls, as
+// monloader's OpenAPI spells it; the contract tests hold each call to it
+// and it to monloader's document.
+var monloaderRoutes = []struct{ Method, Path string }{
+	{http.MethodGet, "/api/v1/queue"},
+	{http.MethodGet, "/api/v1/queue/{id}"},
+	{http.MethodGet, "/api/v1/ptr/status"},
+	{http.MethodPost, "/api/v1/metadata"},
+	{http.MethodPost, "/api/v1/replace"},
+	{http.MethodPost, "/api/v1/lookup"},
+	{http.MethodPost, "/api/v1/galleries/rename"},
+	{http.MethodPost, "/api/v1/ptr/lookup"},
+	{http.MethodPost, "/api/v1/ptr/tags"},
+	{http.MethodGet, "/api/v1/ptr/tags/search"},
+	{http.MethodPost, "/api/v1/ptr/contrib"},
+	{http.MethodPost, "/api/v1/ptr/contrib/preview"},
+	{http.MethodPost, "/api/v1/ptr/contrib/pair-preview"},
+	{http.MethodPost, "/api/v1/pair/remove"},
+	{http.MethodGet, "/health"},
+}
 
 // A 409 on a PTR call: the cached capability was stale; the link itself
 // is fine.
 var ErrPTRUnavailable = errors.New("the PTR lookup is unavailable on monloader")
 
+type conflict struct{ code string }
+
+func (c conflict) Error() string { return ErrPTRUnavailable.Error() }
+func (c conflict) Unwrap() error { return ErrPTRUnavailable }
+
+type ContribRefused string
+
+func (e ContribRefused) Error() string { return string(e) }
+
 // It ends the phase: every later row would get the same answer.
-var ErrBudgetSpent = errors.New("monloader's daily lookup budget is spent")
+var errBudgetSpent = errors.New("monloader's daily lookup budget is spent")
 
 // No per-image fallback: one queued job per image is what the batch
 // endpoint exists to stop.
-var ErrPTRBatchUnsupported = errors.New("monloader is too old for batch PTR lookup")
+var errPTRBatchUnsupported = errors.New("monloader is too old for batch PTR lookup")
 
 // A 404 from a monloader too old to search; the dialog falls back to its
 // plain input.
@@ -45,7 +75,7 @@ func (l *Link) enqueue(ctx context.Context, path string, payload map[string]any,
 		return 0, onConflict
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return 0, ErrBudgetSpent
+		return 0, errBudgetSpent
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return 0, peer.StatusError{Peer: App, Status: resp.Status}
@@ -69,7 +99,7 @@ func (l *Link) EnqueueReplace(ctx context.Context, imageID int64, gallery, url s
 	return err
 }
 
-func (l *Link) EnqueueHashLookup(ctx context.Context, imageID int64, gallery, backend, md5, sha256 string, background, budgeted bool) (int64, error) {
+func (l *Link) enqueueHashLookup(ctx context.Context, imageID int64, gallery, backend, md5, sha256 string, background, budgeted bool) (int64, error) {
 	return l.enqueue(ctx, "/api/v1/lookup", map[string]any{
 		"image_id": imageID, "gallery": gallery, "backend": backend, "md5": md5, "sha256": sha256,
 		"background": background, "budgeted": budgeted,
@@ -96,7 +126,7 @@ func (l *Link) GalleryRenamed(ctx context.Context, oldName, newName string) erro
 // Teardown runs remove, which drops the pairing and its token, then tells
 // monloader with the address and token read before it.
 func (l *Link) Teardown(remove func()) error {
-	base, token := l.Base(), l.cfg().Token
+	base, token := l.addr(), l.cfg().Token
 	remove()
 	err := peer.NotifyTeardown(App, base, token)
 	if err != nil {
@@ -105,12 +135,12 @@ func (l *Link) Teardown(remove func()) error {
 	return err
 }
 
-type PTRLookupImage struct {
+type ptrLookupImage struct {
 	ImageID int64  `json:"image_id"`
 	SHA256  string `json:"sha256"`
 }
 
-func (l *Link) PTRBatchLookup(ctx context.Context, gallery string, scheduled bool, images []PTRLookupImage) (map[string][]string, uint64, error) {
+func (l *Link) ptrBatchLookup(ctx context.Context, gallery string, scheduled bool, images []ptrLookupImage) (map[string][]string, uint64, error) {
 	resp, err := l.client.Post(ctx, "/api/v1/ptr/lookup", map[string]any{
 		"images": images, "gallery": gallery, "scheduled": scheduled,
 	})
@@ -121,8 +151,8 @@ func (l *Link) PTRBatchLookup(ctx context.Context, gallery string, scheduled boo
 	if resp.StatusCode == http.StatusConflict {
 		return nil, 0, ErrPTRUnavailable
 	}
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, 0, ErrPTRBatchUnsupported
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return nil, 0, errPTRBatchUnsupported
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, peer.StatusError{Peer: App, Status: resp.Status}
@@ -137,7 +167,7 @@ func (l *Link) PTRBatchLookup(ctx context.Context, gallery string, scheduled boo
 	return out.Results, out.Index, nil
 }
 
-func (l *Link) PTRIndexCursor(ctx context.Context) (uint64, error) {
+func (l *Link) ptrIndexCursor(ctx context.Context) (uint64, error) {
 	resp, err := l.client.Do(ctx, http.MethodGet, "/api/v1/ptr/status", nil)
 	if err != nil {
 		return 0, err
@@ -146,21 +176,31 @@ func (l *Link) PTRIndexCursor(ctx context.Context) (uint64, error) {
 	if resp.StatusCode != http.StatusOK {
 		return 0, peer.StatusError{Peer: App, Status: resp.Status}
 	}
-	var out struct {
-		Progress struct {
-			UpdateIndex uint64 `json:"update_index"`
-		} `json:"progress"`
-	}
+	var out ptrStatus
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return 0, err
 	}
 	return out.Progress.UpdateIndex, nil
 }
 
+type ptrStatus struct {
+	Enabled  bool `json:"enabled"`
+	Progress struct {
+		UpdateIndex uint64 `json:"update_index"`
+	} `json:"progress"`
+	State     string `json:"state"`
+	Queryable bool   `json:"queryable"`
+	Contrib   *struct {
+		Account bool `json:"account"`
+		Banned  bool `json:"banned"`
+		Failed  int  `json:"failed"`
+	} `json:"contrib"`
+}
+
 // false leaves the row in flight. An empty result is inconclusive: moving
 // the ladder on it would walk an image to "nothing found" while monloader
 // is down.
-func (l *Link) JobOutcome(ctx context.Context, jobID int64) (string, bool) {
+func (l *Link) jobOutcome(ctx context.Context, jobID int64) (string, bool) {
 	if jobID == 0 {
 		return "", true // a monloader that reports no job id
 	}
@@ -188,15 +228,13 @@ func (l *Link) JobOutcome(ctx context.Context, jobID int64) (string, bool) {
 		return "", false
 	}
 	switch job.Status {
-	case JobQueued, JobRunning:
+	case contract.JobQueued, contract.JobRunning:
 		return "", false
-	case JobCanceled, JobInterrupted:
+	case contract.JobCanceled, contract.JobInterrupted:
 		return "", true
-	case JobFailed:
-		return lookup.ResultError, true
 	}
 	for _, it := range job.Items {
-		if it.Outcome == ItemEnriched {
+		if it.Outcome == contract.OutcomeEnriched {
 			// A job over both backends cannot say which one matched; that
 			// one's enrich already concluded its own row.
 			if len(lookup.Backends(job.Backend)) > 1 {
@@ -219,10 +257,14 @@ func postJSON[T any](l *Link, ctx context.Context, path string, payload map[stri
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusConflict {
-		return nil, ErrPTRUnavailable
+		var refusal struct {
+			Code string `json:"code"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&refusal)
+		return nil, conflict{refusal.Code}
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return nil, fmt.Errorf("monloader returned %s", resp.Status)
+		return nil, peer.StatusError{Peer: App, Status: resp.Status}
 	}
 	var out T
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -271,14 +313,14 @@ func (l *Link) PTRSpellingSearch(ctx context.Context, q, mode string, limit int)
 	defer func() { _ = resp.Body.Close() }()
 	switch resp.StatusCode {
 	case http.StatusOK:
-	case http.StatusNotFound:
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
 		return nil, false, ErrNoSearch
 	case http.StatusBadRequest:
 		return nil, false, ErrSearchUnbounded
 	case http.StatusConflict:
 		return nil, false, ErrPTRUnavailable
 	default:
-		return nil, false, fmt.Errorf("monloader returned %s", resp.Status)
+		return nil, false, peer.StatusError{Peer: App, Status: resp.Status}
 	}
 	var out struct {
 		Clusters  []PTRCluster `json:"clusters"`
@@ -317,7 +359,11 @@ type ContribPreview struct {
 	PTROnly     []ContribPreviewPTROnly `json:"ptr_only"`
 }
 
-func (l *Link) PreviewContrib(ctx context.Context, sha256 string, tags, implied []string) (*ContribPreview, error) {
+func (l *Link) previewContrib(ctx context.Context, sha256 string, tags, implied []string) (*ContribPreview, error) {
+	// monloader refuses a null list; an image with nothing to send sends [].
+	if tags == nil {
+		tags = []string{}
+	}
 	return postJSON[ContribPreview](l, ctx, "/api/v1/ptr/contrib/preview",
 		map[string]any{"sha256": sha256, "tags": tags, "implied": implied})
 }
@@ -334,11 +380,18 @@ type ContribSendResponse struct {
 }
 
 func (l *Link) SendContrib(ctx context.Context, origin string, items []map[string]any) (*ContribSendResponse, error) {
-	return postJSON[ContribSendResponse](l, ctx, "/api/v1/ptr/contrib",
+	out, err := postJSON[ContribSendResponse](l, ctx, "/api/v1/ptr/contrib",
 		map[string]any{"commit": true, "origin": origin, "items": items})
+	var c conflict
+	if errors.As(err, &c) {
+		if reason, ok := contribRefusals[c.code]; ok {
+			return nil, ContribRefused(reason)
+		}
+	}
+	return out, err
 }
 
-type PairPreview struct {
+type pairPreview struct {
 	APtr        string `json:"a_ptr"`
 	BPtr        string `json:"b_ptr"`
 	Direction   string `json:"direction"`
@@ -346,7 +399,7 @@ type PairPreview struct {
 	Provisional bool   `json:"provisional"`
 }
 
-func (l *Link) PreviewPair(ctx context.Context, kind, a, b string) (*PairPreview, error) {
-	return postJSON[PairPreview](l, ctx, "/api/v1/ptr/contrib/pair-preview",
+func (l *Link) previewPair(ctx context.Context, kind, a, b string) (*pairPreview, error) {
+	return postJSON[pairPreview](l, ctx, "/api/v1/ptr/contrib/pair-preview",
 		map[string]any{"kind": kind, "a": a, "b": b})
 }

@@ -1,32 +1,10 @@
 package web
 
 import (
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/base64"
 	"mime"
 	"net/http"
 	"strings"
 )
-
-func mustRandBytes(n int) []byte {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return b
-}
-
-func (s *Server) csrfToken(sessionID string) string {
-	mac := hmac.New(sha256.New, s.csrfSecret)
-	mac.Write([]byte(sessionID))
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-}
-
-func (s *Server) validateCSRF(sessionID, token string) bool {
-	expected := s.csrfToken(sessionID)
-	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
-}
 
 func parseFormOK(w http.ResponseWriter, r *http.Request) bool {
 	if err := r.ParseForm(); err != nil {
@@ -102,7 +80,7 @@ func (s *Server) cSRFMiddleware(next http.Handler) http.Handler {
 			token = r.FormValue("_csrf")
 		}
 
-		if !s.validateCSRF(sessID, token) && !browserSameOrigin(r) {
+		if !s.sessions.ValidCSRF(sessID, token) && !browserSameOrigin(r) {
 			http.Error(w, "This page's form token is no longer valid. Copy anything unsaved, then reload the page.", http.StatusForbidden)
 			return
 		}

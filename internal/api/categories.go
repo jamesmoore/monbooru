@@ -2,14 +2,12 @@ package api
 
 import (
 	"cmp"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -47,20 +45,7 @@ func writeCategoryError(w http.ResponseWriter, err error) {
 		apiError(w, http.StatusConflict, "conflict", err.Error())
 		return
 	}
-	apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
-}
-
-func getCategory(g *library.Gallery, id int64) (models.TagCategory, error) {
-	var c models.TagCategory
-	var isBuiltin int
-	err := g.DB.Read.QueryRow(
-		`SELECT id, name, color, is_builtin FROM tag_categories WHERE id = ?`, id,
-	).Scan(&c.ID, &c.Name, &c.Color, &isBuiltin)
-	if errors.Is(err, sql.ErrNoRows) {
-		return c, tags.ErrCategoryNotFound
-	}
-	c.IsBuiltin = isBuiltin == 1
-	return c, err
+	serverError(w, err)
 }
 
 func (h *Handler) listCategories(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +119,7 @@ func (h *Handler) patchCategory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cat, err := getCategory(g, id)
+	cat, err := g.TagSvc.GetCategory(id)
 	if err != nil {
 		writeCategoryError(w, err)
 		return
@@ -152,8 +137,8 @@ func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
 		TargetID int64  `json:"target_id"`
 	}
 	// An empty body is the default move to general.
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		apiError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		refuseJSONBody(w, err)
 		return
 	}
 	action := cmp.Or(body.Action, "move")

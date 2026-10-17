@@ -17,19 +17,19 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 func (s *Server) findPairsDistance() int {
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	return s.cfg.Relations.DefaultDistance
 }
 
 func (s *Server) tagPairsEnabled() bool {
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	return s.cfg.Relations.TagPairs
 }
 
@@ -63,16 +63,17 @@ func (s *Server) settingsRelationsPost(w http.ResponseWriter, r *http.Request) {
 		threshold = config.ClampTagPairThreshold(v / 100)
 	}
 	tagPairs := r.FormValue("tag_pairs") == "on"
-	s.cfgMu.Lock()
-	before := s.cfg.Relations
-	s.cfg.Relations.DefaultDistance = d
-	s.cfg.Relations.DefaultSessionOrder = order
-	s.cfg.Relations.IncrementalOnIngest = true
-	s.cfg.Relations.TagPairs = tagPairs
-	s.cfg.Relations.TagPairThreshold = threshold
-	rc := s.cfg.Relations
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	var before, rc config.RelationsConfig
+	if err := s.withConfig(func(c *config.Config) error {
+		before = c.Relations
+		c.Relations.DefaultDistance = d
+		c.Relations.DefaultSessionOrder = order
+		c.Relations.IncrementalOnIngest = true
+		c.Relations.TagPairs = tagPairs
+		c.Relations.TagPairThreshold = threshold
+		rc = c.Relations
+		return nil
+	}); err != nil {
 		flashStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -84,9 +85,8 @@ func (s *Server) settingsRelationsPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	logx.Infof("settings: relations { distance=%d order=%s tag_pairs=%v threshold=%.2f }", d, order, tagPairs, threshold)
-	_, _ = fmt.Fprintf(w,
-		`<div class="flash flash-ok">Saved. distance=%d order=%s tag pairs=%v (%.0f%%)%s</div>`,
-		d, order, tagPairs, threshold*100, pruned)
+	writeInlineFlash(w, "ok", fmt.Sprintf("Saved. distance=%d order=%s tag pairs=%v (%.0f%%)%s",
+		d, order, tagPairs, threshold*100, pruned))
 }
 
 // Every gallery, not only the active one: the settings are app-wide but
@@ -188,16 +188,10 @@ type relationsPageData struct {
 	Counts relationsCounts
 }
 
+var browseKindByShortName = map[string]string{"alt": "alternate", "version": "version", "derivative": "derivative"}
+
 func (s *Server) browseGroupsRedirect(w http.ResponseWriter, r *http.Request) {
-	target := "/relations/browse?kind=duplicate"
-	switch r.URL.Query().Get("kind") {
-	case "alt":
-		target = "/relations/browse?kind=alternate"
-	case "version":
-		target = "/relations/browse?kind=version"
-	case "derivative":
-		target = "/relations/browse?kind=derivative"
-	}
+	target := "/relations/browse?kind=" + cmp.Or(browseKindByShortName[r.URL.Query().Get("kind")], "duplicate")
 	http.Redirect(w, r, target, http.StatusMovedPermanently)
 }
 
@@ -205,16 +199,14 @@ func (s *Server) browseGroupsRedirect(w http.ResponseWriter, r *http.Request) {
 // caller to fill from its own card walk.
 func loadRelationsCounts(cx *library.Gallery, ceiling *Ceiling, skipKind string) relationsCounts {
 	var c relationsCounts
-	get := func(q string, dst *int, args ...any) {
-		if err := cx.DB.Read.QueryRow(q, args...).Scan(dst); err != nil {
-			logx.Debugf("relations counts %q: %v", q, err)
-		}
-	}
 	count := func(table, where string, args []any, dst *int) {
 		if where != "" {
 			where = ` WHERE ` + where
 		}
-		get(`SELECT COUNT(*) FROM `+table+where, dst, args...)
+		q := `SELECT COUNT(*) FROM ` + table + where
+		if err := cx.DB.Read.QueryRow(q, args...).Scan(dst); err != nil {
+			logx.Debugf("relations counts %q: %v", q, err)
+		}
 	}
 	if n, err := cx.PhashMissingUnder(ceiling); err == nil {
 		c.PhashMissing = n
@@ -232,7 +224,7 @@ func loadRelationsCounts(cx *library.Gallery, ceiling *Ceiling, skipKind string)
 		}
 	}
 	if skipKind != "derivative" {
-		if _, total, err := loadDerivativeTreeCards(cx, ceiling); err == nil {
+		if _, _, total, err := loadDerivativeTreeCards(cx, ceiling); err == nil {
 			c.DerivativeTrees = total
 		} else {
 			logx.Debugf("relations counts derivative trees: %v", err)
@@ -288,12 +280,15 @@ func loadBrowseCardsByKind(cx *library.Gallery, kind, sort string, limit, offset
 		cards = append(cards, sliceWindow(chains, offset, limit)...)
 		walkedTotal = total
 	case "derivative":
-		trees, total, tErr := loadDerivativeTreeCards(cx, ceiling)
+		trees, sourcesOf, total, tErr := loadDerivativeTreeCards(cx, ceiling)
 		if tErr != nil {
 			return nil, 0, tErr
 		}
-		sortDerivativeCards(trees, sort)
+		sortVersionCards(trees, sort)
 		cards = append(cards, sliceWindow(trees, offset, limit)...)
+		for i := range cards {
+			cards[i].Graph = layOutDerivatives(cards[i].Members, sourcesOf)
+		}
 		walkedTotal = total
 	case "not_related":
 		where, args := ceiling.WhereTwo("a_image_id", "b_image_id")
@@ -350,7 +345,7 @@ func altSortClause(sort string) string {
 
 func sortVersionCards(cards []browseCard, sortKey string) {
 	switch sortKey {
-	case "length":
+	case "length", "size":
 		sort.SliceStable(cards, func(i, j int) bool {
 			return len(cards[i].Members) > len(cards[j].Members)
 		})
@@ -364,14 +359,6 @@ func sortVersionCards(cards []browseCard, sortKey string) {
 		}
 		sort.SliceStable(cards, func(i, j int) bool {
 			return newest(cards[i]) > newest(cards[j])
-		})
-	}
-}
-
-func sortDerivativeCards(cards []browseCard, sortKey string) {
-	if sortKey == "size" {
-		sort.SliceStable(cards, func(i, j int) bool {
-			return len(cards[i].Members) > len(cards[j].Members)
 		})
 	}
 }
@@ -396,26 +383,24 @@ func annotateBrowseCardIngestedAt(cx *library.Gallery, cards []browseCard) error
 	if len(idSet) == 0 {
 		return nil
 	}
+	type dateRow struct {
+		id       int64
+		ingested string
+	}
 	dates := map[int64]string{}
 	err := db.Chunked(slices.Collect(maps.Keys(idSet)), 500, func(chunk []int64) error {
 		placeholders, args := db.InPlaceholders(chunk)
-		rows, err := cx.DB.Read.Query(
+		rows, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(r *dateRow) []any { return []any{&r.id, &r.ingested} }),
 			`SELECT id, ingested_at FROM images WHERE id IN (`+placeholders+`)`,
 			args...,
 		)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = rows.Close() }()
-		for rows.Next() {
-			var id int64
-			var ingested string
-			if scanErr := rows.Scan(&id, &ingested); scanErr != nil {
-				return scanErr
-			}
-			dates[id] = humanISOTime(ingested)
+		for _, r := range rows {
+			dates[r.id] = humanISOTime(r.ingested)
 		}
-		return rows.Err()
+		return nil
 	})
 	if err != nil {
 		return err
@@ -467,28 +452,20 @@ func finalizeCards(cards []browseCard) ([]browseCard, int) {
 // A chain with any member above the ceiling is dropped whole, so a hidden
 // image's relations never show.
 func loadVersionChainCards(cx *library.Gallery, ceiling *Ceiling) ([]browseCard, int, error) {
-	rows, err := cx.DB.Read.Query(`SELECT child_image_id, parent_image_id, created_at FROM version_edges`)
+	type edgeMeta struct {
+		child, parent int64
+		createdAt     string
+	}
+	list, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(e *edgeMeta) []any { return []any{&e.child, &e.parent, &e.createdAt} }),
+		`SELECT child_image_id, parent_image_id, created_at FROM version_edges`)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer func() { _ = rows.Close() }()
-	type edgeMeta struct {
-		parent    int64
-		createdAt string
-	}
 	edges := map[int64]edgeMeta{}
 	childOf := map[int64]int64{} // parent -> child (UNIQUE per schema)
-	for rows.Next() {
-		var c, p int64
-		var ts string
-		if scanErr := rows.Scan(&c, &p, &ts); scanErr != nil {
-			return nil, 0, scanErr
-		}
-		edges[c] = edgeMeta{parent: p, createdAt: ts}
-		childOf[p] = c
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, err
+	for _, e := range list {
+		edges[e.child] = e
+		childOf[e.parent] = e.child
 	}
 	rootSet := map[int64]bool{}
 	for _, em := range edges {
@@ -527,27 +504,23 @@ func loadVersionChainCards(cx *library.Gallery, ceiling *Ceiling) ([]browseCard,
 
 // One card per component, which has several roots when an image was made
 // from several sources.
-func loadDerivativeTreeCards(cx *library.Gallery, ceiling *Ceiling) ([]browseCard, int, error) {
-	rows, err := cx.DB.Read.Query(`SELECT derivative_image_id, source_image_id, created_at FROM derivative_edges`)
-	if err != nil {
-		return nil, 0, err
+func loadDerivativeTreeCards(cx *library.Gallery, ceiling *Ceiling) ([]browseCard, map[int64][]int64, int, error) {
+	type edgeRow struct {
+		derivative, source int64
+		createdAt          string
 	}
-	defer func() { _ = rows.Close() }()
+	list, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(e *edgeRow) []any { return []any{&e.derivative, &e.source, &e.createdAt} }),
+		`SELECT derivative_image_id, source_image_id, created_at FROM derivative_edges`)
+	if err != nil {
+		return nil, nil, 0, err
+	}
 	derivativesOf := map[int64][]int64{}
 	sourcesOf := map[int64][]int64{}
 	derivCreated := map[int64]string{}
-	for rows.Next() {
-		var d, src int64
-		var ts string
-		if scanErr := rows.Scan(&d, &src, &ts); scanErr != nil {
-			return nil, 0, scanErr
-		}
-		derivativesOf[src] = append(derivativesOf[src], d)
-		sourcesOf[d] = append(sourcesOf[d], src)
-		derivCreated[d] = max(derivCreated[d], ts)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, err
+	for _, e := range list {
+		derivativesOf[e.source] = append(derivativesOf[e.source], e.derivative)
+		sourcesOf[e.derivative] = append(sourcesOf[e.derivative], e.source)
+		derivCreated[e.derivative] = max(derivCreated[e.derivative], e.createdAt)
 	}
 	for src := range derivativesOf {
 		sort.Slice(derivativesOf[src], func(i, j int) bool {
@@ -581,13 +554,12 @@ func loadDerivativeTreeCards(cx *library.Gallery, ceiling *Ceiling) ([]browseCar
 		cards = append(cards, browseCard{
 			Kind:      "derivative",
 			Members:   members,
-			Graph:     layOutDerivatives(members, sourcesOf),
 			Roots:     compRoots,
 			CreatedAt: humanISOTime(latestTS),
 		})
 	}
 	cards, total := finalizeCards(cards)
-	return cards, total, nil
+	return cards, sourcesOf, total, nil
 }
 
 // X coordinates are per-mille of the graph's width, not pixels, so the
@@ -738,14 +710,6 @@ func scanGroupMembers(cx *library.Gallery, table string, groupID int64) ([]int64
 	return db.QueryIDs(cx.DB.Read, `SELECT image_id FROM `+table+` WHERE group_id = ? ORDER BY image_id`, groupID)
 }
 
-var validBrowseKinds = map[string]bool{
-	"duplicate":   true,
-	"alternate":   true,
-	"version":     true,
-	"derivative":  true,
-	"not_related": true,
-}
-
 // The first entry is each kind's default.
 var browseSortsByKind = map[string][]string{
 	"duplicate":   {"recent", "size", "original_added"},
@@ -757,9 +721,6 @@ var browseSortsByKind = map[string][]string{
 
 func resolveBrowseSort(kind, requested string) string {
 	allowed := browseSortsByKind[kind]
-	if len(allowed) == 0 {
-		return "recent"
-	}
 	if slices.Contains(allowed, requested) {
 		return requested
 	}
@@ -774,7 +735,7 @@ func (s *Server) browseRelationsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := cmp.Or(r.URL.Query().Get("kind"), "duplicate")
-	if !validBrowseKinds[kind] {
+	if _, ok := browseSortsByKind[kind]; !ok {
 		s.notFoundHandler(w, r)
 		return
 	}

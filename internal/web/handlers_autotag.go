@@ -15,21 +15,27 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
-	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
-func (s *Server) spawnAutoTagJob(ids []int64, selected []tagger.TaggerStatus, logScope, itemNoun string) {
+// A non-zero imageID settles the run as that one image's.
+func (s *Server) spawnAutoTagJob(ids []int64, selected []tagger.TaggerStatus, imageID int64) {
 	cfg := s.cfgSnapshot()
 	cx := s.active()
 	peak := autotagMemoryMark()
 	go func() {
 		ctx := s.jobs.Context()
 		skipped, err := tagger.RunWithTaggers(ctx, cx.Handle, cfg, ids, selected, s.jobs, cfg.Tagger.ExecutionProvider)
-		if finished, _ := tagger.Settle(ctx, s.jobs, "", itemNoun, len(ids), skipped, err); finished {
-			peak(fmt.Sprintf("%s %d image(s)", logScope, len(ids)))
+		if imageID != 0 {
+			if finished, _ := tagger.SettleImage(ctx, s.jobs, imageID, skipped, err); finished {
+				peak(fmt.Sprintf("image #%d", imageID))
+			}
+			return
+		}
+		if finished, _ := tagger.Settle(ctx, s.jobs, "", "", len(ids), skipped, err); finished {
+			peak(fmt.Sprintf("batch %d image(s)", len(ids)))
 		}
 	}()
 }
@@ -224,10 +230,6 @@ func (s *Server) uploadTarget(w http.ResponseWriter, r *http.Request, cfg *confi
 		writeInlineFlash(w, "err", err.Error())
 		return nil, "", naming, false
 	}
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		writeInlineFlash(w, "err", "Could not create folder: "+err.Error())
-		return nil, "", naming, false
-	}
 	return cx, destDir, naming, true
 }
 
@@ -284,50 +286,37 @@ func uploadErrorReasons(unsupported, ignored, unsaved int, refused []string) str
 func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfgSnapshot()
 	if !tagger.IsAvailable(cfg) {
-		http.Error(w, "auto-tagger not available: "+tagger.UnavailableReason(cfg), http.StatusServiceUnavailable)
+		flashStatus(w, http.StatusServiceUnavailable, "Auto-tagger not available: "+tagger.UnavailableReason(cfg)+".")
 		return
 	}
 
 	if !parseFormOK(w, r) {
 		return
 	}
-	scope := strings.TrimSpace(r.FormValue("scope"))
 	taggerName := strings.TrimSpace(r.FormValue("tagger_name"))
 
 	selected, selErr := tagger.SelectForGallery(cfg, s.activeGallery(), taggerName)
 	if selErr != nil {
-		externalErr(w, r, selErr.Error(), http.StatusBadRequest)
+		flashStatus(w, http.StatusBadRequest, selErr.Error())
 		return
 	}
 
-	var ids []int64
-	if scope == "search" {
-		sc := search.NewScope(search.Parse(r.FormValue("q")), readRatingCookie(r))
-		err := sc.Stream(s.source(), func(id int64) error {
-			ids = append(ids, id)
-			return nil
-		})
-		if err != nil {
-			logx.Errorf("autotag search: %v", err)
-			hxErr(w, r, "Search error.", "search error", http.StatusInternalServerError)
-			return
-		}
-	} else {
-		ids = parseIDList(r.Form["ids"])
+	ids, ok := s.resolveBatchScope(w, r, "autotag", false)
+	if !ok {
+		return
 	}
-
 	if len(ids) == 0 {
-		hxErr(w, r, "No images to tag.", "no images selected", http.StatusBadRequest)
+		flashStatus(w, http.StatusBadRequest, "No images to tag.")
 		return
 	}
 
 	if err := s.jobs.Start(models.JobTypeAutotag); err != nil {
-		hxErr(w, r, "A job is already running.", "job already running", http.StatusConflict)
+		flashStatus(w, http.StatusConflict, "A job is already running.")
 		return
 	}
 	s.jobs.Update(0, len(ids), "starting (loading model may take a few seconds)…")
 
-	s.spawnAutoTagJob(ids, selected, "batch", "")
+	s.spawnAutoTagJob(ids, selected, 0)
 
 	if isHTMXRequest(r) {
 		setFlashHeader(w, fmt.Sprintf("Auto-tagger started for %d image(s).", len(ids)), "ok", nil)
@@ -363,15 +352,7 @@ func (s *Server) autotagImage(w http.ResponseWriter, r *http.Request) {
 	}
 	s.jobs.Update(0, 1, "starting (loading model may take a few seconds)…")
 
-	cx := s.active()
-	peak := autotagMemoryMark()
-	go func() {
-		ctx := s.jobs.Context()
-		skipped, err := tagger.RunWithTaggers(ctx, cx.Handle, cfg, []int64{id}, selected, s.jobs, cfg.Tagger.ExecutionProvider)
-		if finished, _ := tagger.SettleImage(ctx, s.jobs, id, skipped, err); finished {
-			peak(fmt.Sprintf("image #%d", id))
-		}
-	}()
+	s.spawnAutoTagJob([]int64{id}, selected, id)
 
 	if isHTMXRequest(r) {
 		setFlashHeader(w, "Auto-tagger started for this image.", "ok", nil)

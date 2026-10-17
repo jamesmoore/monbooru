@@ -88,31 +88,12 @@ func tokenize(query string) []token {
 
 		j := i
 		if query[j] == '"' {
-			j++
-			for j < len(query) && query[j] != '"' {
-				if query[j] == '\\' && j+1 < len(query) {
-					j += 2
-					continue
-				}
-				j++
-			}
-			if j < len(query) {
-				j++
-			}
+			j = skipQuoted(query, j)
 		} else {
 			for j < len(query) && query[j] != ' ' && query[j] != '\t' {
-				if query[j] == ':' && j+1 < len(query) && query[j+1] == '"' {
-					j += 2
-					for j < len(query) && query[j] != '"' {
-						if query[j] == '\\' && j+1 < len(query) {
-							j += 2
-							continue
-						}
-						j++
-					}
-					if j < len(query) {
-						j++
-					}
+				opensQuote := query[j] == ':' || query[j] == '=' && strings.IndexByte(query[i:j], ':') > 0
+				if opensQuote && j+1 < len(query) && query[j+1] == '"' {
+					j = skipQuoted(query, j+1)
 					break
 				}
 				j++
@@ -137,6 +118,22 @@ func tokenize(query string) []token {
 		tokens = append(tokens, token{kind: tokTag, val: term})
 	}
 	return tokens
+}
+
+// j is the opening quote; the result is the index past the closing one.
+func skipQuoted(query string, j int) int {
+	j++
+	for j < len(query) && query[j] != '"' {
+		if query[j] == '\\' && j+1 < len(query) {
+			j += 2
+			continue
+		}
+		j++
+	}
+	if j < len(query) {
+		j++
+	}
+	return j
 }
 
 type parser struct {
@@ -219,6 +216,8 @@ func (p *parser) parseTerm() Expr {
 		val := t.val[colonIdx+1:]
 		if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
 			val = unescapeQuoted(val[1 : len(val)-1])
+		} else if eq := strings.Index(val, `="`); eq > 0 && len(val) >= eq+3 && val[len(val)-1] == '"' {
+			val = val[:eq+1] + unescapeQuoted(val[eq+2:len(val)-1])
 		}
 		return FilterExpr{Key: key, Val: val}
 

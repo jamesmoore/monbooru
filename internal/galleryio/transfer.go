@@ -10,23 +10,31 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/galleryio/compatibility"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // TransferOneImage merges into a target row with the same sha, else
 // copies and ingests the file; removeAfter then deletes the source, whose
 // files changed since indexing it keeps and counts.
 func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool) (kept int, err error) {
-	var sha, canonPath, folderPath, origin, note, originalSource string
+	var canonPath, folderPath, origin, note, originalSource string
 	var isFav, isMissing int
+	var indexed gallery.Indexed
 	if err := srcCx.DB.Read.QueryRow(
-		`SELECT sha256, canonical_path, folder_path, origin, note, original_source, is_favorited, is_missing FROM images WHERE id = ?`, id,
-	).Scan(&sha, &canonPath, &folderPath, &origin, &note, &originalSource, &isFav, &isMissing); err != nil {
+		`SELECT i.sha256, i.canonical_path, i.folder_path, i.origin, i.note, i.original_source, i.is_favorited, i.is_missing,
+		        i.file_size, COALESCE(ip.mtime_unix, 0), COALESCE(ip.mtime_nsec, 0)
+		   FROM images i LEFT JOIN image_paths ip ON ip.image_id = i.id AND ip.is_canonical = 1
+		  WHERE i.id = ?`, id,
+	).Scan(&indexed.SHA256, &canonPath, &folderPath, &origin, &note, &originalSource, &isFav, &isMissing,
+		&indexed.Size, &indexed.Mtime, &indexed.MtimeNano); err != nil {
 		return 0, fmt.Errorf("load image %d: %w", id, err)
 	}
-	if isMissing == 1 {
+	sha := indexed.SHA256
+	srcInfo, statErr := os.Stat(canonPath)
+	if isMissing == 1 || statErr != nil {
 		return 0, fmt.Errorf("file missing from disk")
 	}
 
@@ -47,25 +55,34 @@ func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool)
 	if err := dstCx.Edit(func(*db.DB) error {
 		switch lookupErr {
 		case nil:
-			same := sameFile(canonPath, dstCanon)
+			same := gallery.SameFile(srcInfo, dstCanon)
 			if same && removeAfter {
 				return errSameFileMove
 			}
-			// Copying a file onto itself truncates it before the copy reads it.
-			restore := dstMissing == 1 && !same
-			if !restore {
-				// The flag trails the disk until the next sync.
-				if _, statErr := os.Stat(dstCanon); os.IsNotExist(statErr) {
-					restore = true
+			// The flag trails the disk until the next sync.
+			_, dstStatErr := os.Stat(dstCanon)
+			if dstMissing == 1 && !os.IsNotExist(dstStatErr) {
+				got, err := gallery.HashFile(dstCanon)
+				if err != nil {
+					return fmt.Errorf("read the target's file %q: %w", dstCanon, err)
+				}
+				if got != sha {
+					return fmt.Errorf("the target's file %q now holds other bytes; sync the target first", dstCanon)
+				}
+				if _, err := gallery.SetMissing(dstCx.DB, dstID, false); err != nil {
+					return err
 				}
 			}
 			// Restore a missing file, or the merge passes on an unviewable row.
-			if restore {
+			if os.IsNotExist(dstStatErr) {
 				if !gallery.NamedInside(dstCx.GalleryPath, dstCanon) {
 					return fmt.Errorf("refusing to restore %q outside gallery root %q", dstCanon, dstCx.GalleryPath)
 				}
 				if err := dstCx.Boundary().Check(dstCanon); err != nil {
 					return fmt.Errorf("refusing to restore %q: %w", dstCanon, err)
+				}
+				if err := gallery.ChangedSinceIndexed(canonPath, indexed); err != nil {
+					return fmt.Errorf("refusing to restore from %q: %w", canonPath, err)
 				}
 				if err := os.MkdirAll(filepath.Dir(dstCanon), 0o755); err != nil {
 					return fmt.Errorf("mkdir dest: %w", err)
@@ -84,7 +101,7 @@ func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool)
 				return err
 			}
 			var landed library.LandResult
-			if sameFile(canonPath, safeBase) {
+			if gallery.SameFile(srcInfo, safeBase) {
 				// Both galleries read this folder: a copy beside it would be
 				// a second file both of them index.
 				if removeAfter {
@@ -122,15 +139,6 @@ func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool)
 
 var errSameFileMove = errors.New("the target gallery reads this same file: moving it would delete it")
 
-func sameFile(a, b string) bool {
-	ai, err := os.Stat(a)
-	if err != nil {
-		return false
-	}
-	bi, err := os.Stat(b)
-	return err == nil && os.SameFile(ai, bi)
-}
-
 type transferTagGroup struct {
 	isAuto     bool
 	taggerName string
@@ -146,7 +154,7 @@ func transferTagGroups(srcCx, dstCx gallery.Handle, id int64) ([]transferTagGrou
 		 FROM image_tags it
 		 JOIN tags t ON t.id = it.tag_id
 		 JOIN tag_categories tc ON tc.id = t.category_id
-		 WHERE it.image_id = ? AND t.is_alias = 0`, id)
+		 WHERE it.image_id = ? AND t.is_alias = 0 AND it.is_implied = 0`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +190,7 @@ func transferTagGroups(srcCx, dstCx gallery.Handle, id int64) ([]transferTagGrou
 			v := conf.Float64
 			c = &v
 		}
-		groups[i].tokens = append(groups[i].tokens, tagToken(cat, name))
+		groups[i].tokens = append(groups[i].tokens, compatibility.TagToken(cat, name))
 		groups[i].confs = append(groups[i].confs, c)
 	}
 	return groups, rows.Err()

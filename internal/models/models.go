@@ -4,10 +4,11 @@ package models
 
 import (
 	"net/url"
+	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 )
-
-func urlQueryEscape(s string) string { return url.QueryEscape(s) }
 
 const (
 	FileTypeJPEG = "jpeg"
@@ -41,16 +42,58 @@ const (
 // MediaKinds lists every bucket MediaKind returns.
 var MediaKinds = []string{"image", "archive", "animated"}
 
-func MediaKind(fileType string) string {
-	switch fileType {
-	case FileTypeJPEG, FileTypePNG, FileTypeWEBP, FileTypeAVIF, FileTypeJXL:
-		return "image"
-	case FileTypeCBZ:
-		return "archive"
-	case FileTypeGIF, FileTypeMP4, FileTypeWEBM:
-		return "animated"
+// FileType is one format ingest stores. Exts[0] is the extension a file
+// monbooru names itself takes; Accept are file-picker tokens beside MIME.
+type FileType struct {
+	Name        string
+	Exts        []string
+	MIME        string
+	Kind        string
+	Video       bool
+	FFmpegStill bool // a still only ffmpeg decodes
+	PageImage   bool // read as a page inside a cbz
+	Accept      []string
+}
+
+// FileTypes is every format ingest stores; adding one is a row here plus
+// its decode path.
+var FileTypes = []FileType{
+	{Name: FileTypeJPEG, Exts: []string{".jpg", ".jpeg"}, MIME: "image/jpeg", Kind: "image", PageImage: true},
+	{Name: FileTypePNG, Exts: []string{".png"}, MIME: "image/png", Kind: "image", PageImage: true},
+	{Name: FileTypeWEBP, Exts: []string{".webp"}, MIME: "image/webp", Kind: "image", PageImage: true},
+	// The bare extensions reach a picker on an OS with no MIME entry for
+	// the format.
+	{Name: FileTypeAVIF, Exts: []string{".avif"}, MIME: "image/avif", Kind: "image", FFmpegStill: true, PageImage: true, Accept: []string{".avif"}},
+	{Name: FileTypeJXL, Exts: []string{".jxl"}, MIME: "image/jxl", Kind: "image", FFmpegStill: true, PageImage: true, Accept: []string{".jxl"}},
+	{Name: FileTypeGIF, Exts: []string{".gif"}, MIME: "image/gif", Kind: "animated", PageImage: true},
+	{Name: FileTypeMP4, Exts: []string{".mp4"}, MIME: "video/mp4", Kind: "animated", Video: true},
+	{Name: FileTypeWEBM, Exts: []string{".webm"}, MIME: "video/webm", Kind: "animated", Video: true},
+	// Served as what the stdlib sniffer already answers for a PK archive.
+	{Name: FileTypeCBZ, Exts: []string{".cbz", ".zip"}, MIME: "application/zip", Kind: "archive", Accept: []string{"application/vnd.comicbook+zip", "application/x-cbz"}},
+}
+
+func LookupFileType(name string) (FileType, bool) {
+	for _, ft := range FileTypes {
+		if ft.Name == name {
+			return ft, true
+		}
+	}
+	return FileType{}, false
+}
+
+func ExtFileType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, ft := range FileTypes {
+		if slices.Contains(ft.Exts, ext) {
+			return ft.Name
+		}
 	}
 	return ""
+}
+
+func MediaKind(fileType string) string {
+	ft, _ := LookupFileType(fileType)
+	return ft.Kind
 }
 
 type Image struct {
@@ -280,15 +323,15 @@ type SavedSearch struct {
 
 // HRef must match the query parameters the gallery handler reads.
 func (s SavedSearch) HRef() string {
-	out := "/?q=" + urlQueryEscape(s.Query)
+	out := "/?q=" + url.QueryEscape(s.Query)
 	if s.Sort != "" {
-		out += "&sort=" + urlQueryEscape(s.Sort)
+		out += "&sort=" + url.QueryEscape(s.Sort)
 	}
 	if s.Order != "" {
-		out += "&order=" + urlQueryEscape(s.Order)
+		out += "&order=" + url.QueryEscape(s.Order)
 	}
 	if s.Seed != "" {
-		out += "&seed=" + urlQueryEscape(s.Seed)
+		out += "&seed=" + url.QueryEscape(s.Seed)
 	}
 	return out
 }

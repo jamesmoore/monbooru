@@ -1,6 +1,4 @@
-// Package desktop is the per-OS side of the -desktop profile. monloader
-// carries a copy, with internal/fsx/exedir.go, kept in step by hand: a fix
-// here belongs there too.
+// Package desktop is the per-OS side of the -desktop profile.
 package desktop
 
 import (
@@ -10,8 +8,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"github.com/monbooru/monbooru/internal/fsx"
 )
 
 type Layout struct {
@@ -36,7 +32,7 @@ func Resolve(app, explicitConfig string) (Layout, error) {
 		// folder is not seeded.
 		if !Sandboxed() {
 			if dir := InstallDir(); dir != "" {
-				if p := filepath.Join(dir, app+".toml"); fsx.IsFile(p) {
+				if p := filepath.Join(dir, app+".toml"); IsFile(p) {
 					l.ConfigPath, l.Portable = p, true
 					l.DataDir = filepath.Join(dir, "data")
 				}
@@ -95,7 +91,7 @@ func Program() string {
 	return exe
 }
 
-// InstallDir is not for bundled tools: fsx.ExeDir has to keep pointing
+// InstallDir is not for bundled tools: ExeDir has to keep pointing
 // inside the AppImage mount.
 func InstallDir() string {
 	p := Program()
@@ -109,7 +105,7 @@ func Sandboxed() bool {
 	if os.Getenv("FLATPAK_ID") != "" {
 		return true
 	}
-	return fsx.IsFile("/.flatpak-info")
+	return IsFile("/.flatpak-info")
 }
 
 func PicturesDir() string {

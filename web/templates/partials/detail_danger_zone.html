@@ -12,10 +12,10 @@
             onclick="openPlaceImageDialog()">Rename / move...</button>
     <button class="btn-danger"
             id="delete-image-btn"
-            hx-delete="/images/{{.ImageID}}?back_q={{urlQ .BackQuery}}&back_sort={{.BackSort}}&back_order={{.BackOrder}}{{if .BackPage}}&back_page={{.BackPage}}{{end}}{{if .BackSeed}}&back_seed={{.BackSeed}}{{end}}{{if .Ref}}&ref={{.Ref}}{{end}}"
+            hx-delete="/images/{{.ImageID}}?ref={{.Ref}}{{.BackKVQS}}"
             hx-swap="none"
             hx-confirm="Delete this image?"
-            data-confirm-danger="{{if .ExtraPaths}}Deletes {{add .ExtraPaths 1}} files: this one and {{.ExtraPaths}} identical cop{{if eq .ExtraPaths 1}}y{{else}}ies{{end}} filed elsewhere. {{end}}Files are permanently deleted from disk. This cannot be undone."
+            data-confirm-danger="{{if .RewrittenBy}}The file stays on disk: it holds image #{{.RewrittenBy}}'s bytes, and the next sync gives it to #{{.RewrittenBy}}.{{if .ExtraPaths}} Its identical cop{{if eq .ExtraPaths 1}}y{{else}}ies{{end}} filed elsewhere {{if eq .ExtraPaths 1}}is{{else}}are{{end}} deleted.{{end}}{{else}}{{if .ExtraPaths}}Deletes {{add .ExtraPaths 1}} files: this one and {{.ExtraPaths}} identical cop{{if eq .ExtraPaths 1}}y{{else}}ies{{end}} filed elsewhere. {{end}}Files are permanently deleted from disk.{{end}} This cannot be undone."
             data-confirm-ok="Delete">Delete image</button>
   </div>
 
@@ -25,7 +25,7 @@
     <form id="remove-tags-form" onsubmit="event.preventDefault(); confirmRemoveTags();">
       <div class="field">
         {{if .ImageSources}}
-        <label style="display:block"><input type="radio" name="mode" value="source"> Tags from a source</label>
+        <label><input type="radio" name="mode" value="source"> Tags from a source</label>
         <div class="field" style="margin: 4px 0 8px 22px">
           <select id="remove-tags-source" class="upload-wide-input">
             {{range .ImageSources}}<option value="{{.}}">{{.}}</option>{{end}}
@@ -33,16 +33,16 @@
         </div>
         {{end}}
         {{if .ImageTaggers}}
-        <label style="display:block"><input type="radio" name="mode" value="tagger"> Tags from an auto-tagger</label>
+        <label><input type="radio" name="mode" value="tagger"> Tags from an auto-tagger</label>
         <div class="field" style="margin: 4px 0 8px 22px">
           <select id="remove-tags-tagger" class="upload-wide-input">
             {{range .ImageTaggers}}<option value="{{.}}">{{.}}</option>{{end}}
           </select>
         </div>
         {{end}}
-        {{if .HasUserTags}}<label style="display:block"><input type="radio" name="mode" value="user"> All user tags</label>{{end}}
-        {{if .HasStaleTags}}<label style="display:block"><input type="radio" name="mode" value="stale"> Stale tags</label>{{end}}
-        <label style="display:block"><input type="radio" name="mode" value="all"> All tags</label>
+        {{if .HasUserTags}}<label><input type="radio" name="mode" value="user"> All user tags</label>{{end}}
+        {{if .HasStaleTags}}<label><input type="radio" name="mode" value="stale"> Stale tags</label>{{end}}
+        <label><input type="radio" name="mode" value="all"> All tags</label>
       </div>
       {{template "dialog_actions" dict "ID" "remove-tags-dialog" "Submit" "Remove" "Class" "btn-warning"}}
     </form>
@@ -61,8 +61,7 @@
              hx-get="/internal/name/preview"
              hx-trigger="input delay:200ms from:#place-image-folder, input delay:200ms from:#place-image-name, preview"
              hx-target="this"
-             hx-vals='js:{scope: "place", ids: "{{.ImageID}}", folder: document.getElementById("place-image-folder").value, name: document.getElementById("place-image-name").value}'
-             hx-swap="innerHTML"></div>
+             hx-vals='js:{scope: "place", ids: "{{.ImageID}}", folder: document.getElementById("place-image-folder").value, name: document.getElementById("place-image-name").value}'></div>
       </div>
       <div id="place-image-error"></div>
       {{template "dialog_actions" dict "ID" "place-image-dialog" "Submit" "Rename / move"}}

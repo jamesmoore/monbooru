@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -38,11 +38,11 @@ type placement struct {
 func plan(database *db.DB, b *Boundary, id int64, folder, name *string) (placement, error) {
 	var p placement
 	if name != nil {
-		p.base = strings.TrimSpace(*name)
-		if p.base == "" || p.base != filepath.Base(p.base) || p.base == "." || p.base == ".." {
-			return p, fmt.Errorf("invalid file name %q", p.base)
+		base := strings.TrimSpace(*name)
+		if base != filepath.Base(base) || base == "." || !filepath.IsLocal(base) {
+			return p, fmt.Errorf("invalid file name %q", base)
 		}
-		p.base = TruncateFilename(p.base, maxNameBytes)
+		p.base = TruncateFilename(base, maxNameBytes)
 	}
 
 	oldCanonical, oldFolder, err := loadMoveSource(database, b, id)
@@ -160,7 +160,7 @@ func PlaceImage(database *db.DB, b *Boundary, id int64, folder, name *string) (*
 
 // An empty dropOldPath demotes the current canonical to an alias instead
 // of dropping it, as a reactivation wants.
-func repointCanonical(tx *sql.Tx, id int64, newPath, newFolder, dropOldPath string) error {
+func repointCanonical(tx *sql.Tx, id int64, newPath, newFolder, dropOldPath string, mtime, mtimeNano int64) error {
 	var owner int64
 	switch err := tx.QueryRow(
 		`SELECT image_id FROM image_paths WHERE path = ? AND image_id != ?`, newPath, id,
@@ -191,8 +191,9 @@ func repointCanonical(tx *sql.Tx, id int64, newPath, newFolder, dropOldPath stri
 		return fmt.Errorf("drop old canonical: %w", err)
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 1)
-		 ON CONFLICT(path) DO UPDATE SET is_canonical = 1`, id, newPath,
+		`INSERT INTO image_paths (image_id, path, is_canonical, mtime_unix, mtime_nsec) VALUES (?, ?, 1, ?, ?)
+		 ON CONFLICT(path) DO UPDATE SET is_canonical = 1, mtime_unix = excluded.mtime_unix, mtime_nsec = excluded.mtime_nsec`,
+		id, newPath, mtime, mtimeNano,
 	); err != nil {
 		return fmt.Errorf("install new canonical: %w", err)
 	}
@@ -271,12 +272,7 @@ func commitRename(database *db.DB, id int64, oldCanonical, newPath string, newFo
 		_ = os.Remove(newPath)
 		return fmt.Errorf("rename file: %w", err)
 	}
-	err := func() error {
-		tx, err := database.Write.Begin()
-		if err != nil {
-			return fmt.Errorf("begin place tx: %w", err)
-		}
-		defer func() { _ = tx.Rollback() }()
+	err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
 		update, args := `UPDATE images SET canonical_path = ? WHERE id = ?`, []any{newPath, id}
 		if newFolder != nil {
 			update = `UPDATE images SET canonical_path = ?, folder_path = ? WHERE id = ?`
@@ -296,11 +292,8 @@ func commitRename(database *db.DB, id int64, oldCanonical, newPath string, newFo
 		); err != nil {
 			return fmt.Errorf("update image_paths row: %w", err)
 		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit place tx: %w", err)
-		}
 		return nil
-	}()
+	})
 	if err != nil {
 		if rnErr := moveIntoPlace(newPath, oldCanonical); rnErr != nil {
 			logx.Errorf("place: reverse rename for %d after a failed update: %v (original: %v)", id, rnErr, err)

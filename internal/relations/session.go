@@ -3,7 +3,7 @@ package relations
 import (
 	"database/sql"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 const DefaultSessionOrder = "smallest_distance_first"
@@ -43,7 +43,7 @@ func (s *Service) SessionOrder() string {
 }
 
 func (s *Service) SetSessionOrder(mode string) {
-	if _, err := s.exec(
+	if _, err := s.db.Write.Exec(
 		`INSERT INTO relation_session (id, order_mode) VALUES (1, ?)
 		 ON CONFLICT(id) DO UPDATE SET order_mode = excluded.order_mode`,
 		mode,
@@ -55,7 +55,7 @@ func (s *Service) SetSessionOrder(mode string) {
 // SkipPair keeps the pair queued but out of the walk until ResetSkipped,
 // so a skip always moves forward.
 func (s *Service) SkipPair(a, b int64, at string) error {
-	_, err := s.exec(
+	_, err := s.db.Write.Exec(
 		`UPDATE potential_relation_pairs SET skipped_at = ? WHERE a_image_id = ? AND b_image_id = ?`,
 		at, a, b,
 	)
@@ -63,7 +63,7 @@ func (s *Service) SkipPair(a, b int64, at string) error {
 }
 
 func (s *Service) DropQueuedPair(a, b int64) error {
-	_, err := s.exec(
+	_, err := s.db.Write.Exec(
 		`DELETE FROM potential_relation_pairs WHERE a_image_id = ? AND b_image_id = ?`, a, b,
 	)
 	return err

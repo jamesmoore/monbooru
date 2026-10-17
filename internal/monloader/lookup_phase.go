@@ -10,9 +10,9 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // monloader's per-request cap for a batch lookup.
@@ -28,7 +28,7 @@ func LookupMD5(ctx context.Context, cx *library.Gallery, imageID int64, stored s
 const onlineLookupChunk = 100
 
 func (l *Link) runPTRLookupPhase(ctx context.Context, cx *library.Gallery) (checked, matched int, err error) {
-	cursor, cerr := l.PTRIndexCursor(ctx)
+	cursor, cerr := l.ptrIndexCursor(ctx)
 	if cerr != nil {
 		return 0, 0, cerr
 	}
@@ -49,11 +49,11 @@ func (l *Link) runPTRLookupPhase(ctx context.Context, cx *library.Gallery) (chec
 		if len(batch) == 0 {
 			continue
 		}
-		images := make([]PTRLookupImage, len(batch))
+		images := make([]ptrLookupImage, len(batch))
 		for i, c := range batch {
-			images[i] = PTRLookupImage{ImageID: c.ImageID, SHA256: c.SHA256}
+			images[i] = ptrLookupImage{ImageID: c.ImageID, SHA256: c.SHA256}
 		}
-		results, answered, lerr := l.PTRBatchLookup(ctx, cx.Name, true, images)
+		results, answered, lerr := l.ptrBatchLookup(ctx, cx.Name, true, images)
 		if lerr != nil {
 			return checked, matched, lerr
 		}
@@ -71,7 +71,7 @@ func (l *Link) runPTRLookupPhase(ctx context.Context, cx *library.Gallery) (chec
 		if aerr != nil {
 			return checked, matched, aerr
 		}
-		l.jobs.Update(checked, checked+len(batch), fmt.Sprintf("[%s] PTR lookup…", cx.Name))
+		l.jobs.Update(min(start+ptrLookupChunk, len(ids)), len(ids), fmt.Sprintf("[%s] PTR lookup…", cx.Name))
 	}
 	return checked, matched, nil
 }
@@ -133,7 +133,7 @@ func (l *Link) runOnlineLookupPhase(ctx context.Context, cx *library.Gallery) (o
 		if err != nil {
 			return res, err
 		}
-		for _, c := range batch {
+		for i, c := range batch {
 			if ctx.Err() != nil {
 				break
 			}
@@ -145,7 +145,7 @@ func (l *Link) runOnlineLookupPhase(ctx context.Context, cx *library.Gallery) (o
 			}
 			eerr := l.EnqueueLookup(ctx, cx, c.ImageID, lookup.BackendBooru, md5, c.SHA256, true, true)
 			switch {
-			case errors.Is(eerr, ErrBudgetSpent):
+			case errors.Is(eerr, errBudgetSpent):
 				res.budgetSpent = true
 				res.stillDue = dueLookupCount(cx, lookup.BackendBooru)
 				return res, nil
@@ -156,7 +156,7 @@ func (l *Link) runOnlineLookupPhase(ctx context.Context, cx *library.Gallery) (o
 				return res, eerr
 			}
 			res.queued++
-			l.jobs.Update(res.queued, res.queued+len(batch), fmt.Sprintf("[%s] online lookup…", cx.Name))
+			l.jobs.Update(start+i+1, len(ids), fmt.Sprintf("[%s] online lookup…", cx.Name))
 		}
 	}
 	res.stillDue = dueLookupCount(cx, lookup.BackendBooru)
@@ -203,7 +203,7 @@ func onlineDroppedLine(res onlineLookupResult) string {
 
 func ptrPhaseLine(checked, matched int, err error, cancelled bool) string {
 	switch {
-	case errors.Is(err, ErrPTRBatchUnsupported):
+	case errors.Is(err, errPTRBatchUnsupported):
 		return "PTR lookup skipped: " + err.Error() + "."
 	case cancelled:
 		return fmt.Sprintf("PTR lookup cancelled (%d checked, %d matched)", checked, matched)
@@ -223,7 +223,7 @@ func (l *Link) LookupDue(ctx context.Context, cx *library.Gallery, ptrOn, booruO
 			parts = append(parts, "PTR lookup skipped: the index is not ready on monloader.")
 		} else {
 			checked, matched, err := l.runPTRLookupPhase(ctx, cx)
-			failed = err != nil && !errors.Is(err, ErrPTRBatchUnsupported) && ctx.Err() == nil
+			failed = err != nil && !errors.Is(err, errPTRBatchUnsupported) && ctx.Err() == nil
 			parts = append(parts, ptrPhaseLine(checked, matched, err, ctx.Err() != nil))
 		}
 	}
@@ -250,7 +250,7 @@ func (l *Link) LookupPTR(ctx context.Context, cx *library.Gallery) ([]string, er
 	checked, matched, err := l.runPTRLookupPhase(ctx, cx)
 	summary := "[" + cx.Name + "] " + ptrPhaseLine(checked, matched, err, ctx.Err() != nil)
 	switch {
-	case errors.Is(err, ErrPTRBatchUnsupported), ctx.Err() != nil:
+	case errors.Is(err, errPTRBatchUnsupported), ctx.Err() != nil:
 		l.jobs.Complete(summary)
 		return nil, nil
 	case err != nil:

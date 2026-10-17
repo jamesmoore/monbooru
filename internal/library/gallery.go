@@ -19,9 +19,9 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/relations"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -37,6 +37,7 @@ type Gallery struct {
 	// A lazy read stamps what it stores with the generation it read before
 	// its query, so a value taken before an invalidation cannot outlive it.
 	cacheGen          atomic.Uint64
+	phashGen          atomic.Uint64
 	folderTreeAll     atomic.Pointer[stamped[[]gallery.FolderNode]]
 	sourceLabelCounts atomic.Pointer[stamped[[]gallery.SourceLabelCount]]
 
@@ -76,6 +77,7 @@ func (cx *Gallery) InvalidateCaches() {
 		return
 	}
 	cx.cacheGen.Add(1)
+	cx.phashGen.Add(1)
 	cx.folderTreeAll.Store(nil)
 	cx.sourceLabelCounts.Store(nil)
 	cx.inboxCountUnder.Store(nil)
@@ -186,7 +188,7 @@ func (cx *Gallery) InboxCountUnder(c *Ceiling) (int, error) {
 func (cx *Gallery) PhashMissingUnder(c *Ceiling) (int, error) {
 	return ceilingCached(c,
 		func() (int, error) { return okErr(cx.tallies.PhashMissing()) },
-		&cx.cacheGen, &cx.phashMissingUnder,
+		&cx.phashGen, &cx.phashMissingUnder,
 		func() (int, error) { return gallery.PhashMissingUnder(cx.DB, c.RankFilter()) })
 }
 
@@ -196,7 +198,7 @@ func (cx *Gallery) invalidatePhashMissing() {
 	if cx == nil {
 		return
 	}
-	cx.cacheGen.Add(1)
+	cx.phashGen.Add(1)
 	cx.tallies.InvalidatePhashMissing()
 	cx.phashMissingUnder.Store(nil)
 	cx.cache.Drop()

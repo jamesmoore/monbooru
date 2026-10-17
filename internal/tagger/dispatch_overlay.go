@@ -51,7 +51,7 @@ func UpdateDispatchOverlay(modelPath, taggerName string, mutate func(map[string]
 // deleted: the file existing is what "differs from stock" means.
 func SaveDispatchOverlay(modelPath, taggerName string, rules []DispatchEntry) error {
 	embedded := map[string]DispatchEntry{}
-	for _, e := range EmbeddedDispatchRules(taggerName) {
+	for _, e := range DefaultDispatchRules(modelPath, taggerName) {
 		embedded[e.Source] = e
 	}
 	kept := make([]DispatchEntry, 0, len(rules))

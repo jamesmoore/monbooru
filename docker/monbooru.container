@@ -17,7 +17,7 @@ NoNewPrivileges=true
 DropCapability=ALL
 AddCapability=CHOWN DAC_OVERRIDE
 
-Volume=/path/to/your/models:/models:ro
+Volume=/path/to/your/models:/models
 Volume=/path/to/your/gallery:/gallery
 # Additional galleries (need to be mounted in settings)
 #Volume=/path/to/your/gallery2:/gallery2
@@ -37,3 +37,4 @@ HealthOnFailure=kill
 
 # To install monloader, check https://github.com/monbooru/monloader
 # install it alongside this unit to pull from supported booru sites.
+#Network=monbooru.network

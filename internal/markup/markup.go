@@ -215,10 +215,10 @@ func renderNodes(b *strings.Builder, nodes []node, res Resolver) {
 		case nodeText:
 			b.WriteString(html.EscapeString(n.text))
 		case nodeMark:
-			open, closing := markElement(n.name)
-			b.WriteString(open)
+			m := marks[n.name]
+			b.WriteString(m.open)
 			renderNodes(b, n.child, res)
-			b.WriteString(closing)
+			b.WriteString(m.closing)
 		case nodeTag:
 			renderTag(b, n, res)
 		case nodeURL:
@@ -240,11 +240,6 @@ var marks = markVocabulary{
 	"s":    {"<s>", "</s>"},
 	"code": {"<code>", "</code>"},
 	"tn":   {`<span class="mk-tn">`, "</span>"},
-}
-
-func markElement(name string) (open, closing string) {
-	m := marks[name]
-	return m.open, m.closing
 }
 
 func renderTag(b *strings.Builder, n node, res Resolver) {

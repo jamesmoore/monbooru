@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // Capped at three: the job summary is one line and the only place they show.
@@ -77,6 +77,9 @@ func (s *Server) resolveTagScope(r *http.Request) ([]int64, error) {
 }
 
 func (s *Server) startTagScopeRun(w http.ResponseWriter, r *http.Request, run func(ids []int64)) {
+	if !parseFormOK(w, r) {
+		return
+	}
 	ids, err := s.resolveTagScope(r)
 	if err != nil {
 		flashStatus(w, http.StatusBadRequest, err.Error())
@@ -199,9 +202,6 @@ func (s *Server) runBatchTagAlias(ids []int64, canonID int64) {
 }
 
 func (s *Server) batchMergeFoldedPost(w http.ResponseWriter, r *http.Request) {
-	if !parseFormOK(w, r) {
-		return
-	}
 	s.startTagScopeRun(w, r, s.runMergeFolded)
 }
 

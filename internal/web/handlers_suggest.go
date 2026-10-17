@@ -11,10 +11,10 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/searchkw"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -48,27 +48,12 @@ func (s *Server) renderSearchSuggest(w http.ResponseWriter, rows []suggestItem) 
 }
 
 func (s *Server) suggestLabels(q db.Querier, logLabel, query string, args ...any) []string {
-	rows, err := q.Query(query, args...)
+	out, err := db.QueryStrings(q, query, args...)
 	if err != nil {
 		logx.Warnf("%s suggest: %v", logLabel, err)
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
-	var out []string
-	for rows.Next() {
-		var v string
-		if err := rows.Scan(&v); err != nil {
-			logx.Warnf("%s suggest: scan: %v", logLabel, err)
-			continue
-		}
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		logx.Warnf("%s suggest: iter: %v", logLabel, err)
-	}
-	return out
+	return slices.DeleteFunc(out, func(v string) bool { return v == "" })
 }
 
 // The NOCASE range seeks the index where LIKE 'prefix%' would walk all of
@@ -316,12 +301,7 @@ func (s *Server) tagSuggest(w http.ResponseWriter, r *http.Request) {
 		catName, tagPrefix = f.Category, f.Name
 	}
 
-	var suggestions []models.Tag
-	if catName != "" {
-		suggestions, _ = s.tagSvc().SuggestTagsInCategory(tagPrefix, catName, 10)
-	} else {
-		suggestions, _ = s.tagSvc().SuggestTags(tagPrefix, 10)
-	}
+	suggestions, _ := s.tagSvc().SuggestTags(tagPrefix, catName, 10)
 
 	if catName != "" {
 		for i := range suggestions {
@@ -396,16 +376,7 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 			key := strings.ToLower(last[:colonIdx])
 			val := last[colonIdx+1:]
 			if searchkw.IsKeyword(key) {
-				// Free-text values keep their case for the range scans.
-				vp := strings.ToLower(val)
-				switch key {
-				case "collection", "source", "name", "prompt", "model", "sampler", "comfyui":
-					vp = strings.TrimPrefix(val, `"`)
-				case "tagged", "autotagged":
-					// expansionRows compares case-sensitively; keep the fold.
-					vp = strings.TrimPrefix(vp, `"`)
-				}
-				rows := s.systemSuggestLevel2(key, vp)
+				rows := s.systemSuggestLevel2(key, suggestValuePrefix(key, val))
 				if len(rows) == 0 {
 					w.WriteHeader(http.StatusNoContent)
 					return
@@ -454,12 +425,23 @@ func (s *Server) searchSuggest(w http.ResponseWriter, r *http.Request) {
 	s.renderSearchSuggest(w, tagSuggestItems(suggestions, ""))
 }
 
+// Free-text values keep their case for the range scans.
+func suggestValuePrefix(key, val string) string {
+	switch key {
+	case "collection", "source", "name", "prompt", "model", "sampler", "comfyui":
+		return strings.TrimPrefix(val, `"`)
+	case "tagged", "autotagged":
+		// expansionRows compares case-sensitively; keep the fold.
+		return strings.TrimPrefix(strings.ToLower(val), `"`)
+	}
+	return strings.ToLower(val)
+}
+
 func (s *Server) renderSystemSuggest(w http.ResponseWriter, rest string) {
 	var rows []suggestItem
 	if colonIdx := strings.IndexByte(rest, ':'); colonIdx >= 0 {
 		key := strings.ToLower(rest[:colonIdx])
-		valPrefix := strings.ToLower(rest[colonIdx+1:])
-		rows = s.systemSuggestLevel2(key, valPrefix)
+		rows = s.systemSuggestLevel2(key, suggestValuePrefix(key, rest[colonIdx+1:]))
 	} else {
 		rows = s.systemSuggestLevel1(strings.ToLower(rest))
 	}
@@ -524,7 +506,8 @@ func quotedSDLabelRows(key string, labels []string) []suggestItem {
 }
 
 func (s *Server) systemSuggestLevel2(key, valPrefix string) []suggestItem {
-	if key == "cat" {
+	switch key {
+	case "cat":
 		var rows []suggestItem
 		for _, cat := range s.systemCategoryRows() {
 			if !strings.HasPrefix(cat.Name, valPrefix) {
@@ -539,39 +522,31 @@ func (s *Server) systemSuggestLevel2(key, valPrefix string) []suggestItem {
 			}
 		}
 		return rows
-	}
-	if key == "collection" {
+	case "collection":
 		return quotedSDLabelRows("collection", s.queryCollectionLabels(valPrefix, 10))
-	}
-	if key == "source" {
+	case "source":
 		return append(expansionRows(key, valPrefix),
 			quotedSDLabelRows("source", s.querySourceLabels(valPrefix, 10))...)
-	}
 	// A label repeating an expansion (user) keeps only the expansion row.
-	if key == "tagged" || key == "autotagged" {
+	case "tagged", "autotagged":
 		labels := s.queryTaggerLabels(valPrefix, 10, key == "autotagged")
 		labels = slices.DeleteFunc(labels, func(l string) bool {
 			return slices.Contains(searchkw.Expansions[key], strings.ToLower(l))
 		})
 		return append(expansionRows(key, valPrefix), quotedSDLabelRows(key, labels)...)
-	}
-	if key == "name" {
+	case "name":
 		if valPrefix == "" {
 			return nil
 		}
 		return quotedSDLabelRows("name", s.queryNameBasenames(valPrefix, 10))
-	}
-	if key == "model" {
+	case "model":
 		return quotedSDLabelRows("model", s.querySDStringField("model", "model_checkpoint", valPrefix, 10, false))
-	}
-	if key == "comfyui" {
+	case "comfyui":
 		return quotedSDLabelRows("comfyui", s.queryComfyTerms(valPrefix, 10))
-	}
-	if key == "sampler" {
+	case "sampler":
 		return quotedSDLabelRows("sampler", s.querySDStringField("sampler", "sampler", valPrefix, 10, false))
-	}
 	// Empty prefix lists nothing: a DISTINCT over prompts scans every row.
-	if key == "prompt" {
+	case "prompt":
 		if valPrefix == "" {
 			return nil
 		}
@@ -627,4 +602,24 @@ func alreadyTypedTags(contextTokens []string) map[string]struct{} {
 		set[t] = struct{}{}
 	}
 	return set
+}
+
+// Exclusive upper bound of prefix's BINARY range, for a >=, < scan in
+// place of LIKE 'prefix%'.
+func nextPrefix(prefix string) string {
+	b := []byte(prefix)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 0xFF {
+			b[i]++
+			return string(b[:i+1])
+		}
+	}
+	return prefix + "\xff"
+}
+
+// Lowercased first: NOCASE folds to lower case, so a bound built from "Z"
+// would exclude every lower-case continuation.
+func nocasePrefixRange(prefix string) (lo, hi string) {
+	lo = strings.ToLower(prefix)
+	return lo, nextPrefix(lo)
 }

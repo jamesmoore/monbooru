@@ -14,7 +14,7 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // A read request holds the read lock for its whole handler and loads the
@@ -326,40 +326,12 @@ func (s *Set) Remove(name string, removeFolder bool) (kept []string, err error) 
 		return nil, ErrJobRunning
 	}
 	defer r.Release()
-	s.Lock()
-	cx := s.Get(name)
-	if cx == nil {
-		s.Unlock()
-		return nil, fmt.Errorf("unknown gallery %q", name)
-	}
-	if name == s.ActiveName() {
-		s.Unlock()
-		return nil, fmt.Errorf("cannot remove the active gallery; switch to another first")
-	}
-	if name == s.host.DefaultGallery() {
-		s.Unlock()
-		return nil, fmt.Errorf("cannot remove the default gallery; set another as default first")
-	}
-	if len(s.Names()) <= 1 {
-		s.Unlock()
-		return nil, fmt.Errorf("cannot remove the last gallery")
-	}
-	if err := cx.exportBusy(); err != nil {
-		s.Unlock()
+	cx, bound, err := s.removeMember(name)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.host.Removed(name); err != nil {
-		s.Unlock()
-		return nil, fmt.Errorf("persist gallery removal: %w", err)
-	}
 	galleryPath := cx.GalleryPath
-	bound := cx.Boundary()
 	dataDir := filepath.Dir(cx.DBPath)
-	cx.Close()
-	s.publish(func(members map[string]*Gallery, _ *string) { delete(members, name) })
-	s.Redraw()
-	s.Unlock()
-
 	removeOwnData(cx.DBPath, cx.ThumbnailsPath)
 	if removeFolder {
 		kept = removeGalleryFolder(galleryPath, bound)
@@ -369,6 +341,35 @@ func (s *Set) Remove(name string, removeFolder bool) (kept []string, err error) 
 	}
 	s.restartEnclosing(galleryPath)
 	return kept, nil
+}
+
+func (s *Set) removeMember(name string) (*Gallery, *gallery.Boundary, error) {
+	s.Lock()
+	defer s.Unlock()
+	cx := s.Get(name)
+	if cx == nil {
+		return nil, nil, fmt.Errorf("unknown gallery %q", name)
+	}
+	if name == s.ActiveName() {
+		return nil, nil, fmt.Errorf("cannot remove the active gallery; switch to another first")
+	}
+	if name == s.host.DefaultGallery() {
+		return nil, nil, fmt.Errorf("cannot remove the default gallery; set another as default first")
+	}
+	if len(s.Names()) <= 1 {
+		return nil, nil, fmt.Errorf("cannot remove the last gallery")
+	}
+	if err := cx.exportBusy(); err != nil {
+		return nil, nil, err
+	}
+	if err := s.host.Removed(name); err != nil {
+		return nil, nil, fmt.Errorf("persist gallery removal: %w", err)
+	}
+	bound := cx.Boundary()
+	cx.Close()
+	s.publish(func(members map[string]*Gallery, _ *string) { delete(members, name) })
+	s.Redraw()
+	return cx, bound, nil
 }
 
 // removeOwnData deletes only what monbooru wrote: a gallery folder can sit
@@ -445,91 +446,81 @@ func (s *Set) Repoint(name, galleryPath string) (bool, error) {
 		return false, ErrJobRunning
 	}
 	defer r.Release()
-	s.Lock()
-	cx := s.Get(name)
-	if cx == nil {
-		s.Unlock()
-		return false, fmt.Errorf("unknown gallery %q", name)
-	}
-	if cx.GalleryPath == galleryPath {
-		s.Unlock()
-		return false, nil
-	}
-	layout := s.host.Layout()
-	if other := layout.galleryOnFolder(galleryPath, name); other != "" {
-		s.Unlock()
-		return false, fmt.Errorf("%s is already the folder of gallery %s", galleryPath, other)
-	}
-	if err := layout.inOwnFolder(galleryPath); err != nil {
-		s.Unlock()
+	newCx, oldPath, err := s.repointMember(name, galleryPath)
+	if err != nil || newCx == nil {
 		return false, err
 	}
-	if err := cx.exportBusy(); err != nil {
-		s.Unlock()
-		return false, err
-	}
-	// Opened before the old one closes, so a failed open leaves the
-	// gallery as it was.
-	newCx, err := Open(config.Gallery{Name: name, GalleryPath: galleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath})
-	if err != nil {
-		s.Unlock()
-		return false, err
-	}
-	if err := s.host.Repointed(name, galleryPath); err != nil {
-		newCx.Close()
-		s.Unlock()
-		return false, fmt.Errorf("persist gallery path: %w", err)
-	}
-	oldPath := cx.GalleryPath
-	cx.Close()
-	s.publish(func(members map[string]*Gallery, _ *string) { members[name] = newCx })
-	s.Redraw()
-	s.Unlock()
 	s.start(newCx)
 	s.restartEnclosing(oldPath)
 	return true, nil
 }
 
+// repointMember returns no gallery when the path is unchanged.
+func (s *Set) repointMember(name, galleryPath string) (*Gallery, string, error) {
+	s.Lock()
+	defer s.Unlock()
+	cx := s.Get(name)
+	if cx == nil {
+		return nil, "", fmt.Errorf("unknown gallery %q", name)
+	}
+	if cx.GalleryPath == galleryPath {
+		return nil, "", nil
+	}
+	layout := s.host.Layout()
+	if other := layout.galleryOnFolder(galleryPath, name); other != "" {
+		return nil, "", fmt.Errorf("%s is already the folder of gallery %s", galleryPath, other)
+	}
+	if err := layout.inOwnFolder(galleryPath); err != nil {
+		return nil, "", err
+	}
+	if err := cx.exportBusy(); err != nil {
+		return nil, "", err
+	}
+	// Opened before the old one closes, so a failed open leaves the
+	// gallery as it was.
+	newCx, err := Open(config.Gallery{Name: name, GalleryPath: galleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath})
+	if err != nil {
+		return nil, "", err
+	}
+	if err := s.host.Repointed(name, galleryPath); err != nil {
+		newCx.Close()
+		return nil, "", fmt.Errorf("persist gallery path: %w", err)
+	}
+	oldPath := cx.GalleryPath
+	cx.Close()
+	s.publish(func(members map[string]*Gallery, _ *string) { members[name] = newCx })
+	s.Redraw()
+	return newCx, oldPath, nil
+}
+
 // Replace holds the job lane rather than the lock: a held lock would freeze
-// every request for minutes. stage runs in the open gallery's data folder, so
-// a failed stage leaves it as it was; it reopens even after a failed apply.
-func (s *Set) Replace(name string, stage func(dataDir string) error, apply func(dbPath, thumbnailsPath string, bound *gallery.Boundary) error) (*Gallery, error) {
+// every request for minutes. stage runs in the open gallery's data folder and
+// apply calls quiesce before its first write, so a refusal before then leaves
+// the gallery as it was; once quiesced it reopens even after a failed apply.
+func (s *Set) Replace(name string, stage func(dataDir string) error, apply func(dbPath, thumbnailsPath string, bound *gallery.Boundary, quiesce func() error) error) (*Gallery, error) {
 	r, err := s.jobs.Reserve()
 	if err != nil {
 		return nil, ErrJobRunning
 	}
 	defer r.Release()
-	s.Lock()
-	cx := s.Get(name)
-	if cx == nil {
-		s.Unlock()
-		return nil, fmt.Errorf("unknown gallery %q", name)
+	cx, g, bound, err := s.replaceTarget(name)
+	if err != nil {
+		return nil, err
 	}
-	if name == s.ActiveName() {
-		s.Unlock()
-		return nil, fmt.Errorf("cannot import over the active gallery; switch to another first")
-	}
-	if name == s.host.DefaultGallery() {
-		s.Unlock()
-		return nil, fmt.Errorf("cannot import over the default gallery; set another as default first")
-	}
-	g := config.Gallery{Name: name, GalleryPath: cx.GalleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath}
-	bound := cx.Boundary()
-	s.Unlock()
-
 	if err := stage(filepath.Dir(g.DBPath)); err != nil {
 		return nil, err
 	}
-
-	s.Lock()
-	if err := cx.exportBusy(); err != nil {
-		s.Unlock()
-		return nil, err
+	quiesced := false
+	applyErr := apply(g.DBPath, g.ThumbnailsPath, bound, func() error {
+		if err := s.quiesce(cx); err != nil {
+			return err
+		}
+		quiesced = true
+		return nil
+	})
+	if !quiesced {
+		return cx, applyErr
 	}
-	cx.Close()
-	s.Unlock()
-
-	applyErr := apply(g.DBPath, g.ThumbnailsPath, bound)
 	newCx, openErr := Open(g)
 	if openErr != nil {
 		if applyErr != nil {
@@ -544,4 +535,31 @@ func (s *Set) Replace(name string, stage func(dataDir string) error, apply func(
 	s.start(newCx)
 	go newCx.warmCaches()
 	return newCx, applyErr
+}
+
+func (s *Set) replaceTarget(name string) (*Gallery, config.Gallery, *gallery.Boundary, error) {
+	s.Lock()
+	defer s.Unlock()
+	cx := s.Get(name)
+	if cx == nil {
+		return nil, config.Gallery{}, nil, fmt.Errorf("unknown gallery %q", name)
+	}
+	if name == s.ActiveName() {
+		return nil, config.Gallery{}, nil, fmt.Errorf("cannot import over the active gallery; switch to another first")
+	}
+	if name == s.host.DefaultGallery() {
+		return nil, config.Gallery{}, nil, fmt.Errorf("cannot import over the default gallery; set another as default first")
+	}
+	g := config.Gallery{Name: name, GalleryPath: cx.GalleryPath, DBPath: cx.DBPath, ThumbnailsPath: cx.ThumbnailsPath}
+	return cx, g, cx.Boundary(), nil
+}
+
+func (s *Set) quiesce(cx *Gallery) error {
+	s.Lock()
+	defer s.Unlock()
+	if err := cx.exportBusy(); err != nil {
+		return err
+	}
+	cx.Close()
+	return nil
 }

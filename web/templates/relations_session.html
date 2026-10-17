@@ -210,8 +210,7 @@
   // anything but A or B falls back to A.
   function currentLeftID() {
     var v = leftInput ? leftInput.value : null;
-    if (v === pair.dataset.a || v === pair.dataset.b) return v;
-    return pair.dataset.a;
+    return v === pair.dataset.b ? pair.dataset.b : pair.dataset.a;
   }
 
   function flipSides() {

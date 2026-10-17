@@ -1,6 +1,8 @@
 package api
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,7 +19,7 @@ func (h *Handler) serveImageFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canonPath, fileType, ok := containedCanonical(w, g, id)
-	if !ok {
+	if !ok || !canonicalOnDisk(w, canonPath) {
 		return
 	}
 	if ct := gallery.MIMEForFileType(fileType); ct != "" {
@@ -33,7 +35,7 @@ func (h *Handler) serveImageStill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canonPath, fileType, ok := containedCanonical(w, g, id)
-	if !ok {
+	if !ok || !canonicalOnDisk(w, canonPath) {
 		return
 	}
 	if gallery.IsVideoType(fileType) || fileType == models.FileTypeCBZ {
@@ -48,8 +50,7 @@ func (h *Handler) serveImageStill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	frame, err := gallery.RenderStillFrame(canonPath, os.TempDir(), 0)
-	if err != nil {
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+	if serverError(w, err) {
 		return
 	}
 	defer func() { _ = os.Remove(frame) }()
@@ -57,17 +58,25 @@ func (h *Handler) serveImageStill(w http.ResponseWriter, r *http.Request) {
 }
 
 func containedCanonical(w http.ResponseWriter, g *library.Gallery, id int64) (canonPath, fileType string, ok bool) {
-	if err := g.DB.Read.QueryRow(
+	err := g.DB.Read.QueryRow(
 		`SELECT canonical_path, file_type FROM images WHERE id = ?`, id,
-	).Scan(&canonPath, &fileType); err != nil {
+	).Scan(&canonPath, &fileType)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !gallery.NamedInside(g.GalleryPath, canonPath) {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
 		return "", "", false
 	}
-	if !gallery.NamedInside(g.GalleryPath, canonPath) {
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+	if serverError(w, err) {
 		return "", "", false
 	}
 	return canonPath, fileType, true
+}
+
+func canonicalOnDisk(w http.ResponseWriter, canonPath string) bool {
+	if _, err := os.Stat(canonPath); err != nil {
+		apiError(w, http.StatusNotFound, "not_found", "image file not found")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) serveThumbnail(w http.ResponseWriter, r *http.Request) {

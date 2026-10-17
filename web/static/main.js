@@ -280,13 +280,6 @@ function cycleSort() {
     applyRandomSort();
     return true;
   }
-  var opt = sortEl.querySelector('option[value="' + next + '"]');
-  if (!opt) {
-    opt = document.createElement('option');
-    opt.value = next;
-    opt.textContent = next;
-    sortEl.appendChild(opt);
-  }
   sortEl.value = next;
   return applySortChange(sortEl);
 }
@@ -329,9 +322,7 @@ function isTagDetailPage()  { return !!document.getElementById('tag-detail-page'
 function isTagsPage()       { return !!document.getElementById('tags-page'); }
 function isCategoriesPage() { return !!document.getElementById('categories-page'); }
 function isSettingsPage()   { return !!document.getElementById('settings-page'); }
-function batchBarVisible() {
-  return !!document.querySelector('#batch-bar.visible');
-}
+function batchBarVisible()  { return !!document.querySelector('#batch-bar.visible'); }
 
 function activeSurfaces() {
   var s = ['anywhere'];
@@ -574,9 +565,6 @@ var lightbox = (function () {
   };
 })();
 
-// Global for the templates' inline onclick.
-function openLightbox(e, src) { return lightbox.open(e, src); }
-
 function openReaderJumpDialog() {
   var dlg = document.getElementById('reader-jump-dialog');
   if (!dlg) return false;
@@ -642,7 +630,7 @@ function handleReaderKey(e) {
       var pageLink = document.querySelector('.reader-page-link');
       if (pageLink) {
         e.preventDefault();
-        openLightbox(null, pageLink.href);
+        lightbox.open(null, pageLink.href);
         return true;
       }
       return false;
@@ -832,7 +820,7 @@ document.addEventListener('keydown', function(e) {
   }
 
   if (e.key === 'f') {
-    if (batchBarVisible()) { e.preventDefault(); openBatchFavoriteDialog('selection'); return; }
+    if (batchBarVisible()) { e.preventDefault(); openBatchDialog('batch-fav', 'selection'); return; }
     if (clickFirstSelector(['.btn-fav'])) { e.preventDefault(); return; }
   }
 
@@ -872,7 +860,7 @@ document.addEventListener('keydown', function(e) {
 
   if (e.key === 'v' && isDetailPage()) {
     var lbTrigger = document.querySelector('.detail-img-link');
-    if (lbTrigger) { e.preventDefault(); openLightbox(null, lbTrigger.href); return; }
+    if (lbTrigger) { e.preventDefault(); lightbox.open(null, lbTrigger.href); return; }
   }
 
   if (e.key === 't') {
@@ -893,7 +881,7 @@ document.addEventListener('keydown', function(e) {
   }
 
   if (e.key === 'i') {
-    if (batchBarVisible()) { e.preventDefault(); openBatchInboxDialog('selection'); return; }
+    if (batchBarVisible()) { e.preventDefault(); openBatchDialog('batch-inbox', 'selection'); return; }
     if (isDetailPage()) {
       if (clickFirstSelector(['.btn-inbox'])) { e.preventDefault(); return; }
     }
@@ -923,7 +911,7 @@ document.addEventListener('keydown', function(e) {
         e.preventDefault(); openBatchLookupDialog('selection'); return;
       }
     }
-    if (clickFirstSelector(['.add-tag-form .btn-hash-lookup'])) { e.preventDefault(); return; }
+    if (clickFirstSelector(['.add-tag-form .btn-hash-lookup:not([disabled])'])) { e.preventDefault(); return; }
   }
 
   if (isGalleryPage()) {
@@ -941,7 +929,7 @@ document.addEventListener('keydown', function(e) {
     }
     if (e.key === 'O') { if (cycleSort()) { e.preventDefault(); return; } }
     if (e.key === 'D') { if (flipSortDirection()) { e.preventDefault(); return; } }
-    if (e.key === 'S' && !batchBarVisible()) {
+    if (e.key === 'S' && document.querySelector('#batch-bar:not(.visible)')) {
       if (openSaveSearchDialog()) { e.preventDefault(); return; }
     }
     if (e.key === 'Home') { if (jumpGridCursor('first')) { e.preventDefault(); return; } }
@@ -1163,141 +1151,6 @@ document.addEventListener('close', function(e) {
   if (e.target.id === 'ptr-contrib-dialog') htmx.trigger(document.body, 'ptr-contrib-closed');
 }, true);
 
-document.body.addEventListener('click', function(e) {
-  var tab = e.target.closest && e.target.closest('.dialog-tab');
-  if (!tab || !tab.dataset.panel) return;
-  var strip = tab.closest('.dialog-tabs');
-  var scope = strip && strip.parentElement;
-  if (!scope) return;
-  strip.querySelectorAll('.dialog-tab').forEach(function(t) {
-    t.classList.toggle('active', t === tab);
-  });
-  scope.querySelectorAll('.dialog-panel').forEach(function(p) {
-    p.hidden = p.id !== tab.dataset.panel;
-  });
-});
-
-// Enter would implicitly submit the dialog's config form; the input
-// already searches on its search event.
-document.body.addEventListener('keydown', function(e) {
-  if (e.key !== 'Enter') return;
-  var el = e.target;
-  if (el && el.name === 'q' && el.closest && el.closest('.tc-mappings')) {
-    e.preventDefault();
-  }
-});
-
-document.body.addEventListener('click', function(e) {
-  var btn = e.target.closest && e.target.closest('.tc-edit, .tc-reset, .tc-edit-cancel, .tc-filter, .tc-more-btn');
-  if (!btn) return;
-  var panel = btn.closest('.tc-mappings');
-  if (!panel) return;
-  var search = panel.querySelector('input[name=q]');
-  var limit = panel.querySelector('input[name=limit]');
-
-  if (btn.classList.contains('tc-filter')) {
-    panel.querySelectorAll('.tc-filter').forEach(function(f) { f.classList.toggle('active', f === btn); });
-    var hidden = panel.querySelector('input[name=filter]');
-    if (hidden) hidden.value = btn.dataset.filter;
-    if (search) htmx.trigger(search, 'search');
-    return;
-  }
-
-  if (btn.classList.contains('tc-more-btn')) {
-    if (limit) limit.value = btn.dataset.limit;
-    if (search) htmx.trigger(search, 'search');
-    return;
-  }
-
-  var open = panel.querySelector('.tc-editor-row');
-  if (open) open.remove();
-
-  if (!btn.classList.contains('tc-edit')) return;
-
-  var row = btn.closest('tr');
-  var tpl = panel.querySelector('.tc-editor-template');
-  if (!row || !tpl) return;
-  var editor = tpl.content.firstElementChild.cloneNode(true);
-  var apply = editor.querySelector('.tc-edit-apply');
-  apply.value = row.dataset.source;
-  if (row.dataset.category) editor.querySelector('.tc-edit-category').value = row.dataset.category;
-  editor.querySelector('.tc-edit-name').value =
-    row.dataset.name !== row.dataset.source ? row.dataset.name : '';
-  editor.querySelector('.tc-edit-mute').checked = row.dataset.muted === '1';
-  // Left alone, Enter would submit the dialog's form and close the pop-in.
-  editor.addEventListener('keydown', function(ev) {
-    if (ev.key !== 'Enter') return;
-    ev.preventDefault();
-    apply.click();
-  });
-  row.after(editor);
-  htmx.process(editor);
-});
-
-function taggerGalAllToggle(cb) {
-  var form = cb.closest('form');
-  if (!form) return;
-  form.querySelectorAll('input[name=gallery_names]').forEach(function(c) {
-    c.disabled = cb.checked;
-    if (cb.checked) c.checked = true;
-  });
-}
-
-function taggerGalSelect(btn, on) {
-  var form = btn.closest('form');
-  if (!form) return;
-  var allCb = form.querySelector('input[name=all]');
-  if (allCb && allCb.checked) {
-    allCb.checked = false;
-    taggerGalAllToggle(allCb);
-  }
-  form.querySelectorAll('input[name=gallery_names]').forEach(function(c) {
-    c.checked = !!on;
-  });
-}
-
-function threshRowAtDefault(row) {
-  var atDefault = true;
-  row.querySelectorAll('input[type=number]').forEach(function(inp) {
-    if (inp.value !== (inp.dataset.default || '')) atDefault = false;
-  });
-  var cb = row.querySelector('input[type=checkbox]');
-  if (cb && cb.checked !== (cb.dataset.defaultChecked === '1')) atDefault = false;
-  return atDefault;
-}
-
-function syncThreshRow(row) {
-  if (!row) return;
-  var reset = row.querySelector('.reset-thresh');
-  // A class, not hidden: visibility keeps the link's width so the column
-  // does not reflow.
-  if (reset) reset.classList.toggle('reset-thresh-shown', !threshRowAtDefault(row));
-}
-
-function resetThreshRow(link) {
-  var row = link.closest('tr');
-  if (!row) return;
-  row.querySelectorAll('input[type=number]').forEach(function(inp) {
-    inp.value = inp.dataset.default || '';
-  });
-  var cb = row.querySelector('input[type=checkbox]');
-  if (cb) cb.checked = cb.dataset.defaultChecked === '1';
-  syncThreshRow(row);
-}
-
-function syncThreshRowFromEvent(e) {
-  var row = e.target.closest && e.target.closest('.tagger-thresh-table tbody tr');
-  if (row) syncThreshRow(row);
-}
-document.body.addEventListener('input', syncThreshRowFromEvent);
-document.body.addEventListener('change', syncThreshRowFromEvent);
-document.body.addEventListener('htmx:afterSwap', function(e) {
-  var t = e.detail && e.detail.target;
-  if (!t) return;
-  var table = t.querySelector && t.querySelector('.tagger-thresh-table');
-  if (table) table.querySelectorAll('tbody tr').forEach(syncThreshRow);
-});
-
 document.body.addEventListener('htmx:afterSwap', function(e) {
   if (!e.detail || !e.detail.target || e.detail.target.id !== 'monloader-light') return;
   const light = document.getElementById('monloader-light');
@@ -1453,12 +1306,14 @@ document.body.addEventListener('htmx:beforeSwap', function(e) {
     return;
   }
   const notice = document.getElementById('page-notice');
-  if (xhr.status < 400 && notice && notice.dataset.session) notice.hidden = true;
+  const saved = xhr.status < 400 && e.detail.requestConfig && e.detail.requestConfig.verb !== 'get';
+  if (saved && notice && notice.dataset.session) notice.hidden = true;
   if (xhr.status !== 409) return;
   if (xhr.getResponseHeader('X-Monbooru-Gallery')) {
     showPageNotice(xhr.responseText);
     return;
   }
+  if (!/^text\/html/.test(xhr.getResponseHeader('Content-Type') || '')) e.detail.serverResponse = escapeHTML(xhr.responseText);
   e.detail.shouldSwap = true;
 });
 
@@ -1558,9 +1413,14 @@ document.addEventListener('click', function(e) {
   fetch('/internal/search/ids?q=' + encodeURIComponent(btn.dataset.clusterAll), {
     headers: {'Accept': 'application/json'},
   }).then(function(res) {
+    if (sessionLost(res)) {
+      showLoginNotice();
+      return null;
+    }
     if (!res.ok) throw new Error('ids');
     return res.json();
   }).then(function(data) {
+    if (!data) return;
     var ids = data.ids.map(String);
     ids.forEach(function(v) {
       if (pickedIDs.indexOf(v) === -1) pickedIDs.push(v);
@@ -2175,6 +2035,7 @@ function showActionFlash(html, kind) {
   }
   var token = String(Date.now()) + Math.random();
   slot.dataset.token = token;
+  if (kind === 'err' || /flash-(err|warn)/.test(slot.innerHTML)) return;
   setTimeout(function() {
     if (slot.dataset.token === token) slot.innerHTML = '';
   }, 5000);
@@ -2294,12 +2155,12 @@ function revealSidebarFor(el) {
 function getFolderCookie() {
   var m = document.cookie.match(/monbooru_folders=([^;]*)/);
   if (!m) return new Set();
-  try { return new Set(decodeURIComponent(m[1]).split(',').filter(Boolean)); }
+  try { return new Set(decodeURIComponent(m[1]).split(',').filter(Boolean).map(decodeURIComponent)); }
   catch (err) { return new Set(); }
 }
 
 function setFolderCookie(set) {
-  document.cookie = 'monbooru_folders=' + encodeURIComponent(Array.from(set).join(',')) + '; path=/; max-age=31536000';
+  document.cookie = 'monbooru_folders=' + encodeURIComponent(Array.from(set).map(encodeURIComponent).join(',')) + '; path=/; max-age=31536000';
 }
 
 function toggleFolderItem(btn, targetId, path) {
@@ -2409,15 +2270,18 @@ function lastWordIndex(words) {
   return -1;
 }
 
+function suggestInputOf(btn) {
+  var dd = btn.closest('.suggest-dropdown');
+  var input = dd && dd.parentElement && dd.parentElement.querySelector('input[type="text"]');
+  if (!input) return null;
+  dd.innerHTML = '';
+  return input;
+}
+
 function applyTagSuggest(btn) {
   var tagName = btn.dataset.tagName;
   if (!tagName) return;
-  var dd = btn.closest('.suggest-dropdown');
-  if (!dd) return;
-  dd.innerHTML = '';
-  var container = dd.parentElement;
-  if (!container) return;
-  var input = container.querySelector('input[type="text"]');
+  var input = suggestInputOf(btn);
   if (!input) return;
   if (input.dataset.multiTags) {
     var words = input.value.split(/(\s+)/);
@@ -2430,7 +2294,7 @@ function applyTagSuggest(btn) {
   }
   input.value = tagName;
   input.focus();
-  var form = input.closest('form') || container.querySelector('form');
+  var form = input.closest('form');
   if (form && form.id === 'add-tag-form') {
     form.requestSubmit();
   }
@@ -2439,13 +2303,8 @@ function applyTagSuggest(btn) {
 function applyLabelSuggest(btn, key) {
   var label = btn.dataset[key];
   if (label == null) return;
-  var dd = btn.closest('.suggest-dropdown');
-  if (!dd) return;
-  var container = dd.parentElement;
-  if (!container) return;
-  var input = container.querySelector('input[type="text"]');
+  var input = suggestInputOf(btn);
   if (!input) return;
-  dd.innerHTML = '';
   input.value = label;
   input.focus();
 }
@@ -2475,7 +2334,7 @@ function namePreviewVals(prefix, scope) {
   var ids = kind === 'search'
     ? Array.prototype.map.call(document.querySelectorAll('.thumb-card'),
         function(c) { return c.dataset.id; })
-    : selectedImageIds();
+    : pickedIDs.slice();
   var slot = document.getElementById(prefix + '-preview');
   var rows = parseInt(slot && slot.dataset.rows, 10) || 5;
   return {
@@ -2609,6 +2468,11 @@ function refreshGalleryGrid() {
   window.htmx.ajax('GET', u.pathname + u.search, {target: '#gallery-grid', swap: 'innerHTML'});
 }
 
+function inboxBusy() {
+  var input = document.getElementById('inbox-upload-file-input');
+  return !!(input && input.files && input.files.length);
+}
+
 // The first settle reports whatever job last finished, often before this
 // page rendered, so its reload is skipped.
 var _firstJobStatusSettle = true;
@@ -2617,9 +2481,11 @@ var _lastWatcherNotices = -1;
 // Set when an action starts a job, whose completion then reloads the
 // page: the grid swap after a job intermittently fails to settle.
 var _pendingGalleryReload = false;
+var _pendingReloadShownAt = '';
 
 function armGalleryReload() {
   _pendingGalleryReload = true;
+  _pendingReloadShownAt = (document.getElementById('job-status') || {dataset: {}}).dataset.finishedAt || '';
   refreshJobStatus();
 }
 
@@ -2667,7 +2533,7 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
       _lastWatcherNotices = watcherNotices;
       needRefresh = true;
     }
-    if (needRefresh) {
+    if (needRefresh && !inboxBusy()) {
       refreshGalleryGrid();
     }
   }
@@ -2689,7 +2555,7 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
     }, 30000);
   }
 
-  if (isDone && _pendingGalleryReload) {
+  if (isDone && _pendingGalleryReload && finishedAt !== _pendingReloadShownAt) {
     if (finishedAt) _lastReloadedFinishedAt = finishedAt;
     if (document.getElementById('gallery-grid') || document.getElementById('tags-page') || document.getElementById('tag-detail-page') || document.getElementById('collections-page')) {
       var pendingDone = el.querySelector('.job-done');
@@ -2723,7 +2589,7 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
     if (grid) {
       var doneEl = el.querySelector('.job-done');
       if (doneEl) showActionFlash(escapeHTML(doneEl.textContent || ''), 'ok');
-      refreshGalleryGrid();
+      if (!inboxBusy()) refreshGalleryGrid();
     }
 
     var imageTags = document.getElementById('image-tags');
@@ -2766,14 +2632,10 @@ function searchScopeParts() {
   return parts;
 }
 
-function selectedImageIds() {
-  return pickedIDs.slice();
-}
-
 // One comma-joined parameter: a selection built across pages can pass
 // net/url's 10000-parameter cap, and the parser rejects the whole request.
 function selectionScopeIds() {
-  var ids = selectedImageIds();
+  var ids = pickedIDs.slice();
   if (ids.length === 0) return null;
   return ['ids=' + encodeURIComponent(ids.join(','))];
 }
@@ -2782,7 +2644,7 @@ function batchScopeParams(scope, flash) {
   if (scope === 'search') return searchScopeParts();
   var ids = selectionScopeIds();
   if (!ids) {
-    if (flash) flash.innerHTML = '<div class="flash flash-err">No images selected.</div>';
+    setFlashText(flash, 'err', 'No images selected.');
     return null;
   }
   return ids;
@@ -2790,7 +2652,7 @@ function batchScopeParams(scope, flash) {
 
 function relayPlugin(btn) {
   var pinned = btn.closest('[data-image-id]');
-  var ids = pinned ? [pinned.dataset.imageId] : selectedImageIds();
+  var ids = pinned ? [pinned.dataset.imageId] : pickedIDs.slice();
   if (!ids.length || !window.htmx) return;
   window.htmx.ajax('POST', '/internal/plugin/relay', {
     swap: 'none',
@@ -2833,23 +2695,6 @@ function pluginPageNavigated(e) {
 function closePluginPage() {
   var dlg = document.getElementById('plugin-open-dialog');
   if (dlg && dlg.open) dlg.close();
-}
-
-// opts: endpoint, scope, params (encoded "k=v" parts, without _csrf or
-// scope), dialogId, flashId, failMsg, consumesScope (clears the
-// selection: the rows are gone afterwards).
-function runBatchOp(opts) {
-  clearSlots(opts.flashId);
-  var parts = ['scope=' + encodeURIComponent(opts.scope)].concat(opts.params || []);
-  postForm(opts.endpoint, new URLSearchParams(parts.join('&')), {
-    dialogId: opts.dialogId,
-    flashId: opts.flashId,
-    failMsg: opts.failMsg || 'Action failed.',
-    onOK: function() {
-      if (opts.consumesScope) clearSelection();
-      armGalleryReload();
-    }
-  });
 }
 
 // opts: countId, requireMatches (refuse a search scope matching nothing),
@@ -2917,12 +2762,20 @@ function openHxRewriteDialog(formId, attr, url, dialogId) {
   document.getElementById(dialogId).showModal();
 }
 
-function openRenameDialog(btn) {
-  var name = btn.dataset.name;
-  document.getElementById('rename-src-name').textContent = name;
-  clearSlots('rename-error');
-  var input = document.getElementById('rename-new-name');
+function openNameDialog(ids, name, url) {
+  document.getElementById(ids.src).textContent = name;
+  clearSlots(ids.err);
+  var input = document.getElementById(ids.input);
   input.value = name;
+  openHxRewriteDialog(ids.form, 'hx-post', url, ids.dialog);
+  input.focus();
+  input.select();
+}
+
+function openRenameDialog(btn) {
+  openNameDialog({src: 'rename-src-name', err: 'rename-error', input: 'rename-new-name',
+                  form: 'rename-form', dialog: 'rename-dialog'},
+                 btn.dataset.name, '/tags/' + btn.dataset.id + '/rename');
   // An alias cannot keep its old name as an alias: that would point an
   // alias at an alias, so the row is hidden or not rendered for one.
   var keep = document.getElementById('rename-keep-alias');
@@ -2930,26 +2783,32 @@ function openRenameDialog(btn) {
     keep.checked = false;
     document.getElementById('rename-keep-alias-row').hidden = btn.dataset.isAlias === '1';
   }
-  openHxRewriteDialog('rename-form', 'hx-post', '/tags/' + btn.dataset.id + '/rename', 'rename-dialog');
-  input.focus();
-  input.select();
 }
 
 function confirmBatchSimple(prefix, endpoint, extraParams, failMsg, consumesScope) {
   var scope = document.getElementById(prefix + '-scope').value;
-  var scoped = batchScopeParams(scope, document.getElementById(prefix + '-flash'));
+  var flashId = prefix + '-flash';
+  var scoped = batchScopeParams(scope, document.getElementById(flashId));
   if (!scoped) return;
-  var params = (extraParams || []).concat(scoped);
-  runBatchOp({endpoint: endpoint, scope: scope, params: params,
-              dialogId: prefix + '-dialog', flashId: prefix + '-flash', failMsg: failMsg,
-              consumesScope: consumesScope});
+  clearSlots(flashId);
+  var parts = ['scope=' + encodeURIComponent(scope)].concat(extraParams || [], scoped);
+  postForm(endpoint, new URLSearchParams(parts.join('&')), {
+    dialogId: prefix + '-dialog',
+    flashId: flashId,
+    failMsg: failMsg || 'Action failed.',
+    onOK: function() {
+      if (consumesScope) clearSelection();
+      armGalleryReload();
+    }
+  });
 }
 
 // opts: method (POST), hx (sends HX-Request), okStatus (the one success
 // status), dialogId (closed on OK), onOK(res), flashId (gets the error
 // body), failMsg, onErr(text) (instead of the flash), catchMsg (the
 // network-failure text for the flash or onErr; with neither, the page
-// notice says the server did not answer).
+// notice says the server did not answer), onDone (when the page notice
+// takes the answer).
 function postForm(url, params, opts) {
   opts = opts || {};
   var csrf = getCSRFToken();
@@ -2966,10 +2825,12 @@ function postForm(url, params, opts) {
   }).then(function(res) {
     if (sessionLost(res)) {
       showLoginNotice();
+      if (opts.onDone) opts.onDone();
       return;
     }
     if (res.status === 403 || (res.status === 409 && res.headers.get('X-Monbooru-Gallery'))) {
       res.text().then(showPageNotice);
+      if (opts.onDone) opts.onDone();
       return;
     }
     var ok = opts.okStatus ? res.status === opts.okStatus : res.ok;
@@ -2986,7 +2847,7 @@ function postForm(url, params, opts) {
   });
   p.catch(function() {
     var msg = opts.catchMsg || 'Request failed.';
-    if (flash) flash.innerHTML = '<div class="flash flash-err">' + msg + '</div>';
+    if (flash) setFlashText(flash, 'err', msg);
     else if (opts.onErr) opts.onErr(msg);
     else showUnansweredNotice();
   });
@@ -3059,6 +2920,7 @@ var suggestPairs = {
   'source-suggest': {input: 'source-site-input'},
   'batch-collection-suggest': {input: 'batch-collection-input'},
   'collection-suggest': {input: 'collection-name-input'},
+  'generate-collection-suggest': {input: 'generate-collection-input'},
   'collection-rename-suggest': {input: 'collection-rename-input'},
   'alias-create-suggest': {input: 'alias-create-canon', clearOnEmpty: true},
   'batch-alias-suggest': {input: 'batch-alias-canon', clearOnEmpty: true},
@@ -3328,7 +3190,10 @@ function initInboxUpload() {
   });
   form.addEventListener('htmx:afterRequest', function(e) {
     if (submitBtn) submitBtn.disabled = false;
-    if (!e.detail.successful) return;
+    if (!e.detail.successful) {
+      if (result && !result.querySelector('.flash')) setFlashText(result, 'err', 'Upload failed: nothing was uploaded.');
+      return;
+    }
     // The result slot sits inside #gallery-grid, which the refresh below
     // replaces.
     if (result && result.innerHTML.trim() !== '') {
@@ -3342,17 +3207,19 @@ function initInboxUpload() {
 document.addEventListener('DOMContentLoaded', initInboxUpload);
 
 function mergeCategoryCollision(tagID, catID) {
-  postForm('/tags/' + tagID + '/category', {category_id: String(catID), merge: '1'}, {
-    method: 'PATCH',
-    flashId: 'tag-flash',
-    catchMsg: 'Merge request failed.',
-    onOK: function() {
-      stashActionFlash('Merged into the existing tag.', 'ok');
-      window.location.reload();
-    },
-    // The body is unescaped plain text, and tag names may hold < and >.
-    onErr: function(t) { setFlashText(document.getElementById('tag-flash'), 'err', t || 'Merge failed.'); }
-  });
+  showConfirm('Merge this tag into the existing one?', function() {
+    postForm('/tags/' + tagID + '/category', {category_id: String(catID), merge: '1'}, {
+      method: 'PATCH',
+      flashId: 'tag-flash',
+      catchMsg: 'Merge request failed.',
+      onOK: function() {
+        stashActionFlash('Merged into the existing tag.', 'ok');
+        window.location.reload();
+      },
+      // The body is unescaped plain text, and tag names may hold < and >.
+      onErr: function(t) { setFlashText(document.getElementById('tag-flash'), 'err', t || 'Merge failed.'); }
+    });
+  }, 'Its images and implications move onto the existing tag and its name stays as a zero-usage alias. This cannot be undone.', 'Merge');
 }
 
 function deleteTagFlow(btn, tagID, onSuccess) {
@@ -3368,32 +3235,25 @@ function deleteTagFlow(btn, tagID, onSuccess) {
     btn.disabled = true;
     var el = document.getElementById('tag-flash');
     setFlashText(el, 'warn', (isRating ? 'Stripping' : 'Deleting') + ' "' + name + '"…');
-    fetch('/tags/' + tagID, {
+    postForm('/tags/' + tagID, null, {
       method: 'DELETE',
-      headers: {'X-CSRF-Token': getCSRFToken(), 'X-Monbooru-Gallery': activeGallery()}
-    }).then(function(r) {
-      if (sessionLost(r)) {
+      catchMsg: 'Delete request failed.',
+      onDone: function() {
         btn.disabled = false;
         el.textContent = '';
-        showLoginNotice();
-        return;
-      }
-      if (r.ok) {
+      },
+      onOK: function() {
         // A raw fetch does not process HX-Trigger, so the flash is
         // stashed by hand.
         stashActionFlash(escapeHTML(isRating
           ? 'Stripped "' + name + '" from every image.'
           : 'Tag "' + name + '" deleted.'), 'ok');
         onSuccess();
-      } else {
+      },
+      onErr: function(t) {
         btn.disabled = false;
-        r.text().then(function(t) {
-          setFlashText(el, 'err', t || 'Delete failed.');
-        });
+        setFlashText(el, 'err', t || 'Delete failed.');
       }
-    }).catch(function() {
-      btn.disabled = false;
-      setFlashText(el, 'err', 'Delete request failed.');
     });
   }, danger, isRating ? 'Strip' : 'Delete');
 }

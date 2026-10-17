@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/monbooru/monbooru/internal/peer"
 )
@@ -17,12 +16,8 @@ import (
 // App is the peer's name in pairing records and error text.
 const App = peer.Companion
 
-// A backstop for callers with an unbounded context: it must stay above every
-// per-call deadline, or it cuts off a send monloader may still commit.
-var httpClient = &http.Client{Timeout: 15 * time.Second}
-
-// ErrUnconfigured is returned before any I/O when no link is set up.
-var ErrUnconfigured = errors.New("monloader is not configured")
+// errUnconfigured is returned before any I/O when no link is set up.
+var errUnconfigured = errors.New("monloader is not configured")
 
 // Client reads Base and Token on every call so a re-pair or a pause lands
 // without rebuilding it. Base must return "" while the link is paused.
@@ -35,7 +30,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte) (*htt
 	base := strings.TrimRight(c.Base(), "/")
 	token := c.Token()
 	if base == "" || token == "" {
-		return nil, ErrUnconfigured
+		return nil, errUnconfigured
 	}
 	var payload io.Reader
 	if body != nil {
@@ -49,7 +44,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte) (*htt
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	return httpClient.Do(req)
+	return peer.Client.Do(req)
 }
 
 func (c *Client) Post(ctx context.Context, path string, payload map[string]any) (*http.Response, error) {

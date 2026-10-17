@@ -2,6 +2,7 @@
 package db
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -75,7 +76,17 @@ const NormalizeWindowsFolderPathSQL = `UPDATE images SET folder_path = ltrim(rep
 
 // Bump bootstrapSchemaVersion for a new one-shot or an index the planner
 // needs stats for: ANALYZE runs once per bump.
-const bootstrapSchemaVersion = 14
+const bootstrapSchemaVersion = 15
+
+// A library below MinUpgradeUserVersion was last opened outside the
+// two-minor upgrade window; UpgradeVia is a release that still upgrades
+// it. Raising the floor is what lets a one-shot under it be deleted.
+const (
+	MinUpgradeUserVersion = 13
+	UpgradeVia            = "v1.22.1"
+)
+
+var ErrLibraryTooOld = errors.New("library too old to upgrade directly")
 
 // WAL serialises writers, so Write holds one connection and Read a pool.
 type DB struct {
@@ -83,8 +94,11 @@ type DB struct {
 	Write *sql.DB
 }
 
+// Only these are URI syntax in a path; a URL encoding breaks relative and drive-letter paths.
+var uriPathEscaper = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
+
 func Open(path string) (*DB, error) {
-	dsn := "file:" + path +
+	dsn := "file:" + uriPathEscaper.Replace(path) +
 		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=foreign_keys(on)" +
 		"&_pragma=journal_mode(wal)" +
@@ -175,12 +189,5 @@ func (db *DB) Vacuum(ctx context.Context) error {
 }
 
 func (db *DB) Close() error {
-	var firstErr error
-	if err := db.Read.Close(); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	if err := db.Write.Close(); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	return firstErr
+	return cmp.Or(db.Read.Close(), db.Write.Close())
 }

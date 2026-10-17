@@ -45,7 +45,7 @@ func setNonEmpty(v url.Values, pairs ...string) url.Values {
 }
 
 // setPrefCookie keeps a preference for a year; an empty value deletes it.
-func setPrefCookie(w http.ResponseWriter, name, value string) {
+func setPrefCookie(w http.ResponseWriter, r *http.Request, name, value string) {
 	age := 31_536_000
 	if value == "" {
 		age = -1
@@ -55,6 +55,7 @@ func setPrefCookie(w http.ResponseWriter, name, value string) {
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
 		MaxAge:   age,
 		SameSite: http.SameSiteLaxMode,
 	})
@@ -72,12 +73,7 @@ func (b backContext) QueryString(sep string) template.URL {
 }
 
 func (b backContext) DetailURL(id int64) string {
-	base := fmt.Sprintf("/images/%d", id)
-	v := b.URLValues()
-	if len(v) == 0 {
-		return base
-	}
-	return base + "?" + v.Encode()
+	return fmt.Sprintf("/images/%d", id) + string(b.QueryString("?"))
 }
 
 func (b backContext) GalleryURL() string {

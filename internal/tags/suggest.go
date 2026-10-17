@@ -86,8 +86,9 @@ func (s *Service) RelatedImages(imageID int64, limit int, excluded []int64) ([]m
 	return out, rows.Err()
 }
 
-func (s *Service) SuggestTags(prefix string, limit int) ([]models.Tag, error) {
-	return SuggestUsageRanked(s.db, prefix, "", false, limit)
+// categoryName narrows the suggestions to one category; "" takes every one.
+func (s *Service) SuggestTags(prefix, categoryName string, limit int) ([]models.Tag, error) {
+	return SuggestUsageRanked(s.db, prefix, categoryName, false, limit)
 }
 
 func SuggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsage bool, limit int) ([]models.Tag, error) {
@@ -147,20 +148,6 @@ func SuggestTwoPass(likePrefix string, limit int, query func(pat, notLike string
 		out = append(out, more...)
 	}
 	return out, nil
-}
-
-func (s *Service) SuggestTagsInCategory(prefix, categoryName string, limit int) ([]models.Tag, error) {
-	return db.QueryAll(s.db.Read, ScanTag,
-		`SELECT t.id, t.name, tc.name, tc.color, t.usage_count
-		 FROM (SELECT id, name, category_id, usage_count
-		       FROM tags
-		       WHERE category_id = (SELECT id FROM tag_categories WHERE name = ?)
-		         AND name LIKE ? ESCAPE '\' AND is_alias = 0
-		       ORDER BY usage_count DESC
-		       LIMIT ?) t
-		 JOIN tag_categories tc ON tc.id = t.category_id
-		 ORDER BY t.usage_count DESC`,
-		categoryName, db.EscapeLike(NormalizeTagName(prefix))+"%", limit)
 }
 
 func ScanTag(rows *sql.Rows) (models.Tag, error) {

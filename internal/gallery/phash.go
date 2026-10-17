@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"math"
 	"os"
@@ -58,6 +59,23 @@ func greyResize32(img image.Image) [phashSize][phashSize]float64 {
 	if w == 0 || h == 0 {
 		return out
 	}
+	rgb := func(x, y int) (uint8, uint8, uint8) {
+		r, g, bl, _ := img.At(x, y).RGBA()
+		return uint8(r >> 8), uint8(g >> 8), uint8(bl >> 8)
+	}
+	// At boxes a colour per pixel; these read the planes and give the same bytes.
+	switch m := img.(type) {
+	case *image.YCbCr:
+		rgb = func(x, y int) (uint8, uint8, uint8) {
+			ci := m.COffset(x, y)
+			return color.YCbCrToRGB(m.Y[m.YOffset(x, y)], m.Cb[ci], m.Cr[ci])
+		}
+	case *image.Gray:
+		rgb = func(x, y int) (uint8, uint8, uint8) {
+			v := m.Pix[m.PixOffset(x, y)]
+			return v, v, v
+		}
+	}
 	for dy := 0; dy < phashSize; dy++ {
 		y0 := dy * h / phashSize
 		y1 := (dy + 1) * h / phashSize
@@ -74,8 +92,8 @@ func greyResize32(img image.Image) [phashSize][phashSize]float64 {
 			var n int
 			for y := y0; y < y1; y++ {
 				for x := x0; x < x1; x++ {
-					r, g, bl, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-					sum += 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(bl>>8)
+					r, g, bl := rgb(b.Min.X+x, b.Min.Y+y)
+					sum += 0.299*float64(r) + 0.587*float64(g) + 0.114*float64(bl)
 					n++
 				}
 			}

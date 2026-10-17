@@ -10,8 +10,8 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 var IncrementalProbeDistance atomic.Int32
@@ -244,26 +244,27 @@ func lookupPhashFromTree(tree *BKTree, id int64) int64 {
 	return tree.idIndex[id]
 }
 
+// A nil tree probes by SQL.
 func incrementalProbe(database *db.DB, tree *BKTree, id, phash int64, distance int) error {
 	if unqueued, err := imageUnqueued(database, id); err != nil || unqueued {
 		return err
 	}
-	candidates, _ := tree.SearchWithinDistance(phash, distance)
-	if len(candidates) == 0 {
-		return nil
+	candidates, err := probeCandidates(database, tree, phash, distance)
+	if err != nil || len(candidates) == 0 {
+		return err
 	}
 	ctx := context.Background()
 	now := time.Now().UTC().Format(time.RFC3339)
-	for _, cid := range candidates {
-		if cid == id {
+	for _, c := range candidates {
+		if c.id == id {
 			continue
 		}
-		if unqueued, err := imageUnqueued(database, cid); err != nil {
+		if unqueued, err := imageUnqueued(database, c.id); err != nil {
 			return err
 		} else if unqueued {
 			continue
 		}
-		lo, hi := canonicalPair(id, cid)
+		lo, hi := canonicalPair(id, c.id)
 		known, err := pairAlreadyKnown(ctx, database, lo, hi)
 		if err != nil {
 			return err
@@ -271,13 +272,35 @@ func incrementalProbe(database *db.DB, tree *BKTree, id, phash int64, distance i
 		if known {
 			continue
 		}
-		other := lookupPhashFromTree(tree, cid)
 		if _, err := database.Write.Exec(
 			`INSERT OR IGNORE INTO potential_relation_pairs (a_image_id, b_image_id, distance, created_at) VALUES (?, ?, ?, ?)`,
-			lo, hi, hammingDistance(phash, other), now,
+			lo, hi, hammingDistance(phash, c.phash), now,
 		); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+type phashHit struct{ id, phash int64 }
+
+func probeCandidates(database *db.DB, tree *BKTree, phash int64, distance int) ([]phashHit, error) {
+	if tree != nil {
+		ids, _ := tree.SearchWithinDistance(phash, distance)
+		hits := make([]phashHit, len(ids))
+		for i, cid := range ids {
+			hits[i] = phashHit{cid, lookupPhashFromTree(tree, cid)}
+		}
+		return hits, nil
+	}
+	rows, err := database.Read.Query(
+		`SELECT id, phash FROM images WHERE phash IS NOT NULL AND hammingdist(phash, ?) <= ?`, phash, distance)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return db.ScanAll(rows, func(r *sql.Rows) (phashHit, error) {
+		var h phashHit
+		return h, r.Scan(&h.id, &h.phash)
+	})
 }

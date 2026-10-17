@@ -1,5 +1,4 @@
-// Package logx gates the stdlib logger by level. monloader carries a copy
-// kept in step by hand, so a fix here belongs there too.
+// Package logx gates the stdlib logger by level.
 package logx
 
 import (

@@ -1,5 +1,4 @@
 {{define "partials/tag_sidebar.html"}}
 <div id="sidebar-inner" hx-get="{{.SidebarURL}}"
-     hx-trigger="{{if .SidebarCollapsed}}sidebar-shown from:body{{else}}load{{end}}"
-     hx-swap="innerHTML"></div>
+     hx-trigger="{{if .SidebarCollapsed}}sidebar-shown from:body{{else}}load{{end}}"></div>
 {{end}}

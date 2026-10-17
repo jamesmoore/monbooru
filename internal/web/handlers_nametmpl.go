@@ -119,7 +119,7 @@ func (s *Server) namePreview(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		from := namePath(facts.Folder, facts.Base)
-		to := namePath(gallery.FolderPath(s.galleryPath(), dest), filepath.Base(dest))
+		to := namePath(gallery.FolderPath(cx.GalleryPath, dest), filepath.Base(dest))
 		changed = changed || from != to
 		rows = append(rows, namePreviewRow{From: elideMiddle(from, namePreviewFrom), FromFull: from, To: to})
 	}

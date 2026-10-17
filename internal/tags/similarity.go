@@ -1,9 +1,10 @@
 package tags
 
 import (
+	"cmp"
 	"database/sql"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/monbooru/monbooru/internal/db"
 )
@@ -360,11 +361,8 @@ func SharedTags(database *db.DB, a, b int64, limit, visibleCount int) ([]SharedT
 	if err != nil {
 		return nil, 0, err
 	}
-	sort.Slice(shared, func(i, j int) bool {
-		if shared[i].Weight != shared[j].Weight {
-			return shared[i].Weight > shared[j].Weight
-		}
-		return shared[i].Name < shared[j].Name
+	slices.SortFunc(shared, func(a, b SharedTag) int {
+		return cmp.Or(cmp.Compare(b.Weight, a.Weight), cmp.Compare(a.Name, b.Name))
 	})
 	total := len(shared)
 	if limit > 0 && total > limit {

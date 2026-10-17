@@ -14,11 +14,13 @@ import (
 // order sort and the adjacency cursor can ride scalar columns:
 // series != '' iff the image has a membership, and then names one of them.
 
+const membershipOrder = `position IS NULL, position, name`
+
 func CollectionsForImage(database *db.DB, imageID int64) ([]models.Collection, error) {
 	return db.QueryAll(database.Read, db.ScanRow(func(c *models.Collection) []any {
 		return []any{&c.Name, &c.Order}
 	}), `SELECT name, position FROM image_collections WHERE image_id = ?
-		 ORDER BY position IS NULL, position, name`, imageID)
+		 ORDER BY `+membershipOrder, imageID)
 }
 
 func AddCollectionMembership(database *db.DB, imageID int64, name string, order *int) error {
@@ -73,10 +75,21 @@ func RenameCollectionMembership(database *db.DB, imageID int64, prev, name strin
 		return errors.New("collection name required")
 	}
 	return db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+		home, err := homeName(tx, imageID)
+		if err != nil {
+			return err
+		}
 		if err := removeMembershipTx(tx, imageID, prev); err != nil {
 			return err
 		}
-		return addMembershipTx(tx, imageID, name, order)
+		if err := addMembershipTx(tx, imageID, name, order); err != nil {
+			return err
+		}
+		if !strings.EqualFold(home, prev) {
+			return nil
+		}
+		_, err = tx.Exec(`UPDATE images SET series = ?, series_order = ? WHERE id = ?`, name, order, imageID)
+		return err
 	})
 }
 
@@ -145,7 +158,7 @@ func rebindHomeTx(tx *sql.Tx, imageID int64, changedName string) error {
 	var pos sql.NullInt64
 	err = tx.QueryRow(
 		`SELECT name, position FROM image_collections WHERE image_id = ?
-		 ORDER BY position IS NULL, position, name LIMIT 1`, imageID).Scan(&name, &pos)
+		 ORDER BY `+membershipOrder+` LIMIT 1`, imageID).Scan(&name, &pos)
 	if errors.Is(err, sql.ErrNoRows) {
 		_, e := tx.Exec(`UPDATE images SET series = '', series_order = NULL WHERE id = ?`, imageID)
 		return e
@@ -342,7 +355,7 @@ func SortCollectionByFilename(database *db.DB, name string) error {
 		return []any{&m.id, &m.filename}
 	}), `SELECT c.image_id, basename(i.canonical_path)
 		 FROM image_collections c JOIN images i ON i.id = c.image_id
-		 WHERE c.name = ? AND i.is_missing = 0
+		 WHERE c.name = ?
 		 ORDER BY c.image_id`, name)
 	if err != nil {
 		return err
@@ -384,18 +397,18 @@ func CollectionCeilingHidden(database *db.DB, name string, ceiling RankCeiling) 
 	return blind - filtered, nil
 }
 
-// CollectionHiddenOrderedIDs must be appended to a ceiling-filtered
-// reorder's ids, or ReorderCollection clears positions the dialog never
-// showed.
+// CollectionHiddenOrderedIDs, the positioned members the dialog cannot
+// show (missing, or above the ceiling), must be appended to a reorder's
+// ids, or ReorderCollection clears positions the operator never saw.
 func CollectionHiddenOrderedIDs(database *db.DB, name string, ceiling RankCeiling) ([]int64, error) {
-	if !ceiling.Active {
-		return nil, nil
+	overCeiling, args := "", []any{name}
+	if ceiling.Active {
+		overCeiling, args = " OR i.rating_rank > ?", append(args, ceiling.Rank)
 	}
 	return db.QueryIDs(database.Read,
 		`SELECT c.image_id FROM image_collections c JOIN images i ON i.id = c.image_id
-		 WHERE c.name = ? AND c.position IS NOT NULL AND i.is_missing = 0 AND i.rating_rank > ?
-		 ORDER BY c.position, c.image_id`,
-		name, ceiling.Rank)
+		 WHERE c.name = ? AND c.position IS NOT NULL AND (i.is_missing = 1`+overCeiling+`)
+		 ORDER BY c.position, c.image_id`, args...)
 }
 
 // CollectionMemberIDs includes missing rows, so a rename or dissolve
@@ -406,32 +419,31 @@ func CollectionMemberIDs(database *db.DB, name string) ([]int64, error) {
 }
 
 func CollectionCBZMembers(database *db.DB, name string) ([]CBZMember, error) {
-	rows, err := database.Read.Query(
-		`SELECT i.canonical_path, i.file_type, basename(i.canonical_path), c.position
+	type memberRow struct {
+		CBZMember
+		pos sql.NullInt64
+	}
+	rows, err := db.QueryAll(database.Read, db.ScanRow(func(r *memberRow) []any {
+		return []any{&r.Path, &r.FileType, &r.filename, &r.pos}
+	}), `SELECT i.canonical_path, i.file_type, basename(i.canonical_path), c.position
 		 FROM image_collections c JOIN images i ON i.id = c.image_id
 		 WHERE c.name = ? AND i.is_missing = 0
 		 ORDER BY c.position IS NULL, c.position, c.image_id`, name)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
 	var out, unordered []CBZMember
-	for rows.Next() {
-		var m CBZMember
-		var pos sql.NullInt64
-		if err := rows.Scan(&m.Path, &m.FileType, &m.filename, &pos); err != nil {
-			return nil, err
-		}
-		if pos.Valid {
-			out = append(out, m)
+	for _, r := range rows {
+		if r.pos.Valid {
+			out = append(out, r.CBZMember)
 		} else {
-			unordered = append(unordered, m)
+			unordered = append(unordered, r.CBZMember)
 		}
 	}
 	sort.SliceStable(unordered, func(i, j int) bool {
 		return NaturalLess(strings.ToLower(unordered[i].filename), strings.ToLower(unordered[j].filename))
 	})
-	return append(out, unordered...), rows.Err()
+	return append(out, unordered...), nil
 }
 
 func AddCollectionToImages(database *db.DB, ids []int64, name string) error {
@@ -468,9 +480,9 @@ func RemoveCollectionFromImages(database *db.DB, ids []int64, name string) error
 		_, err := tx.Exec(
 			`UPDATE images SET
 			   series = COALESCE((SELECT name FROM image_collections c WHERE c.image_id = images.id
-			                      ORDER BY c.position IS NULL, c.position, c.name LIMIT 1), ''),
+			                      ORDER BY `+membershipOrder+` LIMIT 1), ''),
 			   series_order = (SELECT position FROM image_collections c WHERE c.image_id = images.id
-			                   ORDER BY c.position IS NULL, c.position, c.name LIMIT 1)
+			                   ORDER BY `+membershipOrder+` LIMIT 1)
 			 WHERE series = ? COLLATE NOCASE AND id IN (`+placeholders+`)`,
 			labelArgs...,
 		)

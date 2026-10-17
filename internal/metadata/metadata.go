@@ -12,18 +12,16 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-func Extract(path, fileType string) (*models.SDMetadata, *models.ComfyUIMetadata, error) {
+func Extract(path, fileType string) (*models.SDMetadata, *models.ComfyUIMetadata) {
 	switch fileType {
 	case "png":
-		sd, comfy, err := extractFromPNG(path)
-		return sd, comfy, err
+		return extractFromPNG(path)
 	case "jpeg":
-		sd, err := extractSDFromJPEG(path)
-		return sd, nil, err
+		return sdFromEXIF(decodeJPEGEXIF(path)), nil
 	case "webp":
-		return extractSDFromWebP(path), nil, nil
+		return sdFromEXIF(decodeWebPEXIF(path)), nil
 	default:
-		return nil, nil, nil
+		return nil, nil
 	}
 }
 
@@ -34,9 +32,9 @@ func ExtractGeneric(path, fileType string) []models.SDParam {
 	case "png":
 		return genericFromPNG(path)
 	case "jpeg":
-		return genericFromEXIF(path)
+		return collectEXIFTags(decodeJPEGEXIF(path))
 	case "webp":
-		return genericFromWebP(path)
+		return collectEXIFTags(decodeWebPEXIF(path))
 	default:
 		return nil
 	}
@@ -52,31 +50,30 @@ func genericFromPNG(path string) []models.SDParam {
 	if err != nil {
 		return nil
 	}
+	for _, p := range pngTextParsers {
+		delete(chunks, p.Key)
+	}
 	out := make([]models.SDParam, 0, len(chunks))
 	for _, k := range slices.Sorted(maps.Keys(chunks)) {
-		switch k {
-		case "parameters", "prompt", "workflow":
-			continue
-		}
 		out = append(out, models.SDParam{Key: k, Val: chunks[k]})
 	}
 	return out
 }
 
-func genericFromEXIF(path string) []models.SDParam {
-	x := decodeJPEGEXIF(path)
+// A JPEG APP1 segment's ceiling; a WebP EXIF chunk can be far larger.
+const maxNumericEXIFBytes = 64 * 1024
+
+func collectEXIFTags(x *exifData) []models.SDParam {
 	if x == nil {
 		return nil
 	}
-	return collectEXIFTags(x)
-}
-
-func collectEXIFTags(x *exifData) []models.SDParam {
 	out := make([]models.SDParam, 0, len(x.tags))
 	for name, tag := range x.tags {
-		if name != userCommentField {
-			out = append(out, models.SDParam{Key: name, Val: tag.String()})
+		numeric := tag.typ != exifASCII && tag.typ != exifUndefined
+		if name == userCommentField || numeric && len(tag.val) > maxNumericEXIFBytes {
+			continue
 		}
+		out = append(out, models.SDParam{Key: name, Val: tag.String()})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
@@ -88,7 +85,7 @@ func EXIFOrientation(path, fileType string) (int, bool) {
 	case "jpeg":
 		x = decodeJPEGEXIF(path)
 	case "webp":
-		x, _ = decodeWebPEXIF(path)
+		x = decodeWebPEXIF(path)
 	}
 	if x == nil {
 		return 0, false

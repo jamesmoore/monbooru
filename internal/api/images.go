@@ -28,13 +28,14 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/markup"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/relations"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/contract"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -80,6 +81,14 @@ func linkFirstSource(g *library.Gallery, source, derivative int64) {
 	}
 }
 
+type enrichRequest struct {
+	provenanceJSON
+	Tags       []string `json:"tags"`
+	SourceMD5  string   `json:"source_md5"`
+	Verify     bool     `json:"verify"`
+	Similarity float64  `json:"similarity"`
+}
+
 func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
@@ -91,16 +100,10 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	case err != nil:
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		serverError(w, err)
 		return
 	}
-	var body struct {
-		provenanceJSON
-		Tags       []string `json:"tags"`
-		SourceMD5  string   `json:"source_md5"`
-		Verify     bool     `json:"verify"`
-		Similarity float64  `json:"similarity"`
-	}
+	var body enrichRequest
 	if !decodeJSON(w, r, &body) {
 		return
 	}
@@ -122,8 +125,7 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 			if got == "" {
 				var err error
 				if got, err = g.StoreMD5(r.Context(), id); err != nil {
-					h.recordFetch(g, id, "error", "could not verify the file; fetch not applied")
-					apiError(w, http.StatusInternalServerError, "internal_error", "cannot hash image: "+err.Error())
+					h.refuse(w, g, id, "could not verify the file; fetch not applied", http.StatusInternalServerError, "internal_error", "cannot hash image: "+err.Error())
 					return
 				}
 			}
@@ -152,39 +154,33 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 	sum, tagWarnings, err := h.mergeSource(g, id, prov.source, prov.postID, prov.url, sourceMD5, prov.parentURL,
 		prov.postFile, body.Tags, "api")
 	if err != nil {
-		h.recordFetch(g, id, "error", "fetch failed while applying tags")
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		h.refuse(w, g, id, "fetch failed while applying tags", http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	linkParentRelations(g, id, prov.url, prov.parentURL)
+	failed := "recording the match score"
 	if err := g.Edit(func(d *db.DB) error {
-		return gallery.SetSourceSimilarity(d, id, prov.source, prov.postID, body.Similarity)
-	}); err != nil {
-		h.recordFetch(g, id, "error", "fetch failed while recording the match score")
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		return
-	}
-	// After the merge, which creates a first enrich's origin row.
-	if md5Verdict != "" {
-		if err := g.Edit(func(d *db.DB) error { return gallery.SetSourceMD5Match(d, id, prov.source, prov.postID, md5Verdict) }); err != nil {
-			h.recordFetch(g, id, "error", "fetch failed while recording the hash verdict")
-			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
-			return
+		if err := gallery.SetSourceSimilarity(d, id, prov.source, prov.postID, body.Similarity); err != nil {
+			return err
 		}
-	}
-	if step, err := applySourceProvenance(g, id, prov); err != nil {
-		h.recordFetch(g, id, "error", "fetch failed while applying "+step)
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		// After the merge, which creates a first enrich's origin row.
+		if md5Verdict != "" {
+			failed = "recording the hash verdict"
+			if err := gallery.SetSourceMD5Match(d, id, prov.source, prov.postID, md5Verdict); err != nil {
+				return err
+			}
+		}
+		step, err := gallery.ApplySourceProvenance(d, id, prov.source, prov.postID, prov.commentary, prov.translated, prov.original, prov.notes)
+		failed = "applying " + step
+		return err
+	}); err != nil {
+		h.refuse(w, g, id, "fetch failed while "+failed, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	h.recordFetch(g, id, "ok", fetchSummary(sum, len(body.Tags)))
 	// A hash lookup reports its hit by enriching.
 	recordLookupHit(g, id, prov.source)
-	resp := map[string]any{"merge": sum, "verified": verified}
-	if len(tagWarnings) > 0 {
-		resp["tag_warnings"] = tagWarnings
-	}
-	WriteJSON(w, http.StatusOK, resp)
+	WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"merge": sum, "verified": verified}, tagWarnings))
 }
 
 func applySourceProvenance(g *library.Gallery, id int64, p provenance) (string, error) {
@@ -230,7 +226,7 @@ func (h *Handler) fetchStatusReport(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "state is required")
 		return
 	}
-	h.recordFetch(g, id, body.State, body.Message)
+	h.recordFetch(g, id, body.State, firstRunes(body.Message, maxFetchMessageLen))
 	recordLookupTerminal(g, id, body.Kind, body.Backend, body.State)
 	WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -247,7 +243,7 @@ func recordLookupHit(g *library.Gallery, imageID int64, source string) {
 
 func recordLookupTerminal(g *library.Gallery, imageID int64, kind, backend, state string) {
 	result, concluded := monloader.Outcome(state)
-	if !concluded || (kind != "" && kind != monloader.KindLookup) {
+	if !concluded || (kind != "" && kind != contract.KindLookup) {
 		return
 	}
 	// A monloader that names neither kind nor backend concludes every
@@ -283,22 +279,19 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	case err != nil:
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		serverError(w, err)
 		return
 	}
 	if gallery.IsVideoType(fileType) || fileType == models.FileTypeCBZ {
-		h.recordFetch(g, id, "error", "this file type cannot be replaced")
-		apiError(w, http.StatusConflict, "wrong_type", "only image rows can have their file replaced")
+		h.refuse(w, g, id, "this file type cannot be replaced", http.StatusConflict, "wrong_type", "only image rows can have their file replaced")
 		return
 	}
 	if !gallery.NamedInside(g.GalleryPath, canonical) {
-		h.recordFetch(g, id, "error", "the file is outside this gallery")
-		apiError(w, http.StatusConflict, "conflict", "the image's file is outside the gallery root")
+		h.refuse(w, g, id, "the file is outside this gallery", http.StatusConflict, "conflict", "the image's file is outside the gallery root")
 		return
 	}
 	if err := g.Boundary().Check(canonical); err != nil {
-		h.recordFetch(g, id, "error", "the file sits in a folder this gallery leaves out")
-		apiError(w, http.StatusConflict, "conflict", "the image's file is not this gallery's: "+err.Error())
+		h.refuse(w, g, id, "the file sits in a folder this gallery leaves out", http.StatusConflict, "conflict", "the image's file is not this gallery's: "+err.Error())
 		return
 	}
 	if !isMultipart(r.Header.Get("Content-Type")) {
@@ -351,20 +344,17 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	applyMeta := func() (gallery.MergeSummary, []string, bool) {
 		sum, tagWarnings, err := h.mergeSource(g, id, prov.source, prov.postID, prov.url, claimedMD5, prov.parentURL, prov.postFile, tags, "api")
 		if err != nil {
-			h.recordFetch(g, id, "error", "replace failed while applying tags")
-			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			h.refuse(w, g, id, "replace failed while applying tags", http.StatusInternalServerError, "internal_error", err.Error())
 			return sum, nil, false
 		}
 		linkParentRelations(g, id, prov.url, prov.parentURL)
 		if step, err := applySourceProvenance(g, id, prov); err != nil {
-			h.recordFetch(g, id, "error", "replace failed while applying "+step)
-			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			h.refuse(w, g, id, "replace failed while applying "+step, http.StatusInternalServerError, "internal_error", err.Error())
 			return sum, tagWarnings, false
 		}
 		if prov.source != "" {
 			if err := g.Edit(func(d *db.DB) error { return gallery.MarkSourceExact(d, id, prov.source, prov.postID, newMD5) }); err != nil {
-				h.recordFetch(g, id, "error", "replace failed while recording the source state")
-				apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+				h.refuse(w, g, id, "replace failed while recording the source state", http.StatusInternalServerError, "internal_error", err.Error())
 				return sum, tagWarnings, false
 			}
 		}
@@ -382,11 +372,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 			msg += " " + fetchSummary(sum, len(tags))
 		}
 		h.recordFetch(g, id, "ok", msg)
-		resp := map[string]any{"replaced": false, "merge": sum}
-		if len(tagWarnings) > 0 {
-			resp["tag_warnings"] = tagWarnings
-		}
-		WriteJSON(w, http.StatusOK, resp)
+		WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"replaced": false, "merge": sum}, tagWarnings))
 		return
 	}
 
@@ -416,8 +402,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	newType, ftErr := gallery.DetectFileType(stagedPath)
 	if ftErr != nil {
 		discardStaged()
-		h.recordFetch(g, id, "error", "the source served an unsupported file type")
-		apiError(w, http.StatusBadRequest, "unsupported_type", "unsupported or unrecognised file type")
+		h.refuse(w, g, id, "the source served an unsupported file type", http.StatusBadRequest, "unsupported_type", "unsupported or unrecognised file type")
 		return
 	}
 	if magic, err := gallery.MagicFileType(stagedPath); err == nil {
@@ -425,8 +410,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if gallery.IsVideoType(newType) || newType == models.FileTypeCBZ {
 		discardStaged()
-		h.recordFetch(g, id, "error", "the source serves a video or archive; only image files can replace an image")
-		apiError(w, http.StatusConflict, "wrong_type", "the replacement must be an image file")
+		h.refuse(w, g, id, "the source serves a video or archive; only image files can replace an image", http.StatusConflict, "wrong_type", "the replacement must be an image file")
 		return
 	}
 	if !gallery.IsFFmpegStill(newType) && !canDecodeImage(stagedPath) {
@@ -434,8 +418,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 			gallery.NormalizeImage(stagedPath) == nil && canDecodeImage(stagedPath)
 		if !rescued {
 			discardStaged()
-			h.recordFetch(g, id, "error", "the downloaded file does not decode as an image")
-			apiError(w, http.StatusUnsupportedMediaType, "unsupported_type", "file does not decode as an image")
+			h.refuse(w, g, id, "the downloaded file does not decode as an image", http.StatusUnsupportedMediaType, "unsupported_type", "file does not decode as an image")
 			return
 		}
 		if reSHA, err := gallery.HashFile(stagedPath); err == nil && reSHA != newSHA {
@@ -452,15 +435,13 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	err = g.ReplaceFile(id, stagedPath, newSHA, newMD5, newType)
 	if errors.As(err, new(gallery.Exclusion)) {
 		discardStaged()
-		h.recordFetch(g, id, "error", "the new file type's name is one this gallery leaves out")
-		apiError(w, http.StatusConflict, "conflict", err.Error())
+		h.refuse(w, g, id, "the new file type's name is one this gallery leaves out", http.StatusConflict, "conflict", err.Error())
 		return
 	}
 	if err != nil {
 		discardStaged()
 		logx.Warnf("api replace image %d: %v", id, err)
-		h.recordFetch(g, id, "error", "the file replacement failed")
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		h.refuse(w, g, id, "the file replacement failed", http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
@@ -479,11 +460,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 		msg += " " + fetchSummary(sum, len(tags))
 	}
 	h.recordFetch(g, id, "ok", msg)
-	resp := map[string]any{"replaced": true, "merge": sum}
-	if len(tagWarnings) > 0 {
-		resp["tag_warnings"] = tagWarnings
-	}
-	WriteJSON(w, http.StatusOK, resp)
+	WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"replaced": true, "merge": sum}, tagWarnings))
 }
 
 func dimsLabel(w, h *int) string {
@@ -510,8 +487,8 @@ func canDecodeImage(path string) bool {
 		return false
 	}
 	defer func() { _ = f.Close() }()
-	_, _, err = image.DecodeConfig(f)
-	return err == nil
+	cfg, _, err := image.DecodeConfig(f)
+	return err == nil && cfg.Width > 0 && cfg.Height > 0
 }
 
 // ffmpeg decodes whatever it can read, so a file merely named .jpg must
@@ -651,8 +628,11 @@ func (h *Handler) getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := h.buildImageResponse(g, id)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		return
+	}
+	if serverError(w, err) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, resp)
@@ -748,7 +728,7 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 				apiError(w, http.StatusConflict, "conflict", err.Error())
 				return
 			}
-			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			serverError(w, err)
 			return
 		}
 	}
@@ -773,8 +753,11 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := h.buildImageResponse(g, id)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		return
+	}
+	if serverError(w, err) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, resp)
@@ -877,10 +860,6 @@ func (h *Handler) parseCreateMultipart(w http.ResponseWriter, r *http.Request, g
 	if badRequest(w, destErr) {
 		return in, false
 	}
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		apiError(w, http.StatusInternalServerError, "internal_error", "failed to create folder: "+err.Error())
-		return in, false
-	}
 
 	in.upload = file
 	if undecodableJPEG(file) {
@@ -923,7 +902,7 @@ func (h *Handler) parseCreateJSON(w http.ResponseWriter, r *http.Request, g *lib
 		apiError(w, http.StatusBadRequest, "invalid_request", "path is required")
 		return in, false
 	}
-	in.imgPath = body.Path
+	imgPath := body.Path
 	in.initialTags = body.Tags
 	in.folder = strings.TrimSpace(body.Folder)
 	in.autotag = body.Autotag
@@ -939,17 +918,17 @@ func (h *Handler) parseCreateJSON(w http.ResponseWriter, r *http.Request, g *lib
 		return in, false
 	}
 
-	if in.folder != "" && !filepath.IsAbs(in.imgPath) {
+	if in.folder != "" && !filepath.IsAbs(imgPath) {
 		destDir, destErr := g.Boundary().ResolveSubdir(in.folder)
 		if badRequest(w, destErr) {
 			return in, false
 		}
-		in.imgPath = filepath.Join(destDir, in.imgPath)
+		imgPath = filepath.Join(destDir, imgPath)
 	}
 
 	// A row outside the gallery would let a later DELETE unlink files the
 	// operator never meant to manage.
-	absPath, absErr := filepath.Abs(in.imgPath)
+	absPath, absErr := filepath.Abs(imgPath)
 	if absErr != nil {
 		apiError(w, http.StatusBadRequest, "invalid_request", "invalid path")
 		return in, false
@@ -959,15 +938,16 @@ func (h *Handler) parseCreateJSON(w http.ResponseWriter, r *http.Request, g *lib
 		apiError(w, http.StatusInternalServerError, "internal_error", "gallery path unresolvable")
 		return in, false
 	}
-	if !gallery.PathInside(galleryAbs, absPath) {
+	rel, relErr := filepath.Rel(galleryAbs, absPath)
+	if relErr != nil || !filepath.IsLocal(rel) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "path must be inside the gallery root")
 		return in, false
 	}
-	if err := g.Boundary().Check(absPath); err != nil {
+	in.imgPath = filepath.Join(galleryAbs, rel)
+	if err := g.Boundary().Check(in.imgPath); err != nil {
 		apiError(w, http.StatusBadRequest, "invalid_request", "path is not this gallery's: "+err.Error())
 		return in, false
 	}
-	in.imgPath = absPath
 
 	// A fixed message, so the response never echoes the filesystem layout.
 	if _, statErr := os.Stat(in.imgPath); os.IsNotExist(statErr) {
@@ -995,14 +975,11 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 	if in.closeUpload != nil {
 		defer in.closeUpload()
 	}
-	origin := in.via
-	if origin == "" {
-		if in.upload != nil {
-			origin = models.OriginUpload
-		} else {
-			origin = models.OriginIngest
-		}
+	origin := models.OriginIngest
+	if in.upload != nil {
+		origin = models.OriginUpload
 	}
+	origin = cmp.Or(in.via, origin)
 	maxMB := h.cfg().Gallery.MaxFileSizeMB
 	spec := library.LandSpec{
 		Origin: origin,
@@ -1021,7 +998,7 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 		landed, err = g.Land(r.Context(), in.destDir, in.uploadName, library.FromReader(in.upload), spec)
 	} else {
 		if err := g.DB.Read.QueryRow(`SELECT image_id FROM image_paths WHERE path = ?`, in.imgPath).Scan(&knownID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			serverError(w, err)
 			return
 		}
 		landed, err = g.LandInPlace(r.Context(), in.imgPath, spec)
@@ -1040,7 +1017,7 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusUnsupportedMediaType, "unsupported_type", "file does not decode as an image")
 		default:
 			logx.Warnf("api createImage ingest: %v", err)
-			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			serverError(w, err)
 		}
 		return
 	}
@@ -1078,15 +1055,11 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusInternalServerError, "internal_error", "failed to build response")
 			return
 		}
-		envelope := map[string]any{
+		WriteJSON(w, http.StatusOK, withWarnings(map[string]any{
 			"image":       resp,
 			"alias_added": aliasAdded,
 			"merge":       sum,
-		}
-		if len(tagWarnings) > 0 {
-			envelope["tag_warnings"] = tagWarnings
-		}
-		WriteJSON(w, http.StatusOK, envelope)
+		}, tagWarnings))
 		return
 	}
 
@@ -1155,10 +1128,7 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(tagWarnings) > 0 || autotagNote != "" {
-		envelope := map[string]any{"image": resp}
-		if len(tagWarnings) > 0 {
-			envelope["tag_warnings"] = tagWarnings
-		}
+		envelope := withWarnings(map[string]any{"image": resp}, tagWarnings)
 		if autotagNote != "" {
 			envelope["autotag"] = autotagNote
 		}
@@ -1241,7 +1211,7 @@ func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
 		sq.OrderCollection = search.PinnedCollectionName(expr)
 	}
 
-	result, err := search.Execute(g.Source(), sq)
+	result, err := search.Execute(context.Background(), g.Source(), sq)
 	if serverError(w, err) {
 		return
 	}
@@ -1274,8 +1244,12 @@ func loadAliasesForImages(g *library.Gallery, ids []int64) (map[int64][]string, 
 	if len(ids) == 0 {
 		return out, nil
 	}
+	type aliasRow struct {
+		imageID int64
+		path    string
+	}
 	placeholders, args := db.InPlaceholders(ids)
-	rows, err := g.DB.Read.Query(
+	rows, err := db.QueryAll(g.DB.Read, db.ScanRow(func(r *aliasRow) []any { return []any{&r.imageID, &r.path} }),
 		`SELECT image_id, path FROM image_paths
 		 WHERE is_canonical = 0 AND image_id IN (`+placeholders+`)
 		 ORDER BY image_id, id`,
@@ -1284,16 +1258,10 @@ func loadAliasesForImages(g *library.Gallery, ids []int64) (map[int64][]string, 
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var imageID int64
-		var path string
-		if err := rows.Scan(&imageID, &path); err != nil {
-			return nil, err
-		}
-		out[imageID] = append(out[imageID], path)
+	for _, r := range rows {
+		out[r.imageID] = append(out[r.imageID], r.path)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func loadTagsForImages(g *library.Gallery, ids []int64) (map[int64][]imageTagJSON, error) {
@@ -1301,8 +1269,14 @@ func loadTagsForImages(g *library.Gallery, ids []int64) (map[int64][]imageTagJSO
 	if len(ids) == 0 {
 		return out, nil
 	}
+	type tagRow struct {
+		imageID int64
+		imageTagJSON
+	}
 	placeholders, args := db.InPlaceholders(ids)
-	rows, err := g.DB.Read.Query(`
+	rows, err := db.QueryAll(g.DB.Read, db.ScanRow(func(r *tagRow) []any {
+		return []any{&r.imageID, &r.Name, &r.Category, &r.IsAuto, &r.Confidence, &r.TaggerName}
+	}), `
 		SELECT it.image_id, t.name, tc.name, it.is_auto, it.confidence, it.tagger_name
 		FROM image_tags it
 		JOIN tags t ON t.id = it.tag_id
@@ -1312,22 +1286,15 @@ func loadTagsForImages(g *library.Gallery, ids []int64) (map[int64][]imageTagJSO
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var imageID int64
-		var tj imageTagJSON
-		var tn *string
-		if err := rows.Scan(&imageID, &tj.Name, &tj.Category, &tj.IsAuto, &tj.Confidence, &tn); err != nil {
-			return nil, err
-		}
-		tj.TaggerName = tn
-		out[imageID] = append(out[imageID], tj)
+	for _, r := range rows {
+		out[r.imageID] = append(out[r.imageID], r.imageTagJSON)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func loadTagSourcesForImage(g *library.Gallery, imageID int64) (map[string][]string, error) {
-	rows, err := g.DB.Read.Query(`
+	type sourceRow struct{ name, cat, source string }
+	rows, err := db.QueryAll(g.DB.Read, db.ScanRow(func(r *sourceRow) []any { return []any{&r.name, &r.cat, &r.source} }), `
 		SELECT t.name, tc.name, its.source
 		FROM image_tag_sources its
 		JOIN tags t ON t.id = its.tag_id
@@ -1337,20 +1304,15 @@ func loadTagSourcesForImage(g *library.Gallery, imageID int64) (map[string][]str
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
 	out := map[string][]string{}
-	for rows.Next() {
-		var name, cat, source string
-		if err := rows.Scan(&name, &cat, &source); err != nil {
-			return nil, err
+	for _, r := range rows {
+		key := r.name
+		if r.cat != "general" {
+			key = r.cat + ":" + r.name
 		}
-		key := name
-		if cat != "general" {
-			key = cat + ":" + name
-		}
-		out[key] = append(out[key], source)
+		out[key] = append(out[key], r.source)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (h *Handler) listImageTags(w http.ResponseWriter, r *http.Request) {
@@ -1418,9 +1380,13 @@ func loadImageTagsJSON(g *library.Gallery, imageID int64) []imageTagJSON {
 	return []imageTagJSON{}
 }
 
-func imageExists(g *library.Gallery, id int64) bool {
+func imageExists(g *library.Gallery, id int64) (bool, error) {
 	var n int
-	return g.DB.Read.QueryRow(`SELECT 1 FROM images WHERE id = ?`, id).Scan(&n) == nil
+	err := g.DB.Read.QueryRow(`SELECT 1 FROM images WHERE id = ?`, id).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (h *Handler) applyInitialTags(g *library.Gallery, imgID int64, rawTags []string, via string) (int, []string, error) {

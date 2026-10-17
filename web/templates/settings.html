@@ -1,9 +1,9 @@
 {{define "maintenance_row"}}
         <tr>
-          <td><strong{{if .Accent}} class="{{.Accent}}"{{end}}>{{.Title}}</strong>{{if .Mark}}<span class="status-badge status-faint">{{.Mark}}</span>{{end}} <span class="field-hint">- {{.Desc}}</span></td>
+          <td><strong{{if .Accent}} class="{{.Accent}}"{{end}}>{{.Title}}</strong>{{if .Mark}}<span class="status-badge status-faint">{{.Mark}}</span>{{end}} <span class="field-hint">- {{.Desc}}{{with .View}} (<a href="{{.}}">view</a>){{end}}</span></td>
           <td>
             <form hx-post="{{.URL}}" hx-target="#flash-maintenance" hx-swap="innerHTML"
-                  {{if .JobKick}}hx-on::after-request="if(event.detail.successful){document.getElementById('job-status').setAttribute('hx-trigger','load');htmx.trigger('#job-status','load')}"
+                  {{if .JobKick}}hx-on::after-request="if(event.detail.successful){refreshJobStatus()}"
                   {{end}}{{if .Confirm}}hx-confirm="{{.Confirm}}"
                   {{if .ConfirmDanger}}data-confirm-danger="{{.ConfirmDanger}}"
                   {{end}}data-confirm-ok="{{.ConfirmOK}}"
@@ -143,8 +143,7 @@
                  hx-get="/internal/name/preview"
                  hx-trigger="input delay:200ms from:#default_upload_folder, input delay:200ms from:#default_upload_name"
                  hx-target="this"
-                 hx-vals='js:{scope: "upload", folder: document.getElementById("default_upload_folder").value, name: document.getElementById("default_upload_name").value}'
-                 hx-swap="innerHTML"></div>
+                 hx-vals='js:{scope: "upload", folder: document.getElementById("default_upload_folder").value, name: document.getElementById("default_upload_name").value}'></div>
           </div>
           <div class="field">
             <label>
@@ -318,8 +317,7 @@
             <input type="text" name="gallery_path" id="gallery-add-path" required>
             {{if .DesktopProfile}}
             <button type="button" class="btn-sm dir-picker-open" data-into="gallery-add-path"
-                    hx-get="/internal/browse?into=gallery-add-path" hx-target="#dir-picker-body"
-                    hx-swap="innerHTML">Browse</button>
+                    hx-get="/internal/browse?into=gallery-add-path" hx-target="#dir-picker-body">Browse</button>
             {{end}}
           </div>
         </div>
@@ -357,16 +355,7 @@
     }
     function onAddGalleryResponse(form) {
       setAddGalleryBusy(form, false);
-      var flash = document.getElementById('flash-gallery-add');
-      if (flash && flash.querySelector('.flash-ok')) {
-        var outer = document.getElementById('flash-galleries');
-        if (outer) outer.innerHTML = flash.innerHTML;
-        writeStash('monbooru_import_flash', {h: flash.innerHTML});
-        flash.innerHTML = '';
-        document.getElementById('gallery-add-dialog').close();
-        form.reset();
-        setTimeout(function(){ window.location.reload(); }, 1500);
-      }
+      reloadWithGalleryFlash('flash-gallery-add', 'gallery-add-dialog', '.flash-ok');
     }
     </script>
   </section>
@@ -453,14 +442,9 @@
 
   <script>
   function openGalleryRename(btn) {
-    var name = btn.dataset.name;
-    document.getElementById('gallery-rename-src').textContent = name;
-    clearSlots('flash-gallery-rename');
-    var input = document.getElementById('gallery-rename-input');
-    input.value = name;
-    openHxRewriteDialog('gallery-rename-form', 'hx-post', '/settings/galleries/' + name + '/rename', 'gallery-rename-dialog');
-    input.focus();
-    input.select();
+    openNameDialog({src: 'gallery-rename-src', err: 'flash-gallery-rename', input: 'gallery-rename-input',
+                    form: 'gallery-rename-form', dialog: 'gallery-rename-dialog'},
+                   btn.dataset.name, '/settings/galleries/' + btn.dataset.name + '/rename');
   }
   function openGalleryDelete(btn) {
     var name = btn.dataset.name;
@@ -674,8 +658,7 @@
             </td>
             <td>
               <div class="tagger-actions">
-              {{if not $r.Installed}}
-                {{if $r.Supported}}
+              {{if $r.Files}}
                 {{if $.DesktopProfile}}
                 <button type="button" class="btn-sm tagger-act-state"
                         onclick="document.getElementById('tagger-get-{{$r.Name}}').showModal()">Install</button>
@@ -687,8 +670,8 @@
                         data-host-cmd="{{$r.HostCommand}}"
                         data-docker-cmd="{{$r.DockerCommand}}">Install</button>
                 {{end}}
-                {{end}}
-              {{else if not $r.Malformed}}
+              {{end}}
+              {{if and $r.Installed (not $r.Malformed)}}
                 {{if $r.Enabled}}
                 <button type="button" class="btn-sm tagger-act-state"
                         hx-post="/settings/tagger/{{$r.Name}}/disable" hx-target="#flash-tagger" hx-swap="innerHTML">Disable</button>
@@ -715,6 +698,7 @@
       {{else}}
       <p class="field-hint">No tagger subfolders found in <code>{{$cfg.Paths.ModelPath}}</code>.</p>
       {{end}}
+      <p class="field-hint" id="tagger-registry">More taggers: see <code>TAGGERS.md</code> in the <a href="{{.PluginsRepoURL}}" target="_blank" rel="noopener">monbooru-plugins</a> registry.</p>
     </div>
     {{range $rows}}{{if and .Installed (not .Malformed)}}
     <dialog id="tagger-config-{{.Name}}" class="tagger-config-dialog">
@@ -723,7 +707,7 @@
     </dialog>
     {{end}}{{end}}
     {{if .DesktopProfile}}
-    {{range $rows}}{{if and (not .Installed) .Supported}}
+    {{range $rows}}{{if .Files}}
     <dialog id="tagger-get-{{.Name}}" class="tagger-get-dialog">
       <p><strong>{{.Name}}</strong> - {{.Description}}</p>
       {{if .Gated}}
@@ -768,6 +752,143 @@
       </div>
     </dialog>
     {{end}}
+
+  <script>
+  document.body.addEventListener('click', function(e) {
+    var tab = e.target.closest && e.target.closest('.dialog-tab');
+    if (!tab || !tab.dataset.panel) return;
+    var strip = tab.closest('.dialog-tabs');
+    var scope = strip && strip.parentElement;
+    if (!scope) return;
+    strip.querySelectorAll('.dialog-tab').forEach(function(t) {
+      t.classList.toggle('active', t === tab);
+    });
+    scope.querySelectorAll('.dialog-panel').forEach(function(p) {
+      p.hidden = p.id !== tab.dataset.panel;
+    });
+  });
+
+  // Enter would implicitly submit the dialog's config form; the input
+  // already searches on its search event.
+  document.body.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter') return;
+    var el = e.target;
+    if (el && el.name === 'q' && el.closest && el.closest('.tc-mappings')) {
+      e.preventDefault();
+    }
+  });
+
+  document.body.addEventListener('click', function(e) {
+    var btn = e.target.closest && e.target.closest('.tc-edit, .tc-reset, .tc-edit-cancel, .tc-filter, .tc-more-btn');
+    if (!btn) return;
+    var panel = btn.closest('.tc-mappings');
+    if (!panel) return;
+    var search = panel.querySelector('input[name=q]');
+    var limit = panel.querySelector('input[name=limit]');
+
+    if (btn.classList.contains('tc-filter')) {
+      panel.querySelectorAll('.tc-filter').forEach(function(f) { f.classList.toggle('active', f === btn); });
+      var hidden = panel.querySelector('input[name=filter]');
+      if (hidden) hidden.value = btn.dataset.filter;
+      if (search) htmx.trigger(search, 'search');
+      return;
+    }
+
+    if (btn.classList.contains('tc-more-btn')) {
+      if (limit) limit.value = btn.dataset.limit;
+      if (search) htmx.trigger(search, 'search');
+      return;
+    }
+
+    var open = panel.querySelector('.tc-editor-row');
+    if (open) open.remove();
+
+    if (!btn.classList.contains('tc-edit')) return;
+
+    var row = btn.closest('tr');
+    var tpl = panel.querySelector('.tc-editor-template');
+    if (!row || !tpl) return;
+    var editor = tpl.content.firstElementChild.cloneNode(true);
+    var apply = editor.querySelector('.tc-edit-apply');
+    apply.value = row.dataset.source;
+    if (row.dataset.category) editor.querySelector('.tc-edit-category').value = row.dataset.category;
+    editor.querySelector('.tc-edit-name').value =
+      row.dataset.name !== row.dataset.source ? row.dataset.name : '';
+    editor.querySelector('.tc-edit-mute').checked = row.dataset.muted === '1';
+    // Left alone, Enter would submit the dialog's form and close the pop-in.
+    editor.addEventListener('keydown', function(ev) {
+      if (ev.key !== 'Enter') return;
+      ev.preventDefault();
+      apply.click();
+    });
+    row.after(editor);
+    htmx.process(editor);
+  });
+
+  function taggerGalAllToggle(cb) {
+    var form = cb.closest('form');
+    if (!form) return;
+    form.querySelectorAll('input[name=gallery_names]').forEach(function(c) {
+      c.disabled = cb.checked;
+      if (cb.checked) c.checked = true;
+    });
+  }
+
+  function taggerGalSelect(btn, on) {
+    var form = btn.closest('form');
+    if (!form) return;
+    var allCb = form.querySelector('input[name=all]');
+    if (allCb && allCb.checked) {
+      allCb.checked = false;
+      taggerGalAllToggle(allCb);
+    }
+    form.querySelectorAll('input[name=gallery_names]').forEach(function(c) {
+      c.checked = !!on;
+    });
+  }
+
+  function threshRowAtDefault(row) {
+    var atDefault = true;
+    row.querySelectorAll('input[type=number]').forEach(function(inp) {
+      if (inp.value !== (inp.dataset.default || '')) atDefault = false;
+    });
+    var cb = row.querySelector('input[type=checkbox]');
+    if (cb && cb.checked !== (cb.dataset.defaultChecked === '1')) atDefault = false;
+    return atDefault;
+  }
+
+  function syncThreshRow(row) {
+    if (!row) return;
+    var reset = row.querySelector('.reset-thresh');
+    // A class, not hidden: visibility keeps the link's width so the column
+    // does not reflow.
+    if (reset) reset.classList.toggle('reset-thresh-shown', !threshRowAtDefault(row));
+  }
+
+  function resetThreshRow(link) {
+    var row = link.closest('tr');
+    if (!row) return;
+    row.querySelectorAll('input[type=number]').forEach(function(inp) {
+      inp.value = inp.dataset.default || '';
+    });
+    var cb = row.querySelector('input[type=checkbox]');
+    if (cb) cb.checked = cb.dataset.defaultChecked === '1';
+    syncThreshRow(row);
+  }
+
+  function syncThreshRowFromEvent(e) {
+    var row = e.target.closest && e.target.closest('.tagger-thresh-table tbody tr');
+    if (row) syncThreshRow(row);
+  }
+  document.body.addEventListener('input', syncThreshRowFromEvent);
+  document.body.addEventListener('change', syncThreshRowFromEvent);
+  document.body.addEventListener('htmx:afterSwap', function(e) {
+    var t = e.detail && e.detail.target;
+    if (!t) return;
+    var table = t.querySelector && t.querySelector('.tagger-thresh-table');
+    if (table) table.querySelectorAll('tbody tr').forEach(syncThreshRow);
+  });
+  </script>
   </section>
 
   <section id="relations" class="settings-section">
@@ -832,18 +953,7 @@
           <div class="table-scroll">
           <table class="maintenance-table">
             <tbody>
-              <tr>
-                <td><strong>Missing images</strong> <span class="field-hint">- remove DB entries whose files are gone (<a href="/?q=missing:true">view</a>)</span></td>
-                <td>
-                  <form hx-post="/settings/maintenance/prune-missing" hx-target="#flash-maintenance" hx-swap="innerHTML"
-                        hx-confirm="Prune the images marked missing whose file is gone from disk?"
-                        data-confirm-danger="Tags on those images are removed too. An image whose file is still on disk is kept. Re-mounting the gallery volume before pruning restores the files."
-                        data-confirm-ok="Prune"
-                        style="display:inline">
-                    <button type="submit" class="btn-danger btn-sm">Prune</button>
-                  </form>
-                </td>
-              </tr>
+              {{template "maintenance_row" dict "Title" "Missing images" "Desc" "remove DB entries whose files are gone" "View" "/?q=missing:true" "URL" "/settings/maintenance/prune-missing" "Verb" "Prune" "Danger" true "Confirm" "Prune the images marked missing whose file is gone from disk?" "ConfirmDanger" "Tags on those images are removed too. An image whose file is still on disk is kept. Re-mounting the gallery volume before pruning restores the files." "ConfirmOK" "Prune"}}
               {{template "maintenance_row" dict "Title" "Orphaned thumbnails" "Desc" "remove thumbnail files with no matching image" "URL" "/settings/maintenance/prune-orphaned-thumbnails" "Verb" "Remove" "Confirm" "Remove every thumbnail file with no matching image?" "ConfirmOK" "Remove"}}
               {{template "maintenance_row" dict "Title" "Empty folders" "Desc" "list the folders under the gallery root holding nothing, then remove the ones you pick" "URL" "/settings/maintenance/empty-folders" "Verb" "Scan" "Mark" "report"}}
               {{template "maintenance_row" dict "Title" "Rebuild thumbnails" "Desc" "regenerate thumbnail files for every image" "URL" "/settings/maintenance/rebuild-thumbnails" "Verb" "Rebuild" "Mark" "long job" "JobKick" true "Confirm" "Rebuild thumbnails for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Rebuild"}}

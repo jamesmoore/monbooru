@@ -15,8 +15,7 @@
           hx-post="{{.PreviewURL}}"
           hx-include="closest form"
           hx-vals='js:{body: document.getElementById("{{.Target}}").value}'
-          hx-target="#{{.Target}}-preview"
-          hx-swap="innerHTML">[preview]</button>
+          hx-target="#{{.Target}}-preview">[preview]</button>
 </div>
 <div id="{{.Target}}-preview" class="markup-preview"></div>
 {{end}}

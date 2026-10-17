@@ -77,13 +77,6 @@ func (s *Server) categoryIDByName(name string) (int64, bool) {
 	return id, ok && err == nil
 }
 
-func (s *Server) galleryPath() string {
-	if cx := s.active(); cx != nil {
-		return cx.GalleryPath
-	}
-	return ""
-}
-
 func (s *Server) boundary() *gallery.Boundary {
 	if cx := s.active(); cx != nil {
 		return cx.Boundary()
@@ -94,13 +87,6 @@ func (s *Server) boundary() *gallery.Boundary {
 func (s *Server) thumbnailsPath() string {
 	if cx := s.active(); cx != nil {
 		return cx.ThumbnailsPath
-	}
-	return ""
-}
-
-func (s *Server) dbPath() string {
-	if cx := s.active(); cx != nil {
-		return cx.DBPath
 	}
 	return ""
 }

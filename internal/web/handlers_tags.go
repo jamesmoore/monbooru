@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -56,12 +56,8 @@ func (s *Server) originKinds(labels []string) map[string]string {
 	for _, l := range labels {
 		switch l {
 		case "":
-		case "user":
-			kinds[l] = "user"
-		case "ptr":
-			kinds[l] = "ptr"
-		case "auto":
-			kinds[l] = "auto"
+		case "user", "ptr", "auto":
+			kinds[l] = l
 		default:
 			unknown = append(unknown, l)
 		}
@@ -141,16 +137,11 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 	prefix := q.Get("q")
 	if catIDStr == "" && prefix != "" && strings.HasSuffix(prefix, ":") && strings.Count(prefix, ":") == 1 {
 		catName := strings.TrimSuffix(prefix, ":")
-		if catName != "" && s.categoryExists(catName) {
-			if catID, ok, err := tags.CategoryIDByName(s.db(), catName); ok && err == nil {
-				dst := r.URL
-				vals := dst.Query()
-				vals.Del("q")
-				vals.Set("cat", strconv.FormatInt(catID, 10))
-				dst.RawQuery = vals.Encode()
-				http.Redirect(w, r, dst.String(), http.StatusSeeOther)
-				return
-			}
+		if catID, ok := s.categoryIDByName(catName); catName != "" && ok {
+			q.Del("q")
+			q.Set("cat", strconv.FormatInt(catID, 10))
+			http.Redirect(w, r, "/tags?"+q.Encode(), http.StatusSeeOther)
+			return
 		}
 	}
 	p := tagListingParamsFrom(q)
@@ -162,7 +153,7 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cats, _ := s.tagSvc().ListCategories()
-	totalPages := (total + 99) / 100
+	totalPages := (total + tagListingPageSize - 1) / tagListingPageSize
 
 	if total > 0 && p.Page > totalPages {
 		p.Page = totalPages
@@ -292,13 +283,15 @@ func tagListingParamsFrom(q url.Values) tagListingParams {
 	return p
 }
 
+const tagListingPageSize = 100
+
 func (s *Server) tagListingFilter(p tagListingParams) tags.TagFilter {
 	f := tags.TagFilter{
 		Prefix:        p.Prefix,
 		Sort:          p.Sort,
 		Order:         p.Order,
 		PageIndex:     p.Page - 1,
-		Limit:         100,
+		Limit:         tagListingPageSize,
 		Origin:        p.Origin,
 		Type:          p.Type,
 		CreatedAfter:  createdAfterCutoff(p.CreatedAfter),
@@ -525,11 +518,7 @@ func (s *Server) addTagAliasPost(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case len(failures) == 0:
-		noun := "alias"
-		if added != 1 {
-			noun = "aliases"
-		}
-		msg := strconv.Itoa(added) + " " + noun + " created."
+		msg := strconv.Itoa(added) + " " + pluralWord(added, "alias", "aliases") + " created."
 		if note := unknownCategoryNote(unknownCats); note != "" {
 			msg += " " + note + "."
 		}
@@ -563,11 +552,7 @@ func (s *Server) removeTagAliasesDelete(w http.ResponseWriter, r *http.Request) 
 		}
 		removed++
 	}
-	noun := "alias"
-	if removed != 1 {
-		noun = "aliases"
-	}
-	setFlashHeader(w, strconv.Itoa(removed)+" "+noun+" removed.", "ok",
+	setFlashHeader(w, strconv.Itoa(removed)+" "+pluralWord(removed, "alias", "aliases")+" removed.", "ok",
 		map[string]any{"tag-relations-changed": ""})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -592,9 +577,6 @@ func (s *Server) deleteTagHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteTagsSearchPost(w http.ResponseWriter, r *http.Request) {
-	if !parseFormOK(w, r) {
-		return
-	}
 	s.startTagScopeRun(w, r, s.runDeleteTagsByIDs)
 }
 

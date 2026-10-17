@@ -10,17 +10,18 @@
       {{if .SelfManaged}}<span class="status-badge status-faint">self-managed</span>{{end}}
       {{if .Address}}<code class="peer-address">{{.Address}}</code>{{end}}
       {{if .Command}}<span class="status-badge {{if eq .RunState "running"}}status-enabled{{else if eq .RunState "stopped"}}status-off{{else}}status-warn{{end}}">managed - {{.RunState}}</span>{{end}}
+      {{if .Refused}}<span class="status-badge status-warn">refused - {{.Refused}}</span>{{end}}
     </div>
     {{if .Companion}}
     <form id="monloader-urls" hx-post="/settings/monloader" hx-target="#flash-plugins" hx-swap="innerHTML">
       <div class="field">
         <label for="monloader_api_url">api url</label>
-        <input type="text" name="api_url" id="monloader_api_url" value="{{.APIURL}}" placeholder="auto-detected from pairing"{{if .APIURLPinned}} disabled{{end}}>
+        <input type="text" name="api_url" id="monloader_api_url" value="{{.APIURL}}" hx-preserve="true" placeholder="auto-detected from pairing"{{if .APIURLPinned}} disabled{{end}}>
         {{if .APIURLPinned}}<span class="field-hint">Set by {{.APIURLPinned}} in the environment.</span>{{end}}
       </div>
       <div class="field">
         <label for="monloader_url">web url</label>
-        <input type="text" name="monloader_url" id="monloader_url" value="{{.WebURL}}" placeholder="{{.WebURLHint}}"{{if .WebURLPinned}} disabled{{end}}>
+        <input type="text" name="monloader_url" id="monloader_url" value="{{.WebURL}}" hx-preserve="true" placeholder="{{.WebURLHint}}"{{if .WebURLPinned}} disabled{{end}}>
         {{if .WebURLPinned}}<span class="field-hint">Set by {{.WebURLPinned}} in the environment.</span>{{end}}
       </div>
     </form>
@@ -40,7 +41,7 @@
     {{end}}
     {{if and (not .Paired) .Companion}}
     <div class="peer-line field-hint">Not paired yet. In monloader click "connect to monbooru", then approve the request above.</div>
-    {{else if not .Paired}}
+    {{else if and (not .Paired) (not .Refused)}}
     <div class="peer-line field-hint">Not paired yet. Its buttons appear once it offers to pair and you approve it above.</div>
     {{end}}
     <div class="peer-actions">

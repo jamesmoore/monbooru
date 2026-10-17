@@ -7,9 +7,9 @@ import (
 	"strconv"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
@@ -21,11 +21,11 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusInternalServerError, "No active gallery.")
 		return
 	}
-	s.cfgMu.Lock()
+	s.cfgMu.RLock()
 	distance := s.cfg.Relations.DefaultDistance
 	tagPairs := s.cfg.Relations.TagPairs
 	tagPairThreshold := s.cfg.Relations.TagPairThreshold
-	s.cfgMu.Unlock()
+	s.cfgMu.RUnlock()
 	if n, err := strconv.Atoi(r.FormValue("distance")); err == nil && n >= 0 && n <= config.MaxPhashDistance {
 		distance = n
 	}

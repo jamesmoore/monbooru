@@ -14,7 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/fsx"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
+
 	"github.com/monbooru/monbooru/internal/procx"
 )
 
@@ -38,7 +39,7 @@ func resolveTool(name string) string {
 	if runtime.GOOS == "windows" {
 		binary += ".exe"
 	}
-	if dir := fsx.ExeDir(); dir != "" {
+	if dir := desktop.ExeDir(); dir != "" {
 		if p := filepath.Join(dir, binary); runnable(p) {
 			return p
 		}
@@ -178,8 +179,7 @@ func tenPercentOffset(srcPath string) string {
 
 // The video track can end before 10% of the container's length, so a
 // render that fails there is tried again from the start.
-func fromTenPercent(srcPath string, render func(offset string) error) error {
-	offset := tenPercentOffset(srcPath)
+func fromTenPercent(offset string, render func(offset string) error) error {
 	err := render(offset)
 	if err != nil && offset != "0.000" {
 		err = render("0")
@@ -187,13 +187,14 @@ func fromTenPercent(srcPath string, render func(offset string) error) error {
 	return err
 }
 
-func generateVideoThumb(srcPath, dstPath string) error {
-	return fromTenPercent(srcPath, func(offset string) error {
+func generateVideoThumb(srcPath, dstPath, tenPercent string) error {
+	return fromTenPercent(tenPercent, func(offset string) error {
 		return runFFmpegToFile(dstPath, ".vthumb.*.jpg", "thumbnail", func(tmp string) []string {
 			return []string{
 				"-y",
 				"-ss", offset,
 				"-i", srcPath,
+				"-update", "1",
 				"-frames:v", "1",
 				"-vf", fitWithin(thumbMaxDim),
 				"-q:v", "2",
@@ -204,8 +205,8 @@ func generateVideoThumb(srcPath, dstPath string) error {
 	})
 }
 
-func generateVideoHover(srcPath, dstPath string) error {
-	return fromTenPercent(srcPath, func(offset string) error {
+func generateVideoHover(srcPath, dstPath, tenPercent string) error {
+	return fromTenPercent(tenPercent, func(offset string) error {
 		return runFFmpegToFile(dstPath, ".vhover.*.webp", "hover", func(tmp string) []string {
 			return []string{
 				"-y",
@@ -226,6 +227,7 @@ func generateGIFHover(srcPath, dstPath string) error {
 	return runFFmpegToFile(dstPath, ".ghover.*.webp", "gif hover", func(tmp string) []string {
 		return []string{
 			"-y",
+			"-t", "4",
 			"-i", srcPath,
 			"-vf", fitWithin(thumbMaxDim),
 			"-loop", "0",
@@ -257,6 +259,7 @@ func ExtractVideoFrames(srcPath, tmpDir string, positions []float64) ([]string, 
 			"-y",
 			"-ss", strconv.FormatFloat(offset, 'f', 3, 64),
 			"-i", srcPath,
+			"-update", "1",
 			"-frames:v", "1",
 			"-q:v", "2",
 			"--",
@@ -289,32 +292,37 @@ func probeDuration(srcPath string) (float64, error) {
 }
 
 func ProbeDurationSeconds(srcPath string) (float64, bool) {
-	if !ffprobeAvailable() {
-		return 0, false
-	}
-	d, err := probeDuration(srcPath)
-	if err != nil || d <= 0 {
-		return 0, false
-	}
-	return d, true
+	p := probeVideo(srcPath)
+	return p.duration, p.duration > 0
 }
 
-// The display size: the thumbnail and the player apply a phone video's
-// rotation, so a quarter turn swaps the coded width and height.
 func ProbeVideoDimensions(srcPath string) (int, int, bool) {
+	p := probeVideo(srcPath)
+	return p.width, p.height, p.width > 0
+}
+
+type videoProbe struct {
+	width, height int
+	duration      float64
+}
+
+// The size is the display size: the thumbnail and the player apply a
+// phone video's rotation, so a quarter turn swaps the coded width and height.
+func probeVideo(srcPath string) videoProbe {
+	var p videoProbe
 	if !ffprobeAvailable() {
-		return 0, 0, false
+		return p
 	}
 	out, err := runFFmpeg(false, ffprobePath,
 		"-v", "quiet",
 		"-select_streams", "v:0",
-		"-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate",
+		"-show_entries", "format=duration:stream=width,height:stream_side_data=rotation:stream_tags=rotate",
 		"-print_format", "json",
 		"--",
 		srcPath,
 	)
 	if err != nil {
-		return 0, 0, false
+		return p
 	}
 	var probe struct {
 		Streams []struct {
@@ -327,13 +335,22 @@ func ProbeVideoDimensions(srcPath string) (int, int, bool) {
 				Rotate string `json:"rotate"`
 			} `json:"tags"`
 		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
 	}
-	if json.Unmarshal(out, &probe) != nil || len(probe.Streams) == 0 {
-		return 0, 0, false
+	if json.Unmarshal(out, &probe) != nil {
+		return p
+	}
+	if d, err := strconv.ParseFloat(probe.Format.Duration, 64); err == nil && d > 0 {
+		p.duration = d
+	}
+	if len(probe.Streams) == 0 {
+		return p
 	}
 	st := probe.Streams[0]
 	if st.Width <= 0 || st.Height <= 0 {
-		return 0, 0, false
+		return p
 	}
 	rotation, _ := strconv.ParseFloat(st.Tags.Rotate, 64)
 	for _, sd := range st.SideData {
@@ -341,10 +358,11 @@ func ProbeVideoDimensions(srcPath string) (int, int, bool) {
 			rotation = sd.Rotation
 		}
 	}
+	p.width, p.height = st.Width, st.Height
 	if int(math.Abs(rotation))%180 == 90 {
-		return st.Height, st.Width, true
+		p.width, p.height = st.Height, st.Width
 	}
-	return st.Width, st.Height, true
+	return p
 }
 
 // probeVideoHasAudio is false also when ffprobe is missing or fails, so

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"html/template"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -14,9 +15,9 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type relatedTile struct {
@@ -54,13 +55,10 @@ func (s *Server) relatedEntriesGet(w http.ResponseWriter, r *http.Request) {
 		"Tiles":         tiles,
 		"Collection":    siblings,
 		"ImagePaths":    paths,
-		"CSRFToken":     s.csrfToken(sessionFromContext(r.Context())),
+		"CSRFToken":     s.sessions.CSRFToken(sessionFromContext(r.Context())),
 		"ActiveGallery": s.activeGallery(),
-		"BackQ":         back.Q,
-		"BackSort":      back.Sort,
-		"BackOrder":     back.Order,
-		"BackSeed":      back.Seed,
-		"BackPage":      back.Page,
+		"BackQS":        back.QueryString("?"),
+		"BackKVQS":      back.QueryString("&"),
 	})
 }
 
@@ -176,11 +174,7 @@ func (s *Server) imageRelationsPage(w http.ResponseWriter, r *http.Request) {
 		Collection:                     collection,
 		NextOriginalIfOriginalUnlinked: nextOriginal,
 		AltGroupMembersOrdered:         reorderSelfFirst(rels.AltGroupMembers, id),
-		BackQ:                          back.Q,
-		BackSort:                       back.Sort,
-		BackOrder:                      back.Order,
-		BackSeed:                       back.Seed,
-		BackPage:                       back.Page,
+		BackQS:                         back.QueryString("?"),
 	}
 	if rels.DupGroup != nil {
 		pageData.DupGroupMembersOrdered = reorderSelfFirst(rels.DupGroup.Members, id)
@@ -300,11 +294,7 @@ type relationsImagePageData struct {
 	DerivativeGraph                *derivGraph
 	DerivativeActions              map[int64]string
 	VersionActions                 map[int64]string
-	BackQ                          string
-	BackSort                       string
-	BackOrder                      string
-	BackSeed                       string
-	BackPage                       string
+	BackQS                         template.URL
 }
 
 func derivativeActionMap(self int64, rels *relations.ImageRelations) map[int64]string {
@@ -493,7 +483,7 @@ func reviewAgainPost(w http.ResponseWriter, r *http.Request, cx *library.Gallery
 		var ar, br int64
 		if err := cx.DB.Read.QueryRow(
 			`SELECT COUNT(*), COALESCE(MIN(image_id), 0), COALESCE(MAX(image_id), 0)
-			 FROM `+groupMembersTable(subkind)+` WHERE group_id = ?`, gid,
+			 FROM `+browseGroupKinds[subkind].membersTable+` WHERE group_id = ?`, gid,
 		).Scan(&n, &ar, &br); err != nil {
 			writeRelationError(w, err)
 			return
@@ -503,16 +493,13 @@ func reviewAgainPost(w http.ResponseWriter, r *http.Request, cx *library.Gallery
 			return
 		}
 		a, b = ar, br
+		dissolve := cx.RelationsSvc.DissolveAltGroup
 		if subkind == "duplicate" {
-			if err := cx.RelationsSvc.DissolveDupGroup(gid); err != nil {
-				writeRelationError(w, err)
-				return
-			}
-		} else {
-			if err := cx.RelationsSvc.DissolveAltGroup(gid); err != nil {
-				writeRelationError(w, err)
-				return
-			}
+			dissolve = cx.RelationsSvc.DissolveDupGroup
+		}
+		if err := dissolve(gid); err != nil {
+			writeRelationError(w, err)
+			return
 		}
 	case "version", "derivative", "not_related":
 		ar, br, ok := parseRelationPair(w, r)
@@ -541,13 +528,6 @@ func reviewAgainPost(w http.ResponseWriter, r *http.Request, cx *library.Gallery
 	lo, hi := min(a, b), max(a, b)
 	dest := "/relations/session?a=" + strconv.FormatInt(lo, 10) + "&b=" + strconv.FormatInt(hi, 10)
 	hxRedirect(w, r, dest)
-}
-
-func groupMembersTable(subkind string) string {
-	if subkind == "alternate" {
-		return "alt_group_members"
-	}
-	return "dup_group_members"
 }
 
 type copyTagsPreviewGroup struct {
@@ -623,19 +603,18 @@ func (s *Server) reverseRelationPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var err error
 	switch r.FormValue("type") {
 	case "version":
-		if err := cx.RelationsSvc.ReverseVersionEdge(a, b); err != nil {
-			writeRelationError(w, err)
-			return
-		}
+		err = cx.RelationsSvc.ReverseVersionEdge(a, b)
 	case "derivative":
-		if err := cx.RelationsSvc.ReverseDerivativeEdge(a, b); err != nil {
-			writeRelationError(w, err)
-			return
-		}
+		err = cx.RelationsSvc.ReverseDerivativeEdge(a, b)
 	default:
 		flashStatus(w, http.StatusBadRequest, "Unknown relation type.")
+		return
+	}
+	if err != nil {
+		writeRelationError(w, err)
 		return
 	}
 	writeInlineFlash(w, "ok", "Edge reversed.")
@@ -681,12 +660,14 @@ func (s *Server) mergeGroupsPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	redirectKind := "duplicate"
-	if kind == "alt" {
-		redirectKind = "alternate"
-	}
-	target := "/relations/browse?kind=" + redirectKind
-	hxRedirect(w, r, target)
+	hxRedirect(w, r, "/relations/browse?kind="+cmp.Or(browseKindByShortName[kind], "duplicate"))
+}
+
+var dissolveOpFor = map[string]string{
+	"duplicate":  "dissolve-dup",
+	"alternate":  "dissolve-alt",
+	"version":    "dissolve-version",
+	"derivative": "dissolve-derivative",
 }
 
 func (s *Server) dissolveGroupsPost(w http.ResponseWriter, r *http.Request) {
@@ -695,19 +676,10 @@ func (s *Server) dissolveGroupsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := cmp.Or(r.URL.Query().Get("kind"), r.FormValue("kind"))
-	byRoot := map[string]struct {
-		field    string
-		dissolve func(int64) error
-	}{
-		"duplicate":  {"group_id", cx.RelationsSvc.DissolveDupGroup},
-		"alternate":  {"group_id", cx.RelationsSvc.DissolveAltGroup},
-		"version":    {"root_id", cx.RelationsSvc.DissolveVersionChain},
-		"derivative": {"root_id", cx.RelationsSvc.DissolveDerivativeTree},
-	}
-	switch entry, uniform := byRoot[kind]; {
+	switch op, uniform := relationRemoveOps[dissolveOpFor[kind]]; {
 	case uniform:
-		for _, id := range parseIDList(r.Form[entry.field]) {
-			if err := entry.dissolve(id); err != nil {
+		for _, id := range parseIDList(r.Form[op.field]) {
+			if err := op.run(cx.RelationsSvc, id, 0); err != nil {
 				writeRelationError(w, err)
 				return
 			}

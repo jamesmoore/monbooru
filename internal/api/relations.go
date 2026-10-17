@@ -83,9 +83,15 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "invalid_request", "missing a or b")
 		return
 	}
-	if !imageExists(g, body.A) || !imageExists(g, body.B) {
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
-		return
+	for _, id := range []int64{body.A, body.B} {
+		exists, err := imageExists(g, id)
+		if serverError(w, err) {
+			return
+		}
+		if !exists {
+			apiError(w, http.StatusNotFound, "not_found", "image not found")
+			return
+		}
 	}
 	left, right := body.A, body.B
 	if body.Direction == "ba" {
@@ -95,27 +101,24 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, "internal_error", "relations not wired")
 		return
 	}
-	var err error
-	switch body.Type {
-	case "duplicate":
-		err = g.RelationsSvc.AddDuplicate(left, right)
-	case "alternate":
-		err = g.RelationsSvc.AddAlternate(left, right)
-	case "version":
-		err = g.RelationsSvc.AddVersionEdge(left, right)
-	case "derivative":
-		err = g.RelationsSvc.AddDerivativeEdge(left, right)
-	case "not_related":
-		err = g.RelationsSvc.AddNotRelated(left, right)
-	default:
+	add, known := relationAdders[body.Type]
+	if !known {
 		apiError(w, http.StatusBadRequest, "invalid_request", "unknown type")
 		return
 	}
-	if err != nil {
+	if err := add(g.RelationsSvc, left, right); err != nil {
 		writeRelationError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+}
+
+var relationAdders = map[string]func(svc *relations.Service, a, b int64) error{
+	"duplicate":   (*relations.Service).AddDuplicate,
+	"alternate":   (*relations.Service).AddAlternate,
+	"version":     (*relations.Service).AddVersionEdge,
+	"derivative":  (*relations.Service).AddDerivativeEdge,
+	"not_related": (*relations.Service).AddNotRelated,
 }
 
 type relationsRemoveBody struct {
@@ -208,5 +211,5 @@ func writeRelationError(w http.ResponseWriter, err error) {
 		apiError(w, fe.Status, fe.Code, fe.Message)
 		return
 	}
-	apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+	serverError(w, err)
 }

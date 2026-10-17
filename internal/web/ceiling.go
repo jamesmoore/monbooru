@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/monbooru/monbooru/internal/library"
+	"github.com/monbooru/monbooru/internal/tags"
 )
 
 const ratingCeilingCookieName = "monbooru_rating_ceiling"
@@ -51,18 +52,17 @@ func readRatingCookie(r *http.Request) string {
 	if err != nil {
 		return ""
 	}
-	switch c.Value {
-	case "general", "sensitive", "questionable", "explicit":
+	if tags.IsCanonicalRating(c.Value) {
 		return c.Value
 	}
 	return ""
 }
 
-func writeRatingCookie(w http.ResponseWriter, level string) {
-	switch level {
-	case "general", "sensitive", "questionable":
-		setPrefCookie(w, ratingCeilingCookieName, level)
-	default:
-		setPrefCookie(w, ratingCeilingCookieName, "")
+// The top level is no ceiling at all, so it clears the cookie.
+func writeRatingCookie(w http.ResponseWriter, r *http.Request, level string) {
+	if rank := tags.RatingRank(level); rank >= 0 && rank < len(tags.RatingLevels)-1 {
+		setPrefCookie(w, r, ratingCeilingCookieName, level)
+		return
 	}
+	setPrefCookie(w, r, ratingCeilingCookieName, "")
 }

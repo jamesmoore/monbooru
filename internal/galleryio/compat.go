@@ -11,9 +11,7 @@ import (
 	"github.com/monbooru/monbooru/internal/library"
 )
 
-func detectCompatFormat(files []*zip.File) string { return compatibility.Detect(files) }
-
-func replaceFromCompatArchive(files []*zip.File, format, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int) (int, error) {
+func replaceFromCompatArchive(files []*zip.File, format, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int, quiesce func() error) (int, error) {
 	result, err := compatibility.Translate(files, format)
 	if err != nil {
 		return 0, err
@@ -21,7 +19,7 @@ func replaceFromCompatArchive(files []*zip.File, format, dbPath, thumbsPath stri
 	return ApplyLightReplace(
 		toLightManifest(result.Manifest),
 		translatedFilesFromCompat(result.Files),
-		dbPath, thumbsPath, b, format, maxFileSizeMB,
+		dbPath, thumbsPath, b, format, maxFileSizeMB, quiesce,
 	)
 }
 
@@ -43,18 +41,7 @@ func mergeFromCompatArchive(ctx context.Context, cx *library.Gallery, files []*z
 }
 
 func toLightManifest(m compatibility.Manifest) LightManifest {
-	out := LightManifest{
-		Version: LightManifestVersion,
-		Images:  make([]LightManifestImage, 0, len(m.Images)),
-	}
-	for _, img := range m.Images {
-		out.Images = append(out.Images, LightManifestImage{
-			SHA256: img.SHA256,
-			Path:   img.Path,
-			Tags:   img.Tags,
-		})
-	}
-	return out
+	return LightManifest{Version: LightManifestVersion, Images: m.Images}
 }
 
 func translatedFilesFromCompat(in map[string]*zip.File) []translatedFile {

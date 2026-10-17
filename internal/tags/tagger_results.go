@@ -48,12 +48,14 @@ func (s *Service) ApplyTaggerResults(ctx context.Context, imageID int64, hits []
 			}
 			hasRating = true
 		}
-		var tagID int64
+		var tagID, resolvedCat int64
 		var isAlias int
 		var canonicalID sql.NullInt64
 		err := tx.QueryRowContext(ctx,
-			`SELECT id, is_alias, canonical_tag_id FROM tags WHERE name = ? AND category_id = ?`, h.Name, h.CategoryID,
-		).Scan(&tagID, &isAlias, &canonicalID)
+			`SELECT t.id, t.is_alias, t.canonical_tag_id, COALESCE(c.category_id, t.category_id)
+			 FROM tags t LEFT JOIN tags c ON c.id = t.canonical_tag_id
+			 WHERE t.name = ? AND t.category_id = ?`, h.Name, h.CategoryID,
+		).Scan(&tagID, &isAlias, &canonicalID, &resolvedCat)
 		if err == sql.ErrNoRows {
 			res, err2 := tx.ExecContext(ctx,
 				`INSERT INTO tags (name, category_id, usage_count, origin) VALUES (?, ?, 0, ?)`, h.Name, h.CategoryID, h.Tagger)
@@ -65,6 +67,12 @@ func (s *Service) ApplyTaggerResults(ctx context.Context, imageID int64, hits []
 			return fmt.Errorf("lookup tag %q (cat=%d): %w", h.Name, h.CategoryID, err)
 		} else if isAlias == 1 && canonicalID.Valid {
 			tagID = canonicalID.Int64
+			if s.ratingCatID != 0 && resolvedCat == s.ratingCatID && h.CategoryID != s.ratingCatID {
+				if manualRated {
+					continue
+				}
+				hasRating = true
+			}
 		}
 		if prev, ok := targets[tagID]; !ok || h.Score > prev.score {
 			targets[tagID] = target{score: h.Score, taggerName: h.Tagger}
@@ -72,8 +80,8 @@ func (s *Service) ApplyTaggerResults(ctx context.Context, imageID int64, hits []
 	}
 
 	type rowInfo struct {
-		isAuto     bool
-		taggerName string
+		isAuto, isImplied bool
+		taggerName        string
 	}
 	current := map[int64]rowInfo{}
 	type tagRow struct {
@@ -82,12 +90,12 @@ func (s *Service) ApplyTaggerResults(ctx context.Context, imageID int64, hits []
 	}
 	existing, err := db.QueryAllContext(ctx, tx, func(rows *sql.Rows) (tagRow, error) {
 		var r tagRow
-		var isAuto int
+		var isAuto, isImplied int
 		var tname sql.NullString
-		err := rows.Scan(&r.id, &isAuto, &tname)
-		r.isAuto, r.taggerName = isAuto == 1, tname.String
+		err := rows.Scan(&r.id, &isAuto, &isImplied, &tname)
+		r.isAuto, r.isImplied, r.taggerName = isAuto == 1, isImplied == 1, tname.String
 		return r, err
-	}, `SELECT tag_id, is_auto, tagger_name FROM image_tags WHERE image_id = ?`, imageID)
+	}, `SELECT tag_id, is_auto, is_implied, tagger_name FROM image_tags WHERE image_id = ?`, imageID)
 	if err != nil {
 		return err
 	}
@@ -136,11 +144,12 @@ func (s *Service) ApplyTaggerResults(ctx context.Context, imageID int64, hits []
 
 	for tid, t := range targets {
 		info, exists := current[tid]
-		if !exists || !info.isAuto {
+		if !exists || (!info.isAuto && !info.isImplied) {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE image_tags SET is_implied = 0, confidence = ?, tagger_name = NULLIF(?, '') WHERE image_id = ? AND tag_id = ? AND is_auto = 1`,
+			`UPDATE image_tags SET is_implied = 0, is_auto = 1, confidence = ?, tagger_name = NULLIF(?, '')
+			 WHERE image_id = ? AND tag_id = ? AND (is_auto = 1 OR is_implied = 1)`,
 			t.score, t.taggerName, imageID, tid); err != nil {
 			return fmt.Errorf("refresh attribution for tag %d: %w", tid, err)
 		}

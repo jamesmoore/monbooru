@@ -1,8 +1,9 @@
 package gallery
 
 import (
-	"database/sql"
-	"fmt"
+	"cmp"
+	"slices"
+	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
 )
@@ -53,9 +54,109 @@ func SourceLabelCountsUnderQuery(database *db.DB, limit int, ceiling RankCeiling
 		args...)
 }
 
+type FolderNode struct {
+	Path     string
+	Name     string
+	Count    int
+	Depth    int
+	Children []FolderNode
+}
+
+// FolderTree's counts include every descendant's, and a folder holding
+// only subfolders still gets a node.
+func FolderTree(database *db.DB) ([]FolderNode, error) {
+	return FolderTreeUnder(database, RankCeiling{})
+}
+
+func buildFolderTree(flat []folderCount) []FolderNode {
+	known := map[string]bool{"": true}
+	for _, fc := range flat {
+		known[fc.path] = true
+	}
+	var toAdd []folderCount
+	for _, fc := range flat {
+		if fc.path == "" {
+			continue
+		}
+		segments := strings.Split(fc.path, "/")
+		for i := 1; i < len(segments); i++ {
+			ancestor := strings.Join(segments[:i], "/")
+			if !known[ancestor] {
+				known[ancestor] = true
+				toAdd = append(toAdd, folderCount{path: ancestor, count: 0})
+			}
+		}
+	}
+	flat = append(flat, toAdd...)
+
+	// Pointer-tree intermediate so parent-child wiring survives mutations.
+	type pnode struct {
+		FolderNode
+		children []*pnode
+	}
+
+	rootP := &pnode{FolderNode: FolderNode{Path: "", Name: "(root)", Depth: 0}}
+	pnodeMap := map[string]*pnode{"": rootP}
+
+	// Sort lexicographically so parents always exist before children.
+	slices.SortFunc(flat, func(a, b folderCount) int {
+		return cmp.Compare(a.path, b.path)
+	})
+
+	for _, fc := range flat {
+		if fc.path == "" {
+			rootP.Count = fc.count
+			continue
+		}
+		// folder_path is "/"-separated on every platform, which
+		// filepath.Dir is not.
+		name := fc.path
+		parentPath := ""
+		if i := strings.LastIndex(fc.path, "/"); i >= 0 {
+			name = fc.path[i+1:]
+			parentPath = fc.path[:i]
+		}
+		n := &pnode{FolderNode: FolderNode{
+			Path:  fc.path,
+			Name:  name,
+			Count: fc.count,
+			Depth: strings.Count(fc.path, "/") + 1,
+		}}
+		pnodeMap[fc.path] = n
+
+		parent, ok := pnodeMap[parentPath]
+		if !ok {
+			parent = rootP
+		}
+		parent.children = append(parent.children, n)
+	}
+
+	var rollup func(p *pnode)
+	rollup = func(p *pnode) {
+		for _, c := range p.children {
+			rollup(c)
+			p.Count += c.Count
+		}
+	}
+	rollup(rootP)
+
+	var toValue func(p *pnode) FolderNode
+	toValue = func(p *pnode) FolderNode {
+		n := p.FolderNode
+		for _, c := range p.children {
+			n.Children = append(n.Children, toValue(c))
+		}
+		return n
+	}
+
+	return []FolderNode{toValue(rootP)}
+}
+
 func FolderTreeUnder(database *db.DB, ceiling RankCeiling) ([]FolderNode, error) {
 	where, args := ceiling.and("i")
-	flat, err := db.QueryAll(database.Read, scanFolderRow,
+	flat, err := db.QueryAll(database.Read, db.ScanRow(func(fc *folderCount) []any {
+		return []any{&fc.path, &fc.count}
+	}),
 		`SELECT COALESCE(i.folder_path, ''), COUNT(*) FROM images i
 		 WHERE i.is_missing = 0`+where+`
 		 GROUP BY i.folder_path ORDER BY i.folder_path`,
@@ -69,12 +170,4 @@ func FolderTreeUnder(database *db.DB, ceiling RankCeiling) ([]FolderNode, error)
 type folderCount struct {
 	path  string
 	count int
-}
-
-func scanFolderRow(rows *sql.Rows) (folderCount, error) {
-	var fc folderCount
-	if err := rows.Scan(&fc.path, &fc.count); err != nil {
-		return fc, fmt.Errorf("scanning folder row: %w", err)
-	}
-	return fc, nil
 }

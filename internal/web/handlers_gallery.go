@@ -2,6 +2,7 @@ package web
 
 import (
 	"cmp"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -14,10 +15,10 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/searchkw"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -155,7 +156,7 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 	htmxGridTarget := isHTMXRequest(r) && r.Header.Get("HX-Target") == "gallery-grid"
 
 	firstStart := time.Now()
-	result, err := search.Execute(s.source(), sq)
+	result, err := search.Execute(context.Background(), s.source(), sq)
 	if err != nil {
 		logx.Errorf("gallery search: %v", err)
 		http.Error(w, "search error", http.StatusInternalServerError)
@@ -172,7 +173,7 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 		if page > totalPages {
 			page = totalPages
 			sq.Page = page
-			result, err = search.Execute(s.source(), sq)
+			result, err = search.Execute(context.Background(), s.source(), sq)
 			if err != nil {
 				logx.Errorf("gallery search (clamped): %v", err)
 				http.Error(w, "search error", http.StatusInternalServerError)
@@ -223,7 +224,7 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 		sb = s.sidebarLoad(ids, ceiling)
 	}
 
-	taggerCfg := s.cfgSnapshot()
+	enabledTaggers, taggersPresent, taggerReason := tagger.GalleryTaggers(s.cfgSnapshot(), s.activeGallery())
 	data := galleryData{
 		baseData:          s.base(r, "gallery", "Images - "+s.booruName()),
 		Query:             queryStr,
@@ -242,9 +243,9 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 		FolderTree:        sb.Folders,
 		SourceLabelCounts: sb.SourceLabels,
 		SavedSearches:     sb.Saved,
-		EnabledTaggers:    tagger.EnabledTaggersForGallery(taggerCfg, s.activeGallery()),
-		TaggersPresent:    tagger.Present(taggerCfg),
-		TaggerReason:      tagger.UnavailableReason(taggerCfg),
+		EnabledTaggers:    enabledTaggers,
+		TaggersPresent:    taggersPresent,
+		TaggerReason:      taggerReason,
 		PluginSlot:        s.pluginSlot(r, config.SlotBatchBar, 0, ""),
 		ActiveTagTerms:    computeActiveTagTerms(queryStr),
 	}
@@ -344,7 +345,7 @@ func (s *Server) gallerySidebar(w http.ResponseWriter, r *http.Request) {
 			Limit:      s.pageSize(r),
 			SkipCount:  true,
 		}
-		result, err := search.Execute(s.source(), sq)
+		result, err := search.Execute(context.Background(), s.source(), sq)
 		if err != nil {
 			logx.Errorf("sidebar search: %v", err)
 			http.Error(w, "search error", http.StatusInternalServerError)
@@ -440,25 +441,20 @@ func computeActiveTagTerms(query string) map[string]bool {
 }
 
 func inboxFilterActive(expr search.Expr) bool {
-	if expr == nil {
-		return false
-	}
-	var found bool
-	search.WalkAndedLeaves(expr, func(e search.Expr) {
-		if v, ok := e.(search.FilterExpr); ok && v.Key == "inbox" && strings.ToLower(v.Val) == "true" {
-			found = true
-		}
-	})
-	return found
+	return filterActive(expr, "inbox", func(val string) bool { return strings.ToLower(val) == "true" })
 }
 
 func collectionFilterActive(expr search.Expr) bool {
+	return filterActive(expr, "collection", func(val string) bool { return val != "" })
+}
+
+func filterActive(expr search.Expr, key string, match func(string) bool) bool {
 	if expr == nil {
 		return false
 	}
 	var found bool
 	search.WalkAndedLeaves(expr, func(e search.Expr) {
-		if v, ok := e.(search.FilterExpr); ok && v.Key == "collection" && v.Val != "" {
+		if v, ok := e.(search.FilterExpr); ok && v.Key == key && match(v.Val) {
 			found = true
 		}
 	})

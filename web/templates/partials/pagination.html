@@ -1,18 +1,18 @@
 {{define "partials/pagination.html"}}
 {{if gt .Total 1}}
-<div class="pagination">
+<div class="pagination{{with .Class}} {{.}}{{end}}"{{with .HX}} hx-target="{{.}}" hx-push-url="true"{{end}}>
   {{if and (gt .Page 2) (gt .Total 2)}}
-  <a href="{{.Base}}1">« First</a>
+  <a href="{{.Base}}1"{{if .HX}} hx-get="{{.Base}}1"{{end}}>« First</a>
   {{end}}
   {{if gt .Page 1}}
-  <a href="{{.Base}}{{sub .Page 1}}">← Prev</a>
+  <a href="{{.Base}}{{sub .Page 1}}"{{if .HX}} hx-get="{{.Base}}{{sub .Page 1}}"{{end}}>← Prev</a>
   {{end}}
   <button type="button" class="page-jump current" data-current="{{.Page}}" data-total="{{.Total}}" title="Go to page…">Page {{.Page}} / {{.Total}}</button>
   {{if lt .Page .Total}}
-  <a href="{{.Base}}{{add .Page 1}}">Next →</a>
+  <a href="{{.Base}}{{add .Page 1}}"{{if .HX}} hx-get="{{.Base}}{{add .Page 1}}"{{end}}>Next →</a>
   {{end}}
   {{if and (lt .Page .Total) (gt .Total 2)}}
-  <a href="{{.Base}}{{.Total}}">Last »</a>
+  <a href="{{.Base}}{{.Total}}"{{if .HX}} hx-get="{{.Base}}{{.Total}}"{{end}}>Last »</a>
   {{end}}
 </div>
 {{end}}

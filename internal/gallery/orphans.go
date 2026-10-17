@@ -18,7 +18,9 @@ func PruneOrphanThumbnails(ctx context.Context, database *db.DB, thumbnailsPath 
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("read thumbnails dir: %w", err)
 	}
-	total = len(entries)
+	mangaDir := MangaCacheDir(thumbnailsPath)
+	caches, _ := os.ReadDir(mangaDir)
+	total = len(entries) + len(caches)
 	ids, err := db.QueryIDsContext(ctx, database.Read, `SELECT id FROM images`)
 	if err != nil {
 		return 0, 0, total, err
@@ -52,6 +54,28 @@ func PruneOrphanThumbnails(ctx context.Context, database *db.DB, thumbnailsPath 
 			continue
 		}
 		if err := os.Remove(filepath.Join(thumbnailsPath, e.Name())); err == nil {
+			removed++
+		}
+	}
+	for i, e := range caches {
+		if ctx.Err() != nil {
+			return removed, processed, total, nil
+		}
+		if (len(entries)+i+1)%50 == 0 {
+			report(len(entries) + i + 1)
+		}
+		if !e.IsDir() {
+			continue
+		}
+		processed++
+		id, err := strconv.ParseInt(e.Name(), 10, 64)
+		if err != nil {
+			continue
+		}
+		if _, held := known[id]; held {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(mangaDir, e.Name())); err == nil {
 			removed++
 		}
 	}
