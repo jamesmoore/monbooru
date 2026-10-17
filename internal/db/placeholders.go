@@ -16,11 +16,6 @@ func Chunked[T any](xs []T, chunkSize int, fn func(chunk []T) error) error {
 	return nil
 }
 
-// ScanIDs leaves closing rows to the caller.
-func ScanIDs(rows *sql.Rows) ([]int64, error) {
-	return ScanAll(rows, scanOne[int64])
-}
-
 // ScanAll leaves closing rows to the caller, and on a scan error returns
 // nothing rather than a partial set.
 func ScanAll[T any](rows *sql.Rows, scan func(*sql.Rows) (T, error)) ([]T, error) {
@@ -127,8 +122,7 @@ func QueryIDsContext(ctx context.Context, q CtxQuerier, query string, args ...an
 	return QueryAllContext(ctx, q, scanOne[int64], query, args...)
 }
 
-// InPlaceholders returns "" for no input, and SQLite rejects IN (), so
-// the caller must handle that case.
+// InPlaceholders returns "" for no input, which SQLite reads as an empty IN list (false; NOT IN true).
 func InPlaceholders[T any](xs []T) (string, []any) {
 	if len(xs) == 0 {
 		return "", nil
@@ -140,8 +134,9 @@ func InPlaceholders[T any](xs []T) (string, []any) {
 	return strings.Repeat("?,", len(xs)-1) + "?", args
 }
 
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`)
+
 // EscapeLike's output needs ESCAPE '\' on the LIKE.
 func EscapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`)
-	return r.Replace(s)
+	return likeEscaper.Replace(s)
 }

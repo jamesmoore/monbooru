@@ -2,9 +2,6 @@ package web
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
-	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,71 +13,6 @@ import (
 type contextKey int
 
 const sessionContextKey contextKey = 1
-
-type Session struct {
-	ID        string
-	ExpiresAt time.Time
-}
-
-type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]Session
-}
-
-func NewSessionStore() *SessionStore { return &SessionStore{sessions: map[string]Session{}} }
-
-func (s *SessionStore) NewSession(lifetimeDays int) string {
-	buf := make([]byte, 32)
-	_, _ = rand.Read(buf)
-	id := base64.RawURLEncoding.EncodeToString(buf)
-
-	s.mu.Lock()
-	s.sessions[id] = Session{
-		ID:        id,
-		ExpiresAt: time.Now().Add(time.Duration(lifetimeDays) * 24 * time.Hour),
-	}
-	s.mu.Unlock()
-
-	return id
-}
-
-func (s *SessionStore) GetSession(id string) (Session, bool) {
-	s.mu.RLock()
-	sess, ok := s.sessions[id]
-	s.mu.RUnlock()
-
-	if !ok || time.Now().After(sess.ExpiresAt) {
-		return Session{}, false
-	}
-	return sess, true
-}
-
-func (s *SessionStore) DeleteSession(id string) {
-	s.mu.Lock()
-	delete(s.sessions, id)
-	s.mu.Unlock()
-}
-
-func (s *SessionStore) Clear() {
-	s.mu.Lock()
-	s.sessions = map[string]Session{}
-	s.mu.Unlock()
-}
-
-func (s *SessionStore) ClearExcept(keep string) {
-	s.mu.Lock()
-	maps.DeleteFunc(s.sessions, func(id string, _ Session) bool { return id != keep })
-	s.mu.Unlock()
-}
-
-func (s *SessionStore) SweepExpired() {
-	now := time.Now()
-	s.mu.Lock()
-	maps.DeleteFunc(s.sessions, func(_ string, sess Session) bool {
-		return now.After(sess.ExpiresAt)
-	})
-	s.mu.Unlock()
-}
 
 func sessionFromRequest(r *http.Request) string {
 	c, err := r.Cookie("monbooru_session")
@@ -104,21 +36,14 @@ func (s *Server) sessionMiddleware(next http.Handler) http.Handler {
 		}
 
 		// An "anon" session, so the CSRF check has one to validate.
-		if isPublicPath(r.URL.Path) || isStaticPath(r.URL.Path) {
-			ctx := context.WithValue(r.Context(), sessionContextKey, "anon")
-			next.ServeHTTP(w, r.WithContext(ctx))
-			return
-		}
-
-		if !s.authEnabled() {
+		if isPublicPath(r.URL.Path) || isStaticPath(r.URL.Path) || !s.authEnabled() {
 			ctx := context.WithValue(r.Context(), sessionContextKey, "anon")
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 
 		sessID := sessionFromRequest(r)
-		_, ok := s.sessions.GetSession(sessID)
-		if !ok {
+		if !s.sessions.Valid(sessID) {
 			// No HX-Redirect: a poll would take the page, and whatever was
 			// typed on it, to the login.
 			if isHTMXRequest(r) {
@@ -157,11 +82,8 @@ func isHTMXRequest(r *http.Request) bool { return r.Header.Get("HX-Request") == 
 // proxy, and only the entry that proxy appended: the ones before it are
 // whatever the client sent.
 func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+	host, loopback := peerHost(r)
+	if loopback {
 		if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
 			xff := vals[len(vals)-1]
 			if last := strings.TrimSpace(xff[strings.LastIndex(xff, ",")+1:]); last != "" {
@@ -170,6 +92,25 @@ func clientIP(r *http.Request) string {
 		}
 	}
 	return host
+}
+
+// X-Forwarded-Proto is trusted from a loopback peer only, like
+// X-Forwarded-For in clientIP.
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	_, loopback := peerHost(r)
+	return loopback && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func peerHost(r *http.Request) (host string, loopback bool) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return host, ip != nil && ip.IsLoopback()
 }
 
 // Browsers read "//host", a backslash, and a path whose tab or newline they

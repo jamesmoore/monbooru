@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 const (
@@ -21,9 +21,6 @@ const (
 	RelayTimeout = 10 * time.Second
 	MessageMax   = 200
 )
-
-// A backstop only: it must stay above every per-call deadline.
-var relayClient = &http.Client{Timeout: 15 * time.Second}
 
 type RelayRequest struct {
 	Payload  int     `json:"payload"`
@@ -71,7 +68,7 @@ func CallRelay(ctx context.Context, name, target, token string, payload RelayReq
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := relayClient.Do(req)
+	resp, err := peer.Client.Do(req)
 	if err != nil {
 		return RelayAnswer{}, err
 	}

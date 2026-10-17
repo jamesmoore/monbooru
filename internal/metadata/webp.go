@@ -5,32 +5,30 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
-
-	"github.com/monbooru/monbooru/internal/models"
 )
 
 var exifMagic = []byte("Exif\x00\x00")
 
-func extractSDFromWebP(path string) *models.SDMetadata {
-	x, err := decodeWebPEXIF(path)
-	if err != nil || x == nil {
-		return nil
-	}
-	return sdFromEXIF(x)
-}
+// A RIFF chunk length is attacker-controlled, up to 4 GiB; real EXIF
+// chunks are kilobytes.
+const maxChunkBytes = 16 * 1024 * 1024
 
-func decodeWebPEXIF(path string) (*exifData, error) {
+func decodeWebPEXIF(path string) *exifData {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil
 	}
 	defer func() { _ = f.Close() }()
 
 	exifData, err := readWebPEXIF(f)
 	if err != nil || exifData == nil {
-		return nil, err
+		return nil
 	}
-	return decodeEXIF(exifData)
+	x, err := decodeEXIF(exifData)
+	if err != nil {
+		return nil
+	}
+	return x
 }
 
 func readWebPEXIF(r io.Reader) ([]byte, error) {
@@ -48,9 +46,10 @@ func readWebPEXIF(r io.Reader) ([]byte, error) {
 		}
 		chunkType := string(chunk[0:4])
 		size := binary.LittleEndian.Uint32(chunk[4:8])
-		if size > maxChunkBytes {
+		if chunkType != "EXIF" || size > maxChunkBytes {
 			toSkip := int64(size)
 			if size%2 == 1 {
+				// RIFF chunks are word-aligned; skip the pad byte.
 				toSkip++
 			}
 			if _, err := io.CopyN(io.Discard, r, toSkip); err != nil {
@@ -62,24 +61,8 @@ func readWebPEXIF(r io.Reader) ([]byte, error) {
 		if _, err := io.ReadFull(r, data); err != nil {
 			return nil, nil
 		}
-		if size%2 == 1 {
-			// RIFF chunks are word-aligned; skip the pad byte.
-			pad := make([]byte, 1)
-			_, _ = io.ReadFull(r, pad)
-		}
-		if chunkType == "EXIF" {
-			// Some encoders prepend the JPEG APP1 header; decodeEXIF
-			// wants the bare TIFF payload.
-			data = bytes.TrimPrefix(data, exifMagic)
-			return data, nil
-		}
+		// Some encoders prepend the JPEG APP1 header; decodeEXIF
+		// wants the bare TIFF payload.
+		return bytes.TrimPrefix(data, exifMagic), nil
 	}
-}
-
-func genericFromWebP(path string) []models.SDParam {
-	x, err := decodeWebPEXIF(path)
-	if err != nil || x == nil {
-		return nil
-	}
-	return collectEXIFTags(x)
 }

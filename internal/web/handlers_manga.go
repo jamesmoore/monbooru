@@ -13,8 +13,8 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type readerData struct {
@@ -192,19 +192,18 @@ func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 
 func loadMangaMeta(ctx context.Context, database *db.DB, imageID int64) *models.MangaMetadata {
 	var m models.MangaMetadata
-	var title, series, number, volume, summary, notes sql.NullString
-	var writer, penciller, inker, colorist, letterer sql.NullString
-	var coverArtist, editor, publisher, imprint, genre sql.NullString
-	var web, languageISO, format, manga, ageRating sql.NullString
-	var rawXML sql.NullString
 	err := database.Read.QueryRowContext(ctx, `
-		SELECT image_id, title, series, number, volume, count, summary, notes,
-		       year, month, day, writer, penciller, inker, colorist, letterer, cover_artist, editor, publisher,
-		       imprint, genre, web, language_iso, format, manga, age_rating, community_rating, xml_page_count, raw_xml
+		SELECT image_id, COALESCE(title, ''), COALESCE(series, ''), COALESCE(number, ''), COALESCE(volume, ''), count,
+		       COALESCE(summary, ''), COALESCE(notes, ''), year, month, day,
+		       COALESCE(writer, ''), COALESCE(penciller, ''), COALESCE(inker, ''), COALESCE(colorist, ''),
+		       COALESCE(letterer, ''), COALESCE(cover_artist, ''), COALESCE(editor, ''), COALESCE(publisher, ''),
+		       COALESCE(imprint, ''), COALESCE(genre, ''), COALESCE(web, ''), COALESCE(language_iso, ''),
+		       COALESCE(format, ''), COALESCE(manga, ''), COALESCE(age_rating, ''), community_rating, xml_page_count,
+		       COALESCE(raw_xml, '')
 		FROM manga_metadata WHERE image_id = ?`, imageID,
-	).Scan(&m.ImageID, &title, &series, &number, &volume, &m.Count, &summary, &notes,
-		&m.Year, &m.Month, &m.Day, &writer, &penciller, &inker, &colorist, &letterer, &coverArtist, &editor, &publisher,
-		&imprint, &genre, &web, &languageISO, &format, &manga, &ageRating, &m.CommunityRating, &m.XMLPageCount, &rawXML)
+	).Scan(&m.ImageID, &m.Title, &m.Series, &m.Number, &m.Volume, &m.Count, &m.Summary, &m.Notes,
+		&m.Year, &m.Month, &m.Day, &m.Writer, &m.Penciller, &m.Inker, &m.Colorist, &m.Letterer, &m.CoverArtist, &m.Editor, &m.Publisher,
+		&m.Imprint, &m.Genre, &m.Web, &m.LanguageISO, &m.Format, &m.Manga, &m.AgeRating, &m.CommunityRating, &m.XMLPageCount, &m.RawXML)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -212,27 +211,5 @@ func loadMangaMeta(ctx context.Context, database *db.DB, imageID int64) *models.
 		logx.Debugf("loadMangaMeta: %v", err)
 		return nil
 	}
-	m.Title = title.String
-	m.Series = series.String
-	m.Number = number.String
-	m.Volume = volume.String
-	m.Summary = summary.String
-	m.Notes = notes.String
-	m.Writer = writer.String
-	m.Penciller = penciller.String
-	m.Inker = inker.String
-	m.Colorist = colorist.String
-	m.Letterer = letterer.String
-	m.CoverArtist = coverArtist.String
-	m.Editor = editor.String
-	m.Publisher = publisher.String
-	m.Imprint = imprint.String
-	m.Genre = genre.String
-	m.Web = web.String
-	m.LanguageISO = languageISO.String
-	m.Format = format.String
-	m.Manga = manga.String
-	m.AgeRating = ageRating.String
-	m.RawXML = rawXML.String
 	return &m
 }

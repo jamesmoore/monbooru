@@ -167,11 +167,7 @@ func (d *dtext) tagRef(name, label string) {
 		d.label(label)
 		return
 	}
-	d.out.WriteString("[tag=" + name + "]")
-	d.inLink = true
-	d.label(label)
-	d.inLink = false
-	d.out.WriteString("[/tag]")
+	d.wrap("[tag="+name+"]", "[/tag]", label)
 }
 
 // A site-relative href has no host to resolve against, so it keeps only
@@ -182,11 +178,15 @@ func (d *dtext) urlRef(href, label string) {
 		d.label(label)
 		return
 	}
-	d.out.WriteString("[url=" + href + "]")
+	d.wrap("[url="+href+"]", "[/url]", label)
+}
+
+func (d *dtext) wrap(open, closing, label string) {
+	d.out.WriteString(open)
 	d.inLink = true
 	d.label(label)
 	d.inLink = false
-	d.out.WriteString("[/url]")
+	d.out.WriteString(closing)
 }
 
 func (d *dtext) label(s string) {

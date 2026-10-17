@@ -17,7 +17,8 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/jobs"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type Watcher struct {
@@ -211,11 +212,21 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 }
 
-func (w *Watcher) eventPrefix() string {
-	if w.galleryName == "" {
-		return "watcher: "
+func (w *Watcher) event(msg string) {
+	if w.OnEvent == nil {
+		return
 	}
-	return "watcher [" + w.galleryName + "]: "
+	prefix := "watcher: "
+	if w.galleryName != "" {
+		prefix = "watcher [" + w.galleryName + "]: "
+	}
+	w.OnEvent(prefix + msg)
+}
+
+func (w *Watcher) changed() {
+	if w.OnChange != nil {
+		w.OnChange()
+	}
 }
 
 // Files can land in a new directory before its watch is added, and those
@@ -281,7 +292,8 @@ func (w *Watcher) jobSuppressesIngest() bool {
 	// prune-dirs: every directory it unlinks fires a Remove with no row
 	// behind it.
 	switch st.JobType {
-	case "sync", "move", "transfer", "merge", "delete", "tag", "prune-dirs":
+	case models.JobTypeSync, models.JobTypeMove, models.JobTypeTransfer, models.JobTypeMerge,
+		models.JobTypeDelete, models.JobTypeTag, models.JobTypePruneDirs:
 		return len(st.Galleries) == 0 || slices.Contains(st.Galleries, w.galleryName)
 	}
 	return false
@@ -472,13 +484,14 @@ func (w *Watcher) ingestFile(path string) {
 	if w.Settings != nil {
 		maxMB, naming = w.Settings()
 	}
-	if maxMB > 0 {
-		if info, statErr := os.Stat(path); statErr == nil {
-			if info.Size() > int64(maxMB)*1024*1024 {
-				logx.Warnf("watcher: skipping %q (size %d exceeds %d MB)",
-					path, info.Size(), maxMB)
-				return
-			}
+	if info, statErr := os.Stat(path); statErr == nil {
+		if maxMB > 0 && info.Size() > int64(maxMB)*1024*1024 {
+			logx.Warnf("watcher: skipping %q (size %d exceeds %d MB)",
+				path, info.Size(), maxMB)
+			return
+		}
+		if indexedUnchanged(w.handle.DB, path, info) {
+			return
 		}
 	}
 
@@ -486,8 +499,8 @@ func (w *Watcher) ingestFile(path string) {
 	switch {
 	case err != nil:
 		logx.Warnf("watcher ingest %q: %v", path, err)
-		if errors.Is(err, ErrRewritten) && w.OnEvent != nil {
-			w.OnEvent(w.eventPrefix() + "conflict " + filepath.Base(path))
+		if errors.Is(err, ErrRewritten) {
+			w.event("conflict " + filepath.Base(path))
 		}
 		return
 	case out == ingestDuplicate:
@@ -515,12 +528,19 @@ func (w *Watcher) ingestFile(path string) {
 		w.OnPhash.Landed(img)
 	}
 	logx.Infof("watcher: %s %q", verb, path)
-	if w.OnEvent != nil {
-		w.OnEvent(w.eventPrefix() + verb + " " + filepath.Base(path))
-	}
-	if w.OnChange != nil {
-		w.OnChange()
-	}
+	w.event(verb + " " + filepath.Base(path))
+	w.changed()
+}
+
+// Sync's trust rule, so the event a landing or a rename raises does not
+// hash the file again.
+func indexedUnchanged(database *db.DB, path string, info os.FileInfo) bool {
+	var k syncKnownEntry
+	var missing int
+	err := database.Read.QueryRow(
+		`SELECT i.file_size, ip.mtime_unix, ip.mtime_nsec, i.is_missing FROM image_paths ip JOIN images i ON i.id = ip.image_id WHERE ip.path = ?`, path,
+	).Scan(&k.size, &k.mtime, &k.mtimeNano, &missing)
+	return err == nil && missing == 0 && k.unchanged(info.Size(), info.ModTime().Unix(), info.ModTime().UnixNano())
 }
 
 func (w *Watcher) renameIngested(naming Naming, id int64, path string) string {
@@ -555,20 +575,18 @@ func (w *Watcher) promoteSurvivingCopy(id int64, gonePath string) bool {
 		if _, err := os.Stat(p); err != nil {
 			continue
 		}
-		if err := changedSinceIndexed(p, c.Indexed); err != nil {
+		if err := ChangedSinceIndexed(p, c.Indexed); err != nil {
 			logx.Warnf("watcher promote copy %d: %q %v - left alone", id, p, err)
 			continue
 		}
 		if err := db.InWriteTx(w.db.Write, func(tx *sql.Tx) error {
-			return repointCanonical(tx, id, p, FolderPath(w.galleryPath, p), gonePath)
+			return repointCanonical(tx, id, p, FolderPath(w.galleryPath, p), gonePath, c.Mtime, c.MtimeNano)
 		}); err != nil {
 			logx.Warnf("watcher promote copy %d: %v", id, err)
 			return false
 		}
 		logx.Infof("watcher: %q went, kept id=%d at %q", gonePath, id, p)
-		if w.OnChange != nil {
-			w.OnChange()
-		}
+		w.changed()
 		return true
 	}
 	return false
@@ -634,12 +652,10 @@ func (w *Watcher) markFolderMissing(dir string) {
 		return
 	}
 	logx.Infof("watcher: %q left, marked %d image(s) missing", dir, marked)
-	if marked > 0 && w.OnEvent != nil {
-		w.OnEvent(fmt.Sprintf("%sremoved %d image(s) in %s", w.eventPrefix(), marked, filepath.Base(dir)))
+	if marked > 0 {
+		w.event(fmt.Sprintf("removed %d image(s) in %s", marked, filepath.Base(dir)))
 	}
-	if w.OnChange != nil {
-		w.OnChange()
-	}
+	w.changed()
 }
 
 func (w *Watcher) markFileMissing(path string) {
@@ -672,10 +688,6 @@ func (w *Watcher) markFileMissing(path string) {
 	}
 
 	logx.Infof("watcher: marked missing %q (id=%d)", path, imgID)
-	if w.OnEvent != nil {
-		w.OnEvent(w.eventPrefix() + "removed " + filepath.Base(path))
-	}
-	if w.OnChange != nil {
-		w.OnChange()
-	}
+	w.event("removed " + filepath.Base(path))
+	w.changed()
 }

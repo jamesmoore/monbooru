@@ -17,9 +17,9 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // FolderPath returns "" for the root and outside it; the value is stored,
@@ -67,7 +67,7 @@ func decodeImageDimensions(path string) (w, h *int) {
 	}
 	defer func() { _ = f.Close() }()
 	cfg, _, err := image.DecodeConfig(f)
-	if err != nil {
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
 		return nil, nil
 	}
 	return &cfg.Width, &cfg.Height
@@ -113,70 +113,65 @@ func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, in
 	existingID, err := ImageIDBySHA(database.Read, hash)
 
 	if err == nil {
-		var img models.Image
-		var isMissingInt int
-		scanErr := database.Read.QueryRow(
-			`SELECT id, sha256, canonical_path, folder_path, file_type, file_size, is_missing FROM images WHERE id = ?`,
-			existingID,
-		).Scan(&img.ID, &img.SHA256, &img.CanonicalPath, &img.FolderPath, &img.FileType, &img.FileSize, &isMissingInt)
+		img, scanErr := loadDuplicateRow(database.Read, existingID)
 		if scanErr != nil {
 			return nil, ingestDuplicate, fmt.Errorf("looking up duplicate image %d: %w", existingID, scanErr)
 		}
-		img.IsMissing = isMissingInt == 1
+		fi, statErr := os.Stat(path)
+		if statErr != nil {
+			return nil, ingestCreated, fmt.Errorf("stat file: %w", statErr)
+		}
+		mtime, mtimeNano := fi.ModTime().Unix(), fi.ModTime().UnixNano()
 
 		if img.IsMissing {
 			newFolder := FolderPath(galleryPath, path)
-			tx, txErr := database.Write.Begin()
-			if txErr != nil {
-				return nil, ingestCreated, fmt.Errorf("begin reactivation tx: %w", txErr)
-			}
-			defer func() { _ = tx.Rollback() }()
-			if err := repointCanonical(tx, existingID, path, newFolder, ""); err != nil {
+			if err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+				if err := repointCanonical(tx, existingID, path, newFolder, "", mtime, mtimeNano); err != nil {
+					return err
+				}
+				_, err := tx.Exec(`UPDATE images SET md5 = ? WHERE id = ?`, sum, existingID)
+				return err
+			}); err != nil {
 				return nil, ingestCreated, fmt.Errorf("reactivate image: %w", err)
 			}
-			if _, err := tx.Exec(`UPDATE images SET md5 = ? WHERE id = ?`, sum, existingID); err != nil {
-				return nil, ingestCreated, fmt.Errorf("reactivate image md5: %w", err)
+			// file_size 0 marks a row whose bytes were never read: an import placeholder.
+			if img.FileSize != 0 {
+				_ = generate(path, thumbnailsPath, existingID, img.FileType)
+			} else if phash, editErr := applyInPlaceEdit(h, path, hash, sum, mtime, mtimeNano, fi.Size()); editErr != nil {
+				logx.Warnf("ingest: read restored %q: %v", path, editErr)
+			} else {
+				img.FileSize, img.Phash = fi.Size(), phash
 			}
-			if err := tx.Commit(); err != nil {
-				return nil, ingestCreated, fmt.Errorf("commit reactivation: %w", err)
-			}
-			_ = generate(path, thumbnailsPath, existingID, img.FileType)
 			img.IsMissing = false
 			img.CanonicalPath = path
 			img.FolderPath = newFolder
 			logx.Infof("ingest: reactivated previously missing image id=%d path=%q", existingID, path)
-			return &img, ingestRestored, nil
+			return img, ingestRestored, nil
 		}
 
 		// The old canonical is gone, so this is a move: the old path kept
 		// as an alias would show as a phantom duplicate.
 		if _, statErr := os.Stat(img.CanonicalPath); statErr != nil {
 			newFolder := FolderPath(galleryPath, path)
-			tx, txErr := database.Write.Begin()
-			if txErr != nil {
-				return nil, ingestCreated, fmt.Errorf("begin promote tx: %w", txErr)
-			}
-			defer func() { _ = tx.Rollback() }()
-			if err := repointCanonical(tx, existingID, path, newFolder, img.CanonicalPath); err != nil {
+			if err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
+				return repointCanonical(tx, existingID, path, newFolder, img.CanonicalPath, mtime, mtimeNano)
+			}); err != nil {
 				return nil, ingestCreated, fmt.Errorf("promote canonical path: %w", err)
-			}
-			if err := tx.Commit(); err != nil {
-				return nil, ingestCreated, fmt.Errorf("commit promote: %w", err)
 			}
 			img.CanonicalPath = path
 			img.FolderPath = newFolder
 			logx.Infof("ingest: promoted alias to canonical for image id=%d (old path gone) %q", existingID, path)
-			return &img, ingestMoved, nil
+			return img, ingestMoved, nil
 		}
 
 		_, aliasErr := database.Write.Exec(
-			`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 0)`,
-			existingID, path,
+			`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical, mtime_unix, mtime_nsec) VALUES (?, ?, 0, ?, ?)`,
+			existingID, path, mtime, mtimeNano,
 		)
 		if aliasErr != nil {
 			logx.Warnf("ingest alias: %v", aliasErr)
 		}
-		return &img, ingestDuplicate, nil
+		return img, ingestDuplicate, nil
 	}
 	if err != sql.ErrNoRows {
 		return nil, ingestCreated, fmt.Errorf("checking sha256: %w", err)
@@ -184,7 +179,7 @@ func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, in
 
 	// The walk trusts extensions, so the signature decides here whether
 	// to add a row and which type it records.
-	fileType, err := detectMagicType(path)
+	fileType, err := MagicFileType(path)
 	if err != nil {
 		logx.Warnf("ingest: skip %q: contents are not a supported media type", path)
 		return nil, ingestCreated, fmt.Errorf("ingest %q: %w", path, err)
@@ -197,46 +192,15 @@ func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, in
 
 	folderPath := FolderPath(galleryPath, path)
 
-	var imgWidth, imgHeight *int
-	var pageCount *int
-	var durationSec *float64
+	facts, err := deriveFileFacts(path, fileType, "ingest")
+	if err != nil {
+		logx.Warnf("ingest: skip manga %q: %v", path, err)
+		return nil, ingestCreated, fmt.Errorf("ingest manga: %w", err)
+	}
 	var prefilledSeries string
-	var mangaMeta *models.MangaMetadata
-	if IsVideoType(fileType) {
-		if d, ok := ProbeDurationSeconds(path); ok {
-			durationSec = &d
-		}
-		if w, h, ok := ProbeVideoDimensions(path); ok {
-			imgWidth, imgHeight = &w, &h
-		}
+	if facts.manga != nil {
+		prefilledSeries = facts.manga.Series
 	}
-	if fileType == models.FileTypeCBZ {
-		archive, openErr := OpenManga(path)
-		if openErr != nil {
-			logx.Warnf("ingest: skip manga %q: %v", path, openErr)
-			return nil, ingestCreated, fmt.Errorf("ingest manga: %w", openErr)
-		}
-		w, h, dimErr := archive.coverDimensions()
-		if dimErr == nil {
-			imgWidth, imgHeight = &w, &h
-		} else {
-			logx.Warnf("ingest manga %q: cover dimensions: %v", path, dimErr)
-		}
-		mm, mmErr := metadata.ParseComicInfo(archive.Reader())
-		if mmErr != nil {
-			logx.Warnf("ingest manga %q: ComicInfo: %v", path, mmErr)
-		} else if mm != nil {
-			mangaMeta = mm
-			prefilledSeries = mm.Series
-		}
-		pcVal := len(archive.Pages)
-		pageCount = &pcVal
-		_ = archive.Close()
-	} else if !IsVideoType(fileType) {
-		imgWidth, imgHeight = stillDimensions(path, fileType)
-	}
-
-	sdMeta, comfyMeta, sourceType := extractGenerationMeta(path, fileType)
 
 	// ON CONFLICT DO NOTHING: a concurrent ingest may have written this
 	// SHA since the read-pool check.
@@ -252,7 +216,7 @@ func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, in
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(sha256) DO NOTHING
 		 RETURNING id`,
-		hash, sum, path, folderPath, fileType, imgWidth, imgHeight, fi.Size(), sourceType, origin, pageCount, prefilledSeries, durationSec,
+		hash, sum, path, folderPath, fileType, facts.width, facts.height, fi.Size(), facts.sourceType, origin, facts.pageCount, prefilledSeries, facts.durationSec,
 	).Scan(&imgID)
 
 	if insertErr == sql.ErrNoRows {
@@ -261,24 +225,19 @@ func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, in
 			return nil, ingestCreated, fmt.Errorf("race: fetch existing sha: %w", err)
 		}
 		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical) VALUES (?, ?, 0)`,
-			existingID, path,
+			`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical, mtime_unix, mtime_nsec) VALUES (?, ?, 0, ?, ?)`,
+			existingID, path, fi.ModTime().Unix(), fi.ModTime().UnixNano(),
 		); err != nil {
 			return nil, ingestCreated, fmt.Errorf("race: insert alias path: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, ingestCreated, fmt.Errorf("race: commit alias: %w", err)
 		}
-		var img models.Image
-		var isMissingInt int
-		if err := database.Read.QueryRow(
-			`SELECT id, sha256, canonical_path, folder_path, file_type, file_size, is_missing FROM images WHERE id = ?`,
-			existingID,
-		).Scan(&img.ID, &img.SHA256, &img.CanonicalPath, &img.FolderPath, &img.FileType, &img.FileSize, &isMissingInt); err != nil {
+		img, err := loadDuplicateRow(database.Read, existingID)
+		if err != nil {
 			return nil, ingestDuplicate, fmt.Errorf("race: reload existing image %d: %w", existingID, err)
 		}
-		img.IsMissing = isMissingInt == 1
-		return &img, ingestDuplicate, nil
+		return img, ingestDuplicate, nil
 	}
 	if insertErr != nil {
 		return nil, ingestCreated, fmt.Errorf("inserting image: %w", insertErr)
@@ -291,12 +250,12 @@ func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, in
 		return nil, ingestCreated, fmt.Errorf("inserting image_path: %w", err)
 	}
 
-	if err := insertGenerationMetadata(context.Background(), tx, imgID, sdMeta, comfyMeta); err != nil {
+	if err := insertGenerationMetadata(context.Background(), tx, imgID, facts.sd, facts.comfy); err != nil {
 		return nil, ingestCreated, err
 	}
-	if mangaMeta != nil {
-		mangaMeta.ImageID = imgID
-		if err := insertMangaMeta(tx, mangaMeta); err != nil {
+	if facts.manga != nil {
+		facts.manga.ImageID = imgID
+		if err := insertMangaMeta(tx, facts.manga); err != nil {
 			return nil, ingestCreated, fmt.Errorf("inserting manga_metadata: %w", err)
 		}
 	}
@@ -326,13 +285,13 @@ func ingestWithHash(h Handle, path, hash, sum, origin string) (*models.Image, in
 		CanonicalPath: path,
 		FolderPath:    folderPath,
 		FileType:      fileType,
-		Width:         imgWidth,
-		Height:        imgHeight,
+		Width:         facts.width,
+		Height:        facts.height,
 		FileSize:      fi.Size(),
-		SourceType:    sourceType,
+		SourceType:    facts.sourceType,
 		Origin:        origin,
-		PageCount:     pageCount,
-		DurationSec:   durationSec,
+		PageCount:     facts.pageCount,
+		DurationSec:   facts.durationSec,
 		Series:        prefilledSeries,
 		IngestedAt:    time.Now().UTC(),
 	}
@@ -354,7 +313,7 @@ func ingestInPlaceEdit(h Handle, path, hash, sum string, id int64) (*models.Imag
 	case err != sql.ErrNoRows:
 		return nil, ingestCreated, fmt.Errorf("checking sha256: %w", err)
 	}
-	fileType, err := detectMagicType(path)
+	fileType, err := MagicFileType(path)
 	if err != nil {
 		logx.Warnf("ingest: skip %q: contents are not a supported media type", path)
 		return nil, ingestCreated, fmt.Errorf("ingest %q: %w", path, err)
@@ -373,9 +332,68 @@ func ingestInPlaceEdit(h Handle, path, hash, sum string, id int64) (*models.Imag
 	}, ingestEdited, nil
 }
 
+func loadDuplicateRow(q db.RowQuerier, id int64) (*models.Image, error) {
+	var img models.Image
+	var isMissing int
+	if err := q.QueryRow(
+		`SELECT id, sha256, canonical_path, folder_path, file_type, file_size, is_missing FROM images WHERE id = ?`, id,
+	).Scan(&img.ID, &img.SHA256, &img.CanonicalPath, &img.FolderPath, &img.FileType, &img.FileSize, &isMissing); err != nil {
+		return nil, err
+	}
+	img.IsMissing = isMissing == 1
+	return &img, nil
+}
+
+type fileFacts struct {
+	width, height *int
+	pageCount     *int
+	durationSec   *float64
+	manga         *models.MangaMetadata
+	sd            *models.SDMetadata
+	comfy         *models.ComfyUIMetadata
+	sourceType    string
+}
+
+// The error is an archive that will not open; the facts still carry its generation metadata.
+func deriveFileFacts(path, fileType, logCtx string) (fileFacts, error) {
+	var f fileFacts
+	f.sd, f.comfy, f.sourceType = extractGenerationMeta(path, fileType)
+	switch {
+	case fileType == models.FileTypeCBZ:
+		archive, err := OpenManga(path)
+		if err != nil {
+			return f, err
+		}
+		defer func() { _ = archive.Close() }()
+		if w, h, err := archive.coverDimensions(); err == nil {
+			f.width, f.height = &w, &h
+		} else {
+			logx.Warnf("%s manga %q: cover dimensions: %v", logCtx, path, err)
+		}
+		if mm, err := metadata.ParseComicInfo(archive.Reader()); err != nil {
+			logx.Warnf("%s manga %q: ComicInfo: %v", logCtx, path, err)
+		} else {
+			f.manga = mm
+		}
+		pages := len(archive.Pages)
+		f.pageCount = &pages
+	case IsVideoType(fileType):
+		p := probeVideo(path)
+		if p.duration > 0 {
+			f.durationSec = &p.duration
+		}
+		if p.width > 0 {
+			f.width, f.height = &p.width, &p.height
+		}
+	default:
+		f.width, f.height = stillDimensions(path, fileType)
+	}
+	return f, nil
+}
+
 // A path that rewrites a file's bytes must store all three.
 func extractGenerationMeta(path, fileType string) (*models.SDMetadata, *models.ComfyUIMetadata, string) {
-	sd, comfy, _ := metadata.Extract(path, fileType)
+	sd, comfy := metadata.Extract(path, fileType)
 	switch {
 	case sd != nil && comfy != nil:
 		return sd, comfy, models.SourceTypeBoth
@@ -466,7 +484,7 @@ func DropDuplicateCopy(database *db.DB, imageID int64, path, logCtx string) {
 	if canonical == path {
 		return
 	}
-	// With the canonical gone from disk this copy is the only one, and a sync promotes it.
+	// Ingest promotes a copy whose canonical is gone; one gone since is the only copy left.
 	if _, err := os.Stat(canonical); err != nil {
 		return
 	}

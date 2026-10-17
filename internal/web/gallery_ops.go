@@ -14,7 +14,7 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/galleryio"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 func (s *Server) switchGallery(name string) error { return s.set.Switch(name) }
@@ -25,18 +25,16 @@ func (s *Server) setDefault(name string) error {
 		s.set.Unlock()
 		return fmt.Errorf("unknown gallery %q", name)
 	}
-	s.cfgMu.Lock()
-	unchanged := s.cfg.DefaultGallery == name
-	if !unchanged {
-		s.cfg.DefaultGallery = name
-	}
-	s.cfgMu.Unlock()
-	s.set.Unlock()
-	if unchanged {
+	if s.defaultGallery() == name {
+		s.set.Unlock()
 		return nil
 	}
-
-	if err := s.saveConfig(); err != nil {
+	err := s.withConfig(func(c *config.Config) error {
+		c.DefaultGallery = name
+		return nil
+	})
+	s.set.Unlock()
+	if err != nil {
 		return fmt.Errorf("persist default gallery: %w", err)
 	}
 	logx.Infof("gallery: default set to %q", name)
@@ -65,30 +63,9 @@ func (s *Server) renameGallery(oldName, newName string) error {
 	return s.set.Rename(strings.TrimSpace(oldName), strings.TrimSpace(newName))
 }
 
-// keepGalleryRefs returns what puts back the galleries and every list
-// naming one.
-func keepGalleryRefs(cfg *config.Config) func() {
-	galleries, def, schedule := slices.Clone(cfg.Galleries), cfg.DefaultGallery, cfg.Schedule.Galleries
-	taggerLists := make([][]string, len(cfg.Tagger.Taggers))
-	for i := range cfg.Tagger.Taggers {
-		taggerLists[i] = cfg.Tagger.Taggers[i].Galleries
-	}
-	return func() {
-		cfg.Galleries, cfg.DefaultGallery, cfg.Schedule.Galleries = galleries, def, schedule
-		for i := range cfg.Tagger.Taggers {
-			cfg.Tagger.Taggers[i].Galleries = taggerLists[i]
-		}
-	}
-}
-
 func renameGalleryInConfig(cfg *config.Config, oldName, newName, newDB, newThumbs string) {
-	for i := range cfg.Galleries {
-		if cfg.Galleries[i].Name == oldName {
-			cfg.Galleries[i].Name = newName
-			cfg.Galleries[i].DBPath = newDB
-			cfg.Galleries[i].ThumbnailsPath = newThumbs
-			break
-		}
+	if g := cfg.FindGallery(oldName); g != nil {
+		g.Name, g.DBPath, g.ThumbnailsPath = newName, newDB, newThumbs
 	}
 	if cfg.DefaultGallery == oldName {
 		cfg.DefaultGallery = newName
@@ -284,18 +261,14 @@ type setHost struct{ s *Server }
 
 func (h setHost) Layout() library.Layout {
 	s := h.s
-	s.cfgMu.RLock()
-	c := *s.cfg
-	c.Galleries = slices.Clone(c.Galleries)
-	c.Gallery.Ignore = slices.Clone(c.Gallery.Ignore)
-	s.cfgMu.RUnlock()
+	c := s.cfgSnapshot()
 	return library.Layout{
 		Galleries:   c.Galleries,
 		DataPath:    c.Paths.DataPath,
 		ModelPath:   c.Paths.ModelPath,
 		ThemesDir:   s.themesDir(),
 		PluginsDir:  s.pluginsDir(),
-		Ignore:      c.Gallery.Ignore,
+		Ignore:      slices.Clone(c.Gallery.Ignore),
 		DerivePaths: c.DerivePaths,
 	}
 }
@@ -304,37 +277,33 @@ func (h setHost) Background(name string) library.Background { return h.s.backgro
 
 func (h setHost) DefaultGallery() string { return h.s.defaultGallery() }
 
-func (h setHost) save(edit func(cfg *config.Config)) error {
-	h.s.cfgMu.Lock()
-	defer h.s.cfgMu.Unlock()
-	undo := keepGalleryRefs(h.s.cfg)
-	edit(h.s.cfg)
-	if err := config.Save(h.s.cfg, h.s.configPath); err != nil {
-		undo()
-		return err
-	}
-	return nil
-}
-
 func (h setHost) Added(g config.Gallery) error {
-	return h.save(func(cfg *config.Config) { cfg.Galleries = append(cfg.Galleries, g) })
+	return h.s.withConfig(func(cfg *config.Config) error {
+		cfg.Galleries = append(cfg.Galleries, g)
+		return nil
+	})
 }
 
 func (h setHost) Removed(name string) error {
-	return h.save(func(cfg *config.Config) {
+	return h.s.withConfig(func(cfg *config.Config) error {
 		cfg.Galleries = slices.DeleteFunc(cfg.Galleries, func(g config.Gallery) bool { return g.Name == name })
 		cfg.DropGalleryRefs(name)
+		return nil
 	})
 }
 
 func (h setHost) Repointed(name, galleryPath string) error {
-	return h.save(func(cfg *config.Config) {
+	return h.s.withConfig(func(cfg *config.Config) error {
 		if g := cfg.FindGallery(name); g != nil {
 			g.GalleryPath = galleryPath
 		}
+		return nil
 	})
 }
 
 func (h setHost) Renamed(oldName, newName, dbPath, thumbnailsPath string) error {
-	return h.save(func(cfg *config.Config) { renameGalleryInConfig(cfg, oldName, newName, dbPath, thumbnailsPath) })
+	return h.s.withConfig(func(cfg *config.Config) error {
+		renameGalleryInConfig(cfg, oldName, newName, dbPath, thumbnailsPath)
+		return nil
+	})
 }

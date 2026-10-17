@@ -21,7 +21,7 @@ func (s *Server) monloaderStatusHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	status, version := s.ml.Refresh(ctx)
+	st := s.ml.Refresh(ctx)
 	// Panels seeded from stale flags re-mount on this event. Compared with
 	// what the page was last told, not with the cache before the probe: the
 	// background probe refreshes the cache too.
@@ -30,9 +30,10 @@ func (s *Server) monloaderStatusHandler(w http.ResponseWriter, r *http.Request) 
 		w.Header().Set("HX-Trigger", "monloader-status-changed")
 	}
 	s.renderTemplate(w, "partials/monloader_light.html", map[string]any{
-		"MonloaderConn":    status,
-		"MonloaderVersion": version,
-		"MonloaderSeen":    seen,
-		"MonloaderURL":     s.monloaderWebBase(),
+		"MonloaderConn":     st.Conn,
+		"MonloaderVersion":  st.Version,
+		"MonloaderMismatch": st.APIMismatch,
+		"MonloaderSeen":     seen,
+		"MonloaderURL":      s.monloaderWebBase(),
 	})
 }

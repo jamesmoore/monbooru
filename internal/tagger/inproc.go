@@ -22,7 +22,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -202,6 +202,9 @@ func (b *inprocBackend) ensure(req RunRequest) (err error) {
 		outIdx := profile.OutputIndex
 		if outIdx < 0 || outIdx >= len(outputs) {
 			return fmt.Errorf("ort model for %q: profile output_index %d out of range (have %d)", t.Name, outIdx, len(outputs))
+		}
+		if err := checkLabelWidth(outputs[outIdx].Dimensions, len(labels)); err != nil {
+			return fmt.Errorf("ort model for %q: %w", t.Name, err)
 		}
 		inputSize := profile.InputSize
 		if inputSize == 0 {
@@ -388,6 +391,16 @@ func inferInputSize(dims ort.Shape, layout string) int {
 	return int(d)
 }
 
+func checkLabelWidth(dims ort.Shape, n int) error {
+	if len(dims) == 0 {
+		return nil
+	}
+	if w := dims[len(dims)-1]; w > 0 && w != int64(n) {
+		return fmt.Errorf("%d labels for %d outputs", n, w)
+	}
+	return nil
+}
+
 func (b *inprocBackend) teardownLocked() {
 	for _, s := range b.sessions {
 		_ = s.session.Destroy()
@@ -437,14 +450,13 @@ func (b *inprocBackend) Status() CacheStatus {
 	if !b.initialized {
 		return CacheStatus{}
 	}
-	out := CacheStatus{
+	return CacheStatus{
 		Loaded:   true,
 		Provider: b.provider,
 		InUse:    b.inUse,
 		LastUsed: b.lastUsed,
 		Sessions: slices.Sorted(maps.Keys(b.sessions)),
 	}
-	return out
 }
 
 func (b *inprocBackend) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
@@ -647,16 +659,18 @@ func prepareInputs(path string, loaded []loadedTagger) ([]*image.RGBA, error) {
 	if err != nil {
 		return nil, err
 	}
+	if img.Bounds().Empty() {
+		return nil, fmt.Errorf("image has no pixels (%dx%d)", img.Bounds().Dx(), img.Bounds().Dy())
+	}
 
 	type padKey struct {
 		size int
-		pad  string
 		fill [3]uint8
 	}
 	padded := make(map[padKey]*image.RGBA, len(loaded))
 	inputs := make([]*image.RGBA, len(loaded))
 	for i, lt := range loaded {
-		k := padKey{lt.inputSize, lt.profile.Pad, lt.profile.FillColor}
+		k := padKey{lt.inputSize, padFill(lt.profile)}
 		if padded[k] == nil {
 			padded[k] = padAndResize(img, lt.inputSize, lt.profile)
 		}

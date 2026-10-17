@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 const dispatchSchemaVersion = 1
@@ -42,15 +42,18 @@ func DispatchTargetCategories(modelPath, taggerName string) []string {
 
 // Overlay rules come last, so a map keyed on Source keeps them.
 func allDispatchRules(modelPath, taggerName string) []DispatchEntry {
-	return slices.Concat(EmbeddedDispatchRules(taggerName), OverlayDispatchRules(modelPath, taggerName))
+	return slices.Concat(DefaultDispatchRules(modelPath, taggerName), OverlayDispatchRules(modelPath, taggerName))
 }
 
-func EmbeddedDispatchRules(taggerName string) []DispatchEntry {
-	data, err := defaultDispatchFS.ReadFile("dispatch_default/" + taggerName + ".json")
+// DefaultDispatchRules are the rules a tagger ships with: monbooru's own for
+// a tagger it ships, else the model folder's dispatch_default.json, which a
+// registry entry installs. Either is stock; dispatch.json is the overlay.
+func DefaultDispatchRules(modelPath, taggerName string) []DispatchEntry {
+	data, source, err := stockFile(modelPath, taggerName, stockDispatch)
 	if err != nil {
 		return nil
 	}
-	return parseDispatchDoc(data, "embedded "+taggerName)
+	return parseDispatchDoc(data, source)
 }
 
 func OverlayDispatchRules(modelPath, taggerName string) []DispatchEntry {

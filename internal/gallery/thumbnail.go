@@ -16,13 +16,15 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/image/draw"
 	"golang.org/x/image/webp"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/fsx"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 const thumbMaxDim = 300
@@ -36,6 +38,8 @@ const (
 	ViewMaxDim    = 4000
 )
 
+var viewRenditionMu sync.Mutex
+
 func viewRenditionPath(dir string, imageID int64) string {
 	return filepath.Join(dir, fmt.Sprintf("%d_view.jpg", imageID))
 }
@@ -47,6 +51,13 @@ func NeedsViewRendition(width, height int) bool { return int64(width)*int64(heig
 // needs one.
 func EnsureViewRendition(srcPath, dstDir string, imageID int64, fileType string, maxDim int) (string, error) {
 	dst := viewRenditionPath(dstDir, imageID)
+	if _, err := os.Stat(dst); err == nil {
+		return dst, nil
+	}
+	// One build at a time: concurrent views render once, and two big
+	// decodes never share the memory budget.
+	viewRenditionMu.Lock()
+	defer viewRenditionMu.Unlock()
 	if _, err := os.Stat(dst); err == nil {
 		return dst, nil
 	}
@@ -109,6 +120,9 @@ func decodedBytes(img image.Image) int64 {
 // head is the header DecodeConfig read, which a progressive JPEG's
 // coefficient buffers are sized from.
 func decodeBudgetError(cfg image.Config, format string, head []byte) error {
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return fmt.Errorf("image is %dx%d, it has no pixels", cfg.Width, cfg.Height)
+	}
 	// The pixel check also catches a byte count that overflowed.
 	pixels := int64(cfg.Width) * int64(cfg.Height)
 	need := pixels * decodedBytesPerPixel(cfg.ColorModel)
@@ -242,6 +256,9 @@ func DecodeImageWithCap(r io.Reader) (image.Image, error) {
 		return decodeFirstWebPFrame(io.MultiReader(&buf, r), cfg)
 	}
 	img, _, err := image.Decode(io.MultiReader(&buf, r))
+	if err == nil && img.Bounds().Empty() {
+		return nil, fmt.Errorf("image decodes to %v, it has no pixels", img.Bounds())
+	}
 	return img, err
 }
 
@@ -347,11 +364,12 @@ func writeThumbnails(srcPath, dstDir string, imageID int64, fileType string, pag
 	dstPath := ThumbnailPath(dstDir, imageID)
 
 	if IsVideoType(fileType) {
-		if err := generateVideoThumb(srcPath, dstPath); err != nil {
+		offset := tenPercentOffset(srcPath)
+		if err := generateVideoThumb(srcPath, dstPath, offset); err != nil {
 			return err
 		}
 		hoverDst := hoverPath(dstDir, imageID)
-		if err := generateVideoHover(srcPath, hoverDst); err != nil {
+		if err := generateVideoHover(srcPath, hoverDst, offset); err != nil {
 			logx.Warnf("hover preview for %q: %v", srcPath, err)
 		}
 		return nil
@@ -417,14 +435,32 @@ func queueMangaPageThumbs(srcPath, imageDir string) {
 			go func() {
 				for job := range mangaThumbQueue {
 					pregenerateMangaPageThumbs(job.srcPath, job.imageDir)
+					pageThumbsPending.Add(-1)
 				}
 			}()
 		}
 	})
+	pageThumbsPending.Add(1)
 	select {
 	case mangaThumbQueue <- mangaThumbJob{srcPath: srcPath, imageDir: imageDir}:
 	default:
+		pageThumbsPending.Add(-1)
 	}
+}
+
+var pageThumbsPending atomic.Int64
+
+// WaitPageThumbs reports whether every queued page-thumbnail precompute,
+// in any gallery, finished within d.
+func WaitPageThumbs(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for pageThumbsPending.Load() > 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
 }
 
 // Reopens the archive so no handle is held while the job waits in the queue.

@@ -1,6 +1,7 @@
 package tags
 
 import (
+	"cmp"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -243,7 +244,7 @@ func tagFilterWhere(filter TagFilter) (string, []any) {
 			     WHERE it.tag_id = t.id AND it.stale = 1) = t.usage_count`
 	}
 	if filter.FoldedOnly {
-		where += ` AND t.id IN (SELECT old_id FROM folded_tag_pairs)`
+		where += ` AND t.id IN (SELECT fp.old_id FROM ` + liveFoldedPairs + `)`
 	}
 	switch {
 	case filter.ZeroOnly:
@@ -303,7 +304,7 @@ func (s *Service) ListTags(filter TagFilter) ([]models.Tag, int, error) {
 
 	foldedCol := "NULL"
 	if filter.FoldedOnly {
-		foldedCol = `(SELECT t2.name FROM folded_tag_pairs fp JOIN tags t2 ON t2.id = fp.new_id WHERE fp.old_id = t.id AND fp.ambiguous = 0 LIMIT 1)`
+		foldedCol = `(SELECT n.name FROM ` + liveFoldedPairs + ` WHERE fp.old_id = t.id AND fp.ambiguous = 0 LIMIT 1)`
 	}
 
 	// The page is picked from tags alone so the sort index can stop at
@@ -644,11 +645,8 @@ func (s *Service) UsageBreakdown(tagID int64) ([]AppliedByCount, []UsageMonth, e
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
-	sort.Slice(applied, func(i, j int) bool {
-		if applied[i].Count != applied[j].Count {
-			return applied[i].Count > applied[j].Count
-		}
-		return applied[i].Label < applied[j].Label
+	slices.SortFunc(applied, func(a, b AppliedByCount) int {
+		return cmp.Or(cmp.Compare(b.Count, a.Count), cmp.Compare(a.Label, b.Label))
 	})
 	sort.Slice(months, func(i, j int) bool { return months[i].Month < months[j].Month })
 	return applied, months, nil
@@ -773,7 +771,11 @@ func stripTagsTx(tx *sql.Tx, ids []int64) error {
 
 // DeleteTag keeps a canonical rating row and only strips it from every image.
 func (s *Service) DeleteTag(id int64) error {
-	if s.isLockedRatingTag(id) {
+	locked, err := s.isLockedRatingTag(id)
+	if err != nil {
+		return err
+	}
+	if locked {
 		return s.stripTagFromAllImages(id)
 	}
 	return s.inWriteTx(func(tx *sql.Tx) error {
@@ -803,28 +805,31 @@ func (s *Service) stripTagFromAllImages(tagID int64) error {
 	})
 }
 
-func (s *Service) isRatingTag(id int64) bool {
-	_, ok := s.ratingRowName(id)
-	return ok
+func (s *Service) isRatingTag(id int64) (bool, error) {
+	_, ok, err := s.ratingRowName(id)
+	return ok, err
 }
 
 // Only the canonical four are locked: an import can leave other names in
 // the rating category, and those must stay repairable.
-func (s *Service) isLockedRatingTag(id int64) bool {
-	name, ok := s.ratingRowName(id)
-	return ok && IsCanonicalRating(name)
+func (s *Service) isLockedRatingTag(id int64) (bool, error) {
+	name, ok, err := s.ratingRowName(id)
+	return ok && IsCanonicalRating(name), err
 }
 
-func (s *Service) ratingRowName(id int64) (string, bool) {
+func (s *Service) ratingRowName(id int64) (string, bool, error) {
 	if s.ratingCatID == 0 {
-		return "", false
+		return "", false, nil
 	}
 	var catID int64
 	var name string
-	if err := s.db.Read.QueryRow(`SELECT category_id, name FROM tags WHERE id = ?`, id).Scan(&catID, &name); err != nil {
-		return "", false
+	switch err := s.db.Read.QueryRow(`SELECT category_id, name FROM tags WHERE id = ?`, id).Scan(&catID, &name); {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case err != nil:
+		return "", false, err
 	}
-	return name, catID == s.ratingCatID
+	return name, catID == s.ratingCatID, nil
 }
 
 func (s *Service) RenameTag(id int64, newName string) error { return s.renameTag(id, newName, false) }
@@ -939,10 +944,13 @@ func (s *Service) ChangeTagCategory(tagID, newCategoryID int64) error {
 func (s *Service) changeTagCategoryTx(tx *sql.Tx, tagID, newCategoryID int64) error {
 	var currentCatID int64
 	var name string
-	if err := tx.QueryRow(
+	switch err := tx.QueryRow(
 		`SELECT category_id, name FROM tags WHERE id = ?`, tagID,
-	).Scan(&currentCatID, &name); err != nil {
+	).Scan(&currentCatID, &name); {
+	case errors.Is(err, sql.ErrNoRows):
 		return ErrTagNotFound
+	case err != nil:
+		return err
 	}
 	if currentCatID == newCategoryID {
 		return nil

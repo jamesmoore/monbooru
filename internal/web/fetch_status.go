@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/monloader"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 const (
@@ -99,7 +100,7 @@ func lookupMissBody(trail, hashes string) string {
 			// A PTR match sets no source URL, so the lookup reports a
 			// miss even though its tags landed.
 			b.WriteString("<div>" + html.EscapeString(entry))
-			if strings.HasPrefix(entry, monloader.PTRTrailName+": match") {
+			if strings.HasPrefix(entry, contract.TrailPTR+": match") {
 				b.WriteString(" (reload the page to see them)")
 			}
 			b.WriteString("</div>")
@@ -150,15 +151,15 @@ func linkifyTrailEntry(entry string) string {
 
 // Keyed on monloader's stable queue error codes.
 var fetchFailureMessages = map[string]string{
-	monloader.CodeUnsupportedURL:      "monloader can't fetch this source URL.",
-	monloader.CodeNetworkUnreachable:  "monloader couldn't reach the source.",
-	monloader.CodeAuthRequired:        "The source needs a login monloader doesn't have.",
-	monloader.CodeBlocked:             "The source blocked monloader's fetch.",
-	monloader.CodeRateLimited:         "The source is rate-limiting; try again later.",
-	monloader.CodeDownloadFailed:      "The source fetch failed on monloader.",
-	monloader.CodeMonbooruUnreachable: "monloader fetched the source but couldn't apply the tags.",
-	monloader.CodeMonbooruRejected:    "monloader fetched the source but couldn't apply the tags.",
-	monloader.CodeMappingFailed:       "monloader couldn't read the source's metadata.",
+	contract.CodeUnsupportedURL:      "monloader can't fetch this source URL.",
+	contract.CodeNetworkUnreachable:  "monloader couldn't reach the source.",
+	contract.CodeAuthRequired:        "The source needs a login monloader doesn't have.",
+	contract.CodeBlocked:             "The source blocked monloader's fetch.",
+	contract.CodeRateLimited:         "The source is rate-limiting; try again later.",
+	contract.CodeDownloadFailed:      "The source fetch failed on monloader.",
+	contract.CodeMonbooruUnreachable: "monloader fetched the source but couldn't apply the tags.",
+	contract.CodeMonbooruRejected:    "monloader fetched the source but couldn't apply the tags.",
+	contract.CodeMappingFailed:       "monloader couldn't read the source's metadata.",
 }
 
 func fetchFailureMessage(state, msg string) string {

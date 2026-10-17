@@ -47,6 +47,11 @@ func (h *Handler) recordFetch(g *library.Gallery, imageID int64, state, message 
 	}
 }
 
+func (h *Handler) refuse(w http.ResponseWriter, g *library.Gallery, imageID int64, fetchMsg string, status int, code, msg string) {
+	h.recordFetch(g, imageID, "error", fetchMsg)
+	apiError(w, status, code, msg)
+}
+
 // WithMemoryMark: mark runs at an auto-tag job's start, and the func it
 // returns logs the peak.
 func (h *Handler) WithMemoryMark(mark func() func(scope string)) *Handler {
@@ -61,15 +66,18 @@ func (h *Handler) WithGalleryLock(lock func() (unlock func())) *Handler {
 	return h
 }
 
+// The file cap is LandSpec's; the slack only bounds a push's metadata fields.
+const multipartMetaSlack = 8 << 20
+
+const maxJSONBody = 16 << 20
+
 // A slow push holding the gallery lock while its body arrives would stall
 // every request queued behind a gallery switch.
 func (h *Handler) bodyThenLock(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if isMultipart(r.Header.Get("Content-Type")) {
-			// A zero or negative size disables the cap; the 4 KiB slack
-			// alone would refuse every push.
 			if maxBytes := int64(h.cfg().Gallery.MaxFileSizeMB) * 1024 * 1024; maxBytes > 0 {
-				r.Body = http.MaxBytesReader(w, r.Body, maxBytes+4096)
+				r.Body = http.MaxBytesReader(w, r.Body, maxBytes+multipartMetaSlack)
 			}
 			if err := r.ParseMultipartForm(32 << 20); err != nil {
 				if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -107,11 +115,19 @@ func (h *Handler) resolveGallery(w http.ResponseWriter, r *http.Request) (*libra
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(dst); err != nil {
+		refuseJSONBody(w, err)
 		return false
 	}
 	return true
+}
+
+func refuseJSONBody(w http.ResponseWriter, err error) {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		apiError(w, http.StatusRequestEntityTooLarge, "file_too_large", "JSON body exceeds 16 MiB")
+		return
+	}
+	apiError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 }
 
 func (h *Handler) galleryAndID(w http.ResponseWriter, r *http.Request) (*library.Gallery, int64, bool) {
@@ -133,7 +149,11 @@ func (h *Handler) galleryAndExistingID(w http.ResponseWriter, r *http.Request) (
 	if !ok {
 		return nil, 0, false
 	}
-	if !imageExists(g, id) {
+	exists, err := imageExists(g, id)
+	if serverError(w, err) {
+		return nil, 0, false
+	}
+	if !exists {
 		apiError(w, http.StatusNotFound, "not_found", "image not found")
 		return nil, 0, false
 	}
@@ -227,6 +247,15 @@ func SetCORS(w http.ResponseWriter, r *http.Request, cfg *config.Config) bool {
 	return true
 }
 
+// CORSOK writes the 403 itself when SetCORS refuses the origin.
+func CORSOK(w http.ResponseWriter, r *http.Request, cfg *config.Config) bool {
+	if SetCORS(w, r, cfg) {
+		return true
+	}
+	apiError(w, http.StatusForbidden, "forbidden", "CORS: origin not allowed")
+	return false
+}
+
 // The arrival address counts alongside base_url: a base_url left at
 // "localhost" would otherwise refuse the page monbooru itself just served.
 func corsAllowed(cfg *config.Config, r *http.Request, origin string) bool {
@@ -264,8 +293,7 @@ func requestOrigin(cfg *config.Config, r *http.Request) string {
 // Outside auth: a preflight never carries credentials.
 func (h *Handler) preflight(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg()
-	if !SetCORS(w, r, cfg) {
-		apiError(w, http.StatusForbidden, "forbidden", "CORS: origin not allowed")
+	if !CORSOK(w, r, cfg) {
 		return
 	}
 	if r.Header.Get("Origin") != "" {
@@ -279,8 +307,7 @@ func (h *Handler) preflight(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg := h.cfg()
-		if !SetCORS(w, r, cfg) {
-			apiError(w, http.StatusForbidden, "forbidden", "CORS: origin not allowed")
+		if !CORSOK(w, r, cfg) {
 			return
 		}
 
@@ -356,6 +383,13 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func withWarnings(m map[string]any, warnings []string) map[string]any {
+	if len(warnings) > 0 {
+		m["tag_warnings"] = warnings
+	}
+	return m
 }
 
 func writePage(w http.ResponseWriter, page, limit, total int, results any) {

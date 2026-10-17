@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type Probe struct {
@@ -103,12 +103,12 @@ func (p *Peers) Refresh(ctx context.Context, c *config.Config) {
 			continue
 		}
 		wg.Go(func() {
-			version, ok := peer.Health(ctx, base)
+			h, ok := peer.Health(ctx, base)
 			if !ok {
 				p.MarkDown(pc.Name)
 				return
 			}
-			p.SetProbe(pc.Name, Probe{Conn: peer.ConnOK, Version: version, CheckedAt: time.Now()})
+			p.SetProbe(pc.Name, Probe{Conn: peer.ConnOK, Version: h.Version, CheckedAt: time.Now()})
 		})
 	}
 	wg.Wait()

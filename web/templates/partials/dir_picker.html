@@ -2,18 +2,15 @@
 <div class="dir-picker">
   <p class="dir-picker-path"><code>{{.Path}}</code></p>
   {{if .Err}}<p class="field-hint">{{.Err}}</p>{{end}}
-  <ul class="dir-picker-list">
+  <ul class="dir-picker-list" hx-target="#dir-picker-body">
     {{if .Parent}}
-    <li><button type="button" class="dir-picker-entry" hx-get="/internal/browse?into={{urlQ .Into}}&amp;path={{urlQ .Parent}}"
-                hx-target="#dir-picker-body" hx-swap="innerHTML">..</button></li>
+    <li><button type="button" class="dir-picker-entry" hx-get="/internal/browse?into={{urlQ .Into}}&amp;path={{urlQ .Parent}}">..</button></li>
     {{end}}
     {{range .Roots}}
-    <li><button type="button" class="dir-picker-entry" hx-get="/internal/browse?into={{urlQ $.Into}}&amp;path={{urlQ .Path}}"
-                hx-target="#dir-picker-body" hx-swap="innerHTML">{{.Name}}</button></li>
+    <li><button type="button" class="dir-picker-entry" hx-get="/internal/browse?into={{urlQ $.Into}}&amp;path={{urlQ .Path}}">{{.Name}}</button></li>
     {{end}}
     {{range .Entries}}
-    <li><button type="button" class="dir-picker-entry" hx-get="/internal/browse?into={{urlQ $.Into}}&amp;path={{urlQ .Path}}"
-                hx-target="#dir-picker-body" hx-swap="innerHTML">{{.Name}}/</button></li>
+    <li><button type="button" class="dir-picker-entry" hx-get="/internal/browse?into={{urlQ $.Into}}&amp;path={{urlQ .Path}}">{{.Name}}/</button></li>
     {{end}}
   </ul>
   {{if not .Entries}}

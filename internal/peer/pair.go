@@ -4,52 +4,27 @@
 package peer
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
-	"maps"
 	"net"
 	"net/url"
 	"slices"
 	"strings"
-	"sync"
-	"time"
 	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/config"
+	"github.com/monbooru/monbooru/internal/shared/pairing"
 )
 
 // Companion is the companion's name in pairing records; its credential and
 // pause live in [monloader], every other peer's in a [[plugin]] block.
 const Companion = "monloader"
 
-const (
-	pendingTTL = 5 * time.Minute
-	maxPending = 16
-)
-
-type State string
-
-const (
-	Pending  State = "pending"
-	Approved State = "approved"
-	Denied   State = "denied"
-)
-
-// Nothing is issued until the claim, so an approval the peer never
-// collects mints no token.
 type Req struct {
-	ID        string
-	App       string
+	pairing.Request
 	URL       string
-	Source    string
-	Scopes    []string
 	PeerToken string
 	Version   string
 	Buttons   []config.PluginButton
-	State     State
-	Claimed   bool
-	CreatedAt time.Time
 	Repair    bool
 }
 
@@ -60,117 +35,9 @@ func (r Req) OpenOutranksScopes() bool {
 		slices.ContainsFunc(r.Buttons, func(b config.PluginButton) bool { return b.Mode == config.ModeOpen })
 }
 
-type Store struct {
-	mu sync.Mutex
-	m  map[string]*Req
-}
+type Store = pairing.Store[Req, *Req]
 
-func NewStore() *Store { return &Store{m: map[string]*Req{}} }
-
-func pairID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func (ps *Store) sweepLocked() {
-	cutoff := time.Now().Add(-pendingTTL)
-	maps.DeleteFunc(ps.m, func(_ string, r *Req) bool {
-		return r.CreatedAt.Before(cutoff)
-	})
-}
-
-// A second request from the same app replaces its pending one: the
-// endpoint is unauthenticated, and one noisy peer would otherwise fill
-// the cap for the TTL.
-func (ps *Store) Create(req Req) (string, bool) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	ps.sweepLocked()
-	maps.DeleteFunc(ps.m, func(_ string, r *Req) bool {
-		return r.State == Pending && r.App == req.App
-	})
-	pending := 0
-	for _, r := range ps.m {
-		if r.State == Pending {
-			pending++
-		}
-	}
-	if pending >= maxPending {
-		return "", false
-	}
-	req.ID, req.State, req.CreatedAt = pairID(), Pending, time.Now()
-	ps.m[req.ID] = &req
-	return req.ID, true
-}
-
-// A plugin stopped by a removal may offer to pair on its way out; a card
-// for it is noise.
-func (ps *Store) DropPending(app string) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	maps.DeleteFunc(ps.m, func(_ string, r *Req) bool {
-		return r.State == Pending && r.App == app
-	})
-}
-
-func (ps *Store) ListPending() []Req {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	ps.sweepLocked()
-	var out []Req
-	for _, r := range ps.m {
-		if r.State == Pending {
-			out = append(out, *r)
-		}
-	}
-	return out
-}
-
-func (ps *Store) Get(id string) (Req, bool) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	if r, ok := ps.m[id]; ok {
-		return *r, true
-	}
-	return Req{}, false
-}
-
-func (ps *Store) SetState(id string, st State) bool {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	r, ok := ps.m[id]
-	if !ok || r.State != Pending {
-		return false
-	}
-	r.State = st
-	return true
-}
-
-func (ps *Store) Claim(id string) (Req, bool) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	r, ok := ps.m[id]
-	if !ok || r.State != Approved || r.Claimed {
-		return Req{}, false
-	}
-	r.Claimed = true
-	return *r, true
-}
-
-func (ps *Store) Unclaim(id string) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	if r, ok := ps.m[id]; ok {
-		r.Claimed = false
-	}
-}
-
-func (ps *Store) Remove(id string) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	delete(ps.m, id)
-}
+func NewStore() *Store { return pairing.NewStore[Req]() }
 
 func ValidateOffer(app, version string, buttons []config.PluginButton) error {
 	if err := config.ValidatePluginName(app); err != nil {
@@ -192,6 +59,8 @@ func CallbackURL(advertised, source string) string {
 	}
 	if port := u.Port(); port != "" {
 		u.Host = net.JoinHostPort(source, port)
+	} else if strings.Contains(source, ":") {
+		u.Host = "[" + source + "]"
 	} else {
 		u.Host = source
 	}

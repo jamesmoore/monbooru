@@ -20,9 +20,9 @@ import (
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
@@ -33,6 +33,8 @@ const graceDelay = 5 * time.Minute
 // Past its slot by more than this, the clock was asleep or stepped: the
 // slot goes to the catch-up rule instead of running late.
 const wakeSlack = 2 * time.Minute
+
+const catchUpRetry = time.Minute
 
 type Host interface {
 	// View is the schedule a pass reads, with the lookup phases off while
@@ -150,7 +152,9 @@ func (s *Scheduler) Run() {
 				break slot
 			case fire:
 				if s.clockFireOwed(time.Now()) {
-					s.RunNow()
+					if sched, _ := s.host.View(); !s.RunNow() && sched.EffectiveMode() == config.ScheduleAtTimeCatchup {
+						go s.catchUpAfter(catchUpRetry, catchUpRetry)
+					}
 				} else {
 					logx.Infof("scheduler: today's pass already ran; skipping the clock trigger")
 				}
@@ -179,22 +183,31 @@ func clockWake(next, now time.Time) (wait time.Duration, fire, missed bool) {
 	return 0, true, false
 }
 
-func (s *Scheduler) catchUp() {
+func (s *Scheduler) catchUp() { s.catchUpAfter(graceDelay, catchUpRetry) }
+
+func (s *Scheduler) catchUpAfter(grace, retry time.Duration) {
 	if !s.catchUpOwed() {
 		return
 	}
-	select {
-	case <-s.done:
-		return
-	case <-time.After(graceDelay):
+	for wait := grace; ; wait = retry {
+		select {
+		case <-s.done:
+			return
+		case <-time.After(wait):
+		}
+		// Re-read: the schedule may have changed during the wait.
+		if !s.catchUpOwed() {
+			return
+		}
+		if s.jobs.IsRunning() {
+			continue
+		}
+		logx.Infof("scheduler: running the pass this machine was not awake for")
+		s.markCatchUpDay(time.Now())
+		if s.RunNow() {
+			return
+		}
 	}
-	// Re-read: the schedule may have changed during the grace delay.
-	if !s.catchUpOwed() {
-		return
-	}
-	logx.Infof("scheduler: running the pass this machine was not awake for")
-	s.markCatchUpDay(time.Now())
-	s.RunNow()
 }
 
 func (s *Scheduler) catchUpOwed() bool {
@@ -293,11 +306,6 @@ func parseTime(v string) (clockTime, error) {
 	return clockTime{hour: t.Hour(), minute: t.Minute()}, nil
 }
 
-func hasAnyEnabled(sc config.ScheduleConfig) bool {
-	return sc.SyncGallery || sc.RemoveOrphans || sc.RunAutoTaggers || sc.FindRelationPairs ||
-		sc.LookupPTR || sc.LookupBooru
-}
-
 func hasWork(sc config.ScheduleConfig, galleries []string) bool {
 	for _, action := range config.ScheduleActions {
 		for _, g := range galleries {
@@ -312,11 +320,11 @@ func hasWork(sc config.ScheduleConfig, galleries []string) bool {
 // RunNow runs a pass unless a job holds the lane. The lookup phases run
 // last: an external limit can cut them short without costing the rest,
 // and their writes must not interleave with autotag's.
-func (s *Scheduler) RunNow() {
+func (s *Scheduler) RunNow() bool {
 	r, err := s.jobs.Reserve()
 	if err != nil {
 		logx.Warnf("scheduler: skipping run (a job is already running)")
-		return
+		return false
 	}
 	defer r.Release()
 
@@ -332,7 +340,8 @@ func (s *Scheduler) RunNow() {
 		case cancelled:
 			info = "cancelled"
 		}
-		s.recordRun(started, time.Since(started), info)
+		// A pass the shutdown cut short stays owed, so the next boot's catch-up redoes it.
+		s.recordRun(started, time.Since(started), info, !cancelled || !s.stopping())
 	}()
 
 	sched, _ := s.host.View()
@@ -363,7 +372,7 @@ func (s *Scheduler) RunNow() {
 
 	for _, name := range names {
 		if abort() {
-			return
+			return true
 		}
 		cx := s.set.Get(name)
 		runs := func(action string) bool { return sched.RunsOn(action, name) }
@@ -373,16 +382,16 @@ func (s *Scheduler) RunNow() {
 		logx.Infof("scheduler: running actions on gallery %q", name)
 
 		if phase(runs(config.ActionSyncGallery) && !cx.Degraded, "sync "+name, func() error { return s.sync(r, cx) }) {
-			return
+			return true
 		}
 		if phase(runs(config.ActionRemoveOrphans), "remove-orphans "+name, func() error { return s.removeOrphans(r, cx) }) {
-			return
+			return true
 		}
 		if phase(runs(config.ActionRunAutoTaggers) && tagger.IsAvailable(s.host.Config()), "autotag "+name, func() error { return s.autotag(r, cx) }) {
-			return
+			return true
 		}
 		if phase(runs(config.ActionFindRelationPairs), "find-pairs "+name, func() error { return s.findRelationPairs(r, cx) }) {
-			return
+			return true
 		}
 		if phase(runs(config.ActionLookupPTR), "ptr-lookup "+name, func() error {
 			switch {
@@ -395,7 +404,7 @@ func (s *Scheduler) RunNow() {
 			}
 			return nil
 		}) {
-			return
+			return true
 		}
 		if phase(runs(config.ActionLookupBooru), "online-lookup "+name, func() error {
 			if !s.lookups.Usable() {
@@ -404,9 +413,10 @@ func (s *Scheduler) RunNow() {
 			}
 			return s.lookup(r, cx, "online lookup", s.lookups.LookupOnline)
 		}) {
-			return
+			return true
 		}
 	}
+	return true
 }
 
 func (s *Scheduler) startPhase(r *jobs.Reservation, jobType, phase, gallery string) (context.Context, error) {
@@ -519,13 +529,24 @@ func (s *Scheduler) autotag(r *jobs.Reservation, cx *library.Gallery) error {
 	return err
 }
 
-func (s *Scheduler) recordRun(started time.Time, dur time.Duration, info string) {
+func (s *Scheduler) recordRun(started time.Time, dur time.Duration, info string, persist bool) {
 	s.mu.Lock()
 	s.lastRun, s.lastDur, s.lastInfo = started, dur, info
 	s.mu.Unlock()
 	// Persisted: the catch-up after a restart needs to know whether last
 	// night ran.
-	s.saveRun(started)
+	if persist {
+		s.saveRun(started)
+	}
+}
+
+func (s *Scheduler) stopping() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
 }
 
 type Status struct {
@@ -560,7 +581,7 @@ func (s *Scheduler) Status() Status {
 		st.NextRunNote = "No next run scheduled (set to never)."
 	case mode == config.ScheduleOnStart:
 		st.NextRunNote = "No next run scheduled (it runs at startup only)."
-	case !hasAnyEnabled(sched):
+	case !slices.ContainsFunc(config.ScheduleActions, sched.Enabled):
 		st.NextRunNote = "No next run scheduled (every action is off)."
 	case !hasWork(sched, galleries):
 		st.NextRunNote = "No next run scheduled (no gallery is ticked for the actions that are on)."

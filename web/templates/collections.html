@@ -119,7 +119,7 @@ document.getElementById('collection-rename-form').addEventListener('submit', fun
   var name = document.getElementById('collection-rename-input').value.trim();
   var err = document.getElementById('collection-rename-error');
   err.innerHTML = '';
-  if (!name) { err.innerHTML = '<div class="flash flash-err">New name required.</div>'; return; }
+  if (!name) { setFlashText(err, 'err', 'New name required.'); return; }
   postForm('/collections/rename', {prev: prev, name: name}, {
     okStatus: 202,
     dialogId: 'collection-rename-dialog',
@@ -220,11 +220,31 @@ function openCollectionOrder(btn) {
   clearSlots('collection-order-error');
   var body = document.getElementById('collection-order-body');
   body.innerHTML = 'Loading…';
-  fetch('/collections/order?name=' + encodeURIComponent(btn.dataset.name), {credentials: 'same-origin', headers: {'HX-Request': 'true'}})
-    .then(function(r) { return r.text(); })
-    .then(function(html) { body.innerHTML = html; captureOrigOrder(); applyOrderMode(); })
-    .catch(function() { body.innerHTML = '<div class="flash flash-err">Could not load the collection.</div>'; });
+  loadCollectionOrder('/collections/order?name=' + encodeURIComponent(btn.dataset.name), function() {
+    setFlashText(body, 'err', 'Could not load the collection.');
+  });
   dlg.showModal();
+}
+
+function loadCollectionOrder(url, onFail) {
+  fetch(url, {credentials: 'same-origin', headers: {'HX-Request': 'true'}})
+    .then(function(r) {
+      if (sessionLost(r)) {
+        document.getElementById('collection-order-dialog').close();
+        showLoginNotice();
+        return;
+      }
+      if (!r.ok) {
+        onFail();
+        return;
+      }
+      return r.text().then(function(html) {
+        document.getElementById('collection-order-body').innerHTML = html;
+        captureOrigOrder();
+        applyOrderMode();
+      });
+    })
+    .catch(onFail);
 }
 
 // The rename writes back the server's name: a collision may have suffixed it.
@@ -256,30 +276,20 @@ function startTileRename(span) {
     if (!name || name === stem) { finish(); return; }
     busy = true;
     input.disabled = true;
-    var body = new URLSearchParams();
-    body.set('name', name);
-    body.set('inline', '1');
-    fetch('/images/' + tile.dataset.id + '/place', {
-      method: 'POST',
-      headers: {'X-CSRF-Token': getCSRFToken(), 'X-Monbooru-Gallery': activeGallery(), 'Content-Type': 'application/x-www-form-urlencoded'},
-      body: body
-    }).then(function(r) {
-      if (sessionLost(r)) {
-        showLoginNotice();
-        finish();
-        return;
-      }
-      if (!r.ok) {
+    postForm('/images/' + tile.dataset.id + '/place', {name: name, inline: '1'}, {
+      onDone: finish,
+      onErr: function() {
         setFlashText(document.getElementById('collection-order-error'), 'err', 'Rename failed.');
         finish();
-        return;
+      },
+      onOK: function(r) {
+        r.text().then(function(newName) {
+          tile.dataset.filename = newName;
+          tile.title = newName;
+          finish(newName);
+        });
       }
-      r.text().then(function(newName) {
-        tile.dataset.filename = newName;
-        tile.title = newName;
-        finish(newName);
-      });
-    }).catch(function() { finish(); });
+    });
   });
   input.addEventListener('blur', function() { if (!busy) finish(); });
 }
@@ -299,12 +309,10 @@ document.getElementById('collection-order-body').addEventListener('click', funct
   var more = e.target.closest('.collection-order-more');
   if (more) {
     var dlg = document.getElementById('collection-order-dialog');
-    var body = document.getElementById('collection-order-body');
     more.disabled = true;
-    fetch('/collections/order?name=' + encodeURIComponent(dlg.dataset.name) + '&limit=' + more.dataset.limit, {credentials: 'same-origin', headers: {'HX-Request': 'true'}})
-      .then(function(r) { return r.text(); })
-      .then(function(html) { body.innerHTML = html; captureOrigOrder(); applyOrderMode(); })
-      .catch(function() { more.disabled = false; });
+    loadCollectionOrder('/collections/order?name=' + encodeURIComponent(dlg.dataset.name) + '&limit=' + more.dataset.limit, function() {
+      more.disabled = false;
+    });
     return;
   }
   var tile = e.target.closest('.collection-order-tile');
@@ -330,7 +338,7 @@ document.getElementById('collection-order-form').addEventListener('submit', func
   } else if (_orderMode === 'filename') {
     params = {collection: name, mode: 'filename'};
   } else {
-    err.innerHTML = '<div class="flash flash-err">Click images to set an order, or switch to "By filename".</div>';
+    setFlashText(err, 'err', 'Click images to set an order, or switch to "By filename".');
     return;
   }
   postForm('/collections/order', params, {

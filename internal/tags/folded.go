@@ -93,9 +93,13 @@ func (s *Service) ScanFoldedDuplicates() (int, error) {
 	return len(countByOld), nil
 }
 
+const liveFoldedPairs = `folded_tag_pairs fp
+	JOIN tags o ON o.id = fp.old_id AND o.is_alias = 0
+	JOIN tags n ON n.id = fp.new_id AND n.is_alias = 0 AND n.category_id = o.category_id`
+
 func (s *Service) FoldedDuplicatesCount() (int, error) {
 	var n int
-	err := s.db.Read.QueryRow(`SELECT COUNT(DISTINCT old_id) FROM folded_tag_pairs`).Scan(&n)
+	err := s.db.Read.QueryRow(`SELECT COUNT(DISTINCT fp.old_id) FROM ` + liveFoldedPairs).Scan(&n)
 	return n, err
 }
 
@@ -122,11 +126,14 @@ func (s *Service) MergeFolded(ctx context.Context, oldIDs []int64) (FoldedMergeR
 			res.Cancelled = true
 			return res, nil
 		}
+		// The pairs are as of the last scan: a merge, alias, rename or move
+		// since can have undone one.
 		var newID int64
+		var oldName, newName string
 		e := s.db.Read.QueryRow(
-			`SELECT new_id FROM folded_tag_pairs WHERE old_id = ? AND ambiguous = 0`, oldID,
-		).Scan(&newID)
-		if e == sql.ErrNoRows {
+			`SELECT fp.new_id, o.name, n.name FROM `+liveFoldedPairs+` WHERE fp.old_id = ? AND fp.ambiguous = 0`, oldID,
+		).Scan(&newID, &oldName, &newName)
+		if e == sql.ErrNoRows || (e == nil && LegacyFold(newName) != oldName) {
 			res.Skipped++
 			continue
 		}
@@ -138,10 +145,8 @@ func (s *Service) MergeFolded(ctx context.Context, oldIDs []int64) (FoldedMergeR
 			res.addRefusal(e)
 			continue
 		}
-		if _, err := s.db.Write.Exec(`DELETE FROM folded_tag_pairs WHERE old_id = ?`, oldID); err == nil {
-			s.changed()
-		}
 		res.Merged++
+		s.changed()
 	}
 	return res, nil
 }

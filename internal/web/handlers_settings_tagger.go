@@ -17,7 +17,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -44,7 +44,7 @@ type taggerRow struct {
 	TargetDir string
 }
 
-func (s *Server) installedTaggerRow(t tagger.TaggerStatus, totalGalleries int, modelPath string) taggerRow {
+func (s *Server) installedTaggerRow(t tagger.TaggerStatus, totalGalleries int, modelPath string, entry *tagger.CatalogEntry) taggerRow {
 	ruleCount := len(tagger.OverlayDispatchRules(modelPath, t.Name))
 	return taggerRow{
 		Name:                t.Name,
@@ -54,7 +54,7 @@ func (s *Server) installedTaggerRow(t tagger.TaggerStatus, totalGalleries int, m
 		Enabled:             t.Enabled,
 		ConfidenceThreshold: t.ConfidenceThreshold,
 		ConfigSummary:       taggerConfigSummary(t.TaggerInstance, totalGalleries, ruleCount),
-		Differs:             taggerDiffersFromStock(t.TaggerInstance, modelPath),
+		Differs:             taggerDiffersFromStock(t.TaggerInstance, modelPath, entry),
 		Installed:           true,
 	}
 }
@@ -77,8 +77,8 @@ func taggerConfigSummary(inst config.TaggerInstance, totalGalleries, ruleCount i
 	return out
 }
 
-func taggerDiffersFromStock(inst config.TaggerInstance, modelPath string) bool {
-	seed := tagger.SeedTaggerInstance(inst.Name, inst.Enabled, catalogEntryByName(modelPath, inst.Name))
+func taggerDiffersFromStock(inst config.TaggerInstance, modelPath string, entry *tagger.CatalogEntry) bool {
+	seed := tagger.SeedTaggerInstance(inst.Name, inst.Enabled, entry)
 	if inst.ConfidenceThreshold != seed.ConfidenceThreshold {
 		return true
 	}
@@ -145,17 +145,18 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.cfgMu.Lock()
-	providerChanged := s.cfg.Tagger.ExecutionProvider != newProvider
-	s.cfg.Tagger.ExecutionProvider = newProvider
-	if n, err := strconv.Atoi(r.FormValue("parallel")); err == nil && n >= 1 {
-		s.cfg.Tagger.Parallel = n
-	}
-	if n, err := strconv.Atoi(r.FormValue("idle_release_after_minutes")); err == nil && n >= 0 {
-		s.cfg.Tagger.IdleReleaseAfterMinutes = n
-	}
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	var providerChanged bool
+	if err := s.withConfig(func(c *config.Config) error {
+		providerChanged = c.Tagger.ExecutionProvider != newProvider
+		c.Tagger.ExecutionProvider = newProvider
+		if n, err := strconv.Atoi(r.FormValue("parallel")); err == nil && n >= 1 {
+			c.Tagger.Parallel = n
+		}
+		if n, err := strconv.Atoi(r.FormValue("idle_release_after_minutes")); err == nil && n >= 0 {
+			c.Tagger.IdleReleaseAfterMinutes = n
+		}
+		return nil
+	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
@@ -182,17 +183,17 @@ func (s *Server) settingsTaggerDisablePost(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) updateTagger(name string, mutate func(*config.TaggerInstance)) error {
 	modelPath := s.modelPath()
-	s.cfgMu.Lock()
-	if i := slices.IndexFunc(s.cfg.Tagger.Taggers, func(t config.TaggerInstance) bool { return t.Name == name }); i >= 0 {
-		mutate(&s.cfg.Tagger.Taggers[i])
-	} else {
-		catalog := catalogEntryByName(modelPath, name)
-		seeded := tagger.SeedTaggerInstance(name, false, catalog)
-		mutate(&seeded)
-		s.cfg.Tagger.Taggers = append(s.cfg.Tagger.Taggers, seeded)
-	}
-	s.cfgMu.Unlock()
-	return s.saveConfig()
+	return s.withConfig(func(c *config.Config) error {
+		if i := slices.IndexFunc(c.Tagger.Taggers, func(t config.TaggerInstance) bool { return t.Name == name }); i >= 0 {
+			mutate(&c.Tagger.Taggers[i])
+		} else {
+			catalog := catalogEntryByName(modelPath, name)
+			seeded := tagger.SeedTaggerInstance(name, false, catalog)
+			mutate(&seeded)
+			c.Tagger.Taggers = append(c.Tagger.Taggers, seeded)
+		}
+		return nil
+	})
 }
 
 func (s *Server) applyTaggerEnabled(w http.ResponseWriter, name string, enabled bool) {
@@ -251,7 +252,7 @@ func (s *Server) settingsTaggerConfigGet(w http.ResponseWriter, r *http.Request)
 }
 
 func taggerExport(modelPath, name string, inst config.TaggerInstance) (map[string]any, error) {
-	embedded := tagger.EmbeddedDispatchRules(name)
+	embedded := tagger.DefaultDispatchRules(modelPath, name)
 	overlay, overlayErr := tagger.ReadDispatchOverlay(modelPath, name)
 	merged := tagger.MergedDispatchRules(modelPath, name)
 	exportJSON := ""
@@ -263,14 +264,10 @@ func taggerExport(modelPath, name string, inst config.TaggerInstance) (map[strin
 	if profile, err := tagger.ResolveProfile(modelPath, name, taggerTagsFile(inst)); err == nil {
 		if b, err := tagger.ProfileExportDoc(profile); err == nil {
 			profileJSON = string(b) + "\n"
-			marked := map[string]bool{}
-			for _, f := range sidecarFields {
-				marked[f] = true
-			}
 			for _, line := range strings.Split(string(b), "\n") {
 				mark := ""
 				trimmed := strings.TrimSpace(line)
-				if i := strings.Index(trimmed, `":`); strings.HasPrefix(trimmed, `"`) && i > 0 && marked[trimmed[1:i]] {
+				if i := strings.Index(trimmed, `":`); strings.HasPrefix(trimmed, `"`) && i > 0 && slices.Contains(sidecarFields, trimmed[1:i]) {
 					mark = "add"
 				}
 				profileLines = append(profileLines, exportLine{Text: line, Mark: mark})
@@ -499,13 +496,10 @@ func (s *Server) parseGalleriesForm(r *http.Request) []string {
 		return nil
 	}
 	galleries := []string{}
-	valid := map[string]bool{}
-	for _, g := range s.galleries() {
-		valid[g.Name] = true
-	}
+	known := s.galleries()
 	for _, n := range r.Form["gallery_names"] {
 		n = strings.TrimSpace(n)
-		if n == "" || !valid[n] {
+		if n == "" || !slices.ContainsFunc(known, func(g config.Gallery) bool { return g.Name == n }) {
 			continue
 		}
 		galleries = append(galleries, n)
@@ -535,7 +529,7 @@ func (s *Server) settingsTaggerMappingPost(w http.ResponseWriter, r *http.Reques
 	s.renderTemplate(w, "tagger_export_panel", export)
 	summary := taggerConfigSummary(inst, len(s.galleries()), len(tagger.OverlayDispatchRules(modelPath, name)))
 	_, _ = fmt.Fprintf(w, `<span id="tagger-config-summary-%s" class="field-hint" hx-swap-oob="true">%s</span>`, name, html.EscapeString(summary))
-	s.renderTemplate(w, "tagger_reset_button", map[string]any{"Name": name, "Differs": taggerDiffersFromStock(inst, modelPath), "OOB": true})
+	s.renderTemplate(w, "tagger_reset_button", map[string]any{"Name": name, "Differs": taggerDiffersFromStock(inst, modelPath, catalogEntryByName(modelPath, inst.Name)), "OOB": true})
 }
 
 func (s *Server) applyMappingRule(name, modelPath string, r *http.Request) (errMsg string) {
@@ -562,7 +556,8 @@ func (s *Server) applyMappingRule(name, modelPath string, r *http.Request) (errM
 			rename = valid
 		}
 		if target := cmp.Or(rename, source); category == "rating" && !tags.IsCanonicalRating(target) {
-			return "A rating label must become general, sensitive, questionable or explicit, not " + target + "."
+			last := len(tags.RatingLevels) - 1
+			return "A rating label must become " + strings.Join(tags.RatingLevels[:last], ", ") + " or " + tags.RatingLevels[last] + ", not " + target + "."
 		}
 		entry = tagger.DispatchEntry{Source: source, Category: category, Name: rename}
 	}
@@ -663,8 +658,7 @@ func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global f
 	modelPath := s.modelPath()
 	global = inst.ConfidenceThreshold
 
-	profile, _ := tagger.ResolveProfile(modelPath, name, taggerTagsFile(inst))
-	emit := profile.EmittedCategories()
+	emit := tagger.EmittedCategories(modelPath, name, taggerTagsFile(inst))
 
 	colors := s.categoryColors()
 
@@ -747,24 +741,23 @@ func (s *Server) galleryDialogData(name string) (rows []taggerGalleryRow, allChe
 	}
 	galleries := s.galleries()
 	allChecked = inst.Galleries == nil
-	picked := map[string]bool{}
-	for _, n := range inst.Galleries {
-		picked[n] = true
-	}
 	for _, g := range galleries {
 		rows = append(rows, taggerGalleryRow{
 			Name:    g.Name,
-			Checked: allChecked || picked[g.Name],
+			Checked: allChecked || slices.Contains(inst.Galleries, g.Name),
 		})
 	}
 	return rows, allChecked, true
 }
 
 func catalogEntryByName(modelPath, name string) *tagger.CatalogEntry {
-	for _, e := range tagger.LoadCatalog(modelPath) {
+	return catalogEntry(tagger.LoadCatalog(modelPath), name)
+}
+
+func catalogEntry(catalog []tagger.CatalogEntry, name string) *tagger.CatalogEntry {
+	for _, e := range catalog {
 		if e.Name == name {
-			entry := e
-			return &entry
+			return &e
 		}
 	}
 	return nil
@@ -773,56 +766,42 @@ func catalogEntryByName(modelPath, name string) *tagger.CatalogEntry {
 // Persisted, so a re-downloaded model has to be re-enabled deliberately.
 // An unmounted model_path would read as every file gone, so it disables
 // nothing.
-func (s *Server) disableMissingTaggers() {
+func (s *Server) reconcileTaggers(catalog []tagger.CatalogEntry) {
 	cfg := s.cfgSnapshot()
-	if fi, err := os.Stat(cfg.Paths.ModelPath); err != nil || !fi.IsDir() {
-		return
+	fi, err := os.Stat(cfg.Paths.ModelPath)
+	mounted := err == nil && fi.IsDir()
+	known := func(c *config.Config, name string) bool {
+		return slices.ContainsFunc(c.Tagger.Taggers, func(t config.TaggerInstance) bool { return t.Name == name })
 	}
 	missing := map[string]bool{}
-	for _, t := range tagger.DiscoverTaggers(cfg) {
-		missing[t.Name] = t.Missing
-	}
-	s.cfgMu.Lock()
-	changed := false
-	for i, t := range s.cfg.Tagger.Taggers {
-		if t.Enabled && missing[t.Name] {
-			s.cfg.Tagger.Taggers[i].Enabled = false
-			changed = true
-			logx.Infof("settings: auto-disabled tagger %q (files missing)", t.Name)
+	var fresh []tagger.TaggerStatus
+	for _, d := range tagger.DiscoverTaggers(cfg) {
+		missing[d.Name] = mounted && d.Missing
+		if d.Available && !known(cfg, d.Name) {
+			fresh = append(fresh, d)
 		}
 	}
-	s.cfgMu.Unlock()
-	if changed {
-		if err := s.saveConfig(); err != nil {
-			logx.Warnf("auto-disable taggers: save config: %v", err)
-		}
+	gone := func(t config.TaggerInstance) bool { return t.Enabled && missing[t.Name] }
+	if len(fresh) == 0 && !slices.ContainsFunc(cfg.Tagger.Taggers, gone) {
+		return
 	}
-}
-
-func (s *Server) persistNewlyDiscoveredTaggers() {
-	discovered := tagger.DiscoverTaggers(s.cfgSnapshot())
-	modelPath := s.modelPath()
-	s.cfgMu.Lock()
-	known := make(map[string]bool, len(s.cfg.Tagger.Taggers))
-	for _, t := range s.cfg.Tagger.Taggers {
-		known[t.Name] = true
-	}
-	added := false
-	for _, d := range discovered {
-		if known[d.Name] || !d.Available {
-			continue
+	if err := s.withConfig(func(c *config.Config) error {
+		for i, t := range c.Tagger.Taggers {
+			if gone(t) {
+				c.Tagger.Taggers[i].Enabled = false
+				logx.Infof("settings: auto-disabled tagger %q (files missing)", t.Name)
+			}
 		}
-		s.cfg.Tagger.Taggers = append(s.cfg.Tagger.Taggers,
-			tagger.SeedTaggerInstance(d.Name, true, catalogEntryByName(modelPath, d.Name)))
-		known[d.Name] = true
-		added = true
-		logx.Infof("settings: auto-enabled discovered tagger %q", d.Name)
-	}
-	s.cfgMu.Unlock()
-	if added {
-		if err := s.saveConfig(); err != nil {
-			logx.Warnf("auto-enable taggers: save config: %v", err)
+		for _, d := range fresh {
+			if known(c, d.Name) {
+				continue
+			}
+			c.Tagger.Taggers = append(c.Tagger.Taggers, tagger.SeedTaggerInstance(d.Name, true, catalogEntry(catalog, d.Name)))
+			logx.Infof("settings: auto-enabled discovered tagger %q", d.Name)
 		}
+		return nil
+	}); err != nil {
+		logx.Warnf("reconcile taggers: save config: %v", err)
 	}
 }
 
@@ -831,18 +810,18 @@ func (s *Server) settingsTaggerDeletePost(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	s.cfgMu.Lock()
+	s.cfgMu.RLock()
 	for _, t := range s.cfg.Tagger.Taggers {
 		if t.Name == name && t.Enabled {
-			s.cfgMu.Unlock()
+			s.cfgMu.RUnlock()
 			writeInlineFlash(w, "err", "Disable tagger "+name+" before deleting it.")
 			return
 		}
 	}
-	// Not through modelPath: it read-locks cfgMu, which deadlocks under
-	// the write lock held here.
+	// Not through modelPath: a second RLock deadlocks behind a waiting
+	// writer.
 	dir := filepath.Join(s.cfg.Paths.ModelPath, name)
-	s.cfgMu.Unlock()
+	s.cfgMu.RUnlock()
 	// The folder goes first: an entry dropped before a failed removal
 	// leaves memory and the TOML disagreeing.
 	if err := os.RemoveAll(dir); err != nil {

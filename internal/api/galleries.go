@@ -23,10 +23,13 @@ func (h *Handler) listGalleries(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		entry := galleryListEntry{Name: gc.Name, Active: gc.Name == activeName}
-		entry.Images, _ = g.VisibleCount()
-		entry.Tags, _ = g.TagCount()
-		out = append(out, entry)
+		images, imagesOK := g.VisibleCount()
+		tags, tagsOK := g.TagCount()
+		if !imagesOK || !tagsOK {
+			apiError(w, http.StatusInternalServerError, "internal_error", "could not count gallery "+gc.Name)
+			return
+		}
+		out = append(out, galleryListEntry{Name: gc.Name, Images: images, Tags: tags, Active: gc.Name == activeName})
 	}
 	WriteJSON(w, http.StatusOK, out)
 }

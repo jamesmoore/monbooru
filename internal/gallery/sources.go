@@ -93,23 +93,22 @@ func ImageSHAAndType(q db.RowQuerier, id int64) (sha, fileType string, err error
 
 // FileTypes leaves out the ids with no row.
 func FileTypes(database *db.DB, ids []int64) (map[int64]string, error) {
+	type typeRow struct {
+		id       int64
+		fileType string
+	}
 	types := make(map[int64]string, len(ids))
 	err := db.Chunked(ids, 500, func(chunk []int64) error {
 		in, args := db.InPlaceholders(chunk)
-		rows, err := database.Read.Query(`SELECT id, file_type FROM images WHERE id IN (`+in+`)`, args...)
+		rows, err := db.QueryAll(database.Read, db.ScanRow(func(r *typeRow) []any { return []any{&r.id, &r.fileType} }),
+			`SELECT id, file_type FROM images WHERE id IN (`+in+`)`, args...)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = rows.Close() }()
-		for rows.Next() {
-			var id int64
-			var fileType string
-			if err := rows.Scan(&id, &fileType); err != nil {
-				return err
-			}
-			types[id] = fileType
+		for _, r := range rows {
+			types[r.id] = r.fileType
 		}
-		return rows.Err()
+		return nil
 	})
 	return types, err
 }

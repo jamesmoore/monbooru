@@ -10,9 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -32,8 +33,6 @@ type sessionPairView struct {
 	A              sessionImageView
 	B              sessionImageView
 	Distance       int
-	Remaining      int
-	Order          string
 	Source         string
 	Score          float64
 	LeftID         int64
@@ -53,7 +52,6 @@ type sessionImageView struct {
 	FileSize int64
 	Filename string
 	FileType string
-	TagCount int
 }
 
 func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
@@ -172,17 +170,16 @@ func loadNextPair(cx *library.Gallery, order, detector string, ceiling *Ceiling,
 	}
 
 	view := sessionPairView{
-		Order: order, Remaining: counts.Open,
 		Distance: pair.Distance, Source: pair.Source, Score: pair.Score,
 		A: sessionImageView{
 			ID: pair.A.ID, Width: pair.A.Width, Height: pair.A.Height,
 			FileSize: pair.A.FileSize, FileType: pair.A.FileType,
-			Filename: path.Base(pair.A.CanonicalPath), TagCount: countTags(cx, pair.A.ID),
+			Filename: path.Base(pair.A.CanonicalPath),
 		},
 		B: sessionImageView{
 			ID: pair.B.ID, Width: pair.B.Width, Height: pair.B.Height,
 			FileSize: pair.B.FileSize, FileType: pair.B.FileType,
-			Filename: path.Base(pair.B.CanonicalPath), TagCount: countTags(cx, pair.B.ID),
+			Filename: path.Base(pair.B.CanonicalPath),
 		},
 	}
 	// The larger file is the likelier original; a tag match is more
@@ -254,7 +251,13 @@ func scanCompareFacts(cx *library.Gallery, id int64, dst *relationCompareFacts) 
 }
 
 func loadTagDelta(cx *library.Gallery, leftID, rightID int64) (left []compareTag, right []compareTag, err error) {
-	rows, err := cx.DB.Read.Query(`
+	type deltaRow struct {
+		owner int64
+		compareTag
+	}
+	rows, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(r *deltaRow) []any {
+		return []any{&r.owner, &r.Name, &r.Category, &r.Color}
+	}), `
 		WITH delta AS (
 			SELECT it.tag_id, MAX(it.image_id) AS owner_id
 			FROM image_tags it
@@ -270,28 +273,20 @@ func loadTagDelta(cx *library.Gallery, leftID, rightID int64) (left []compareTag
 		JOIN tags t ON t.id = delta.tag_id
 		LEFT JOIN tag_categories tc ON tc.id = t.category_id
 		ORDER BY t.name
-		LIMIT 200`, leftID, rightID,
-	)
+		LIMIT 200`, leftID, rightID)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var owner int64
-		var t compareTag
-		var color string
-		if scanErr := rows.Scan(&owner, &t.Name, &t.Category, &color); scanErr != nil {
-			return nil, nil, scanErr
-		}
-		t.Color = tags.SafeCategoryColor(color)
-		switch owner {
+	for _, r := range rows {
+		r.Color = tags.SafeCategoryColor(r.Color)
+		switch r.owner {
 		case leftID:
-			left = append(left, t)
+			left = append(left, r.compareTag)
 		case rightID:
-			right = append(right, t)
+			right = append(right, r.compareTag)
 		}
 	}
-	return left, right, rows.Err()
+	return left, right, nil
 }
 
 func countTags(cx *library.Gallery, id int64) int {
@@ -338,23 +333,15 @@ func (s *Server) sessionDecidePost(w http.ResponseWriter, r *http.Request) {
 
 	// Left is the original, the parent or the source; the symmetric kinds
 	// ignore the order.
-	var err error
-	switch decision {
-	case "duplicate":
-		err = cx.RelationsSvc.AddDuplicateOf(left, right)
-	case "alternate":
-		err = cx.RelationsSvc.AddAlternate(left, right)
-	case "version":
-		err = cx.RelationsSvc.AddVersionEdge(left, right)
-	case "derivative":
-		err = cx.RelationsSvc.AddDerivativeEdge(left, right)
-	case "not_related":
-		err = cx.RelationsSvc.AddNotRelated(left, right)
-	default:
+	add, known := relationAdders[decision]
+	if !known {
 		flashStatus(w, http.StatusBadRequest, "Unknown decision.")
 		return
 	}
-	if err != nil {
+	if decision == "duplicate" {
+		add = (*relations.Service).AddDuplicateOf
+	}
+	if err := add(cx.RelationsSvc, left, right); err != nil {
 		writeRelationError(w, err)
 		return
 	}
@@ -389,11 +376,7 @@ func writeDuplicatePostDecideHeaders(w http.ResponseWriter, cx *library.Gallery,
 	w.Header().Set("X-Relations-Duplicate-ID", strconv.FormatInt(nonOriginal, 10))
 	w.Header().Set("X-Relations-Duplicate-OriginalID", strconv.FormatInt(original, 10))
 	w.Header().Set("X-Relations-Duplicate-GroupID", strconv.FormatInt(gid, 10))
-	if withTags[gid] {
-		w.Header().Set("X-Relations-Duplicate-HasUniqueTags", "1")
-	} else {
-		w.Header().Set("X-Relations-Duplicate-HasUniqueTags", "0")
-	}
+	w.Header().Set("X-Relations-Duplicate-HasUniqueTags", map[bool]string{true: "1", false: "0"}[withTags[gid]])
 	w.WriteHeader(http.StatusNoContent)
 	return true
 }

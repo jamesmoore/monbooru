@@ -27,7 +27,7 @@
 </div>
 {{if .HasMore}}
 <p class="field-hint">Showing the first {{len .Members}} images.
-  <button type="button" class="btn-sm collection-order-more" data-limit="{{.NextLimit}}">[Show more]</button>
+  {{if .CanGrow}}<button type="button" class="btn-sm collection-order-more" data-limit="{{.NextLimit}}">[Show more]</button>{{end}}
 </p>
 {{end}}
 {{end}}

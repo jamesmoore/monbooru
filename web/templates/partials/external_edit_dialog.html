@@ -2,7 +2,6 @@
   <dialog id="{{.Stem}}-dialog">
     <form id="{{.Stem}}-form" hx-post="/images/{{.ImageID}}/{{.Action}}"
           hx-target="#{{.Stem}}-error"
-          hx-swap="innerHTML"
           hx-on::after-request="onExternalEditResponse(event, '{{.Stem}}-dialog')">
 {{end}}
 

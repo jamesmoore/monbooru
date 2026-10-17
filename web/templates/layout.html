@@ -87,7 +87,7 @@
       {{if .Degraded}}<span class="footer-sep">·</span><span class="footer-degraded">degraded</span>{{end}}
       <span class="footer-sep-strong">::</span>
       <span class="footer-rating-label">rating:</span>
-      {{$active := .ActiveRating}}{{range $i, $lv := .RatingLevels}}{{if $i}}<span class="footer-sep">·</span>{{end}}{{if eq $lv.Value $active}}<span class="footer-rating-active">[{{$lv.Label}}]</span>{{else}}<form hx-post="/internal/rating-ceiling?level={{$lv.Value}}" hx-swap="none" hx-on::after-request="clearSelection(); window.location.reload()" style="display:inline"><button type="submit" class="footer-rating-link">{{$lv.Label}}</button></form>{{end}}{{end}}
+      {{$active := .ActiveRating}}{{range $i, $lv := .RatingLevels}}{{if $i}}<span class="footer-sep">·</span>{{end}}{{if eq $lv.Value $active}}<span class="footer-rating-active">[{{$lv.Label}}]</span>{{else}}<form hx-post="/internal/rating-ceiling?level={{$lv.Value}}" hx-swap="none" hx-on::after-request="if(event.detail.successful){clearSelection();window.location.reload()}" style="display:inline"><button type="submit" class="footer-rating-link">{{$lv.Label}}</button></form>{{end}}{{end}}
       <span id="footer-hidden" class="footer-hidden">{{with .HiddenByCeiling}}<span class="footer-sep-strong">::</span>{{.}} hidden {{plural . "image" "images"}} in the current search{{end}}</span>
     </div>
     <div id="footer-right">
@@ -144,7 +144,7 @@
           <li><kbd>D</kbd><span>Flip direction</span></li>
           <li data-when="#thumb-size-ramp"><kbd>-</kbd><kbd>=</kbd><span>Thumbnail size</span></li>
           <li data-when="#select-mode-btn"><kbd>V</kbd><span>Select mode</span></li>
-          <li><kbd>S</kbd><span>Save search dialog</span></li>
+          <li data-when="#batch-bar:not(.visible)"><kbd>S</kbd><span>Save search dialog</span></li>
           <li><kbd>Ctrl</kbd>+<kbd>A</kbd><span>Select page</span></li>
           <li data-when="#batch-select-all-matching:not([hidden])"><kbd>A</kbd><span>Select all matching</span></li>
         </ul>
@@ -192,7 +192,7 @@
           <li data-when="#remove-tags-btn"><kbd>e</kbd><kbd>t</kbd><span>Remove tag(s)</span></li>
           <li data-when="#transfer-image-btn"><kbd>e</kbd><kbd>g</kbd><span>Transfer gallery</span></li>
           <li data-when=".btn-edit-collection"><kbd>e</kbd><kbd>1-9</kbd><span>Edit Nth collection</span></li>
-          <li data-when=".add-tag-form .btn-hash-lookup"><kbd>L</kbd><span>Lookup online boorus</span></li>
+          <li data-when=".add-tag-form .btn-hash-lookup:not([disabled])"><kbd>L</kbd><span>Lookup online boorus</span></li>
           <li data-when=".btn-manga-action.btn-read"><kbd>R</kbd><span>Open in reader</span></li>
           <li data-when=".btn-manga-action.btn-pages"><kbd>P</kbd><span>See all pages</span></li>
           <li data-when=".btn-manga-action.btn-generate-collection"><kbd>C</kbd><span>Generate collection</span></li>

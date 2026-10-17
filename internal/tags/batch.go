@@ -7,11 +7,12 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 )
 
-// BatchResult sums a batch over its chunks: Replaced counts the images
-// whose rating an add replaced, Kept the rows a remove left because
-// another tag on the image implies them.
+// BatchResult sums a batch over its chunks: Touched counts the images a
+// row changed on, Replaced the images whose rating an add replaced, Kept
+// the rows a remove left because another tag on the image implies them.
 type BatchResult struct {
 	Processed int
+	Touched   int
 	Changed   int
 	Replaced  int
 	Kept      int
@@ -27,15 +28,15 @@ func (s *Service) BatchAddTags(ctx context.Context, imageIDs, tagIDs []int64, pr
 		size = 100
 	}
 	return s.batchChunks(ctx, imageIDs, size, progress, func(tx *sql.Tx, chunk []int64) (BatchResult, error) {
-		added, replaced, err := s.BatchAddTagsTx(tx, chunk, tagIDs)
-		return BatchResult{Changed: added, Replaced: replaced}, err
+		added, touched, replaced, err := s.BatchAddTagsTx(tx, chunk, tagIDs)
+		return BatchResult{Touched: touched, Changed: added, Replaced: replaced}, err
 	})
 }
 
 func (s *Service) BatchRemoveTags(ctx context.Context, imageIDs, tagIDs []int64, progress func(done, total int)) (BatchResult, error) {
 	return s.batchChunks(ctx, imageIDs, 500, progress, func(tx *sql.Tx, chunk []int64) (BatchResult, error) {
-		removed, kept, err := batchRemoveTagsTx(tx, chunk, tagIDs)
-		return BatchResult{Changed: removed, Kept: kept}, err
+		removed, touched, kept, err := batchRemoveTagsTx(tx, chunk, tagIDs)
+		return BatchResult{Touched: touched, Changed: removed, Kept: kept}, err
 	})
 }
 
@@ -54,6 +55,7 @@ func (s *Service) batchChunks(ctx context.Context, imageIDs []int64, size int, p
 			return res, err
 		}
 		res.Processed = end
+		res.Touched += got.Touched
 		res.Changed += got.Changed
 		res.Replaced += got.Replaced
 		res.Kept += got.Kept

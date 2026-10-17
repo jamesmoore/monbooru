@@ -126,29 +126,20 @@ func (b *whereBuilder) resolveRelationPresence() {
 
 func (b *whereBuilder) relationAnyClauseForPresence() string {
 	p := &b.relPresence
-	parts := make([]string, 0, 5)
-	if p.dup {
-		parts = append(parts,
-			relDupMemberExists,
-		)
-	}
-	if p.alt {
-		parts = append(parts,
-			relAltMemberExists,
-		)
-	}
-	if p.version {
-		parts = append(parts,
-			relVersionExists,
-		)
-	}
-	if p.derivative {
-		parts = append(parts,
-			"EXISTS (SELECT 1 FROM derivative_edges d WHERE d.derivative_image_id = i.id OR d.source_image_id = i.id)",
-		)
-	}
-	if p.series {
-		parts = append(parts, "("+relSeriesCarrier+")")
+	var parts []string
+	for _, c := range []struct {
+		on     bool
+		clause string
+	}{
+		{p.dup, relDupMemberExists},
+		{p.alt, relAltMemberExists},
+		{p.version, relVersionExists},
+		{p.derivative, "EXISTS (SELECT 1 FROM derivative_edges d WHERE d.derivative_image_id = i.id OR d.source_image_id = i.id)"},
+		{p.series, "(" + relSeriesCarrier + ")"},
+	} {
+		if c.on {
+			parts = append(parts, c.clause)
+		}
 	}
 	if len(parts) == 0 {
 		return "1=0"
@@ -164,23 +155,18 @@ func (b *whereBuilder) relationAnyClauseForPresence() string {
 func (b *whereBuilder) relationNoneClauseForPresence() string {
 	p := &b.relPresence
 	var unions []string
-	if p.dup {
-		unions = append(unions, "SELECT image_id FROM dup_group_members")
-	}
-	if p.alt {
-		unions = append(unions, "SELECT image_id FROM alt_group_members")
-	}
-	if p.version {
-		unions = append(unions,
-			"SELECT child_image_id FROM version_edges",
-			"SELECT parent_image_id FROM version_edges",
-		)
-	}
-	if p.derivative {
-		unions = append(unions,
-			"SELECT derivative_image_id FROM derivative_edges",
-			"SELECT source_image_id FROM derivative_edges",
-		)
+	for _, c := range []struct {
+		on      bool
+		selects []string
+	}{
+		{p.dup, []string{"SELECT image_id FROM dup_group_members"}},
+		{p.alt, []string{"SELECT image_id FROM alt_group_members"}},
+		{p.version, []string{"SELECT child_image_id FROM version_edges", "SELECT parent_image_id FROM version_edges"}},
+		{p.derivative, []string{"SELECT derivative_image_id FROM derivative_edges", "SELECT source_image_id FROM derivative_edges"}},
+	} {
+		if c.on {
+			unions = append(unions, c.selects...)
+		}
 	}
 	if !p.series && len(unions) == 0 {
 		return "1=1"

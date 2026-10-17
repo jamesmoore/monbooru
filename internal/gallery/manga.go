@@ -10,7 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 const mangaPageCacheTTL = 5 * time.Minute
@@ -140,7 +141,7 @@ func generateImageThumbFromAny(srcPath, dstPath string) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return fmt.Errorf("create thumb dir: %w", err)
 	}
-	if IsFFmpegStill(ExtFileType(srcPath)) {
+	if IsFFmpegStill(models.ExtFileType(srcPath)) {
 		return renderStill(srcPath, dstPath, thumbMaxDim)
 	}
 	return generateImageThumb(srcPath, dstPath)

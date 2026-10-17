@@ -14,7 +14,7 @@
   <main id="reader" data-image-id="{{.Image.ID}}" data-page="{{.Page}}" data-total="{{.PageCount}}" data-detail-url="{{$detailHref}}">
     <div id="page-notice" class="degraded-banner" hidden></div>
     <div class="reader-stage">
-      <a href="/images/{{.Image.ID}}/page/{{.Page}}" target="_blank" rel="noopener" class="reader-page-link" title="Zoom page (v)" onclick="return openLightbox(event, this.href)">
+      <a href="/images/{{.Image.ID}}/page/{{.Page}}" target="_blank" rel="noopener" class="reader-page-link" title="Zoom page (v)" onclick="return lightbox.open(event, this.href)">
         <img src="/images/{{.Image.ID}}/page/{{.Page}}" alt="Page {{.Page}}" class="reader-img">
       </a>
       {{if gt .Page 1}}

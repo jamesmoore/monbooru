@@ -14,8 +14,8 @@ import (
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/galleryio"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 func (s *Server) importGallery(name, format string, upload io.Reader) (int, error) {
@@ -69,9 +69,9 @@ func (s *Server) replaceGalleryFromUpload(name, format string, upload io.Reader)
 			}
 			return nil
 		},
-		func(dbPath, thumbnailsPath string, bound *gallery.Boundary) error {
+		func(dbPath, thumbnailsPath string, bound *gallery.Boundary, quiesce func() error) error {
 			var err error
-			leftOut, err = galleryio.ApplyImport(format, tmpPath, dbPath, thumbnailsPath, bound, s.maxFileSizeMB())
+			leftOut, err = galleryio.ApplyImport(format, tmpPath, dbPath, thumbnailsPath, bound, s.maxFileSizeMB(), quiesce)
 			return err
 		})
 	return newCx, leftOut, err
@@ -100,15 +100,15 @@ func (s *Server) settingsGalleryExport(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch {
 	case format == "light" && withImages:
-		err = s.exportGalleryLight(name, w)
+		err = s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryLight(cx.Handle, w) })
 	case format == "light":
-		err = s.exportGalleryLightManifest(name, w)
+		err = s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryLightManifest(cx.Handle, w) })
 	case withImages:
-		err = s.exportGalleryArchive(name, format, w)
+		err = s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryArchive(cx.Handle, format, w) })
 	case format == "db":
-		err = s.exportGalleryDB(name, w)
+		err = s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryDB(cx.Handle, w) })
 	case format == "json":
-		err = s.exportGalleryJSON(name, w)
+		err = s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryJSON(cx.Handle, w, nil) })
 	}
 	if err != nil {
 		logx.Warnf("gallery export %q: %v", name, err)
@@ -311,35 +311,11 @@ func (s *Server) runBatchTransfer(ids []int64, dstCx *library.Gallery, removeAft
 		keptFiles += kept
 		return err
 	})
-	if cancelled {
-		s.jobs.Complete(fmt.Sprintf("transfer cancelled (%d/%d done)", transferred, total))
-		return
-	}
 	summary := fmt.Sprintf("Transferred %d image(s) to %s", transferred, dstCx.Name)
 	if failed > 0 {
 		summary += fmt.Sprintf(", %d failed", failed)
 	}
-	s.jobs.Complete(summary + keptChanged(keptFiles) + ".")
-}
-
-func (s *Server) exportGalleryDB(name string, w io.Writer) error {
-	return s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryDB(cx.Handle, w) })
-}
-
-func (s *Server) exportGalleryJSON(name string, w io.Writer) error {
-	return s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryJSON(cx.Handle, w, nil) })
-}
-
-func (s *Server) exportGalleryArchive(name, format string, w io.Writer) error {
-	return s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryArchive(cx.Handle, format, w) })
-}
-
-func (s *Server) exportGalleryLight(name string, w io.Writer) error {
-	return s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryLight(cx.Handle, w) })
-}
-
-func (s *Server) exportGalleryLightManifest(name string, w io.Writer) error {
-	return s.exportGallery(name, func(cx *library.Gallery) error { return galleryio.ExportGalleryLightManifest(cx.Handle, w) })
+	s.jobs.Finish(nil, cancelled, fmt.Sprintf("transfer cancelled (%d/%d done)", transferred, total), summary+keptChanged(keptFiles)+".")
 }
 
 // Streams without the set's lock, which would stall a queued switch and

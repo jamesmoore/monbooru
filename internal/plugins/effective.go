@@ -2,11 +2,12 @@ package plugins
 
 import (
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // The launch line stays off PluginConfig and out of monbooru.toml, so a
@@ -15,6 +16,7 @@ type Effective struct {
 	config.PluginConfig
 	Launch    Launch
 	Installed bool
+	Refused   string
 }
 
 // Seeds nothing: an example here would be executable code.
@@ -44,7 +46,8 @@ func EffectiveList(blocks []config.PluginConfig, dir string) []Effective {
 		byName[p.Name] = len(out)
 		out = append(out, Effective{PluginConfig: p})
 	}
-	for _, ins := range Discover(dir, reserveName) {
+	found, refused := Discover(dir, reserveName)
+	for _, ins := range found {
 		i, ok := byName[ins.Name]
 		if !ok {
 			out = append(out, Effective{
@@ -56,16 +59,23 @@ func EffectiveList(blocks []config.PluginConfig, dir string) []Effective {
 		}
 		out[i].Launch, out[i].Installed = ins, true
 	}
+	for _, r := range refused {
+		i, ok := byName[r.Name]
+		if !ok {
+			out = append(out, Effective{PluginConfig: config.PluginConfig{Name: r.Name}, Refused: r.Reason})
+			continue
+		}
+		out[i].Refused = r.Reason
+	}
 	return out
 }
 
 func FindEffective(list []Effective, name string) (Effective, bool) {
-	for _, p := range list {
-		if p.Name == name {
-			return p, true
-		}
+	i := slices.IndexFunc(list, func(p Effective) bool { return p.Name == name })
+	if i < 0 {
+		return Effective{}, false
 	}
-	return Effective{}, false
+	return list[i], true
 }
 
 func (e Effective) CommandLine() string {

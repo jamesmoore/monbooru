@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"runtime/debug"
 	"strings"
 
@@ -15,9 +16,9 @@ import (
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	meta "github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
@@ -254,25 +255,25 @@ func (s *Server) startRebuildThumbsJob(cx *library.Gallery) error {
 	if cx == nil || cx.DB == nil {
 		return fmt.Errorf("no gallery context")
 	}
-	type imgRow struct {
-		ID       int64
-		Path     string
-		FileType string
-		Width    sql.NullInt64
-	}
-	imgs, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(img *imgRow) []any {
-		return []any{&img.ID, &img.Path, &img.FileType, &img.Width}
-	}), `SELECT id, canonical_path, file_type, width FROM images WHERE is_missing = 0`)
-	if err != nil {
-		return err
-	}
-
 	if err := s.jobs.Start(models.JobTypeRebuildThumbs); err != nil {
 		return err
 	}
 	thumbnailsPath := cx.ThumbnailsPath
 	galleryName := cx.Name
 	go func() {
+		type imgRow struct {
+			ID       int64
+			Path     string
+			FileType string
+			Width    sql.NullInt64
+		}
+		imgs, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(img *imgRow) []any {
+			return []any{&img.ID, &img.Path, &img.FileType, &img.Width}
+		}), `SELECT id, canonical_path, file_type, width FROM images WHERE is_missing = 0`)
+		if err != nil {
+			s.jobs.Fail(err.Error())
+			return
+		}
 		ctx := s.jobs.Context()
 		processed, rebuilt := 0, 0
 		total := len(imgs)
@@ -370,14 +371,15 @@ func (s *Server) removeMetaTagsPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) vacuumDBPost(w http.ResponseWriter, r *http.Request) {
 	s.goJob(w, models.JobTypeVacuum, "Vacuum started. Watch the status bar for the reclaimed-space report.", func(context.Context) {
-		beforeSize := dbFileSize(s.dbPath())
-		if err := s.db().Vacuum(context.Background()); errors.Is(err, db.ErrCheckpoint) {
+		cx := s.active()
+		beforeSize := dbFileSize(cx.DBPath)
+		if err := cx.DB.Vacuum(context.Background()); errors.Is(err, db.ErrCheckpoint) {
 			logx.Warnf("vacuum: %v", err)
 		} else if err != nil {
 			s.jobs.Fail(err.Error())
 			return
 		}
-		afterSize := dbFileSize(s.dbPath())
+		afterSize := dbFileSize(cx.DBPath)
 		freed := max(beforeSize-afterSize, 0)
 		s.jobs.Complete(fmt.Sprintf("Vacuumed (reclaimed %s).", humanBytesFmt(freed)))
 	})
@@ -433,36 +435,42 @@ func humanBytesFmt(b int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
+func sameSeed(a, b *int64) bool {
+	return (a == nil) == (b == nil) && (a == nil || *a == *b)
+}
+
 func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
-	// Read into a slice so the cursor closes before the job starts,
-	// rather than holding a read connection for the whole run.
-	type imgRow struct {
-		ID        int64
-		Path      string
-		FileType  string
-		sdHash    string
-		comfyHash string
-		source    string
-	}
-
-	imgs, err := db.QueryAll(s.db().Read, db.ScanRow(func(img *imgRow) []any {
-		return []any{&img.ID, &img.Path, &img.FileType, &img.source, &img.sdHash, &img.comfyHash}
-	}), `
-		SELECT i.id, i.canonical_path, i.file_type, i.source_type,
-		       COALESCE(sm.generation_hash, ''),
-		       COALESCE(cm.generation_hash, '')
-		FROM images i
-		LEFT JOIN sd_metadata sm ON sm.image_id = i.id
-		LEFT JOIN comfyui_metadata cm ON cm.image_id = i.id
-		WHERE i.is_missing = 0
-	`)
-	if err != nil {
-		writeInlineFlash(w, "err", err.Error())
-		return
-	}
-
 	active := s.active()
 	s.goJob(w, models.JobTypeReExtract, "Re-extraction started.", func(ctx context.Context) {
+		type imgRow struct {
+			ID        int64
+			Path      string
+			FileType  string
+			sdHash    string
+			comfyHash string
+			sdSeed    *int64
+			comfySeed *int64
+			source    string
+			duration  *float64
+		}
+		// Read into a slice rather than holding a read connection for the
+		// whole run.
+		imgs, err := db.QueryAll(active.DB.Read, db.ScanRow(func(img *imgRow) []any {
+			return []any{&img.ID, &img.Path, &img.FileType, &img.source, &img.duration, &img.sdHash, &img.comfyHash, &img.sdSeed, &img.comfySeed}
+		}), `
+			SELECT i.id, i.canonical_path, i.file_type, i.source_type, i.duration_seconds,
+			       COALESCE(sm.generation_hash, ''),
+			       COALESCE(cm.generation_hash, ''),
+			       sm.seed, cm.seed
+			FROM images i
+			LEFT JOIN sd_metadata sm ON sm.image_id = i.id
+			LEFT JOIN comfyui_metadata cm ON cm.image_id = i.id
+			WHERE i.is_missing = 0
+		`)
+		if err != nil {
+			s.jobs.Fail(err.Error())
+			return
+		}
 		processed := 0
 		updated := 0
 		total := len(imgs)
@@ -475,7 +483,7 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 			if _, err := active.RecomputePhash(ctx, img.ID); err != nil {
 				logx.Debugf("re-extract phash %d: %v", img.ID, err)
 			}
-			sdMeta, comfyMeta, _ := meta.Extract(img.Path, img.FileType)
+			sdMeta, comfyMeta := meta.Extract(img.Path, img.FileType)
 
 			sourceType := models.SourceTypeNone
 			if sdMeta != nil && comfyMeta != nil {
@@ -487,30 +495,46 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 			}
 
 			newSDHash := ""
+			var newSDSeed *int64
 			if sdMeta != nil {
-				newSDHash = sdMeta.GenerationHash
+				newSDHash, newSDSeed = sdMeta.GenerationHash, sdMeta.Seed
 			}
 			newComfyHash := ""
+			var newComfySeed *int64
 			if comfyMeta != nil {
-				newComfyHash = comfyMeta.GenerationHash
+				newComfyHash, newComfySeed = comfyMeta.GenerationHash, comfyMeta.Seed
 			}
 
 			var durationSec *float64
 			if gallery.IsVideoType(img.FileType) {
-				if d, ok := gallery.ProbeDurationSeconds(img.Path); ok {
+				if d, ok := gallery.ProbeDurationSeconds(img.Path); ok && (img.duration == nil || *img.duration != d) {
 					durationSec = &d
 				}
 			}
 
-			// Unchanged hashes skip the rewrite; a probed duration always
-			// rewrites, since the old one is not read to compare.
-			if newSDHash == img.sdHash && newComfyHash == img.comfyHash && sourceType == img.source && durationSec == nil {
+			var manga *models.MangaMetadata
+			mangaMoved := false
+			if img.FileType == models.FileTypeCBZ {
+				if m, err := gallery.ReadComicInfo(img.Path); err != nil {
+					logx.Warnf("re-extract manga %d: %v", img.ID, err)
+				} else {
+					if m != nil {
+						m.ImageID = img.ID
+					}
+					manga, mangaMoved = m, !reflect.DeepEqual(m, loadMangaMeta(ctx, active.DB, img.ID))
+				}
+			}
+
+			// Unchanged hashes and seeds skip the rewrite (the hash leaves the
+			// seed out).
+			if newSDHash == img.sdHash && newComfyHash == img.comfyHash && sourceType == img.source && durationSec == nil && !mangaMoved &&
+				sameSeed(newSDSeed, img.sdSeed) && sameSeed(newComfySeed, img.comfySeed) {
 				processed++
 				continue
 			}
 
 			if err := active.Edit(func(d *db.DB) error {
-				return gallery.ApplyReExtract(ctx, d, img.ID, sourceType, durationSec, sdMeta, comfyMeta)
+				return gallery.ApplyReExtract(ctx, d, img.ID, sourceType, durationSec, sdMeta, comfyMeta, manga, mangaMoved)
 			}); err != nil {
 				logx.Warnf("re-extract image %d: %v", img.ID, err)
 				processed++

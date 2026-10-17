@@ -154,9 +154,9 @@ func gatherTaggerStats(s *Server) taggerCacheStats {
 		InUse:    st.InUse,
 		Sessions: st.Sessions,
 	}
-	s.cfgMu.Lock()
+	s.cfgMu.RLock()
 	mins := s.cfg.Tagger.IdleReleaseAfterMinutes
-	s.cfgMu.Unlock()
+	s.cfgMu.RUnlock()
 	if mins > 0 {
 		out.IdleReleaseAfter = time.Duration(mins) * time.Minute
 	}

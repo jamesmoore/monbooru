@@ -2,7 +2,6 @@ package web
 
 import (
 	"cmp"
-	"github.com/monbooru/monbooru/internal/monloader"
 	"net"
 	"net/http"
 	"slices"
@@ -10,9 +9,11 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/plugins"
+	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/pairing"
 )
 
 type pluginRowView struct {
@@ -33,6 +34,7 @@ type pluginRowView struct {
 	WebURLPinned string
 	Command      string
 	RunState     string
+	Refused      string
 	// Installed is a plugin found in the plugins folder: its Enable
 	// button is the operator's consent to a launch line they never typed.
 	Installed   bool
@@ -45,7 +47,7 @@ func (s *Server) pluginRows() []pluginRowView {
 	for _, p := range s.effectivePlugins() {
 		// Residue, typically of a folder removed after being enabled: the
 		// block stays but earns no row.
-		if p.PeerToken == "" && !p.Installed && p.APIURL == "" {
+		if p.PeerToken == "" && !p.Installed && p.APIURL == "" && p.Refused == "" {
 			continue
 		}
 		row := pluginRowView{
@@ -56,6 +58,7 @@ func (s *Server) pluginRows() []pluginRowView {
 			Paused:    p.Paused,
 			Installed: p.Installed,
 			Enabled:   p.Enabled,
+			Refused:   p.Refused,
 		}
 		if p.PeerToken != "" {
 			row.Conn = peerConn(p.Paused, s.peers.ProbeSeed(p.Name).Conn)
@@ -65,6 +68,10 @@ func (s *Server) pluginRows() []pluginRowView {
 		if p.Installed {
 			row.Command = p.CommandLine()
 			row.RunState = s.peers.State(p.Name)
+			managed = append(managed, row)
+			continue
+		}
+		if p.Refused != "" {
 			managed = append(managed, row)
 			continue
 		}
@@ -137,7 +144,7 @@ func (s *Server) pairedPeerCount() int {
 	return n
 }
 
-func (s *Server) pairViewData(r *http.Request) map[string]any {
+func (s *Server) pairViewData() map[string]any {
 	return map[string]any{
 		"Pending": s.pendingOffers(),
 		"Paired":  s.pairedPeerCount(),
@@ -171,7 +178,7 @@ func (s *Server) pendingOffers() []pendingOffer {
 }
 
 func (s *Server) pluginPairingFragment(w http.ResponseWriter, r *http.Request) {
-	data := s.pairViewData(r)
+	data := s.pairViewData()
 	count, _ := data["Paired"].(int)
 	s.renderTemplate(w, "partials/plugin_pairing.html", data)
 	if was := r.URL.Query().Get("paired"); was != "" && was != strconv.Itoa(count) {
@@ -184,8 +191,8 @@ func (s *Server) pluginPairDeny(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	s.pairs.SetState(r.PathValue("id"), peer.Denied)
-	s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData(r))
+	s.pairs.SetState(r.PathValue("id"), pairing.Denied)
+	s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData())
 }
 
 func (s *Server) pluginPairRemove(w http.ResponseWriter, r *http.Request) {

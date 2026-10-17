@@ -28,9 +28,9 @@ func Enqueued(database *db.DB, imageID int64, backends []string, jobID int64, no
 	for _, backend := range backends {
 		if _, err := database.Write.Exec(
 			`INSERT INTO image_lookups (image_id, backend, queued_at, job_id)
-			 VALUES (?, ?, ?, ?)
+			 VALUES (?, ?, ?, NULLIF(?, 0))
 			 ON CONFLICT(image_id, backend) DO UPDATE SET queued_at = excluded.queued_at, job_id = excluded.job_id`,
-			imageID, backend, stamp(now), nullableID(jobID),
+			imageID, backend, stamp(now), jobID,
 		); err != nil {
 			return err
 		}
@@ -116,10 +116,7 @@ func Waiting(database *db.DB, cutoff time.Time) ([]InFlight, error) {
 // Reset keeps last_at and last_result so the detail page still says when
 // the image was last looked up.
 func Reset(database *db.DB, imageID int64, backend string, now time.Time) error {
-	_, err := database.Write.Exec(
-		`UPDATE image_lookups SET attempts = 0, next_due_at = ?, ptr_cursor = NULL
-		 WHERE image_id = ? AND backend = ?`, stamp(now), imageID, backend)
-	return err
+	return ResetFor(database.Write, "?", []any{imageID}, []string{backend}, now)
 }
 
 // ResetFor is Reset for a set of images and backends; whereIDs is the
@@ -170,11 +167,4 @@ func (r Row) Exhausted() bool {
 func parseStamp(v sql.NullString) time.Time {
 	t, _ := time.Parse("2006-01-02T15:04:05Z", v.String)
 	return t
-}
-
-func nullableID(id int64) any {
-	if id == 0 {
-		return nil
-	}
-	return id
 }

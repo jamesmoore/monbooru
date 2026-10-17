@@ -19,8 +19,7 @@
       <div class="path-row">
         <input type="text" name="gallery_path" id="setup-gallery-path" value="{{.GalleryPath}}" required>
         <button type="button" class="btn-sm dir-picker-open" data-into="setup-gallery-path"
-                hx-get="/internal/browse?into=setup-gallery-path" hx-target="#dir-picker-body"
-                hx-swap="innerHTML">Browse</button>
+                hx-get="/internal/browse?into=setup-gallery-path" hx-target="#dir-picker-body">Browse</button>
       </div>
       <p class="field-hint">Other folders can be added later as further galleries in the Settings.</p>
     </div>

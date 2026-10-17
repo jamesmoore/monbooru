@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/search"
@@ -152,12 +153,7 @@ func templateFuncs() template.FuncMap {
 		"int64Duration": func(d time.Duration) int64 {
 			return int64(d)
 		},
-		"plural": func(n int, one, many string) string {
-			if n == 1 {
-				return one
-			}
-			return many
-		},
+		"plural":      pluralWord,
 		"abbrevCount": abbrevCount,
 		// Always quoted: a term may carry spaces the parser would split on.
 		"comfySearch": func(term string) string {
@@ -170,7 +166,7 @@ func templateFuncs() template.FuncMap {
 			return strings.TrimPrefix(s, "→ ")
 		},
 		"hasPrefix":     strings.HasPrefix,
-		"providerLabel": providerDisplayLabel,
+		"providerLabel": config.ExecutionProviderLabel,
 		"urlDomain": func(s string) string {
 			u, err := url.Parse(s)
 			if err != nil || u.Host == "" {
@@ -332,4 +328,11 @@ func categoryColor(color string) string {
 		return tags.SafeCategoryColor(color)
 	}
 	return "var(--cat-" + strings.ToLower(strings.TrimPrefix(color, "#")) + "," + color + ")"
+}
+
+func pluralWord(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

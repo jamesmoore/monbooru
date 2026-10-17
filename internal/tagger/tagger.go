@@ -20,7 +20,8 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -28,11 +29,12 @@ func IsAvailable(cfg *config.Config) bool { return len(EnabledTaggers(cfg)) > 0 
 
 func buildSupportsInference() bool { return true }
 
-func UnavailableReason(cfg *config.Config) string {
-	if IsAvailable(cfg) {
+func UnavailableReason(cfg *config.Config) string { return reasonFrom(DiscoverTaggers(cfg)) }
+
+func reasonFrom(taggers []TaggerStatus) string {
+	if len(enabledIn(taggers, nil)) > 0 {
 		return ""
 	}
-	taggers := DiscoverTaggers(cfg)
 	if len(taggers) == 0 {
 		return "no tagger subfolders found under paths.model_path"
 	}
@@ -335,7 +337,7 @@ func framesForTagging(canonPath, fileType, mangaCacheDir string, imageID int64) 
 				logx.Warnf("tagger: extract page %d of %q: %v", i, canonPath, err)
 				continue
 			}
-			if gallery.IsFFmpegStill(gallery.ExtFileType(path)) {
+			if gallery.IsFFmpegStill(models.ExtFileType(path)) {
 				frame, err := gallery.RenderStillFrame(path, tempDir, gallery.ViewMaxDim)
 				if err != nil {
 					logx.Warnf("tagger: render page %d of %q: %v", i, canonPath, err)

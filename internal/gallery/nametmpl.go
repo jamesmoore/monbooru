@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // maxNameBytes leaves room under the usual 255-byte filename limit for an
@@ -182,15 +182,11 @@ func parseNameToken(inner string, sc Scope) (namePart, error) {
 func (t *NameTemplate) HasTokens() bool { return t != nil && t.tokens }
 
 func readsMD5(tmpls []*NameTemplate) bool {
-	for _, t := range tmpls {
-		if t == nil {
-			continue
-		}
-		if slices.ContainsFunc(t.parts, func(p namePart) bool { return p.tok == tokMD5 }) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(tmpls, func(t *NameTemplate) bool { return t.uses(tokMD5) })
+}
+
+func (t *NameTemplate) uses(tok nameToken) bool {
+	return t != nil && slices.ContainsFunc(t.parts, func(p namePart) bool { return p.tok == tok })
 }
 
 type NameFacts struct {
@@ -273,17 +269,13 @@ func (t *NameTemplate) Render(f NameFacts) (string, error) {
 		return out, nil
 	// A {folder} template may render the root: that is where a root row
 	// already is.
-	case t.scope.Folder() && (t.scope.source() || t.namesFolder()):
+	case t.scope.Folder() && (t.scope.source() || t.uses(tokFolder)):
 		return "", nil
 	case t.scope.source():
 		return strconv.FormatInt(f.ID, 10), nil
 	default:
 		return "", fmt.Errorf("the template names nothing for image %d", f.ID)
 	}
-}
-
-func (t *NameTemplate) namesFolder() bool {
-	return slices.ContainsFunc(t.parts, func(p namePart) bool { return p.tok == tokFolder })
 }
 
 // identityTokens tell rows apart; a date, a type or a gallery groups them

@@ -256,11 +256,13 @@ type annotationJSON struct {
 	BodyText string `json:"body_text,omitempty"`
 }
 
-// Without it nothing bounds the conversion of a JSON body.
+// Without it only the 16 MiB body cap bounds the DText conversion.
 const maxImageCommentaryDTextLen = 4 * maxImageCommentaryLen
 
-// A JSON body has no size limit: a note's HTML is cut before converting.
+// A note's HTML is cut before converting, for the same reason.
 const maxAnnotationBodyHTMLLen = 4 * maxAnnotationBodyLen
+
+const maxFetchMessageLen = 1000
 
 func firstRunes(s string, n int) string {
 	for i := range s {

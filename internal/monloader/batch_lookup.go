@@ -8,9 +8,9 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type BatchLookupOpts struct {
@@ -29,12 +29,23 @@ func (l *Link) BatchLookup(ctx context.Context, cx *library.Gallery, opts BatchL
 	enqueued, skipped, matched := 0, 0, 0
 	ptrRefused := false
 	total := len(ids)
+	stop := func(err error) {
+		if ctx.Err() != nil {
+			l.jobs.Complete(fmt.Sprintf("Lookup cancelled after queueing %d.", enqueued))
+			return
+		}
+		l.jobs.Fail("monloader unreachable: " + err.Error())
+	}
 	l.jobs.Update(0, total, "looking up…")
 	if opts.Mode == "hash" && opts.PTR {
 		var err error
 		if matched, err = l.batchPTRLookup(ctx, cx, ids); err != nil {
-			if !errors.Is(err, ErrPTRUnavailable) && !errors.Is(err, ErrPTRBatchUnsupported) {
-				l.jobs.Fail("monloader unreachable: " + err.Error())
+			if ctx.Err() != nil {
+				stop(err)
+				return
+			}
+			if !errors.Is(err, ErrPTRUnavailable) && !errors.Is(err, errPTRBatchUnsupported) {
+				l.jobs.Fail("PTR lookup failed: " + err.Error())
 				return
 			}
 			ptrRefused = true
@@ -43,7 +54,7 @@ func (l *Link) BatchLookup(ctx context.Context, cx *library.Gallery, opts BatchL
 	if opts.Booru || opts.Mode == "refresh" {
 		for i, id := range ids {
 			if ctx.Err() != nil {
-				l.jobs.Complete(fmt.Sprintf("Lookup cancelled after queueing %d.", enqueued))
+				stop(ctx.Err())
 				return
 			}
 			if (i+1)%25 == 0 || i == total-1 {
@@ -64,7 +75,7 @@ func (l *Link) BatchLookup(ctx context.Context, cx *library.Gallery, opts BatchL
 						skipped++
 						continue
 					}
-					l.jobs.Fail("monloader unreachable: " + qErr.Error())
+					stop(qErr)
 					return
 				}
 				if queued == 0 {
@@ -86,7 +97,7 @@ func (l *Link) BatchLookup(ctx context.Context, cx *library.Gallery, opts BatchL
 					skipped++
 					continue
 				}
-				l.jobs.Fail("monloader unreachable: " + err.Error())
+				stop(err)
 				return
 			}
 			enqueued++
@@ -135,14 +146,14 @@ func (l *Link) batchPTRLookup(ctx context.Context, cx *library.Gallery, ids []in
 	for start := 0; start < len(ids) && ctx.Err() == nil; start += ptrLookupChunk {
 		chunk := ids[start:min(start+ptrLookupChunk, len(ids))]
 		placeholders, args := db.InPlaceholders(chunk)
-		hashes, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(v *PTRLookupImage) []any {
+		hashes, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(v *ptrLookupImage) []any {
 			return []any{&v.ImageID, &v.SHA256}
 		}), `SELECT id, sha256 FROM images WHERE id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return matched, err
 		}
 		byHash := make(map[string]int64, len(hashes))
-		images := make([]PTRLookupImage, 0, len(hashes))
+		images := make([]ptrLookupImage, 0, len(hashes))
 		for _, h := range hashes {
 			byHash[h.SHA256] = h.ImageID
 			images = append(images, h)
@@ -150,7 +161,7 @@ func (l *Link) batchPTRLookup(ctx context.Context, cx *library.Gallery, ids []in
 		if len(images) == 0 {
 			continue
 		}
-		results, cursor, err := l.PTRBatchLookup(ctx, cx.Name, false, images)
+		results, cursor, err := l.ptrBatchLookup(ctx, cx.Name, false, images)
 		if err != nil {
 			return matched, err
 		}

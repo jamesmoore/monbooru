@@ -10,6 +10,8 @@ import (
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/contract"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // LinkConfig is what the link reads of the live config, on every call.
@@ -30,17 +32,21 @@ type Link struct {
 }
 
 func NewLink(cfg func() LinkConfig, jm *jobs.Manager) *Link {
-	l := &Link{cfg: cfg, jobs: jm, Fetches: NewFetchLog()}
+	l := &Link{cfg: cfg, jobs: jm, Fetches: newFetchLog()}
 	l.client = &Client{Base: l.Base, Token: func() string { return l.cfg().Token }}
 	return l
 }
 
 // A paused link answers "", so every outbound call fails before any I/O.
 func (l *Link) Base() string {
-	c := l.cfg()
-	if c.Paused {
+	if l.cfg().Paused {
 		return ""
 	}
+	return l.addr()
+}
+
+func (l *Link) addr() string {
+	c := l.cfg()
 	if u := strings.TrimSpace(c.APIURL); u != "" {
 		return u
 	}
@@ -68,20 +74,14 @@ func (l *Link) Usable() bool {
 func (l *Link) PTRReady() bool { return l.Cache.Seed().PTR }
 
 func (l *Link) ContribOpen() bool {
-	if !l.cfg().Paired {
-		return false
-	}
 	ml := l.Cache.Seed()
-	return ml.PTR && ml.Contrib
+	return l.cfg().Paired && ml.PTR && ml.Contrib
 }
 
 // A syncing index still answers diffs, marked provisional.
 func (l *Link) ContribReadOpen() bool {
-	if !l.cfg().Paired {
-		return false
-	}
 	ml := l.Cache.Seed()
-	return ml.PTR || ml.PTRSyncing
+	return l.cfg().Paired && (ml.PTR || ml.PTRSyncing)
 }
 
 func (l *Link) ContribHint() (bool, string) {
@@ -90,12 +90,18 @@ func (l *Link) ContribHint() (bool, string) {
 	case ml.Contrib:
 		return true, ""
 	case ml.PTRSyncing:
-		return false, "the Public Tag Repository is still syncing"
+		return false, contribRefusals[contract.CodePTRSyncing]
 	case ml.ContribBanned:
-		return false, "the contribution account is banned"
+		return false, contribRefusals[contract.CodePTRBanned]
 	default:
-		return false, "a contribution account in monloader is required to contribute"
+		return false, contribRefusals[contract.CodePTRAccountRequired]
 	}
+}
+
+var contribRefusals = map[string]string{
+	contract.CodePTRSyncing:         "the Public Tag Repository is still syncing",
+	contract.CodePTRBanned:          "the contribution account is banned",
+	contract.CodePTRAccountRequired: "a contribution account in monloader is required to contribute",
 }
 
 // The authed queue read is there to surface a revoked token.
@@ -104,33 +110,22 @@ func (l *Link) Probe(ctx context.Context) Status {
 	if base == "" {
 		return Status{}
 	}
-	version, up := peer.Health(ctx, base)
+	h, up := peer.Health(ctx, base)
 	if !up {
 		return Status{Conn: peer.ConnDown}
 	}
-	st := Status{Conn: peer.ConnOK, Version: version}
+	st := Status{Conn: peer.ConnOK, Version: h.Version, APIMismatch: h.APIMismatch()}
 	tok := l.cfg().Token
 	if tok != "" {
 		if qresp, qerr := l.client.Do(ctx, http.MethodGet, "/api/v1/queue?limit=1", nil); qerr == nil {
 			defer func() { _ = qresp.Body.Close() }()
-			if qresp.StatusCode == http.StatusUnauthorized || qresp.StatusCode == http.StatusForbidden {
-				return Status{Conn: peer.ConnRejected, Version: version}
+			if c := qresp.StatusCode; c == http.StatusUnauthorized || c == http.StatusForbidden || c == http.StatusServiceUnavailable {
+				st.Conn = peer.ConnRejected
+				return st
 			}
 		}
 		if presp, perr := l.client.Do(ctx, http.MethodGet, "/api/v1/ptr/status", nil); perr == nil {
-			var p struct {
-				Enabled  bool `json:"enabled"`
-				Progress struct {
-					UpdateIndex uint64 `json:"update_index"`
-				} `json:"progress"`
-				State     string `json:"state"`
-				Queryable bool   `json:"queryable"`
-				Contrib   *struct {
-					Account bool `json:"account"`
-					Banned  bool `json:"banned"`
-					Failed  int  `json:"failed"`
-				} `json:"contrib"`
-			}
+			var p ptrStatus
 			_ = json.NewDecoder(presp.Body).Decode(&p)
 			_ = presp.Body.Close()
 			on := presp.StatusCode == http.StatusOK && p.Enabled
@@ -160,11 +155,14 @@ func (l *Link) Probe(ctx context.Context) Status {
 const statusTTL = 10 * time.Second
 
 // The probe runs unlocked so a slow monloader never serializes page renders.
-func (l *Link) Refresh(ctx context.Context) (status, version string) {
+func (l *Link) Refresh(ctx context.Context) Status {
 	if st, ok := l.Cache.Fresh(statusTTL); ok {
-		return st.Conn, st.Version
+		return st
 	}
 	st := l.Probe(ctx)
+	if st.APIMismatch != "" && st.APIMismatch != l.Cache.Seed().APIMismatch {
+		logx.Warnf("monloader: %s", st.APIMismatch)
+	}
 	l.Cache.Store(st)
-	return st.Conn, st.Version
+	return st
 }

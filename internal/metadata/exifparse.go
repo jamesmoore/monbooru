@@ -86,17 +86,9 @@ func decodeEXIF(data []byte) (*exifData, error) {
 		x.load(dirs[1], thumbTagNames)
 	}
 
-	subIFDs := []struct {
-		pointer string
-		names   map[uint16]string
-	}{
-		{exifIFDPointer, exifTagNames},
-		{gpsIFDPointer, gpsTagNames},
-		{interopIFDPointer, interopTagNames},
-	}
-	for _, sub := range subIFDs {
-		x.loadSubIFD(data, order, sub.pointer, sub.names)
-	}
+	x.loadSubIFD(data, order, exifIFDPointer, exifTagNames)
+	x.loadSubIFD(data, order, gpsIFDPointer, gpsTagNames)
+	x.loadSubIFD(data, order, interopIFDPointer, interopTagNames)
 	return x, nil
 }
 

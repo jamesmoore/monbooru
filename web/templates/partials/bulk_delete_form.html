@@ -10,3 +10,7 @@
   <button type="submit" class="btn-danger btn-sm">{{.Label}}</button>
 </form>
 {{end}}
+
+{{define "bulk_delete_dup_files"}}{{template "partials/bulk_delete_form.html" (dict "Action" "/relations/file-duplicates/remove" "Target" . "Confirm" "Remove every non-canonical duplicate file?" "ConfirmDanger" "Their bytes are removed from disk. The canonical path stays." "ConfirmOK" "Remove all" "Label" "Delete all duplicate files" "All" true)}}{{end}}
+
+{{define "bulk_delete_dup_images"}}{{template "partials/bulk_delete_form.html" (dict "Action" "/relations/duplicates/marked/delete-all" "Target" . "Confirm" "Delete every non-original member of every duplicate-image group?" "ConfirmDanger" "Their files are removed from disk. This cannot be undone." "ConfirmOK" "Delete all" "Label" "Delete all duplicate images")}}{{end}}

@@ -17,11 +17,7 @@ func (h schedHost) View() (config.ScheduleConfig, []string) {
 	if h.s.cfg.FindPairedToken(monloader.App) == nil {
 		sched.LookupPTR, sched.LookupBooru = false, false
 	}
-	names := make([]string, len(h.s.cfg.Galleries))
-	for i, g := range h.s.cfg.Galleries {
-		names[i] = g.Name
-	}
-	return sched, names
+	return sched, galleryNames(h.s.cfg.Galleries)
 }
 
 func (h schedHost) Config() *config.Config { return h.s.cfgSnapshot() }

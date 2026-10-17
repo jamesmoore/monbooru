@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"fmt"
-	"github.com/monbooru/monbooru/internal/monloader"
 	"net/http"
 	"os"
 	"slices"
@@ -16,10 +15,11 @@ import (
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -29,22 +29,26 @@ func (s *Server) resolveBatchScope(w http.ResponseWriter, r *http.Request, errLa
 	case "selection":
 		return parseIDList(r.Form["ids"]), true
 	case "search":
-		sc := search.NewScope(search.Parse(r.FormValue("q")), readRatingCookie(r))
-		if viewOrder {
-			seed, _ := strconv.ParseInt(r.FormValue("seed"), 10, 64)
-			sc = sc.InViewOrder(r.FormValue("sort"), r.FormValue("order"), seed)
-		}
-		ids, err := sc.IDs(s.source())
-		if err != nil {
-			logx.Errorf("%s search: %v", errLabel, err)
-			flashStatus(w, http.StatusInternalServerError, "Search error.")
-			return nil, false
-		}
-		return ids, true
+		return s.searchScopeIDs(w, r, errLabel, viewOrder)
 	default:
 		flashStatus(w, http.StatusBadRequest, "scope must be search or selection")
 		return nil, false
 	}
+}
+
+func (s *Server) searchScopeIDs(w http.ResponseWriter, r *http.Request, errLabel string, viewOrder bool) ([]int64, bool) {
+	sc := search.NewScope(search.Parse(r.FormValue("q")), readRatingCookie(r))
+	if viewOrder {
+		seed, _ := strconv.ParseInt(r.FormValue("seed"), 10, 64)
+		sc = sc.InViewOrder(r.FormValue("sort"), r.FormValue("order"), seed)
+	}
+	ids, err := sc.IDs(s.source())
+	if err != nil {
+		logx.Errorf("%s search: %v", errLabel, err)
+		flashStatus(w, http.StatusInternalServerError, "Search error.")
+		return nil, false
+	}
+	return ids, true
 }
 
 func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
@@ -52,10 +56,6 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ids := parseIDList(r.Form["ids"])
-	if len(ids) == 0 {
-		s.startIDsJob(w, models.JobTypeDelete, nil, s.runBulkDelete)
-		return
-	}
 	// Chunked IN lists: a query per row costs a read per checkbox, and
 	// one list overruns SQLite's parameter limit.
 	var known []int64
@@ -77,10 +77,8 @@ func (s *Server) deleteSearchPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	ids, err := search.NewScope(search.Parse(r.FormValue("q")), readRatingCookie(r)).IDs(s.source())
-	if err != nil {
-		logx.Errorf("delete-search: %v", err)
-		flashStatus(w, http.StatusInternalServerError, "Search error.")
+	ids, ok := s.searchScopeIDs(w, r, "delete", false)
+	if !ok {
 		return
 	}
 	s.startIDsJob(w, models.JobTypeDelete, ids, s.runBulkDelete)
@@ -205,10 +203,6 @@ func (s *Server) runBatchPlace(ids []int64, targetFolder *string, folderTmpl, na
 	// Named from what the run did: the folder field opens on {folder}, so
 	// most renames move nothing.
 	_, _, past := placeVerbs(moved > 0, renamed > 0)
-	if cancelled {
-		s.jobs.Complete(fmt.Sprintf("%s cancelled (%d/%d %s)", verb, done, total, past))
-		return
-	}
 	summary := fmt.Sprintf("%s %d image(s).", titleCase(past), done)
 	if failed > 0 {
 		summary = fmt.Sprintf("%s %d image(s), %d failed.", titleCase(past), done, failed)
@@ -219,7 +213,7 @@ func (s *Server) runBatchPlace(ids []int64, targetFolder *string, folderTmpl, na
 	if n := countEmptiedDirs(sources); n > 0 {
 		summary += fmt.Sprintf(" %d folder(s) are now empty.", n)
 	}
-	s.jobs.Complete(summary)
+	s.jobs.Finish(nil, cancelled, fmt.Sprintf("%s cancelled (%d/%d %s)", verb, done, total, past), summary)
 }
 
 func countEmptiedDirs(dirs map[string]struct{}) int {
@@ -375,7 +369,7 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 	}
 	res, err := batch(s.jobs.Context(), ids, tagIDs, progress)
 
-	done := fmt.Sprintf("%s %d image(s) (%d row change(s)).", summary, res.Processed, res.Changed)
+	done := fmt.Sprintf("%s %d of %d image(s) (%d row change(s)).", summary, res.Touched, res.Processed, res.Changed)
 	if note != "" {
 		done += " " + note + "."
 	}
@@ -449,8 +443,11 @@ func (s *Server) runBatchStrip(ids []int64, mode, filterName string) {
 	res, err := s.tagSvc().StripTags(s.jobs.Context(), ids, tags.StripSpec{Mode: mode, Name: filterName}, func(done, total int) {
 		s.jobs.Update(done, total, label+"…")
 	})
-	s.jobs.Finish(err, res.Cancelled, fmt.Sprintf("%s cancelled (%d/%d processed)", label, res.Processed, total),
-		fmt.Sprintf("%s %d image(s) (%d row change(s)).", summary, res.Processed, res.Removed))
+	done := fmt.Sprintf("%s %d of %d image(s) (%d row change(s)).", summary, res.Touched, res.Processed, res.Removed)
+	if res.Kept > 0 {
+		done += fmt.Sprintf(" Kept %d row(s) another tag on the image implies.", res.Kept)
+	}
+	s.jobs.Finish(err, res.Cancelled, fmt.Sprintf("%s cancelled (%d/%d processed)", label, res.Processed, total), done)
 }
 
 func (s *Server) batchInbox(w http.ResponseWriter, r *http.Request) {
@@ -506,11 +503,11 @@ func (s *Server) batchCollection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.startScopedJob(w, r, "batch-collection", models.JobTypeTag, false, func(ids []int64) {
-		s.runBatchCollection(ids, collectionVal, mode)
+		s.runBatchCollection(ids, collectionVal, mode, false)
 	})
 }
 
-func (s *Server) runBatchCollection(ids []int64, label, mode string) {
+func (s *Server) runBatchCollection(ids []int64, label, mode string, dissolve bool) {
 	ctx := s.jobs.Context()
 	const chunkSize = 500
 	total := len(ids)
@@ -529,6 +526,12 @@ func (s *Server) runBatchCollection(ids []int64, label, mode string) {
 			return gallery.AddCollectionToImages(d, chunk, label)
 		})
 	})
+	// So a later collection reusing the label starts opted out.
+	if dissolve && err == nil && !cancelled {
+		if e := cx.Edit(func(d *db.DB) error { return gallery.SetCollectionFindRelations(d, label, false) }); e != nil {
+			logx.Debugf("dissolve collection find-relations flag: %v", e)
+		}
+	}
 	done := fmt.Sprintf("Added %d image(s) to collection.", processed)
 	if remove {
 		done = fmt.Sprintf("Removed %d image(s) from collection.", processed)

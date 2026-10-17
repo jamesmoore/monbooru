@@ -5,6 +5,7 @@ package compatibility
 
 import (
 	"archive/zip"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -30,11 +31,21 @@ type Manifest struct {
 }
 
 // SHA256 may be empty; set it only when it is surely the file's sha256,
-// as a merge tags whatever image already has that sha.
+// as a merge tags whatever image already has that sha. The light export
+// writes this shape, kept small so other software can read and write it.
 type ManifestImage struct {
-	SHA256 string
-	Path   string
-	Tags   []string
+	SHA256 string   `json:"sha256"`
+	Path   string   `json:"path"`
+	Tags   []string `json:"tags"`
+}
+
+// A general name holding a colon is qualified: bare, its prefix could read
+// as a category on the way back in.
+func TagToken(category, name string) string {
+	if (category == "general" || category == "") && !strings.Contains(name, ":") {
+		return name
+	}
+	return cmp.Or(category, "general") + ":" + name
 }
 
 type NormalizedEntry struct {

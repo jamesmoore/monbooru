@@ -6,8 +6,8 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // Comfortably past a real backlog, so a busy queue is never mistaken for
@@ -16,7 +16,7 @@ const lookupGrace = 6 * time.Hour
 
 // Only logs a history failure: the job is already queued on monloader.
 func (l *Link) EnqueueLookup(ctx context.Context, cx *library.Gallery, imageID int64, backend, md5, sha256 string, background, budgeted bool) error {
-	jobID, err := l.EnqueueHashLookup(ctx, imageID, cx.Name, backend, md5, sha256, background, budgeted)
+	jobID, err := l.enqueueHashLookup(ctx, imageID, cx.Name, backend, md5, sha256, background, budgeted)
 	if err != nil {
 		return err
 	}
@@ -40,7 +40,7 @@ func (l *Link) reconcileLookups(ctx context.Context, cx *library.Gallery) (resol
 		if ctx.Err() != nil {
 			return resolved, inconclusive
 		}
-		result, ok := l.JobOutcome(ctx, f.JobID)
+		result, ok := l.jobOutcome(ctx, f.JobID)
 		if !ok {
 			continue
 		}

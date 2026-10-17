@@ -99,13 +99,9 @@ addHex.addEventListener('change', function() {
 });
 
 function openCatRenameDialog(id, name) {
-  document.getElementById('cat-rename-src').textContent = name;
-  clearSlots('cat-rename-error');
-  var input = document.getElementById('cat-rename-input');
-  input.value = name;
-  openHxRewriteDialog('cat-rename-form', 'hx-post', '/tags/categories/' + id + '/rename', 'cat-rename-dialog');
-  input.focus();
-  input.select();
+  openNameDialog({src: 'cat-rename-src', err: 'cat-rename-error', input: 'cat-rename-input',
+                  form: 'cat-rename-form', dialog: 'cat-rename-dialog'},
+                 name, '/tags/categories/' + id + '/rename');
 }
 
 function openCatDeleteDialog(catId, catName) {
@@ -113,8 +109,15 @@ function openCatDeleteDialog(catId, catName) {
   clearSlots('del-cat-flash');
 
   fetch('/tags/categories/' + catId + '/count')
-    .then(function(r) { return r.json(); })
+    .then(function(r) {
+      if (sessionLost(r)) {
+        showLoginNotice();
+        return null;
+      }
+      return r.json();
+    })
     .then(function(data) {
+      if (!data) return;
       var count = data.count || 0;
       var aliases = data.aliases || 0;
       var linked = data.linked_aliases || 0;

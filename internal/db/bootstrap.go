@@ -12,7 +12,20 @@ import (
 // go here: schema.sql runs before the ALTERs and the freshness probes.
 func Bootstrap(db *DB) error {
 	b := &bootstrapper{db: db}
-	b.exec("bootstrapping schema", schemaSQL)
+	// Each one-shot is pinned to the marker that introduced it, or the one
+	// it was gated under, so a library past it skips the step.
+	marker := b.queryInt("read user_version", `PRAGMA user_version`)
+	existing := b.queryInt("probe images table", `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'images'`) > 0
+	if existing && marker < MinUpgradeUserVersion && b.err == nil {
+		return fmt.Errorf("%w: its schema marker is %d and this release opens %d or later; open it once with monbooru %s, which upgrades it, then with this release",
+			ErrLibraryTooOld, marker, MinUpgradeUserVersion, UpgradeVia)
+	}
+	if existing {
+		b.exec("bootstrapping schema", schemaSQL)
+	} else {
+		// A fresh library left at marker 0 by a later failure would be refused as too old.
+		b.execTx("bootstrapping schema", schemaSQL+fmt.Sprintf(";\nPRAGMA user_version = %d", MinUpgradeUserVersion))
+	}
 	b.ensureColumn("images", "origin", `ALTER TABLE images ADD COLUMN origin TEXT NOT NULL DEFAULT 'ingest'`)
 	b.ensureColumn("image_tags", "is_implied", `ALTER TABLE image_tags ADD COLUMN is_implied INTEGER NOT NULL DEFAULT 0`)
 	// Rows from before the inbox existed are archived, not dumped into it.
@@ -21,24 +34,30 @@ func Bootstrap(db *DB) error {
 		`UPDATE images SET is_inbox = 0`,
 		"backfill is_inbox=0 on upgrade")
 	b.exec("create idx_images_inbox_visible", `CREATE INDEX IF NOT EXISTS idx_images_inbox_visible ON images(is_inbox) WHERE is_missing = 0`)
-	// Superseded by idx_image_tags_tag_image, which leads on the same column.
-	b.exec("drop superseded idx_image_tags_tag", `DROP INDEX IF EXISTS idx_image_tags_tag`)
+	if marker < 14 {
+		// Superseded by idx_image_tags_tag_image, which leads on the same column.
+		b.exec("drop superseded idx_image_tags_tag", `DROP INDEX IF EXISTS idx_image_tags_tag`)
+	}
 	b.ensureColumn("images", "source", `ALTER TABLE images ADD COLUMN source TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("images", "url", `ALTER TABLE images ADD COLUMN url TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("images", "note", `ALTER TABLE images ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("images", "original_source", `ALTER TABLE images ADD COLUMN original_source TEXT NOT NULL DEFAULT ''`)
-	b.dropLegacySourceIndex()
-	b.exec("create idx_images_source_type", `CREATE INDEX IF NOT EXISTS idx_images_source_type ON images(source_type)`)
-	b.exec("create idx_images_source", `CREATE INDEX IF NOT EXISTS idx_images_source ON images(source)`)
-	b.exec("create idx_images_source_visible", `CREATE INDEX IF NOT EXISTS idx_images_source_visible ON images(source) WHERE is_missing = 0`)
-	b.exec("create idx_images_source_nocase_visible", `CREATE INDEX IF NOT EXISTS idx_images_source_nocase_visible ON images(source COLLATE NOCASE) WHERE is_missing = 0`)
-	// Older libraries held one origin per image in images.source / url.
-	// The table-wide guard keeps later boots from re-seeding rows the
-	// operator edited.
-	b.exec("seed image_sources from scalar",
-		`INSERT OR IGNORE INTO image_sources (image_id, site, post_id, url)
-		 SELECT id, source, '', url FROM images
-		 WHERE (source != '' OR url != '') AND NOT EXISTS (SELECT 1 FROM image_sources)`)
+	if marker < 15 {
+		// images.source is the primary origin's mirror, read by id only:
+		// the source: filter runs on image_sources.
+		b.exec("drop idx_images_source", `DROP INDEX IF EXISTS idx_images_source`)
+		b.exec("drop idx_images_source_visible", `DROP INDEX IF EXISTS idx_images_source_visible`)
+		b.exec("drop idx_images_source_nocase_visible", `DROP INDEX IF EXISTS idx_images_source_nocase_visible`)
+	}
+	if marker < 14 {
+		// Older libraries held one origin per image in images.source / url.
+		// The table-wide guard keeps a library that cleared its sources
+		// from being re-seeded.
+		b.exec("seed image_sources from scalar",
+			`INSERT OR IGNORE INTO image_sources (image_id, site, post_id, url)
+			 SELECT id, source, '', url FROM images
+			 WHERE (source != '' OR url != '') AND NOT EXISTS (SELECT 1 FROM image_sources)`)
+	}
 	b.ensureColumn("image_sources", "commentary", `ALTER TABLE image_sources ADD COLUMN commentary TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("image_sources", "commentary_translated", `ALTER TABLE image_sources ADD COLUMN commentary_translated TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("image_sources", "original", `ALTER TABLE image_sources ADD COLUMN original TEXT NOT NULL DEFAULT ''`)
@@ -107,11 +126,13 @@ func Bootstrap(db *DB) error {
 	b.ensureColumn("images", "series_order", `ALTER TABLE images ADD COLUMN series_order INTEGER`)
 	b.exec("create idx_images_series", `CREATE INDEX IF NOT EXISTS idx_images_series ON images(series) WHERE series != ''`)
 	b.exec("create idx_images_series_nocase", `CREATE INDEX IF NOT EXISTS idx_images_series_nocase ON images(series COLLATE NOCASE)`)
-	// Older libraries held one collection per image in images.series.
-	b.exec("seed image_collections from series",
-		`INSERT OR IGNORE INTO image_collections (image_id, name, position)
-		 SELECT id, series, series_order FROM images
-		 WHERE series != '' AND NOT EXISTS (SELECT 1 FROM image_collections)`)
+	if marker < 14 {
+		// Older libraries held one collection per image in images.series.
+		b.exec("seed image_collections from series",
+			`INSERT OR IGNORE INTO image_collections (image_id, name, position)
+			 SELECT id, series, series_order FROM images
+			 WHERE series != '' AND NOT EXISTS (SELECT 1 FROM image_collections)`)
+	}
 	// folder: compares NOCASE, which the BINARY idx_images_folder_visible
 	// can't serve; without this the planner walks idx_images_missing and
 	// temp-sorts.
@@ -153,7 +174,6 @@ func Bootstrap(db *DB) error {
 		`UPDATE images SET tag_count = (SELECT COUNT(*) FROM image_tags WHERE image_id = images.id)`,
 		"backfill images.tag_count")
 	b.exec("create idx_images_tag_count_visible", `CREATE INDEX IF NOT EXISTS idx_images_tag_count_visible ON images(tag_count) WHERE is_missing = 0`)
-	b.exec("create idx_images_file_type_visible", `CREATE INDEX IF NOT EXISTS idx_images_file_type_visible ON images(file_type) WHERE is_missing = 0`)
 	b.exec("create trg_image_tags_count_ai", `CREATE TRIGGER IF NOT EXISTS trg_image_tags_count_ai
 		AFTER INSERT ON image_tags
 		BEGIN
@@ -238,10 +258,7 @@ func Bootstrap(db *DB) error {
 	b.exec("create trg_image_collections_pairs_au", `CREATE TRIGGER IF NOT EXISTS trg_image_collections_pairs_au
 		AFTER UPDATE OF name ON image_collections
 		BEGIN
-			UPDATE potential_relation_pairs SET collection_hidden = `+PairHiddenProbe("a_image_id", "b_image_id")+`
-			WHERE a_image_id = NEW.image_id;
-			UPDATE potential_relation_pairs SET collection_hidden = `+PairHiddenProbe("a_image_id", "b_image_id")+`
-			WHERE b_image_id = NEW.image_id;
+			`+pairsResweepBody("a_image_id = NEW.image_id", "b_image_id = NEW.image_id")+`
 		END`)
 	b.exec("create trg_collection_find_relations_pairs_ai", `CREATE TRIGGER IF NOT EXISTS trg_collection_find_relations_pairs_ai
 		AFTER INSERT ON collection_find_relations
@@ -388,35 +405,6 @@ func Bootstrap(db *DB) error {
 	// Trigram FTS makes name: substrings a seek; a leading-% LIKE can't seek.
 	b.exec("create image_basename_canonical_fts", `CREATE VIRTUAL TABLE IF NOT EXISTS image_basename_canonical_fts USING fts5(basename, tokenize='trigram', content='', contentless_delete=1)`)
 	b.exec("create image_basename_alias_fts", `CREATE VIRTUAL TABLE IF NOT EXISTS image_basename_alias_fts USING fts5(basename, image_id UNINDEXED, tokenize='trigram', content='', contentless_delete=1)`)
-	ratingRankUserVersion := b.queryInt("read user_version (fts5 backfill)", `PRAGMA user_version`)
-	// Each one-shot is pinned to the marker that introduced it, so a
-	// later bump can't replay it over rows written since.
-	if ratingRankUserVersion < 13 {
-		// Settles digests stored before the triggers existed; a verdict a
-		// fetch already recorded stands.
-		b.exec("backfill source md5 verdicts", `UPDATE image_sources SET md5_match = CASE
-			WHEN lower(md5) = (SELECT md5 FROM images WHERE id = image_id) THEN 'match' ELSE 'differ' END
-		 WHERE md5_match = '' AND md5 != '' AND (SELECT md5 FROM images WHERE id = image_id) != ''`)
-	}
-	if ratingRankUserVersion < 12 {
-		// Tag rows scored under the old metric can't be re-thresholded:
-		// drop them for find-pairs to requeue, and demote both-detector
-		// rows to their phash evidence.
-		b.exec("drop stale tag-scored pairs", `DELETE FROM potential_relation_pairs WHERE source = 'tags'`)
-		b.exec("demote stale both-detector pairs", `UPDATE potential_relation_pairs SET source = 'phash', score = NULL WHERE source = 'both'`)
-	}
-	if ratingRankUserVersion < 11 {
-		// basename() once split on "/" only; reindex before the FTS
-		// backfill reads the keys back.
-		b.exec("reindex basename_lower", `REINDEX idx_images_basename_lower_visible`)
-		b.exec("clear image_basename_canonical_fts", `DELETE FROM image_basename_canonical_fts`)
-		b.exec("backfill image_basename_canonical_fts", `INSERT INTO image_basename_canonical_fts (rowid, basename)
-			SELECT id, basename_lower FROM images WHERE basename_lower != ''`)
-		b.exec("clear image_basename_alias_fts", `DELETE FROM image_basename_alias_fts`)
-		b.exec("backfill image_basename_alias_fts", `INSERT INTO image_basename_alias_fts (rowid, basename, image_id)
-			SELECT id, basename_lower, image_id FROM image_paths WHERE is_canonical = 0 AND basename_lower != ''`)
-		b.exec("normalize windows folder_path", NormalizeWindowsFolderPathSQL)
-	}
 	b.exec("create trg_image_basename_canonical_fts_ai", `CREATE TRIGGER IF NOT EXISTS trg_image_basename_canonical_fts_ai
 		AFTER INSERT ON images
 		WHEN NEW.basename_lower != ''
@@ -562,12 +550,10 @@ func PairHiddenProbe(aCol, bCol string) string {
 }
 
 func (b *bootstrapper) ensureColumn(table, column, alterSQL string) {
-	if b.hasColumn(table, column) || b.err != nil {
+	if b.hasColumn(table, column) {
 		return
 	}
-	if _, err := b.db.Write.Exec(alterSQL); err != nil {
-		b.err = fmt.Errorf("add column %s.%s: %w", table, column, err)
-	}
+	b.exec("add column "+table+"."+column, alterSQL)
 }
 
 // Older libraries key derivative_edges on the derivative alone. SQLite
@@ -590,14 +576,6 @@ func (b *bootstrapper) widenDerivativeEdgesKey() {
 		DROP TABLE derivative_edges;
 		ALTER TABLE derivative_edges_wide RENAME TO derivative_edges;
 		CREATE INDEX IF NOT EXISTS idx_derivative_edges_source ON derivative_edges(source_image_id);`)
-}
-
-// On older libraries idx_images_source indexes source_type, not source.
-func (b *bootstrapper) dropLegacySourceIndex() {
-	if b.queryInt("inspect idx_images_source",
-		`SELECT COUNT(*) FROM pragma_index_info('idx_images_source') WHERE name = 'source_type'`) > 0 {
-		b.exec("drop legacy idx_images_source", `DROP INDEX idx_images_source`)
-	}
 }
 
 // The DDL and its backfill commit together: a kill between them would

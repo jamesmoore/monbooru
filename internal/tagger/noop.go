@@ -20,7 +20,9 @@ func IsAvailable(_ *config.Config) bool { return false }
 
 func buildSupportsInference() bool { return false }
 
-func UnavailableReason(_ *config.Config) string {
+func UnavailableReason(_ *config.Config) string { return reasonFrom(nil) }
+
+func reasonFrom(_ []TaggerStatus) string {
 	return "inference disabled (built without -tags tagger)"
 }
 

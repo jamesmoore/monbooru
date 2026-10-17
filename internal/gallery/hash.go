@@ -32,7 +32,7 @@ func resolveSubdir(galleryPath, folder string) (string, error) {
 	}
 	folder = strings.Trim(folder, "/\\")
 	cleaned := filepath.Clean(filepath.ToSlash(folder))
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {
+	if !filepath.IsLocal(cleaned) {
 		return "", fmt.Errorf("folder path escapes the gallery root")
 	}
 	abs, err := filepath.Abs(filepath.Join(galleryPath, cleaned))
@@ -79,9 +79,13 @@ func NamedInside(root, target string) bool {
 
 var ErrUnsupportedType = errors.New("unsupported file type")
 
-// SupportedMIMETypes lists bare .avif and .jxl so a picker on an OS that
-// maps no type to them does not hide those files.
-const SupportedMIMETypes = "image/jpeg,image/png,image/webp,image/avif,image/jxl,.avif,.jxl,image/gif,video/mp4,video/webm,application/vnd.comicbook+zip,application/zip,application/x-cbz"
+var SupportedMIMETypes = func() string {
+	var tokens []string
+	for _, ft := range models.FileTypes {
+		tokens = append(append(tokens, ft.MIME), ft.Accept...)
+	}
+	return strings.Join(tokens, ",")
+}()
 
 // CreateUnique creates an empty file under filename, suffixed while the
 // name is taken, and returns its path: the caller writes over its own
@@ -188,39 +192,13 @@ func hashFileDigests(path string) (sha, sum string, err error) {
 // DetectFileType trusts the extension so the sync walk opens no file it
 // can name.
 func DetectFileType(path string) (string, error) {
-	if t := ExtFileType(path); t != "" {
+	if t := models.ExtFileType(path); t != "" {
 		return t, nil
 	}
-	return detectMagicType(path)
+	return MagicFileType(path)
 }
 
-func ExtFileType(path string) string {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".jpg", ".jpeg":
-		return models.FileTypeJPEG
-	case ".png":
-		return models.FileTypePNG
-	case ".webp":
-		return models.FileTypeWEBP
-	case ".avif":
-		return models.FileTypeAVIF
-	case ".jxl":
-		return models.FileTypeJXL
-	case ".gif":
-		return models.FileTypeGIF
-	case ".mp4":
-		return models.FileTypeMP4
-	case ".webm":
-		return models.FileTypeWEBM
-	case ".cbz", ".zip":
-		return models.FileTypeCBZ
-	}
-	return ""
-}
-
-func MagicFileType(path string) (string, error) { return detectMagicType(path) }
-
-func detectMagicType(path string) (string, error) {
+func MagicFileType(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", ErrUnsupportedType
@@ -295,32 +273,30 @@ func hasFtypBrand(buf []byte, brands ...string) bool {
 }
 
 func IsVideoType(fileType string) bool {
-	return fileType == models.FileTypeMP4 || fileType == models.FileTypeWEBM
+	ft, _ := models.LookupFileType(fileType)
+	return ft.Video
 }
 
 // IsFFmpegStill reports the still types Go's image packages cannot decode.
 func IsFFmpegStill(fileType string) bool {
-	return fileType == models.FileTypeAVIF || fileType == models.FileTypeJXL
+	ft, _ := models.LookupFileType(fileType)
+	return ft.FFmpegStill
 }
 
 // Only for files monbooru names itself; an operator's file keeps its name.
-func extForFileType(fileType string) string { return fileTypeMeta[fileType].ext }
+func extForFileType(fileType string) string {
+	ft, ok := models.LookupFileType(fileType)
+	if !ok {
+		return ""
+	}
+	return ft.Exts[0]
+}
 
 // MIMEForFileType exists because http.ServeFile goes by the extension,
 // which the bytes can contradict.
-func MIMEForFileType(fileType string) string { return fileTypeMeta[fileType].mime }
-
-var fileTypeMeta = map[string]struct{ ext, mime string }{
-	models.FileTypeJPEG: {".jpg", "image/jpeg"},
-	models.FileTypePNG:  {".png", "image/png"},
-	models.FileTypeWEBP: {".webp", "image/webp"},
-	models.FileTypeAVIF: {".avif", "image/avif"},
-	models.FileTypeJXL:  {".jxl", "image/jxl"},
-	models.FileTypeGIF:  {".gif", "image/gif"},
-	models.FileTypeMP4:  {".mp4", "video/mp4"},
-	models.FileTypeWEBM: {".webm", "video/webm"},
-	// CBZ serves as what the stdlib sniffer already answers for a PK archive.
-	models.FileTypeCBZ: {".cbz", "application/zip"},
+func MIMEForFileType(fileType string) string {
+	ft, _ := models.LookupFileType(fileType)
+	return ft.MIME
 }
 
 // ContentDispositionFor names the download: the byte routes have no

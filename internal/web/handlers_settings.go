@@ -12,40 +12,16 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/schedule"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"golang.org/x/crypto/bcrypt"
 )
 
-type executionProviderRow struct {
-	Name  string
-	Label string
-}
-
-// Not probed here: the parent must not load ONNX Runtime on a page
-// render, so a bad pick is refused at save time.
-func executionProviderRows() []executionProviderRow {
-	rows := make([]executionProviderRow, 0, len(config.ValidExecutionProviders))
-	for _, name := range config.ValidExecutionProviders {
-		rows = append(rows, executionProviderRow{Name: name, Label: providerDisplayLabel(name)})
-	}
-	return rows
-}
-
-var providerDisplayLabels = map[string]string{
-	"cpu":      "CPU",
-	"cuda":     "CUDA",
-	"directml": "DirectML",
-	"tensorrt": "TensorRT",
-	"openvino": "OpenVINO",
-	"coreml":   "CoreML",
-	"coremlv2": "CoreML V2",
-}
-
-func providerDisplayLabel(name string) string { return cmp.Or(providerDisplayLabels[name], name) }
-
 // Galleries shadows the layout's list with the rows this page's table renders.
+// ExecutionProviders is not probed: the parent must not load ONNX Runtime on
+// a page render, so a bad pick is refused at save time.
 type settingsData struct {
 	baseData
 	Galleries          []galleryRow
@@ -55,7 +31,7 @@ type settingsData struct {
 	ScheduleStatus     schedule.Status
 	ScheduleScope      scheduleScope
 	Stats              statsData
-	ExecutionProviders []executionProviderRow
+	ExecutionProviders []struct{ Name, Label string }
 	ScheduleModes      []scheduleModeRow
 	PluginPending      []pendingOffer
 	PluginPaired       int
@@ -65,17 +41,18 @@ type settingsData struct {
 	ThemesDir          string
 	DesktopProfile     bool
 	DesktopFolders     []string
-	Desktop            desktopIntegration
+	Desktop            desktop.Integration
 	DesktopJobWarning  string
+	PluginsRepoURL     string
 }
 
 func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	base := s.base(r, "settings", "Settings - "+s.booruName())
-	s.disableMissingTaggers()
-	s.persistNewlyDiscoveredTaggers()
-	taggers := tagger.AvailableTaggers(s.cfgSnapshot())
 	modelPath := s.modelPath()
 	catalog := tagger.LoadCatalog(modelPath)
+	s.reconcileTaggers(catalog)
+	cfg := s.cfgSnapshot()
+	taggers := tagger.AvailableTaggers(cfg)
 	taggerByName := map[string]tagger.TaggerStatus{}
 	for _, t := range taggers {
 		taggerByName[t.Name] = t
@@ -85,34 +62,41 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	catalogNames := map[string]bool{}
 	for _, e := range catalog {
 		catalogNames[e.Name] = true
-		row := taggerRow{Name: e.Name, Files: e.Files, TargetDir: filepath.Join(modelPath, e.Name)}
+		target := filepath.Join(modelPath, e.Name)
+		get := e.Missing(target)
+		row := taggerRow{}
 		if t, installed := taggerByName[e.Name]; installed {
-			row = s.installedTaggerRow(t, totalGalleries, modelPath)
+			row = s.installedTaggerRow(t, totalGalleries, modelPath, &e)
+			if !t.Missing || t.Malformed {
+				get.Files = nil
+			}
 		}
+		row.Name = e.Name
+		row.Files, row.TargetDir = get.Files, target
 		row.Supported = true
 		row.Description = e.Description
 		row.Gated = e.Gated
-		row.HostCommand = e.HostCommand()
-		row.DockerCommand = e.DockerCommand("monbooru")
+		row.HostCommand = get.HostCommand()
+		row.DockerCommand = get.DockerCommand("monbooru")
 		supportedRows = append(supportedRows, row)
 	}
 	for _, t := range taggers {
 		if catalogNames[t.Name] {
 			continue
 		}
-		unsupportedRows = append(unsupportedRows, s.installedTaggerRow(t, totalGalleries, modelPath))
+		unsupportedRows = append(unsupportedRows, s.installedTaggerRow(t, totalGalleries, modelPath, nil))
 	}
 	taggerRows := append(supportedRows, unsupportedRows...)
 	s.renderTemplate(w, "settings.html", settingsData{
 		baseData:           base,
 		Galleries:          s.galleryRowsWithSnapshot(s.activeGallery(), base.VisibleCount, base.TagCount),
-		Config:             s.cfgSnapshot(),
+		Config:             cfg,
 		Taggers:            taggers,
 		TaggerRows:         taggerRows,
 		ScheduleStatus:     s.sched.Status(),
-		ScheduleScope:      scheduleScopeView(s.cfgSnapshot(), base.MonloaderPaired),
+		ScheduleScope:      scheduleScopeView(cfg, taggers, base.MonloaderPaired),
 		Stats:              s.gatherStats(),
-		ExecutionProviders: executionProviderRows(),
+		ExecutionProviders: config.ExecutionProviders,
 		ScheduleModes:      scheduleModeRows(),
 		PluginPending:      s.pendingOffers(),
 		PluginPaired:       s.pairedPeerCount(),
@@ -124,7 +108,14 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		DesktopFolders:     s.availableFolders(),
 		Desktop:            s.desktopIntegration(),
 		DesktopJobWarning:  s.desktopJobWarning(),
+		PluginsRepoURL:     pluginsRepoURL(RepoURL),
 	})
+}
+
+// The registry sits beside this repository on whichever forge serves it.
+func pluginsRepoURL(repo string) string {
+	repo = strings.TrimRight(repo, "/")
+	return repo[:strings.LastIndex(repo, "/")+1] + "monbooru-plugins"
 }
 
 func (s *Server) settingsSchedulePost(w http.ResponseWriter, r *http.Request) {
@@ -140,22 +131,22 @@ func (s *Server) settingsSchedulePost(w http.ResponseWriter, r *http.Request) {
 	if !config.IsValidScheduleMode(mode) {
 		mode = config.ScheduleAtTime
 	}
-	s.cfgMu.Lock()
-	s.cfg.Schedule.Time = timeVal
-	s.cfg.Schedule.Mode = mode
-	s.cfg.Schedule.SyncGallery = r.FormValue("sync_gallery") == "on"
-	s.cfg.Schedule.RemoveOrphans = r.FormValue("remove_orphans") == "on"
-	s.cfg.Schedule.RunAutoTaggers = r.FormValue("run_auto_taggers") == "on"
-	s.cfg.Schedule.FindRelationPairs = r.FormValue("find_relation_pairs") == "on"
-	// Drawn only while monloader is paired; a box never on the page was
-	// not unticked.
-	if r.FormValue("lookup_switches") != "" {
-		s.cfg.Schedule.LookupPTR = r.FormValue("lookup_ptr") == "on"
-		s.cfg.Schedule.LookupBooru = r.FormValue("lookup_booru") == "on"
-	}
-	s.cfg.Schedule.Galleries = scheduleGalleriesForm(r, s.cfg.Schedule.Galleries, s.cfg.Galleries)
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	if err := s.withConfig(func(c *config.Config) error {
+		c.Schedule.Time = timeVal
+		c.Schedule.Mode = mode
+		c.Schedule.SyncGallery = r.FormValue("sync_gallery") == "on"
+		c.Schedule.RemoveOrphans = r.FormValue("remove_orphans") == "on"
+		c.Schedule.RunAutoTaggers = r.FormValue("run_auto_taggers") == "on"
+		c.Schedule.FindRelationPairs = r.FormValue("find_relation_pairs") == "on"
+		// Drawn only while monloader is paired; a box never on the page was
+		// not unticked.
+		if r.FormValue("lookup_switches") != "" {
+			c.Schedule.LookupPTR = r.FormValue("lookup_ptr") == "on"
+			c.Schedule.LookupBooru = r.FormValue("lookup_booru") == "on"
+		}
+		c.Schedule.Galleries = scheduleGalleriesForm(r, c.Schedule.Galleries, c.Galleries)
+		return nil
+	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
@@ -226,14 +217,13 @@ var scheduleColumns = []scheduleColumn{
 
 // Shown with one gallery too while a list is set, or that list would
 // restrict it unseen.
-func scheduleScopeView(cfg *config.Config, monloaderPaired bool) scheduleScope {
+func scheduleScopeView(cfg *config.Config, taggers []tagger.TaggerStatus, monloaderPaired bool) scheduleScope {
 	sched := cfg.Schedule
 	names := galleryNames(cfg.Galleries)
 	v := scheduleScope{Show: len(names) > 1 || len(sched.Galleries) > 0, Galleries: names}
 	if !v.Show {
 		return v
 	}
-	taggers := tagger.EnabledTaggers(cfg)
 	for _, c := range scheduleColumns {
 		if !monloaderPaired && (c.Action == config.ActionLookupPTR || c.Action == config.ActionLookupBooru) {
 			continue
@@ -244,7 +234,9 @@ func scheduleScopeView(cfg *config.Config, monloaderPaired bool) scheduleScope {
 		for _, name := range names {
 			c.Picked[name] = slices.Contains(list, name)
 			if c.Action == config.ActionRunAutoTaggers {
-				c.Idle[name] = !slices.ContainsFunc(taggers, func(t tagger.TaggerStatus) bool { return t.AppliesToGallery(name) })
+				c.Idle[name] = !slices.ContainsFunc(taggers, func(t tagger.TaggerStatus) bool {
+					return t.Enabled && t.Available && t.AppliesToGallery(name)
+				})
 			}
 		}
 		v.Columns = append(v.Columns, c)
@@ -312,28 +304,29 @@ func (s *Server) settingsGeneralPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", err.Error())
 		return
 	}
-	s.cfgMu.Lock()
-	if s.cfg.EnvPinned("gallery.watch_enabled") == "" {
-		s.cfg.Gallery.WatchEnabled = r.FormValue("watch_enabled") == "on"
-	}
-	if n, err := strconv.Atoi(r.FormValue("max_file_size_mb")); err == nil && n >= 0 && s.cfg.EnvPinned("gallery.max_file_size_mb") == "" {
-		s.cfg.Gallery.MaxFileSizeMB = n
-	}
-	s.cfg.Gallery.DefaultUploadFolder = uploadFolder
-	s.cfg.Gallery.DefaultUploadName = uploadName
-	s.cfg.Gallery.RenameOnIngest = r.FormValue("rename_on_ingest") == "on"
-	if s.cfg.EnvPinned("gallery.auto_meta_tags") == "" {
-		s.cfg.Gallery.AutoMetaTags = r.FormValue("auto_meta_tags") == "on"
-	}
-	if n, err := strconv.Atoi(r.FormValue("page_size")); err == nil && n > 0 {
-		s.cfg.UI.PageSize = min(n, config.MaxPageSize)
-	}
-	if fit := r.FormValue("thumbnail_fit"); fit == "square" || fit == "natural" {
-		s.cfg.UI.ThumbnailFit = fit
-	}
-	autoMeta := s.cfg.Gallery.AutoMetaTags
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	var autoMeta bool
+	if err := s.withConfig(func(c *config.Config) error {
+		if c.EnvPinned("gallery.watch_enabled") == "" {
+			c.Gallery.WatchEnabled = r.FormValue("watch_enabled") == "on"
+		}
+		if n, err := strconv.Atoi(r.FormValue("max_file_size_mb")); err == nil && n >= 0 && c.EnvPinned("gallery.max_file_size_mb") == "" {
+			c.Gallery.MaxFileSizeMB = n
+		}
+		c.Gallery.DefaultUploadFolder = uploadFolder
+		c.Gallery.DefaultUploadName = uploadName
+		c.Gallery.RenameOnIngest = r.FormValue("rename_on_ingest") == "on"
+		if c.EnvPinned("gallery.auto_meta_tags") == "" {
+			c.Gallery.AutoMetaTags = r.FormValue("auto_meta_tags") == "on"
+		}
+		if n, err := strconv.Atoi(r.FormValue("page_size")); err == nil && n > 0 {
+			c.UI.PageSize = min(n, config.MaxPageSize)
+		}
+		if fit := r.FormValue("thumbnail_fit"); fit == "square" || fit == "natural" {
+			c.UI.ThumbnailFit = fit
+		}
+		autoMeta = c.Gallery.AutoMetaTags
+		return nil
+	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
@@ -358,11 +351,12 @@ func (s *Server) settingsIgnorePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.cfgMu.Lock()
-	changed := !slices.Equal(s.cfg.Gallery.Ignore, ignore)
-	s.cfg.Gallery.Ignore = ignore
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	var changed bool
+	if err := s.withConfig(func(c *config.Config) error {
+		changed = !slices.Equal(c.Gallery.Ignore, ignore)
+		c.Gallery.Ignore = ignore
+		return nil
+	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
@@ -380,15 +374,15 @@ func (s *Server) settingsMonloaderPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	s.cfgMu.Lock()
-	if s.cfg.EnvPinned("server.monloader_url") == "" {
-		s.cfg.Server.MonloaderURL = strings.TrimSpace(r.FormValue("monloader_url"))
-	}
-	if s.cfg.EnvPinned("monloader.api_url") == "" {
-		s.cfg.Monloader.APIURL = strings.TrimSpace(r.FormValue("api_url"))
-	}
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	if err := s.withConfig(func(c *config.Config) error {
+		if c.EnvPinned("server.monloader_url") == "" {
+			c.Server.MonloaderURL = strings.TrimSpace(r.FormValue("monloader_url"))
+		}
+		if c.EnvPinned("monloader.api_url") == "" {
+			c.Monloader.APIURL = strings.TrimSpace(r.FormValue("api_url"))
+		}
+		return nil
+	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
@@ -421,15 +415,25 @@ func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "Error hashing password.")
 		return
 	}
-	s.cfgMu.Lock()
-	s.cfg.Auth.PasswordHash = string(hash)
-	s.cfg.Auth.EnablePassword = true
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	wasOn := s.authEnabled()
+	if err := s.withConfig(func(c *config.Config) error {
+		c.Auth.PasswordHash = string(hash)
+		c.Auth.EnablePassword = true
+		return nil
+	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
 	logx.Infof("settings: password updated from %s", clientIP(r))
+	if !wasOn {
+		// The page's CSRF token is the anon one, so it reloads onto the new session.
+		sessID := s.sessions.Create(s.sessionLifetimeDays())
+		s.sessions.ClearExcept(sessID)
+		s.setSessionCookie(w, r, sessID)
+		setFlashHeader(w, "Password updated.", "ok", nil)
+		w.Header().Set("HX-Refresh", "true")
+		return
+	}
 	s.sessions.ClearExcept(sessionFromContext(r.Context()))
 	writeInlineFlash(w, "ok", "Password updated.")
 	s.renderAuthPasswordOOB(w, r)
@@ -493,9 +497,9 @@ func (s *Server) settingsTokenRevoke(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) renderAuthTokensOOB(w http.ResponseWriter, r *http.Request) {
-	s.cfgMu.Lock()
+	s.cfgMu.RLock()
 	tokens := slices.Clone(s.cfg.Auth.Tokens)
-	s.cfgMu.Unlock()
+	s.cfgMu.RUnlock()
 	s.renderTemplate(w, "partials/auth_tokens.html", map[string]any{
 		"Tokens": tokens,
 		"OOB":    true,
@@ -510,7 +514,7 @@ type tokenScopeRow struct {
 
 func (s *Server) settingsTokenPrivilegesGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s.cfgMu.Lock()
+	s.cfgMu.RLock()
 	var scopes []string
 	var paired bool
 	i := slices.IndexFunc(s.cfg.Auth.Tokens, func(t config.Token) bool { return t.ID == id })
@@ -518,7 +522,7 @@ func (s *Server) settingsTokenPrivilegesGet(w http.ResponseWriter, r *http.Reque
 		scopes = slices.Clone(s.cfg.Auth.Tokens[i].Scopes)
 		paired = s.cfg.Auth.Tokens[i].Paired != ""
 	}
-	s.cfgMu.Unlock()
+	s.cfgMu.RUnlock()
 	if i < 0 {
 		http.Error(w, "token not found", http.StatusNotFound)
 		return
@@ -583,11 +587,11 @@ func (s *Server) settingsRemovePasswordPost(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
-	s.cfgMu.Lock()
-	s.cfg.Auth.EnablePassword = false
-	s.cfg.Auth.PasswordHash = ""
-	s.cfgMu.Unlock()
-	if err := s.saveConfig(); err != nil {
+	if err := s.withConfig(func(c *config.Config) error {
+		c.Auth.EnablePassword = false
+		c.Auth.PasswordHash = ""
+		return nil
+	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}

@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"maps"
 
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-const PTRLookupBatch = 500
+const ptrLookupBatch = 500
 
 // Both halves share the job slot the caller already holds.
 // The spelling is exact, a bare one meaning general, as the PTR writes it.
@@ -56,7 +56,7 @@ func ptrLookupCands(svc *tags.Service, ids []int64) ([]ptrLookupCand, error) {
 // An orphan spelling answers known with nothing behind it, so a connected
 // candidate beats it wherever it turns up; otherwise the tag's own orphan
 // name would shadow an alias holding the whole cluster.
-func ResolvePTRSpelling(graph map[string]PTRTagInfo, own string, aliases []string) (string, PTRTagInfo, bool) {
+func resolvePTRSpelling(graph map[string]PTRTagInfo, own string, aliases []string) (string, PTRTagInfo, bool) {
 	bareName, bareInfo, haveBare := "", PTRTagInfo{}, false
 	connected := func(name string, info PTRTagInfo) bool {
 		if len(info.Aliases)+len(info.Implications)+len(info.ImpliedBy) > 0 || (info.Ideal != "" && info.Ideal != name) {
@@ -150,8 +150,8 @@ func (l *Link) ptrResolveChunk(ctx context.Context, svc *tags.Service, chunk []p
 	for _, id := range unknown {
 		all = append(all, forms[id]...)
 	}
-	for start := 0; start < len(all); start += PTRLookupBatch {
-		part, err := l.PTRTagLookup(ctx, all[start:min(start+PTRLookupBatch, len(all))])
+	for start := 0; start < len(all); start += ptrLookupBatch {
+		part, err := l.PTRTagLookup(ctx, all[start:min(start+ptrLookupBatch, len(all))])
 		if err != nil {
 			return nil, err
 		}
@@ -161,7 +161,7 @@ func (l *Link) ptrResolveChunk(ctx context.Context, svc *tags.Service, chunk []p
 		if _, done := out[c.id]; done {
 			continue
 		}
-		if spelling, info, ok := ResolvePTRSpelling(graph, c.name, forms[c.id]); ok {
+		if spelling, info, ok := resolvePTRSpelling(graph, c.name, forms[c.id]); ok {
 			info.Aliases = append(info.Aliases, spelling)
 			out[c.id] = info
 		}
@@ -198,17 +198,21 @@ func (l *Link) PTRTagSweep(svc *tags.Service, ids []int64, as string) {
 	l.jobs.Update(0, total, "PTR lookup…")
 	for len(cands) > 0 && !cancelled && !unavailable {
 		createdTags := map[int64]struct{}{}
-		for start := 0; start < len(cands) && !cancelled; start += PTRLookupBatch {
+		for start := 0; start < len(cands) && !cancelled; start += ptrLookupBatch {
 			if ctx.Err() != nil {
 				cancelled = true
 				break
 			}
-			chunk := cands[start:min(start+PTRLookupBatch, len(cands))]
+			chunk := cands[start:min(start+ptrLookupBatch, len(cands))]
 			results, err := l.ptrResolveChunk(ctx, svc, chunk, as)
 			if errors.Is(err, ErrPTRUnavailable) {
 				// The PTR going away mid-sweep is a degraded stop, not a
 				// failure: what already applied stays.
 				unavailable = true
+				break
+			}
+			if err != nil && ctx.Err() != nil {
+				cancelled = true
 				break
 			}
 			if err != nil {
@@ -288,6 +292,15 @@ func (l *Link) PTRTagSweep(svc *tags.Service, ids []int64, as string) {
 	l.jobs.Finish(nil, cancelled, fmt.Sprintf("PTR lookup cancelled (%d/%d processed)", processed, total), msg)
 }
 
+func ptrResolve(svc *tags.Service, name string) (catID int64, normalized string, ok bool, err error) {
+	catID, bare, ok := svc.ParseForm(name)
+	if !ok {
+		return 0, "", false, nil
+	}
+	normalized, err = tags.ValidateTagName(bare)
+	return catID, normalized, true, err
+}
+
 // The PTR ideal becomes an alias too, since locally this tag stays the
 // canonical. An alias only takes an unused name, so the operator's
 // catalog wins; AddImplicationFrom guards cycles and aliases.
@@ -299,13 +312,8 @@ func applyPTRTagInfo(svc *tags.Service, tagID int64, info PTRTagInfo, fanOutPare
 		aliasNames = append([]string{info.Ideal}, aliasNames...)
 	}
 	for _, name := range aliasNames {
-		catID, bare, ok := svc.ParseForm(name)
-		if !ok {
-			dropped++
-			continue
-		}
-		normalized, err := tags.ValidateTagName(bare)
-		if err != nil {
+		catID, normalized, ok, err := ptrResolve(svc, name)
+		if !ok || err != nil {
 			dropped++
 			continue
 		}
@@ -325,11 +333,10 @@ func applyPTRTagInfo(svc *tags.Service, tagID int64, info PTRTagInfo, fanOutPare
 		aliases++
 	}
 	for _, name := range info.Implications {
-		catID, bare, ok := svc.ParseForm(name)
+		catID, normalized, ok, err := ptrResolve(svc, name)
 		if !ok {
 			continue
 		}
-		normalized, err := tags.ValidateTagName(bare)
 		if err != nil {
 			logx.Warnf("ptr implication %q: %v", name, err)
 			continue
@@ -364,11 +371,10 @@ func applyPTRTagInfo(svc *tags.Service, tagID int64, info PTRTagInfo, fanOutPare
 	}
 	if pullImpliedBy {
 		for _, name := range info.ImpliedBy {
-			catID, bare, ok := svc.ParseForm(name)
+			catID, normalized, ok, err := ptrResolve(svc, name)
 			if !ok {
 				continue
 			}
-			normalized, err := tags.ValidateTagName(bare)
 			if err != nil {
 				logx.Warnf("ptr implied-by %q: %v", name, err)
 				continue

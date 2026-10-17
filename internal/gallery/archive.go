@@ -12,30 +12,33 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/fsx"
+	"github.com/monbooru/monbooru/internal/models"
 )
 
 type MangaPage struct {
 	Path         string
 	OriginalName string
+	file         *zip.File
 }
 
 type Manga struct {
-	Pages  []MangaPage
-	zr     *zip.ReadCloser
-	byPath map[string]*zip.File
+	Pages []MangaPage
+	zr    *zip.ReadCloser
 }
 
 var errEmptyManga = errors.New("archive contains no recognised image entries")
 
-var pageImageExts = map[string]struct{}{
-	".jpg":  {},
-	".jpeg": {},
-	".png":  {},
-	".webp": {},
-	".avif": {},
-	".jxl":  {},
-	".gif":  {},
-}
+var pageImageExts = func() map[string]struct{} {
+	exts := map[string]struct{}{}
+	for _, ft := range models.FileTypes {
+		if ft.PageImage {
+			for _, e := range ft.Exts {
+				exts[e] = struct{}{}
+			}
+		}
+	}
+	return exts
+}()
 
 var pageSkipBasenames = map[string]struct{}{
 	".ds_store":   {},
@@ -49,7 +52,6 @@ func OpenManga(path string) (*Manga, error) {
 		return nil, fmt.Errorf("open archive %q: %w", path, err)
 	}
 	pages := make([]MangaPage, 0, len(zr.File))
-	byPath := make(map[string]*zip.File, len(zr.File))
 	for _, f := range zr.File {
 		name := f.Name
 		if strings.HasSuffix(name, "/") {
@@ -69,17 +71,16 @@ func OpenManga(path string) (*Manga, error) {
 		if f.UncompressedSize64 == 0 {
 			continue
 		}
-		pages = append(pages, MangaPage{Path: name, OriginalName: filepath.Base(name)})
-		byPath[name] = f
+		pages = append(pages, MangaPage{Path: name, OriginalName: filepath.Base(name), file: f})
 	}
-	sort.Slice(pages, func(i, j int) bool {
+	sort.SliceStable(pages, func(i, j int) bool {
 		return NaturalLess(strings.ToLower(pages[i].Path), strings.ToLower(pages[j].Path))
 	})
 	if len(pages) == 0 {
 		_ = zr.Close()
 		return nil, errEmptyManga
 	}
-	return &Manga{Pages: pages, zr: zr, byPath: byPath}, nil
+	return &Manga{Pages: pages, zr: zr}, nil
 }
 
 func (m *Manga) Close() error {
@@ -100,11 +101,7 @@ func (m *Manga) pageReader(n int) (io.ReadCloser, error) {
 	if n < 0 || n >= len(m.Pages) {
 		return nil, fmt.Errorf("page %d out of range [1,%d]", n+1, len(m.Pages))
 	}
-	f, ok := m.byPath[m.Pages[n].Path]
-	if !ok {
-		return nil, fmt.Errorf("page %d not in archive", n+1)
-	}
-	return f.Open()
+	return m.Pages[n].file.Open()
 }
 
 func (m *Manga) extractPage(n int, dst string) error {
@@ -142,11 +139,14 @@ func (m *Manga) coverDimensions() (int, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, 0, fmt.Errorf("the cover is %dx%d, it has no pixels", cfg.Width, cfg.Height)
+	}
 	return cfg.Width, cfg.Height, nil
 }
 
 func (m *Manga) ffmpegPage(n int) bool {
-	return IsFFmpegStill(ExtFileType(m.Pages[n].OriginalName))
+	return IsFFmpegStill(models.ExtFileType(m.Pages[n].OriginalName))
 }
 
 // ffmpeg reads a file, not the zip stream, so the page goes to a temp file.

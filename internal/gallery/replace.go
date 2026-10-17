@@ -6,13 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/lookup"
+	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // ApplyReplacedFile commits the row before the staged file renames into
@@ -41,14 +43,14 @@ func ApplyReplacedFile(h Handle, imageID int64, stagedPath, newSHA, newMD5, newT
 		return nil, fmt.Errorf("stat staged file: %w", err)
 	}
 	// newType comes from the client's filename; the bytes decide.
-	if actual, magicErr := detectMagicType(stagedPath); magicErr == nil {
+	if actual, magicErr := MagicFileType(stagedPath); magicErr == nil {
 		newType = actual
 	}
 	newW, newH := stillDimensions(stagedPath, newType)
 	sdMeta, comfyMeta, sourceType := extractGenerationMeta(stagedPath, newType)
 
 	newPath := oldPath
-	if newExt := extForFileType(newType); newExt != "" && ExtFileType(oldPath) != newType {
+	if newExt := extForFileType(newType); newExt != "" && models.ExtFileType(oldPath) != newType {
 		stem := filepath.Base(oldPath)
 		stem = stem[:len(stem)-len(filepath.Ext(stem))]
 		if newPath, err = CreateUnique(filepath.Dir(oldPath), stem+newExt); err != nil {
@@ -70,7 +72,10 @@ func ApplyReplacedFile(h Handle, imageID int64, stagedPath, newSHA, newMD5, newT
 	}
 
 	backupPath := stagedPath + ".old"
-	if err := moveIntoPlace(oldPath, backupPath); err != nil {
+	hadOld := true
+	if err := moveIntoPlace(oldPath, backupPath); errors.Is(err, fs.ErrNotExist) {
+		hadOld = false
+	} else if err != nil {
 		dropReservation()
 		return nil, fmt.Errorf("move old file aside: %w", err)
 	}
@@ -122,8 +127,10 @@ func ApplyReplacedFile(h Handle, imageID int64, stagedPath, newSHA, newMD5, newT
 	}
 	if err := db.InWriteTx(database.Write, commit); err != nil {
 		dropReservation()
-		if rbErr := moveIntoPlace(backupPath, oldPath); rbErr != nil {
-			logx.Warnf("replace: restore of %q failed after aborted swap: %v", oldPath, rbErr)
+		if hadOld {
+			if rbErr := moveIntoPlace(backupPath, oldPath); rbErr != nil {
+				logx.Warnf("replace: restore of %q failed after aborted swap: %v", oldPath, rbErr)
+			}
 		}
 		return nil, err
 	}
@@ -134,7 +141,7 @@ func ApplyReplacedFile(h Handle, imageID int64, stagedPath, newSHA, newMD5, newT
 		logx.Warnf("replace: chmod staged file %q: %v", stagedPath, err)
 	}
 	if err := moveIntoPlace(stagedPath, newPath); err != nil {
-		putOldFileBack(database, galleryPath, imageID, oldPath, newPath, backupPath)
+		putOldFileBack(database, galleryPath, imageID, oldPath, newPath, backupPath, hadOld)
 		return nil, fmt.Errorf("place replaced file: %w", err)
 	}
 	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
@@ -158,13 +165,17 @@ func ApplyReplacedFile(h Handle, imageID int64, stagedPath, newSHA, newMD5, newT
 // The committed row names bytes that never landed. With the old file back
 // where the row points, the watcher or the next sync re-derives the row
 // from it, tags kept, rather than both versions being lost.
-func putOldFileBack(database *db.DB, galleryPath string, imageID int64, oldPath, newPath, backupPath string) {
+func putOldFileBack(database *db.DB, galleryPath string, imageID int64, oldPath, newPath, backupPath string, hadOld bool) {
 	if newPath != oldPath {
 		if err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
-			return repointCanonical(tx, imageID, oldPath, FolderPath(galleryPath, oldPath), newPath)
+			// No mtime: the row names the new bytes, so the old file must be hashed.
+			return repointCanonical(tx, imageID, oldPath, FolderPath(galleryPath, oldPath), newPath, 0, 0)
 		}); err != nil {
 			logx.Warnf("replace: pointing image %d back at %q: %v", imageID, oldPath, err)
 		}
+	}
+	if !hadOld {
+		return
 	}
 	if err := moveIntoPlace(backupPath, oldPath); err != nil {
 		logx.Warnf("replace: putting %q back after a failed placement: %v", oldPath, err)

@@ -1,4 +1,5 @@
-// Package web is the HTTP transport: routes, handlers and templates.
+// Package web is the HTTP transport (routes, handlers, templates) and the
+// process's composition root: NewServer opens the set and starts every loop.
 package web
 
 import (
@@ -26,17 +27,19 @@ import (
 
 	"github.com/monbooru/monbooru/internal/api"
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/desktop"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/plugins"
 	"github.com/monbooru/monbooru/internal/schedule"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
+	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/session"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"github.com/monbooru/monbooru/internal/tags"
 	webFS "github.com/monbooru/monbooru/web"
@@ -75,9 +78,8 @@ type Server struct {
 	cfgMu      sync.RWMutex // guards cfg reads/writes and config.Save calls
 	jobs       *jobs.Manager
 	pairs      *peer.Store
-	sessions   *SessionStore
+	sessions   *session.Store
 	loginRL    *loginRateLimiter
-	csrfSecret []byte
 	tmpl       *template.Template
 	staticFS   fs.FS
 	done       chan struct{}
@@ -114,7 +116,10 @@ type Desktop struct {
 }
 
 func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, dk Desktop) (*Server, error) {
-	sessions := NewSessionStore()
+	sessions := session.New()
+	if configPath != "" {
+		metadata.SetNodeOverlay(filepath.Join(filepath.Dir(configPath), "comfyui_nodes.json"))
+	}
 
 	tmpl, err := template.New("").Funcs(templateFuncs()).ParseFS(webFS.FS, "templates/*.html", "templates/partials/*.html")
 	if err != nil {
@@ -133,7 +138,6 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 		pairs:        peer.NewStore(),
 		sessions:     sessions,
 		loginRL:      newLoginRateLimiter(),
-		csrfSecret:   mustRandBytes(32),
 		tmpl:         tmpl,
 		staticFS:     staticFS,
 		done:         make(chan struct{}),
@@ -228,9 +232,9 @@ func (s *Server) runMemoryReclaim() {
 			s.ml.Fetches.Prune()
 			s.ml.ReconcileAll(s.allContexts())
 			debug.FreeOSMemory()
-			s.cfgMu.Lock()
+			s.cfgMu.RLock()
 			mins := s.cfg.Tagger.IdleReleaseAfterMinutes
-			s.cfgMu.Unlock()
+			s.cfgMu.RUnlock()
 			if mins > 0 {
 				before := readVmRSS()
 				if tagger.ReleaseIdle(time.Duration(mins) * time.Minute) {
@@ -339,7 +343,7 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.free("GET /thumbnails/{gallery}/{file}", s.serveThumbnail)
 	// Found, not permanent: the target follows the active theme.
 	rt.free("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, s.booruFaviconURL(), http.StatusFound)
+		http.Redirect(w, r, themeFaviconURL(s.activeTheme()), http.StatusFound)
 	})
 
 	rt.free("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -350,7 +354,8 @@ func (s *Server) registerRoutes(rt *routes) {
 		w.WriteHeader(http.StatusOK)
 		// A second launch reads "app" to tell this instance from another
 		// program on the port.
-		_ = json.NewEncoder(w).Encode(map[string]string{"app": "monbooru", "status": "ok", "version": Version})
+		_ = json.NewEncoder(w).Encode(map[string]any{"app": "monbooru", "status": "ok", "version": Version,
+			"api": peer.APIVersion, "min_peer_api": peer.MinPeerAPI})
 	})
 
 	rt.free("GET /login", s.loginPage)
@@ -459,7 +464,7 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /settings/general", s.settingsGeneralPost)
 	rt.read("POST /settings/general/ignore", s.settingsIgnorePost)
 	rt.free("POST /settings/monloader", s.settingsMonloaderPost)
-	rt.read("POST /settings/tagger", s.settingsTaggerPost)
+	rt.free("POST /settings/tagger", s.settingsTaggerPost)
 	rt.free("POST /settings/auth/password", s.settingsPasswordPost)
 	rt.free("POST /settings/auth/remove-password", s.settingsRemovePasswordPost)
 	rt.free("POST /settings/auth/tokens", s.settingsTokenCreate)
@@ -467,8 +472,8 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.free("GET /settings/auth/tokens/{id}/privileges", s.settingsTokenPrivilegesGet)
 	rt.free("POST /settings/auth/tokens/{id}/privileges", s.settingsTokenPrivilegesPost)
 	rt.read("PATCH /settings/categories/{id}", s.updateCategoryPatch)
-	rt.read("POST /settings/schedule", s.settingsSchedulePost)
-	rt.read("POST /settings/schedule/run", s.settingsScheduleRunPost)
+	rt.free("POST /settings/schedule", s.settingsSchedulePost)
+	rt.free("POST /settings/schedule/run", s.settingsScheduleRunPost)
 	rt.read("GET /setup", s.setupPage)
 	// The wizard's submit repoints the default gallery.
 	rt.write("POST /setup", s.setupPost)
@@ -485,12 +490,6 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("POST /settings/maintenance/tag-conflicts", s.tagCategoryConflictsPost)
 	rt.read("POST /settings/maintenance/find-folded-duplicates", s.findFoldedDuplicatesPost)
 	rt.read("POST /settings/maintenance/lookup-due", s.lookupDuePost)
-	rt.read("GET /settings/maintenance/duplicates-list", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/relations/duplicates/sha256", http.StatusMovedPermanently)
-	})
-	rt.read("POST /settings/maintenance/remove-duplicates", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/relations/file-duplicates/remove", http.StatusMovedPermanently)
-	})
 	rt.read("POST /relations/file-duplicates/remove", s.removeDuplicatesPost)
 	rt.read("GET /relations/duplicates/sha256", s.sha256WalkerPage)
 	rt.read("POST /relations/duplicates/sha256/remove-one", s.sha256WalkerRemoveOnePost)
@@ -525,14 +524,14 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.read("GET /images/{id}/relations", s.imageRelationsPage)
 	rt.read("POST /settings/maintenance/vacuum-db", s.vacuumDBPost)
 	rt.read("POST /settings/maintenance/free-memory", s.freeMemoryPost)
-	rt.read("POST /settings/tagger/{name}/enable", s.settingsTaggerEnablePost)
-	rt.read("POST /settings/tagger/{name}/disable", s.settingsTaggerDisablePost)
-	rt.read("POST /settings/tagger/{name}/delete", s.settingsTaggerDeletePost)
+	rt.free("POST /settings/tagger/{name}/enable", s.settingsTaggerEnablePost)
+	rt.free("POST /settings/tagger/{name}/disable", s.settingsTaggerDisablePost)
+	rt.free("POST /settings/tagger/{name}/delete", s.settingsTaggerDeletePost)
 	rt.read("GET /settings/tagger/{name}/config", s.settingsTaggerConfigGet)
-	rt.read("POST /settings/tagger/{name}/config", s.settingsTaggerConfigPost)
+	rt.free("POST /settings/tagger/{name}/config", s.settingsTaggerConfigPost)
 	rt.read("GET /settings/tagger/{name}/labels", s.settingsTaggerLabelsGet)
 	rt.read("POST /settings/tagger/{name}/mapping", s.settingsTaggerMappingPost)
-	rt.read("POST /settings/tagger/{name}/reset", s.settingsTaggerResetPost)
+	rt.free("POST /settings/tagger/{name}/reset", s.settingsTaggerResetPost)
 
 	rt.read("POST /search/saved", s.createSavedSearch)
 	rt.read("DELETE /search/saved/{id}", s.deleteSavedSearch)
@@ -586,10 +585,10 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.free("GET /settings/galleries/{name}/export", s.settingsGalleryExport)
 	rt.write("POST /settings/galleries/{name}/import", s.settingsGalleryImport)
 
-	rt.read("POST /api/v1/pair/request", s.pairRequest)
-	rt.read("GET /api/v1/pair/status", s.pairStatus)
-	rt.read("POST /api/v1/pair/remove", s.pairTeardown)
-	rt.read("GET /internal/plugins/pairing", s.pluginPairingFragment)
+	rt.free("POST /api/v1/pair/request", s.pairRequest)
+	rt.free("GET /api/v1/pair/status", s.pairStatus)
+	rt.free("POST /api/v1/pair/remove", s.pairTeardown)
+	rt.free("GET /internal/plugins/pairing", s.pluginPairingFragment)
 	rt.free("POST /settings/plugins/pair/{id}/approve", s.pluginPairApprove)
 	rt.free("POST /settings/plugins/pair/{id}/deny", s.pluginPairDeny)
 	rt.free("POST /settings/plugins/{name}/remove", s.pluginPairRemove)
@@ -696,12 +695,14 @@ type ratingLevel struct {
 	Label string
 }
 
-var ratingFooterLevels = []ratingLevel{
-	{Value: "general", Label: "sfw"},
-	{Value: "sensitive", Label: "sensitive"},
-	{Value: "questionable", Label: "questionable"},
-	{Value: "explicit", Label: "explicit"},
-}
+var ratingFooterLevels = func() []ratingLevel {
+	levels := make([]ratingLevel, len(tags.RatingLevels))
+	for i, name := range tags.RatingLevels {
+		levels[i] = ratingLevel{Value: name, Label: name}
+	}
+	levels[0].Label = "sfw"
+	return levels
+}()
 
 type baseData struct {
 	Title       string
@@ -736,6 +737,7 @@ type baseData struct {
 	MonloaderUsable     bool
 	MonloaderConn       string
 	MonloaderVersion    string
+	MonloaderMismatch   string
 	MonloaderSeen       string
 	MonloaderPTR        bool
 	MonloaderPTRSyncing bool
@@ -775,27 +777,28 @@ func (s *Server) base(r *http.Request, nav, title string) baseData {
 	}
 	paired := s.pairedWith(monloader.App)
 	monloaderUsable := s.ml.Usable()
-	themeSheet := s.activeTheme().Path != ""
+	theme := s.activeTheme()
 	return baseData{
 		Title:               title,
 		ActiveNav:           nav,
-		CSRFToken:           s.csrfToken(sessID),
+		CSRFToken:           s.sessions.CSRFToken(sessID),
 		AuthEnabled:         s.authEnabled(),
 		Degraded:            degraded,
 		Version:             Version,
 		RepoURL:             RepoURL,
 		DocURL:              DocURL,
 		Build:               BuildLabel(),
-		Theme:               themeSheet,
+		Theme:               theme.Path != "",
 		SidebarCollapsed:    sidebarCollapsed(r),
 		BooruName:           s.booruName(),
-		BooruLogo:           s.booruLogoURL(),
-		BooruFavicon:        s.booruFaviconURL(),
+		BooruLogo:           themeLogoURL(theme),
+		BooruFavicon:        themeFaviconURL(theme),
 		MonloaderURL:        s.monloaderWebBase(),
 		MonloaderPaired:     paired,
 		MonloaderUsable:     monloaderUsable,
 		MonloaderConn:       ml.Conn,
 		MonloaderVersion:    ml.Version,
+		MonloaderMismatch:   ml.APIMismatch,
 		MonloaderSeen:       ml.Panels(),
 		MonloaderPTR:        ml.PTR,
 		MonloaderPTRSyncing: ml.PTRSyncing,
@@ -976,10 +979,8 @@ func (s *Server) passwordPinned() string {
 
 // The slices settings writers edit in place are cloned; what their elements
 // hold is replaced wholesale, never written through, so one level is enough.
-func (s *Server) cfgSnapshot() *config.Config {
-	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
-	c := *s.cfg
+func cloneConfig(cfg *config.Config) *config.Config {
+	c := *cfg
 	c.Galleries = slices.Clone(c.Galleries)
 	c.Plugins = slices.Clone(c.Plugins)
 	c.Auth.Tokens = slices.Clone(c.Auth.Tokens)
@@ -987,16 +988,20 @@ func (s *Server) cfgSnapshot() *config.Config {
 	return &c
 }
 
+func (s *Server) cfgSnapshot() *config.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return cloneConfig(s.cfg)
+}
+
 func (s *Server) galleries() []config.Gallery {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
-	out := make([]config.Gallery, len(s.cfg.Galleries))
-	copy(out, s.cfg.Galleries)
-	return out
+	return slices.Clone(s.cfg.Galleries)
 }
 
-func (s *Server) booruLogoURL() string {
-	if s.activeTheme().Logo != "" {
+func themeLogoURL(e themeEntry) string {
+	if e.Logo != "" {
 		return "/theme.logo"
 	}
 	return "/static/logo.png"
@@ -1004,8 +1009,7 @@ func (s *Server) booruLogoURL() string {
 
 // Versioned: browsers keep favicons outside the page cache and Firefox
 // does not revalidate them, so a fixed URL keeps the first icon seen.
-func (s *Server) booruFaviconURL() string {
-	e := s.activeTheme()
+func themeFaviconURL(e themeEntry) string {
 	if e.Favicon == "" {
 		return "/static/favicon.png"
 	}
@@ -1036,8 +1040,7 @@ func (s *Server) monloaderLink() monloader.LinkConfig {
 func (s *Server) monloaderWebBase() string {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
-	base := cmp.Or(s.cfg.Server.MonloaderURL, s.cfg.Monloader.APIURL)
-	return strings.TrimRight(base, "/")
+	return strings.TrimRight(s.cfg.Server.MonloaderURL, "/")
 }
 
 func (s *Server) resolveMangaImage(idStr string) (string, bool) {
@@ -1094,7 +1097,7 @@ func (s *Server) serveMangaPagePath(
 		http.NotFound(w, r)
 		return
 	}
-	if fileType := gallery.ExtFileType(page); negotiate && gallery.IsFFmpegStill(fileType) {
+	if fileType := models.ExtFileType(page); negotiate && gallery.IsFFmpegStill(fileType) {
 		w.Header().Add("Vary", "Accept")
 		if !acceptsMediaType(r.Header.Get("Accept"), gallery.MIMEForFileType(fileType)) {
 			if view, err := gallery.EnsureMangaPageView(s.thumbnailsPath(), canonPath, id, n); err != nil {
@@ -1212,6 +1215,10 @@ func (s *Server) Close() {
 	}
 	// Otherwise ReleaseAll waits out a running auto-tag chunk.
 	s.jobs.Cancel()
+	const jobWait = 5 * time.Second
+	if !s.jobs.WaitIdle(jobWait) {
+		logx.Warnf("shutdown: a job was still running %s after its cancel", jobWait)
+	}
 	s.peers.StopAll()
 	tagger.ReleaseAll()
 	s.set.Close()
@@ -1220,14 +1227,15 @@ func (s *Server) Close() {
 func (s *Server) withConfig(fn func(*config.Config) error) error {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
+	before := cloneConfig(s.cfg)
 	if err := fn(s.cfg); err != nil {
+		*s.cfg = *before
 		return err
 	}
 	if err := config.Save(s.cfg, s.configPath); err != nil {
+		*s.cfg = *before
 		logx.Errorf("config save: %v", err)
 		return err
 	}
 	return nil
 }
-
-func (s *Server) saveConfig() error { return s.withConfig(func(*config.Config) error { return nil }) }

@@ -126,9 +126,8 @@ func HiddenByCeiling(src Source, expr Expr, level string) (int, error) {
 // row with an EXISTS.
 func exactCountWhere(src Source, expr Expr) (string, []any) {
 	driverLegs, _ := pickAndDriverTag(src.DB, expr, true)
-	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(expr, src, driverLegs)
-	where, args = applyAndDriver(where, args, driverLegs)
-	return andDefaultVisible(where, hasMissingFilter), args
+	where, args, _, _ := visibleWhere(src, expr, driverLegs)
+	return where, args
 }
 
 // Only a lone literal tag, bare or category-qualified, counts exactly on
@@ -217,32 +216,22 @@ func fastCountTag(src Source, t TagExpr) (int, bool) {
 	if t.Tag == "" {
 		return 0, false
 	}
-	pred, arg, ok := tagNamePredicate("name", t.Wildcard, t.Tag)
+	canonIDs, usage, ok := resolveDriverCanonicals(src.DB, t)
 	if !ok {
-		return 0, false
-	}
-	canonIDs, err := db.QueryIDs(src.DB.Read,
-		`SELECT DISTINCT COALESCE(canonical_tag_id, id) FROM tags WHERE `+pred,
-		arg,
-	)
-	if err != nil {
 		return 0, false
 	}
 	if len(canonIDs) == 0 {
 		return 0, true
 	}
 	if len(canonIDs) == 1 {
-		return countRow(src, `SELECT usage_count FROM tags WHERE id = ?`, canonIDs[0])
+		return int(usage), true
 	}
 	// Same name in two categories: a sum over-counts, and an exact name
 	// wants an exact count.
 	if t.Wildcard == "" {
 		return 0, false
 	}
-	n, ok := countRow(src, `SELECT COALESCE(SUM(usage_count), 0) FROM tags WHERE id IN (`+inlineIDs(canonIDs)+`)`)
-	if !ok {
-		return 0, false
-	}
+	n := int(usage)
 	if n < fastApproxThreshold {
 		return 0, false
 	}
@@ -261,7 +250,7 @@ func fastCountNot(src Source, e NotExpr) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	visible, ok := fastVisibleCount(src)
+	visible, ok := src.Tallies.VisibleCount()
 	if !ok {
 		return 0, false
 	}
@@ -285,7 +274,7 @@ func addInts(a, b int) int { return a + b }
 func minInt(a, b int) int { return min(a, b) }
 
 func capToVisible(src Source, sum int) (int, bool) {
-	v, ok := fastVisibleCount(src)
+	v, ok := src.Tallies.VisibleCount()
 	if !ok {
 		return 0, false
 	}
@@ -293,11 +282,16 @@ func capToVisible(src Source, sum int) (int, bool) {
 }
 
 func fastCountAnd(src Source, e AndExpr) (int, bool) {
-	minN, ok := fastCountBinary(src, e.Left, e.Right, fastTagTotal, minInt)
-	if !ok || minN < fastApproxThreshold {
+	l, lOK := fastTagTotal(src, e.Left)
+	r, rOK := fastTagTotal(src, e.Right)
+	// Every fast count is an upper bound, so either leg's 0 is exact.
+	if lOK && l == 0 || rOK && r == 0 {
+		return 0, true
+	}
+	if !lOK || !rOK || min(l, r) < fastApproxThreshold {
 		return 0, false
 	}
-	return minN, true
+	return min(l, r), true
 }
 
 func fastCountOr(src Source, e OrExpr) (int, bool) {
@@ -327,7 +321,7 @@ func fastCountLookup(src Source, e FilterExpr) (int, bool) {
 	if strings.ToLower(e.Val) != "never" {
 		return 0, false
 	}
-	visible, ok := fastVisibleCount(src)
+	visible, ok := src.Tallies.VisibleCount()
 	if !ok {
 		return 0, false
 	}
@@ -348,10 +342,7 @@ func fastCountCat(src Source, e FilterExpr) (int, bool) {
 		   AND category_id = (SELECT id FROM tag_categories WHERE name = ?)`,
 		strings.ToLower(e.Val),
 	)
-	if !ok {
-		return 0, false
-	}
-	if n < fastApproxThreshold {
+	if !ok || n < fastApproxThreshold {
 		return 0, false
 	}
 	return n, true
@@ -367,25 +358,14 @@ func fastCountFilter(src Source, e FilterExpr) (int, bool) {
 	if searchkw.IsKeyword(e.Key) {
 		return 0, false
 	}
-	catID, ok, err := tags.CategoryIDByName(src.DB, e.Key)
-	if !ok || err != nil {
+	if _, ok, err := tags.CategoryIDByName(src.DB, e.Key); !ok || err != nil {
 		return 0, false
 	}
-	var n int
-	err = src.DB.Read.QueryRow(
-		`SELECT canon.usage_count FROM tags t
-		 JOIN tags canon ON canon.id = COALESCE(t.canonical_tag_id, t.id)
-		 WHERE t.name = ? AND t.category_id = ?
-		 LIMIT 1`,
-		tags.NormalizeTagName(e.Val), catID,
-	).Scan(&n)
-	if err == sql.ErrNoRows {
-		return 0, true
-	}
-	if err != nil {
+	_, usage, ok := resolveFilterDriverCanonicals(src.DB, e.Key, tags.NormalizeTagName(e.Val))
+	if !ok {
 		return 0, false
 	}
-	return n, true
+	return int(usage), true
 }
 
 // usage_count bounds rating:X from above, exactly for the top level; an
@@ -481,13 +461,10 @@ func fastCountAI(src Source, e FilterExpr) (int, bool) {
 // Visible minus the cached untagged count; the NOT EXISTS behind it is
 // too slow to run per search.
 func fastCountTagged(src Source, e FilterExpr) (int, bool) {
-	if e.Val != "" {
-		val, ok := searchkw.ParseBool(e.Val)
-		if !ok || !val {
-			return 0, false
-		}
+	if val, ok := searchkw.ParseBool(e.Val); !ok || !val {
+		return 0, false
 	}
-	visible, ok := fastVisibleCount(src)
+	visible, ok := src.Tallies.VisibleCount()
 	if !ok {
 		return 0, false
 	}
@@ -536,10 +513,6 @@ func fastCountGenerated(src Source, e FilterExpr) (int, bool) {
 
 func countRow(src Source, query string, args ...any) (int, bool) {
 	var n int
-	if err := src.DB.Read.QueryRow(query, args...).Scan(&n); err != nil {
-		return 0, false
-	}
-	return n, true
+	err := src.DB.Read.QueryRow(query, args...).Scan(&n)
+	return n, err == nil
 }
-
-func fastVisibleCount(src Source) (int, bool) { return src.Tallies.VisibleCount() }

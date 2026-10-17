@@ -4,7 +4,7 @@ import (
 	"cmp"
 	"net/http"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -32,12 +32,13 @@ func (s *Server) loginPageData(extra map[string]any) map[string]any {
 
 // Carries every field partials/head.html reads: these pages skip s.base().
 func (s *Server) standalonePageData(title string, extra map[string]any) map[string]any {
+	theme := s.activeTheme()
 	data := map[string]any{
 		"Title":        title,
-		"CSRFToken":    s.csrfToken("anon"),
+		"CSRFToken":    s.sessions.CSRFToken("anon"),
 		"BooruName":    s.booruName(),
-		"BooruFavicon": s.booruFaviconURL(),
-		"Theme":        s.activeTheme().Path != "",
+		"BooruFavicon": themeFaviconURL(theme),
+		"Theme":        theme.Path != "",
 	}
 	for k, v := range extra {
 		data[k] = v
@@ -77,27 +78,33 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	s.loginRL.recordSuccess(ip)
 	logx.Infof("login success from %s", ip)
 
-	sessID := s.sessions.NewSession(s.sessionLifetimeDays())
+	s.setSessionCookie(w, r, s.sessions.Create(s.sessionLifetimeDays()))
+	http.Redirect(w, r, cmp.Or(next, "/"), http.StatusSeeOther)
+}
 
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, sessID string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "monbooru_session",
 		Value:    sessID,
 		Path:     "/",
 		MaxAge:   s.sessionLifetimeDays() * 86400,
 		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, cmp.Or(next, "/"), http.StatusSeeOther)
 }
 
 func (s *Server) logoutPost(w http.ResponseWriter, r *http.Request) {
 	sessID := sessionFromContext(r.Context())
-	s.sessions.DeleteSession(sessID)
+	s.sessions.Delete(sessID)
 	http.SetCookie(w, &http.Cookie{
-		Name:   "monbooru_session",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:     "monbooru_session",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
 	})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }

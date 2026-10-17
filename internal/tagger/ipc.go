@@ -10,7 +10,6 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/gob"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +22,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type ipcMethod uint8
@@ -122,10 +121,7 @@ func (b *ipcBackend) ensureRunning() error {
 	if b.cmd != nil && b.conn != nil {
 		return nil
 	}
-	token, err := newIPCToken()
-	if err != nil {
-		return err
-	}
+	token := rand.Text()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("listen tcp: %w", err)
@@ -198,14 +194,6 @@ func workerEnv(token string) []string {
 	return env
 }
 
-func newIPCToken() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("tagger ipc token: %w", err)
-	}
-	return hex.EncodeToString(b[:]), nil
-}
-
 func ipcHandshakeOK(c net.Conn, want string) bool {
 	_ = c.SetReadDeadline(time.Now().Add(ipcHandshakeTimeout))
 	var hello ipcHello
@@ -254,12 +242,20 @@ func (b *ipcBackend) reapLocked(dropConnFirst bool, verb string) {
 		b.conn = nil
 	}
 	pid := 0
+	var ps *os.ProcessState
 	if b.cmd != nil && b.cmd.ProcessState != nil {
-		pid = b.cmd.ProcessState.Pid()
+		ps = b.cmd.ProcessState
+		pid = ps.Pid()
 	}
 	b.cmd = nil
 	b.childPID.Store(0)
 	b.lastStatus.Store(nil)
+	if ps != nil && !ps.Success() {
+		if ws, ok := ps.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
+			logx.Warnf("tagger-worker: %s pid=%d: %s", verb, pid, ps)
+			return
+		}
+	}
 	logx.Infof("tagger-worker: %s pid=%d", verb, pid)
 }
 

@@ -129,23 +129,22 @@
 {{define "tagger_export_panel"}}
   <div class="dialog-panel" id="tc-export-{{.Name}}" hidden{{if .OOB}} hx-swap-oob="true"{{end}}>
     <p class="field-hint">Click copy to export your current configuration.</p>
-    <p class="code-block-label"><strong>rules</strong>
-      <span class="field-hint">{{.RuleCount}} rules - {{.CustomRules}} changes vs stock</span>
-      <button type="button" class="btn-sm" data-copy-from="#tc-export-json-{{.Name}}" title="Copy the merged dispatch.json">Copy</button>
-      <span class="copy-flash" hidden>copied</span>
-    </p>
-    <pre class="code-block tc-export-block">{{range .ExportRules}}<span{{if .Mark}} class="exp-{{.Mark}}"{{end}}>{{.Text}}</span>{{end}}</pre>
-    <textarea id="tc-export-json-{{.Name}}" hidden readonly>{{.ExportJSON}}</textarea>
+    {{template "tagger_export_block" dict "Label" "rules" "Hint" (printf "%d rules - %d changes vs stock" .RuleCount .CustomRules) "ID" (printf "tc-export-json-%s" .Name) "Title" "Copy the merged dispatch.json" "Lines" .ExportRules "JSON" .ExportJSON}}
     {{if .ProfileJSON}}
-    <p class="code-block-label"><strong>profile</strong>
-      <span class="field-hint">tagger.json{{if .ProfileStock}} - stock{{end}}</span>
-      <button type="button" class="btn-sm" data-copy-from="#tc-profile-json-{{.Name}}" title="Copy the effective tagger.json">Copy</button>
-      <span class="copy-flash" hidden>copied</span>
-    </p>
-    <pre class="code-block tc-export-block">{{range .ProfileLines}}<span{{if .Mark}} class="exp-{{.Mark}}"{{end}}>{{.Text}}</span>{{end}}</pre>
-    <textarea id="tc-profile-json-{{.Name}}" hidden readonly>{{.ProfileJSON}}</textarea>
+    {{$hint := "tagger.json"}}{{if .ProfileStock}}{{$hint = "tagger.json - stock"}}{{end}}
+    {{template "tagger_export_block" dict "Label" "profile" "Hint" $hint "ID" (printf "tc-profile-json-%s" .Name) "Title" "Copy the effective tagger.json" "Lines" .ProfileLines "JSON" .ProfileJSON}}
     {{end}}
   </div>
+{{end}}
+
+{{define "tagger_export_block"}}
+    <p class="code-block-label"><strong>{{.Label}}</strong>
+      <span class="field-hint">{{.Hint}}</span>
+      <button type="button" class="btn-sm" data-copy-from="#{{.ID}}" title="{{.Title}}">Copy</button>
+      <span class="copy-flash" hidden>copied</span>
+    </p>
+    <pre class="code-block tc-export-block">{{range .Lines}}<span{{if .Mark}} class="exp-{{.Mark}}"{{end}}>{{.Text}}</span>{{end}}</pre>
+    <textarea id="{{.ID}}" hidden readonly>{{.JSON}}</textarea>
 {{end}}
 
 {{define "tagger_reset_button"}}<span id="tagger-reset-{{.Name}}" class="tagger-reset-slot"{{if .OOB}} hx-swap-oob="true"{{end}}>{{if .Differs}}

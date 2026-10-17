@@ -8,13 +8,13 @@ import (
 	"html"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	meta "github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
 )
@@ -124,20 +124,13 @@ func loadImage(ctx context.Context, database *db.DB, id int64) (*models.Image, e
 
 func loadSDMeta(ctx context.Context, database *db.DB, id int64) *models.SDMetadata {
 	var m models.SDMetadata
-	var rawParams, genHash *string
 	err := database.Read.QueryRowContext(ctx,
 		`SELECT image_id, COALESCE(prompt, ''), COALESCE(negative_prompt, ''), COALESCE(model, ''), seed,
-		        COALESCE(sampler, ''), steps, cfg_scale, raw_params, generation_hash
+		        COALESCE(sampler, ''), steps, cfg_scale, COALESCE(raw_params, ''), COALESCE(generation_hash, '')
 		 FROM sd_metadata WHERE image_id = ?`, id,
-	).Scan(&m.ImageID, &m.Prompt, &m.NegativePrompt, &m.Model, &m.Seed, &m.Sampler, &m.Steps, &m.CFGScale, &rawParams, &genHash)
+	).Scan(&m.ImageID, &m.Prompt, &m.NegativePrompt, &m.Model, &m.Seed, &m.Sampler, &m.Steps, &m.CFGScale, &m.RawParams, &m.GenerationHash)
 	if err != nil {
 		return nil
-	}
-	if rawParams != nil {
-		m.RawParams = *rawParams
-	}
-	if genHash != nil {
-		m.GenerationHash = *genHash
 	}
 	if m.RawParams != "" {
 		m.ParsedParams = meta.ParseAllSDParams(m.RawParams)
@@ -147,17 +140,13 @@ func loadSDMeta(ctx context.Context, database *db.DB, id int64) *models.SDMetada
 
 func loadComfyMeta(ctx context.Context, database *db.DB, id int64) *models.ComfyUIMetadata {
 	var m models.ComfyUIMetadata
-	var genHash *string
 	err := database.Read.QueryRowContext(ctx,
 		`SELECT image_id, COALESCE(prompt, ''), COALESCE(model_checkpoint, ''), seed, COALESCE(sampler, ''),
-		        steps, cfg_scale, COALESCE(raw_workflow, ''), generation_hash
+		        steps, cfg_scale, COALESCE(raw_workflow, ''), COALESCE(generation_hash, '')
 		 FROM comfyui_metadata WHERE image_id = ?`, id,
-	).Scan(&m.ImageID, &m.Prompt, &m.ModelCheckpoint, &m.Seed, &m.Sampler, &m.Steps, &m.CFGScale, &m.RawWorkflow, &genHash)
+	).Scan(&m.ImageID, &m.Prompt, &m.ModelCheckpoint, &m.Seed, &m.Sampler, &m.Steps, &m.CFGScale, &m.RawWorkflow, &m.GenerationHash)
 	if err != nil {
 		return nil
-	}
-	if genHash != nil {
-		m.GenerationHash = *genHash
 	}
 	return &m
 }
@@ -182,36 +171,21 @@ func extraImagePaths(paths []models.ImagePath) int {
 }
 
 func loadImagePaths(ctx context.Context, database *db.DB, b *gallery.Boundary, id int64) []models.ImagePath {
-	rows, err := database.Read.QueryContext(ctx,
-		`SELECT id, image_id, path, is_canonical FROM image_paths WHERE image_id = ? ORDER BY is_canonical DESC, id`,
-		id,
-	)
+	paths, err := db.QueryAllContext(ctx, database.Read, db.ScanRow(func(p *models.ImagePath) []any {
+		return []any{&p.ID, &p.ImageID, &p.Path, &p.IsCanonical}
+	}), `SELECT id, image_id, path, is_canonical FROM image_paths WHERE image_id = ? ORDER BY is_canonical DESC, id`, id)
 	if err != nil {
 		return nil
 	}
-	defer func() { _ = rows.Close() }()
-	var paths []models.ImagePath
-	for rows.Next() {
-		var p models.ImagePath
-		var isCanon int
-		if err := rows.Scan(&p.ID, &p.ImageID, &p.Path, &isCanon); err != nil {
-			logx.Warnf("load image paths scan: %v", err)
-			continue
+	// A gone file is move history, and one outside the boundary is
+	// another gallery's; neither is a live duplicate.
+	return slices.DeleteFunc(paths, func(p models.ImagePath) bool {
+		if p.IsCanonical {
+			return false
 		}
-		p.IsCanonical = isCanon == 1
-		// A gone file is move history, and one outside the boundary is
-		// another gallery's; neither is a live duplicate.
-		if !p.IsCanonical {
-			if _, statErr := os.Stat(p.Path); os.IsNotExist(statErr) || b.Check(p.Path) != nil {
-				continue
-			}
-		}
-		paths = append(paths, p)
-	}
-	if err := rows.Err(); err != nil {
-		logx.Warnf("load image paths: %v", err)
-	}
-	return paths
+		_, statErr := os.Stat(p.Path)
+		return os.IsNotExist(statErr) || b.Check(p.Path) != nil
+	})
 }
 
 // Must match the stylesheet's --bg.

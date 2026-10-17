@@ -22,9 +22,8 @@ var (
 	ErrImplicationNotFound = errors.New("implication not found")
 )
 
-func scanImplications(rows *sql.Rows, withImpliedCols bool) ([]models.Implication, error) {
-	var out []models.Implication
-	for rows.Next() {
+func scanImplication(withImpliedCols bool) func(*sql.Rows) (models.Implication, error) {
+	return func(rows *sql.Rows) (models.Implication, error) {
 		var im models.Implication
 		var created string
 		var stale int64
@@ -37,17 +36,16 @@ func scanImplications(rows *sql.Rows, withImpliedCols bool) ([]models.Implicatio
 		}
 		cols = append(cols, &created, &im.Origin, &stale)
 		if err := rows.Scan(cols...); err != nil {
-			return nil, err
+			return im, err
 		}
 		im.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		im.Stale = stale == 1
-		out = append(out, im)
+		return im, nil
 	}
-	return out, rows.Err()
 }
 
 func (s *Service) ListImplications(parentID int64) ([]models.Implication, error) {
-	return s.implicationsQuery(
+	return db.QueryAll(s.db.Read, scanImplication(true),
 		`SELECT ti.parent_tag_id, ti.implied_tag_id,
 		        p.name, pc.name, pc.color,
 		        i.name, ic.name, ic.color,
@@ -58,20 +56,11 @@ func (s *Service) ListImplications(parentID int64) ([]models.Implication, error)
 		 JOIN tags i ON i.id = ti.implied_tag_id
 		 JOIN tag_categories ic ON ic.id = i.category_id
 		 WHERE ti.parent_tag_id = ?
-		 ORDER BY i.name`, parentID, true)
-}
-
-func (s *Service) implicationsQuery(query string, arg int64, full bool) ([]models.Implication, error) {
-	rows, err := s.db.Read.Query(query, arg)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	return scanImplications(rows, full)
+		 ORDER BY i.name`, parentID)
 }
 
 func (s *Service) ImpliedBy(tagID int64) ([]models.Implication, error) {
-	return s.implicationsQuery(
+	return db.QueryAll(s.db.Read, scanImplication(false),
 		`SELECT ti.parent_tag_id, ti.implied_tag_id,
 		        p.name, pc.name, pc.color,
 		        ti.created_at, ti.origin, ti.stale
@@ -79,7 +68,7 @@ func (s *Service) ImpliedBy(tagID int64) ([]models.Implication, error) {
 		 JOIN tags p ON p.id = ti.parent_tag_id
 		 JOIN tag_categories pc ON pc.id = p.category_id
 		 WHERE ti.implied_tag_id = ?
-		 ORDER BY p.name`, tagID, false)
+		 ORDER BY p.name`, tagID)
 }
 
 func (s *Service) SyncImplicationStaleness(parentID int64, origin string, fresh map[int64]bool) (int, error) {
@@ -284,9 +273,10 @@ func applyImpliedClosureTx(tx *sql.Tx, imageID int64, implied []int64, ratingCat
 		}
 		if ratingCatID != 0 && !insertedRating {
 			var catID int64
-			if err := tx.QueryRow(`SELECT category_id FROM tags WHERE id = ?`, id).Scan(&catID); err == nil && catID == ratingCatID {
-				insertedRating = true
+			if err := tx.QueryRow(`SELECT category_id FROM tags WHERE id = ?`, id).Scan(&catID); err != nil {
+				return err
 			}
+			insertedRating = catID == ratingCatID
 		}
 	}
 	if insertedRating && ratingCatID != 0 {

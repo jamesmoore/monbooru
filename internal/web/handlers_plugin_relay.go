@@ -8,9 +8,9 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/plugins"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // A 204 with a flash, not an error status: the click swaps nothing, and

@@ -7,7 +7,8 @@
     "normalize": "imagenet",
     "pad": "mean_color_aspect",
     "activation": "logits",
-    "label_format": "camie_json",
+    "label_format": "json",
+    "label_json": {"shape": "index_map", "path": "dataset_info.tag_mapping.idx_to_tag", "category_path": "dataset_info.tag_mapping.tag_to_category"},
     "category_scheme": "name_string",
     "output_index": 1
   }

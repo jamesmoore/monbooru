@@ -1,31 +1,7 @@
-{{define "gallery_pagination_links"}}
-{{$seed := .RandomSeed}}
-{{$q := urlQ .Query}}
-  {{if and (gt .Page 1) (gt .TotalPages 2)}}
-    <a href="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page=1"
-       hx-get="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page=1"
-       hx-target="#gallery-grid" hx-swap="innerHTML" hx-push-url="true">« First</a>
-  {{end}}
-  {{if gt .Page 1}}
-    <a href="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page={{sub .Page 1}}"
-       hx-get="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page={{sub .Page 1}}"
-       hx-target="#gallery-grid" hx-swap="innerHTML" hx-push-url="true">← Prev</a>
-  {{end}}
-  <button type="button" class="page-jump current" data-current="{{.Page}}" data-total="{{.TotalPages}}" title="Go to page…">Page {{.Page}} / {{.TotalPages}}</button>
-  {{if lt .Page .TotalPages}}
-    <a href="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page={{add .Page 1}}"
-       hx-get="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page={{add .Page 1}}"
-       hx-target="#gallery-grid" hx-swap="innerHTML" hx-push-url="true">Next →</a>
-  {{end}}
-  {{if and (lt .Page .TotalPages) (gt .TotalPages 2)}}
-    <a href="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page={{.TotalPages}}"
-       hx-get="/?q={{$q}}&sort={{.Sort}}&order={{.Order}}{{if $seed}}&seed={{$seed}}{{end}}&page={{.TotalPages}}"
-       hx-target="#gallery-grid" hx-swap="innerHTML" hx-push-url="true">Last »</a>
-  {{end}}
-{{end}}
-
 {{define "manga_pill"}}{{if eq .FileType "cbz"}}{{if .PageCount}}<span class="manga-pill">{{deref .PageCount}} pages</span>{{else}}<span class="manga-pill">manga</span>{{end}}{{end}}{{end}}
 {{define "partials/thumbnail_grid.html"}}
+{{$seed := ""}}{{if .RandomSeed}}{{$seed = printf "&seed=%d" .RandomSeed}}{{end}}
+{{$pageBase := printf "/?q=%s&sort=%s&order=%s%s&page=" (urlQ .Query) (urlQ .Sort) (urlQ .Order) $seed}}
 {{if .InboxUploadActive}}
 <div id="inbox-upload" class="inbox-upload">
   {{if .Degraded}}
@@ -34,7 +10,6 @@
   <form id="inbox-upload-form"
         hx-post="/upload"
         hx-target="#inbox-upload-result"
-        hx-swap="innerHTML"
         hx-encoding="multipart/form-data">
     <div id="inbox-upload-drop" class="upload-drop-zone">
       <div class="upload-drop-prompt">
@@ -54,9 +29,7 @@
   {{end}}
 </div>
 {{end}}
-{{if gt .TotalPages 1}}
-<div class="pagination pagination-top">{{template "gallery_pagination_links" .}}</div>
-{{end}}
+{{template "partials/pagination.html" (dict "Base" $pageBase "Page" .Page "Total" .TotalPages "Class" "pagination-top" "HX" "#gallery-grid")}}
 <div class="thumb-grid{{if eq .ThumbnailFit "natural"}} fit-natural{{end}}{{if eq .ThumbSize "s"}} thumb-sm{{end}}{{if eq .ThumbSize "l"}} thumb-lg{{end}}">
   {{range $i, $_ := .Result.Results}}
   {{if $.InboxClusterAtIdx}}{{with index $.InboxClusterAtIdx $i}}
@@ -118,7 +91,5 @@
   {{end}}
 </div>
 
-{{if gt .TotalPages 1}}
-<div class="pagination">{{template "gallery_pagination_links" .}}</div>
-{{end}}
+{{template "partials/pagination.html" (dict "Base" $pageBase "Page" .Page "Total" .TotalPages "HX" "#gallery-grid")}}
 {{end}}

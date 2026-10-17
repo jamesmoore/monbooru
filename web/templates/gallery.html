@@ -39,8 +39,8 @@
     {{if .TaggersPresent}}<button type="button" class="btn-autotag"{{if not .EnabledTaggers}} disabled title="{{.TaggerReason}}"{{end}} onclick="openBatchAutotagDialog('selection')">Auto-tag</button>{{end}}
     {{if .MonloaderPaired}}<button type="button" class="monloader-accent" data-ml-title=""{{if not .MonloaderUsable}} disabled title="{{monloaderOffReason .MonloaderConn}}"{{end}} onclick="openBatchLookupDialog('selection')">Find tags</button>{{end}}
     <span class="batch-bar-sep" aria-hidden="true"></span>
-    <button type="button" onclick="openBatchInboxDialog('selection')">Inbox</button>
-    <button type="button" onclick="openBatchFavoriteDialog('selection')">Favorite</button>
+    <button type="button" onclick="openBatchDialog('batch-inbox', 'selection')">Inbox</button>
+    <button type="button" onclick="openBatchDialog('batch-fav', 'selection')">Favorite</button>
     <button type="button" onclick="openBatchCollectionDialog('selection')">Set collection</button>
     <span class="batch-bar-sep" aria-hidden="true"></span>
     <button type="button" id="batch-download" onclick="openBatchDownloadDialog('selection')">Download</button>
@@ -63,8 +63,7 @@
 
 <dialog id="save-search-dialog">
   <form hx-post="/search/saved"
-        hx-target="#save-search-result"
-        hx-swap="innerHTML">
+        hx-target="#save-search-result">
     <input type="hidden" name="query" id="save-search-query" value="{{.Query}}">
     <input type="hidden" name="sort" id="save-search-sort" value="{{.Sort}}">
     <input type="hidden" name="order" id="save-search-order" value="{{.Order}}">
@@ -115,8 +114,8 @@
   <form id="batch-autotag-form" onsubmit="event.preventDefault(); confirmBatchAutotag();">
     <input type="hidden" id="batch-autotag-scope">
     <div class="field">
-      <label style="display:block"><input type="radio" name="tagger_name" value="" checked> All enabled taggers</label>
-      {{range .EnabledTaggers}}<label style="display:block"><input type="radio" name="tagger_name" value="{{.Name}}"> {{.Name}}</label>{{end}}
+      <label><input type="radio" name="tagger_name" value="" checked> All enabled taggers</label>
+      {{range .EnabledTaggers}}<label><input type="radio" name="tagger_name" value="{{.Name}}"> {{.Name}}</label>{{end}}
     </div>
     <div id="batch-autotag-flash"></div>
     {{template "dialog_actions" dict "ID" "batch-autotag-dialog" "Submit" "Auto-tag" "Class" "btn-autotag"}}
@@ -132,12 +131,12 @@
   <form id="batch-strip-form" onsubmit="event.preventDefault(); confirmBatchStrip();">
     <input type="hidden" name="scope" id="batch-strip-scope">
     <div class="field" onchange="updateBatchStripRow()">
-      <label style="display:block"><input type="radio" name="mode" value="specific" checked> Specific tags by name</label>
+      <label><input type="radio" name="mode" value="specific" checked> Specific tags by name</label>
       <div class="field" style="position:relative; margin: 4px 0 8px 22px" id="batch-strip-specific-row">
         {{template "multi_tag_suggest_input" dict "Name" "tags" "InputID" "batch-strip-input" "SuggestID" "batch-strip-suggest" "Placeholder" "Tags to remove (space-separated, category:name)" "Class" "upload-wide-input" "ValsKey" "tag"}}
       </div>
       {{if .SourceLabelCounts}}
-      <label style="display:block"><input type="radio" name="mode" value="source-specific"> Specific source</label>
+      <label><input type="radio" name="mode" value="source-specific"> Specific source</label>
       <div class="field" style="margin: 4px 0 8px 22px" id="batch-strip-source-row">
         <select name="source" id="batch-strip-source" class="upload-wide-input">
           {{range .SourceLabelCounts}}<option value="{{.Source}}">{{.Source}}</option>{{end}}
@@ -145,18 +144,18 @@
       </div>
       {{end}}
       {{if .EnabledTaggers}}
-      <label style="display:block"><input type="radio" name="mode" value="auto-specific"> Specific auto-tagger</label>
+      <label><input type="radio" name="mode" value="auto-specific"> Specific auto-tagger</label>
       <div class="field" style="margin: 4px 0 8px 22px" id="batch-strip-tagger-row">
         <select name="tagger_name" id="batch-strip-tagger" class="upload-wide-input">
           {{range .EnabledTaggers}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
         </select>
       </div>
       {{end}}
-      <label style="display:block"><input type="radio" name="mode" value="user"> All user tags</label>
-      {{if .SourceLabelCounts}}<label style="display:block"><input type="radio" name="mode" value="source-all"> All external sources</label>{{end}}
-      {{if .SourceLabelCounts}}<label style="display:block"><input type="radio" name="mode" value="stale"> Stale tags</label>{{end}}
-      <label style="display:block"><input type="radio" name="mode" value="auto"> All auto-tagger tags</label>
-      <label style="display:block"><input type="radio" name="mode" value="all"> All tags</label>
+      <label><input type="radio" name="mode" value="user"> All user tags</label>
+      {{if .SourceLabelCounts}}<label><input type="radio" name="mode" value="source-all"> All external sources</label>{{end}}
+      {{if .SourceLabelCounts}}<label><input type="radio" name="mode" value="stale"> Stale tags</label>{{end}}
+      <label><input type="radio" name="mode" value="auto"> All auto-tagger tags</label>
+      <label><input type="radio" name="mode" value="all"> All tags</label>
     </div>
     <div id="batch-strip-flash"></div>
     {{template "dialog_actions" dict "ID" "batch-strip-dialog" "Submit" "Remove" "Class" "btn-warning"}}
@@ -174,9 +173,7 @@
       <div id="batch-place-preview"
            hx-get="/internal/name/preview"
            hx-trigger="input delay:200ms from:#batch-place-folder, input delay:200ms from:#batch-place-name, preview"
-           hx-target="this"
-           hx-vals='js:{...namePreviewVals("batch-place", "place-batch")}'
-           hx-swap="innerHTML"></div>
+           hx-vals='js:{...namePreviewVals("batch-place", "place-batch")}'></div>
       <button type="button" class="name-preview-more" id="batch-place-check"
               onclick="checkBatchPlaceCollisions()">check the whole scope for taken names</button>
     </div>
@@ -418,7 +415,7 @@ function confirmBatchTransfer() {
   var target = document.getElementById('batch-transfer-target');
   var flash = document.getElementById('batch-transfer-flash');
   if (!target || !target.value) {
-    if (flash) flash.innerHTML = '<div class="flash flash-err">Pick a target gallery.</div>';
+    setFlashText(flash, 'err', 'Pick a target gallery.');
     return;
   }
   var params = ['target=' + encodeURIComponent(target.value)];
@@ -548,7 +545,7 @@ function confirmBatchStrip() {
   if (mode === 'specific') {
     var tags = (document.getElementById('batch-strip-input').value || '').trim();
     if (!tags) {
-      if (flash) flash.innerHTML = '<div class="flash flash-err">No tags provided.</div>';
+      setFlashText(flash, 'err', 'No tags provided.');
       return;
     }
     url = '/internal/batch-tag';
@@ -563,7 +560,7 @@ function confirmBatchStrip() {
       var taggerEl = document.getElementById('batch-strip-tagger');
       var taggerName = taggerEl ? taggerEl.value : '';
       if (!taggerName) {
-        if (flash) flash.innerHTML = '<div class="flash flash-err">Pick an auto-tagger.</div>';
+        setFlashText(flash, 'err', 'Pick an auto-tagger.');
         return;
       }
       params.push('tagger_name=' + encodeURIComponent(taggerName));
@@ -571,7 +568,7 @@ function confirmBatchStrip() {
       var srcEl = document.getElementById('batch-strip-source');
       var src = srcEl ? srcEl.value : '';
       if (!src) {
-        if (flash) flash.innerHTML = '<div class="flash flash-err">Pick a source.</div>';
+        setFlashText(flash, 'err', 'Pick a source.');
         return;
       }
       params.push('source=' + encodeURIComponent(src));
@@ -605,7 +602,7 @@ function openTagDialog(scope) {
 function confirmBatchTag() {
   var tags = (document.getElementById('batch-tag-input').value || '').trim();
   if (!tags) {
-    document.getElementById('batch-tag-flash').innerHTML = '<div class="flash flash-err">No tags provided.</div>';
+    setFlashText(document.getElementById('batch-tag-flash'), 'err', 'No tags provided.');
     return;
   }
   confirmBatchSimple('batch-tag', '/internal/batch-tag', ['op=add', 'tags=' + encodeURIComponent(tags)],
@@ -622,37 +619,21 @@ function toggleFavFilter() {
   submitSearch();
 }
 
-function openBatchInboxDialog(scope) {
-  openBatchDialog('batch-inbox', scope);
-}
-
-function openBatchFavoriteDialog(scope) {
-  openBatchDialog('batch-fav', scope);
-}
-
-function openBatchLabeledDialog(prefix, scope) {
-  openBatchDialog(prefix, scope, {
-    radio: '#' + prefix + '-dialog input[name="mode"][value="add"]',
-    clearIds: [prefix + '-input', prefix + '-suggest'],
-    focusId: prefix + '-input'
+function openBatchCollectionDialog(scope) {
+  openBatchDialog('batch-collection', scope, {
+    radio: '#batch-collection-dialog input[name="mode"][value="add"]',
+    clearIds: ['batch-collection-input', 'batch-collection-suggest'],
+    focusId: 'batch-collection-input'
   });
 }
 
-function confirmBatchLabeled(prefix, endpoint, field) {
-  var labelEl = document.getElementById(prefix + '-input');
-  var modeEl = document.querySelector('#' + prefix + '-dialog input[name="mode"]:checked');
-  confirmBatchSimple(prefix, endpoint,
-    [field + '=' + encodeURIComponent(labelEl ? labelEl.value : ''),
+function confirmBatchCollection() {
+  var labelEl = document.getElementById('batch-collection-input');
+  var modeEl = document.querySelector('#batch-collection-dialog input[name="mode"]:checked');
+  confirmBatchSimple('batch-collection', '/internal/batch-collection',
+    ['collection=' + encodeURIComponent(labelEl ? labelEl.value : ''),
      'mode=' + (modeEl ? modeEl.value : 'add')],
     'Apply failed.');
-}
-
-function openBatchCollectionDialog(scope) {
-  openBatchLabeledDialog('batch-collection', scope);
-}
-
-function confirmBatchCollection() {
-  confirmBatchLabeled('batch-collection', '/internal/batch-collection', 'collection');
 }
 
 function applyRandomSort() {
