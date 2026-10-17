@@ -7,8 +7,7 @@ extension in [monsender](https://github.com/monbooru/monsender),
 documentation in [mondocs](https://github.com/monbooru/mondocs),
 plugin and theme listings in
 [monbooru-plugins](https://github.com/monbooru/monbooru-plugins),
-the trimmed ffmpeg and ffprobe builds every artifact ships and the flags
-they are built with in
+the trimmed ffmpeg and ffprobe builds in
 [ffmpeg-builds](https://github.com/monbooru/ffmpeg-builds).
 
 ## Bug reports and feature requests
@@ -18,8 +17,7 @@ Open an issue. For a bug, include the version, how you run it
 relevant log lines/screenshots. For a feature, describe the problem or workflow
 first, not only the solution you have in mind.
 
-A report or request that turns into a shipped change is credited in
-the changelog of the release that ships it.
+A report or request that turns into a shipped change is credited in the changelog of the release that ships it.
 
 ## Pull requests
 
@@ -36,8 +34,7 @@ the changelog of the release that ships it.
 
 What review expects:
 
-- Match the existing code style and search for a similar case before
-  inventing a new pattern.
+- Match the existing code style and search for a similar case before inventing a new pattern.
 - Stdlib first. A new dependency needs a strong justification and
   should be discussed in the issue before any code is written.
 - Small, focused changes review fast. Cross-cutting changes that
@@ -47,32 +44,27 @@ Make sure you have reviewed every line of the diff yourself, and that you have c
 
 ## Auto-tagger configurations (monbooru)
 
-Support for an ONNX tagger model is data, not Go. A model is
-described by up to three JSON files:
+Support for an ONNX tagger model lives in
+[monbooru-plugins](https://github.com/monbooru/monbooru-plugins), one
+folder per model under `taggers/<name>/`:
 
-- a catalog entry in `internal/tagger/catalog_default.json`: name,
-  description, download URLs for the model and label files, default
-  thresholds;
-- a preprocessing profile in
-  `internal/tagger/profile_default/<name>.json`, only when the
+- `model.json`: description, download URLs for the model and label
+  files, default thresholds;
+- `profile_default.json`, a preprocessing profile, only when the
   defaults inferred from the label file are wrong (input size,
   layout, channels, normalization, padding, activation, label
   format, category scheme);
-- a label dispatch table in
-  `internal/tagger/dispatch_default/<name>.json`, routing
+- `dispatch_default.json`, a label dispatch table routing
   model-specific labels into tag categories (a rule can also rename
   a label or drop it).
 
 To propose a new model, get it working locally first: drop it under
 `<model_path>/<name>/` and tune it with `tagger.json` and
-`dispatch.json` sidecars, which use the same format as the shipped
-defaults. Dispatch rules are edited in the app (the tagger's
-Configure dialog, mappings tab), and its export tab shows both files
-merged with your changes, with a Copy button - what you paste over
-the matching `dispatch_default` / `profile_default` file in a PR is
-exactly that. Once it works, a PR submits those files verbatim plus a
-catalog entry with public download URLs. See
-[Configuration](https://monbooru.github.io/mondocs/configuration.html#custom-onnx-models)
+`dispatch.json` sidecars, which use the same format as the stock
+files. Dispatch rules can be edited in the app, in the tagger's mapping tab. Once it works, make a PR to add the folder with those files
+verbatim and a `model.json` with public download URLs; see
+[TAGGERS.md](https://github.com/monbooru/monbooru-plugins/blob/main/TAGGERS.md),
+[Your own models](https://monbooru.github.io/mondocs/advanced/auto-tagger.html#your-own-models)
 and the
 [auto-tagger guide](https://monbooru.github.io/mondocs/guides/auto-tagger.html).
 
@@ -81,8 +73,7 @@ better threshold, a label dispatched to the wrong category, a
 missing rename. If you would rather not touch the repo, an issue
 with the model link and the settings that worked for you is enough.
 
-A model whose label-file format or category scheme the app does not
-already read needs code changes; open an issue first.
+A model whose label-file format or category scheme the app does not already read needs code changes; open an issue first.
 
 ## Site profiles (monloader)
 

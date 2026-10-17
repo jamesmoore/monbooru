@@ -1,8 +1,9 @@
 package tagger
 
 import (
+	"cmp"
 	"math"
-	"sort"
+	"slices"
 )
 
 // Tuned for the WD14, JoyTag and Camie distributions: attribution
@@ -85,11 +86,6 @@ func AggregateInferenceScores(perFrame [][]float32, labels []CandidateLabel, opt
 		}
 	}
 
-	disabled := make(map[string]bool, len(opts.DisabledCategories))
-	for _, c := range opts.DisabledCategories {
-		disabled[c] = true
-	}
-
 	byCat := map[int64][]AggregatedCandidate{}
 	catNames := map[int64]string{}
 	for idx, e := range agg {
@@ -100,7 +96,7 @@ func AggregateInferenceScores(perFrame [][]float32, labels []CandidateLabel, opt
 		if lbl.Placeholder {
 			continue
 		}
-		if disabled[lbl.CatName] {
+		if slices.Contains(opts.DisabledCategories, lbl.CatName) {
 			continue
 		}
 		if e.hits < opts.MinHits {
@@ -123,11 +119,8 @@ func AggregateInferenceScores(perFrame [][]float32, labels []CandidateLabel, opt
 	for catID, list := range byCat {
 		// Name breaks ties so two equal runs emit the same set.
 		k := ResolveTopK(opts.PerCategoryTopK, catNames[catID])
-		sort.Slice(list, func(i, j int) bool {
-			if list[i].Score != list[j].Score {
-				return list[i].Score > list[j].Score
-			}
-			return list[i].Name < list[j].Name
+		slices.SortFunc(list, func(a, b AggregatedCandidate) int {
+			return cmp.Or(cmp.Compare(b.Score, a.Score), cmp.Compare(a.Name, b.Name))
 		})
 		if k > 0 && len(list) > k {
 			list = list[:k]

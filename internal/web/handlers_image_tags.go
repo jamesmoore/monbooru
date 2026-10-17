@@ -11,8 +11,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -212,7 +214,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 	tagMode := readTagModeCookie(r)
 	if requested := r.URL.Query().Get("tagmode"); requested != "" {
 		tagMode = normalizeTagMode(requested)
-		writeTagModeCookie(w, tagMode)
+		writeTagModeCookie(w, r, tagMode)
 	}
 	hasUserTags, hasStaleTags := userAndStaleTags(imageTags)
 	// The tag routes carry no back context; the page they were sent from does.
@@ -249,10 +251,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 		"ImageSources":     distinctTaggerNames(imageTags, false),
 		"CanTransfer":      len(s.galleryList()) > 1,
 		"BackQuery":        back.Q,
-		"BackSort":         back.Sort,
-		"BackOrder":        back.Order,
-		"BackPage":         back.Page,
-		"BackSeed":         back.Seed,
+		"BackKVQS":         back.QueryString("&"),
 		"Ref":              ref,
 		"ErrMsg":           errMsg,
 		"WarnMsg":          warnMsg,
@@ -261,6 +260,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 		"CurrentFolder":    folderPath,
 		"Filename":         filename,
 		"ExtraPaths":       extraPaths,
+		"RewrittenBy":      gallery.RewrittenBy(s.db().Read, id),
 		"TagCount":         tagCount,
 	})
 }
@@ -306,12 +306,7 @@ func (s *Server) removeCategoryTagsFromImageHandler(w http.ResponseWriter, r *ht
 
 func (s *Server) dropSourceContributionHandler(w http.ResponseWriter, r *http.Request) {
 	source := strings.TrimSpace(r.URL.Query().Get("source"))
-	var tagIDs []int64
-	for _, raw := range r.URL.Query()["tag"] {
-		if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
-			tagIDs = append(tagIDs, id)
-		}
-	}
+	tagIDs := parseIDList(r.URL.Query()["tag"])
 	s.removeImageTagsWithMsg(w, r, func(id int64) (string, error) {
 		if source == "" {
 			return "", nil
@@ -392,10 +387,26 @@ func (s *Server) removeTagFromImage(w http.ResponseWriter, r *http.Request) {
 		var name string
 		_ = s.db().Read.QueryRow(`SELECT name FROM tags WHERE id = ?`, tagID).Scan(&name)
 		removed, err := s.tagSvc().RemoveTagFromImage(id, tagID)
-		if err != nil || removed == 0 {
+		if err != nil {
 			return "", err
 		}
-		return "removed: " + name, nil
+		if removed > 0 {
+			return "removed: " + name, nil
+		}
+		parents, err := db.QueryStrings(s.db().Read,
+			`SELECT p.name FROM tag_implications ti
+			 JOIN image_tags it ON it.image_id = ? AND it.tag_id = ti.parent_tag_id
+			 JOIN tags p ON p.id = ti.parent_tag_id
+			 WHERE ti.implied_tag_id = ? AND EXISTS (SELECT 1 FROM image_tags WHERE image_id = ? AND tag_id = ?)
+			 ORDER BY p.name`, id, tagID, id, tagID)
+		if err != nil || len(parents) == 0 {
+			return "", err
+		}
+		verb := "implies"
+		if len(parents) > 1 {
+			verb = "imply"
+		}
+		return fmt.Sprintf("kept: %s (%s %s it)", name, strings.Join(parents, ", "), verb), nil
 	})
 }
 

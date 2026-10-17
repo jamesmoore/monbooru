@@ -188,6 +188,18 @@ func (m *Manager) IsRunning() bool {
 	return m.lane != nil || (m.state != nil && m.state.Running)
 }
 
+// WaitIdle reports false when the lane is still held after d.
+func (m *Manager) WaitIdle(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for m.IsRunning() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
+}
+
 // Finished only grows, so a watcher sampling less often than the
 // auto-dismiss still sees a job end.
 func (m *Manager) Finished() uint64 {

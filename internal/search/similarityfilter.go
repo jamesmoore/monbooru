@@ -137,9 +137,7 @@ func similarityMatchIDs(ctx context.Context, src Source, q Query) []int64 {
 		defer src.Cache.releaseFan(key)
 	}
 	driverLegs, _ := pickAndDriverTag(database, q.Expr, false)
-	where, args, hasMissingFilter, _ := buildWhereDBDriverFull(q.Expr, src, driverLegs)
-	where, args = applyAndDriver(where, args, driverLegs)
-	where = andDefaultVisible(where, hasMissingFilter)
+	where, args, _, _ := visibleWhere(src, q.Expr, driverLegs)
 	ids := fanSimilarityIDs(ctx, src, seed, q.Order, where, args)
 	if len(ids) < adjacencyCacheMaxIDs {
 		src.Cache.set(key, ids, gen)

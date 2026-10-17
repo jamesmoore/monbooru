@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "nodes": {
+    "CLIPTextEncode": {"prompt": "text"},
+    "KSampler": {"positive": "positive", "seed": "seed", "steps": "steps", "cfg": "cfg", "sampler": "sampler_name", "scheduler": "scheduler"},
+    "KSamplerAdvanced": {"positive": "positive", "seed": "noise_seed", "steps": "steps", "cfg": "cfg", "sampler": "sampler_name", "scheduler": "scheduler"},
+    "KSamplerSelect": {"seed": "seed", "steps": "steps", "cfg": "cfg", "sampler": "sampler_name", "scheduler": "scheduler"},
+    "CheckpointLoaderSimple": {"model": "ckpt_name"},
+    "CheckpointLoader": {"model": "ckpt_name"},
+    "unCLIPCheckpointLoader": {"model": "ckpt_name"},
+    "easy fullLoader": {"model": "ckpt_name"},
+    "easy a1111Loader": {"model": "ckpt_name"},
+    "UNETLoader": {"model": "unet_name"},
+    "LoraLoader": {"lora": "lora_name"},
+    "LoraLoaderModelOnly": {"lora": "lora_name"},
+    "Lora Loader Stack (rgthree)": {"lora": "lora_%02d", "lora_count": 10},
+    "Seed (rgthree)": {"seed": "seed"},
+    "SeedNode": {"seed": "seed"},
+    "RandomSeed": {"seed": "seed"}
+  }
+}

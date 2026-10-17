@@ -21,7 +21,6 @@
                  hx-get="/tags/{{.TagID}}/ptr-lookup-search"
                  hx-trigger="input changed delay:250ms, change from:#ptr-lookup-anywhere"
                  hx-target="#ptr-lookup-suggest"
-                 hx-swap="innerHTML"
                  hx-vals='js:{q: document.getElementById("ptr-lookup-as").value, anywhere: document.getElementById("ptr-lookup-anywhere").checked ? "1" : ""}'
                  hx-sync="closest form:abort"
                  hx-on::before-request="if (suggestDisarmed(this)) event.preventDefault()"

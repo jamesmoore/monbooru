@@ -1,5 +1,34 @@
 # Changelog
 
+## [v1.22.2] - 2026-10-17
+### Added
+- PixAI v1 in the tagger catalog. ([#143](https://github.com/monbooru/monbooru/issues/143))
+- Tagger profiles accept csv, txt or json label files, custom normalisation and pad colour.
+- A `comfyui_nodes.json` beside `monbooru.toml` maps new ComfyUI nodes to recipe fields.
+- `/health` reports the API contract version, and the footer flags a mismatched monloader.
+
+### Changed
+- A library last opened before v1.19 is refused; open it once with v1.22.1 first.
+- Camie v2 is no longer bundled; extra taggers install from their registry folder, not `models.json`.
+- A refused PTR contribution says why: no account, banned, or index still syncing.
+- Unknown keys in `monbooru.toml` are named in a startup warning.
+- Rescans and video imports skip re-hashing and re-probing files that have not changed.
+
+### Fixed
+- Search handles quotes after `=`, prefixed `mime:` lists, literal `ai:` values and exact totals.
+- Merges, transfers and replaces keep tag attribution.
+- ComfyUI metadata reads KSamplerAdvanced seeds and only the sampler node's scheduler.
+- PTR lookups handle cancellation, misses and older monloaders; unpairing a paused monloader notifies it.
+- Monloader links point at `server.monloader_url`, not an API address the browser cannot reach.
+- Files staged in the inbox drop zone survive a running job's grid refresh.
+- Setting the first password no longer logs out the person who set it.
+- Symlinked theme and plugin folders are found; stopped plugins no longer show as running.
+- The auto-tagger skips frames that decode to no pixels instead of crashing.
+- The shipped Docker files mount `/models` read-write, so tagger mappings and deletes work.
+- Session cookies are marked Secure when served over HTTPS.
+
+Thanks to @StockholmAlcoholic for the suggestion (https://github.com/monbooru/monbooru/issues/143).
+
 ## [v1.22.1] - 2026-10-11
 ### Added
 - API clients can request full-size, lossless WebP images for AVIF and JPEG XL files.
@@ -118,9 +147,6 @@ Thanks to @GenCreamer for the report (https://github.com/monbooru/monbooru/issue
 - One download per platform instead of a desktop and a server build; `-desktop=false` restores server behaviour. 
 - The CUDA and OpenVINO images dependencies updates.
 
-### Removed
-- `server.logo` and `server.custom_css`; a theme folder carries `theme.css`, `logo.png` and `favicon.png` instead.
-
 ### Fixed
 - Auto-tagging no longer reads a large image as pixel art. ([#128](https://github.com/monbooru/monbooru/issues/128))
 - The API's CORS check no longer takes the request's own Host as proof of origin.
@@ -138,6 +164,9 @@ Thanks to @GenCreamer for the report (https://github.com/monbooru/monbooru/issue
 - The image viewer's zoom readout is measured against the image.
 - The health probe answers while a password is set.
 - The Remove tags dialog counts the batch, not the library.
+
+### Removed
+- `server.logo` and `server.custom_css`; a theme folder carries `theme.css`, `logo.png` and `favicon.png` instead.
 
 Thanks to @CeareDelafont for the suggestions (https://github.com/monbooru/monbooru/issues/107, https://github.com/monbooru/monbooru/issues/122, https://github.com/monbooru/monbooru/issues/123, https://github.com/monbooru/monbooru/issues/124).
 Thanks to @gary-host-laptop for the suggestions (https://github.com/monbooru/monbooru/issues/89, https://github.com/monbooru/monbooru/issues/90, https://github.com/monbooru/monbooru/issues/101), (https://github.com/monbooru/monbooru-plugins/issues/5).
@@ -282,6 +311,7 @@ Co-authored-by: PROP65 <132837123+PROP65@users.noreply.github.com>
 - Batch Find-tags dialog overhaul.
 - The Tags page and tag autocomplete are faster on large catalogs.
 - A first search on a large library no longer stalls caching the whole match set.
+- See https://github.com/monbooru/monbooru-plugins for the plugins and theme repository.
 
 ### Fixed
 - A wildcard search no longer reports more matches than the library holds.
@@ -293,8 +323,6 @@ Co-authored-by: PROP65 <132837123+PROP65@users.noreply.github.com>
 - The login page loads the custom stylesheet and logo.
 - Deleting a tag category names the tags that collide and refuses rating as the target.
 - A peer that lost its credentials can pair again instead of being refused.
-
-See https://github.com/monbooru/monbooru-plugins for the plugins and theme repository.
 
 Thanks to @QiE2035 for the suggestions (https://github.com/monbooru/monbooru/issues/78, https://github.com/monbooru/monbooru/issues/102).
 Thanks to @gary-host-laptop for the feature (https://github.com/monbooru/monbooru/issues/77), the fix (https://github.com/monbooru/monbooru/issues/98), the suggestions (https://github.com/monbooru/monbooru/issues/65, https://github.com/monbooru/monbooru/issues/106) and bug report (https://github.com/monbooru/monbooru/issues/99).
@@ -460,8 +488,6 @@ Thanks to @JustRoxy for the suggestions (https://github.com/monbooru/monbooru/is
 - Moved the help page to the online documentation.
 
 ## [v1.14.0] - 2026-07-13
-Please update monloader to >=v1.4.0.
-
 ### Added
 - Sort a collection by filename order from the reorder dialog. ([#37](https://github.com/monbooru/monbooru/issues/37))
 - Transfer an image, or a whole search or selection, to another gallery. ([#45](https://github.com/monbooru/monbooru/issues/45))
@@ -478,6 +504,7 @@ Please update monloader to >=v1.4.0.
 - Keyboard shortcuts: `L` opens monloader lookup; `e o` and `e n` edit the original source and note.
 
 ### Changed
+- Please update monloader to >=v1.4.0.
 - Tags page sorts from column headers and filters in place, and hides aliases by default.
 - Renaming a tag can keep the old name as an alias pointing to it.
 - Each source's commentary and annotations move into their own collapsible panel.
@@ -510,24 +537,23 @@ Please update monloader to >=v1.4.0.
 - A failed JSON gallery import leaves the target gallery intact.
 
 ## [v1.12.0] - 2026-07-01
-This update include a breaking change with the monbooru and monsender pairing mechanism. Update monloader to >v1.2.0 and use the pairing mechanism.
-
 ### Added
 - Named, scoped API tokens managed in Settings, each with its own privileges.
 - Pairing with monloader from Settings: approval flow, connectivity light.
 
 ### Changed
+- This update include a breaking change with the monbooru and monsender pairing mechanism. Update monloader to >v1.2.0 and use the pairing mechanism.
 - Monloader now connects via pairing; update monloader past v1.2.0 and re-pair (breaking).
 - `type:image` search now excludes gif, mp4, and webm.
 - Search flags a filter value that isn't in the filter's allowed set.
 - Relations browse offers [review again] on 2-member derivative trees.
 
-### Removed
-- The `auth.api_token` config value and `MONBOORU_AUTH_API_TOKEN` env var; use named tokens.
-
 ### Fixed
 - Relations review-again reopens the exact pair instead of a different image.
 - Full-archive import clears the missing flag on the files it extracts.
+
+### Removed
+- The `auth.api_token` config value and `MONBOORU_AUTH_API_TOKEN` env var; use named tokens.
 
 ## [v1.11.1] - 2026-06-24
 ### Added
@@ -765,9 +791,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 ### Changed
 - Footer shows the gallery's collection count instead of the saved-search count.
 
-### Removed
-- Settings -> Maintenance: `Merge general tags` (superseded by the v1.7 category dispatchers).
-
 ### Fixed
 - Search: `date:>=YYYY-MM-DD` and `date:<=YYYY-MM-DD` extend to end-of-day; bare `<category>:` routes to `cat:<category>` instead of match-all; leading `OR` with no left operand is dropped; `name`, `folder`, `source`, `collection`, and `category:` filters are case-insensitive.
 - API: aliases populated in the search response; batch tag add / remove route through the same single-image helpers as the UI (fan-out, alias resolution, implication propagation).
@@ -776,6 +799,9 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Gallery: `DeleteImage` unlink gated on `PathInside` so an alias outside the gallery root can't be removed via a delete request; image decode bounded by a megapixel cap so a giant source can't OOM-kill the thumbnailer or tagger; `batchDelete` fetches its targets in a single `IN` query instead of N+1.
 - Detail page: SHA-256 digest aligned with its label; external-edit dialogs close only on form responses.
 - Source autocomplete quotes values with spaces.
+
+### Removed
+- Settings -> Maintenance: `Merge general tags` (superseded by the v1.7 category dispatchers).
 
 ### Internal
 - Search latency: NOCASE-collated partial visible indexes for `source` / `folder` / `series`; AND-driver materialisation bounded to the bucket window; category-qualified tag pre-resolved to skip a per-row 2-table join; partial seed indexes on `sd_metadata` and `comfyui_metadata`; sort-index hint trimmed to filters without a covering column index; `basename_lower` indexed column added; sidebar fan-out reduced to `image_tags` and `saved_searches`; re-`ANALYZE` on boot after v1.7.2 schema additions.
@@ -887,16 +913,15 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Favourite styling switched from the yellow ★ glyph to a red heart (♥/♡) across the gallery grid overlay, the toolbar `Favourites` filter button, and the detail-page action row. 
 - Per-image external metadata: new `images.source` (free-form provenance label, e.g. site name) and `images.url` (canonical web URL) columns, edited from the detail page via small `[edit]` pop-ins. The URL field is rendered as an `http(s)`-only target=_blank link.
 - Search keyword `source:my_label` for exact-match against the new `images.source` field, riding `idx_images_source`.
-- Keyboard shortcut overhault:
-  - Keyboard shortcut overlay: press `?` anywhere to display the cheat-sheet.
-  - Chord-based navigation: `g g`, `g u`, `g c`, `g t`, `g s`, `g h` jump to gallery / upload / categories / tags / settings / help.
-  - Vim aliases: `h j k l` for the gallery grid cursor, `[` and `]` for prev/next page, `g g` / `G` for first/last page, `p` for the page-jump dialog. Detail-page `h l j k` alias the prev/next-image arrows.
-  - Gallery view-level shortcuts: `F` / `I` toggle the favorites / inbox filters, `R` random-sorts, `O` cycles sort, `D` flips direction, `S` opens save-search directly, `Home` / `End` jump to the first / last visible thumbnail.
-  - Selection-bar shortcuts: `m` moves, `i` toggles inbox/archive, `Delete` deletes (with confirm), in addition to the existing `a` / `r` / `t`.
-  - Detail page shortcuts: `m` opens the move dialog, `o` opens the original in a new tab, `Backspace` returns to the gallery.
-  - Tags page shortcuts: `n` opens the create-tag dialog, `N` opens the create-alias dialog, page navigation parity with the gallery.
-  - Categories page: `n` focuses the Add category form. Settings page: `1`-`6` jump to the section headings.
-  - Anywhere: `Y` clicks the topbar Sync button, `,` / `.` walk the SFW ceiling, `\` opens the gallery-switch dialog when more than one gallery is configured.
+- Keyboard shortcut overlay: press `?` anywhere to display the cheat-sheet.
+- Chord-based navigation: `g g`, `g u`, `g c`, `g t`, `g s`, `g h` jump to gallery / upload / categories / tags / settings / help.
+- Vim aliases: `h j k l` for the gallery grid cursor, `[` and `]` for prev/next page, `g g` / `G` for first/last page, `p` for the page-jump dialog. Detail-page `h l j k` alias the prev/next-image arrows.
+- Gallery view-level shortcuts: `F` / `I` toggle the favorites / inbox filters, `R` random-sorts, `O` cycles sort, `D` flips direction, `S` opens save-search directly, `Home` / `End` jump to the first / last visible thumbnail.
+- Selection-bar shortcuts: `m` moves, `i` toggles inbox/archive, `Delete` deletes (with confirm), in addition to the existing `a` / `r` / `t`.
+- Detail page shortcuts: `m` opens the move dialog, `o` opens the original in a new tab, `Backspace` returns to the gallery.
+- Tags page shortcuts: `n` opens the create-tag dialog, `N` opens the create-alias dialog, page navigation parity with the gallery.
+- Categories page: `n` focuses the Add category form. Settings page: `1`-`6` jump to the section headings.
+- Anywhere: `Y` clicks the topbar Sync button, `,` / `.` walk the SFW ceiling, `\` opens the gallery-switch dialog when more than one gallery is configured.
 - Settings → Stats section: per-gallery DB size and a memory containment tree.
 - Footer: server-side render time displayed.
 
@@ -1018,14 +1043,12 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Memory: read connections run `PRAGMA shrink_memory` and `runtime/debug.FreeOSMemory()` every 5 minutes when the job manager is idle, so RSS plateaus instead of holding the post-burst peak.
 
 ## [v1.4.2] - 2026-04-28
-
 ### Internal
 - Search: fast-path counts for pure-tag, wildcard, NOT, AND, OR, and category-qualified queries; pinned partial sort index for the unfiltered-newest path; fast-path approximations gated on a per-query usage threshold.
 - Search: autocomplete candidate and context caps tightened; context CTE capped at 50k rows.
 - Tags: `RelatedImages` drops popular tags from the seed set and uses a smaller candidate buffer; tag-count recalc chunks by `tag_id` range to release the SQLite writer.
 
 ## [v1.4.1] - 2026-04-27
-
 ### Added
 - Tag names accept `?`, `>`, `<`, `=`, `^`.
 - Enabled auto-taggers whose model files have gone missing are auto-disabled at startup instead of failing silently at inference time.
@@ -1056,7 +1079,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Performance: per-gallery distinct-tagger and tag/saved-count caches; `SuggestTagsWithFilter` materialises its filter context once and caps candidate tags before combo counting; partial index pinned for the unfiltered-newest sort; partial index on `is_missing=0`; index on `image_tags(tagger_name)` for `is_auto=1` distinct scans; lazy sidebar URLs carry page IDs; the `DiscoverTaggers` walk is shared between settings and bulk-tagger rows.
 
 ## [v1.4.0] - 2026-04-26
-
 ### Added
 - Import hydrus network and bloombooru exports directly from the gallery import dialog. (images and tags)
 - Add gallery form accepts an optional `.db`/`.json`/`.zip` upload; the new gallery is created and the file imported into it in the same step. Add and merge import now switch the active gallery automatically.
@@ -1094,7 +1116,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Docs: new migration guide (`docs/MIGRATING.md`)
 
 ## [v1.3.0] - 2026-04-25
-
 ### Added
 - Per-gallery import/export controls in Settings → Galleries. Imports can replace current gallery or merge with it. You can export/import only the database (as full .db or .json or as a minimal .json) or the database+images as .zip.
 - Tag aliases: adding or searching a tag under any of its alias names resolves to the canonical tag. Auto-tagger output goes through the same alias resolution before it lands on a row.
@@ -1119,7 +1140,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Cleanup pass on stale comments and dead notes; readme updates; assets recompressed.
 
 ## [v1.2.3] - 2026-04-21
-
 ### Added
 - Status bar row under the gallery header and on the detail topbar.
 - Tmux-style footer with gallery / tags / saved-search counts;
@@ -1141,7 +1161,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Excessive margin on the topbar sync button.
 
 ## [v1.2.2] - 2026-04-20
-
 ### Added
 - Detail page: gallery-style search bar at the top of the page; submits as a plain GET `/` so the next view is a full gallery render with the chosen query, sort, and order. The input autocompletes against tags the same way the gallery input does.
 - Detail page: folder, source, and saved-search sections appear in the sidebar below the image's tag groups, lazy-loaded so the image tags paint first.
@@ -1158,7 +1177,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Detail-page header controls (input, buttons, selects) share a single 28 px height and consistent padding, so buttons no longer render taller than the selects next to them.
 
 ## [v1.2.1] - 2026-04-19
-
 ### Fixed
 - Tag names containing `:` (like `:3`) round-trip cleanly through the search parser, the auto-tagger, and the category-qualified API DELETE endpoint, without colliding with the `category:tag` syntax.
 - Detail page: filename next to the back link and in the topbar/title; double disclosure marker on the metadata panel dropped; ComfyUI refs scroll to the referenced node; invalid-tag error clears while typing; search autocomplete no longer rewrites the URL.
@@ -1173,7 +1191,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Web: missing `_hover.webp` thumbnails return 204; random sort is visible in the gallery sort dropdown; Save-search and Delete-all hide when there's no query or empty result set; job-flash auto-dismiss shortens once a client has seen it.
 
 ## [v1.2.0] - 2026-04-18
-
 ### Added
 - Move images into another folder from the UI: **Move image** in the detail page's action row, **Move selected** in the gallery's batch bar. Folder input autocompletes against existing folders; missing folders are created, filename collisions are auto-suffixed, and empty source folders are cleaned up after the move.
 
@@ -1185,7 +1202,6 @@ This update include a breaking change with the monbooru and monsender pairing me
 - Sidebar folder tree: deeply nested folders no longer slide off the right edge of the sidebar. Indent is now a fixed 12 px per level instead of the quadratic `depth × 12` that accumulated through nested `<li>` padding boxes.
 
 ## [v1.1.0] - 2026-04-18
-
 ### Added
 - Multi-gallery support. Galleries are named directories with their own SQLite DB and thumbnails under `<paths.data_path>/<name>/`. Create, rename, and delete galleries from Settings → Galleries; switch at runtime with the topbar button. The REST API targets a specific gallery via `?gallery=<name>` or the `X-Monbooru-Gallery` header; unknown names return 400.
 - Daily maintenance schedule: pick a time of day to run sync, auto-tag, recompute counts, merge general tags, and vacuum. All actions enabled by default; toggle per-action in Settings.
@@ -1215,5 +1231,5 @@ This update include a breaking change with the monbooru and monsender pairing me
 - `MONBOORU_PATHS_GALLERY`, `MONBOORU_PATHS_DB`, and `MONBOORU_PATHS_THUMBNAILS` env overrides. Replaced by `MONBOORU_PATHS_DATA_PATH`.
 
 ## [v1.0.0] - 2026-04-16
-
-Initial release.
+### Added
+- Initial release.

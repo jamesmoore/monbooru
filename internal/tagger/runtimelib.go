@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/monbooru/monbooru/internal/fsx"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
 )
 
 // sharedLibPath tries the executable's directory first so a bundled
@@ -19,7 +19,7 @@ func sharedLibPath() string {
 	if runtime.GOOS == "windows" {
 		name = "onnxruntime.dll"
 	}
-	if dir := fsx.ExeDir(); dir != "" {
+	if dir := desktop.ExeDir(); dir != "" {
 		candidates = append(candidates, filepath.Join(dir, name))
 	}
 	if runtime.GOOS == "windows" {
@@ -47,7 +47,7 @@ func missingRuntimeLibrary() string {
 	reason := "missing " + filepath.Base(path)
 	// A bare name means nothing was found anywhere.
 	if path == filepath.Base(path) {
-		if dir := fsx.ExeDir(); dir != "" {
+		if dir := desktop.ExeDir(); dir != "" {
 			return reason + " (expected in " + dir + ")"
 		}
 		return reason

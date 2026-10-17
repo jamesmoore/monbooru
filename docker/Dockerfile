@@ -20,15 +20,14 @@ RUN echo 'monbooru:x:1000:1000:monbooru:/home/monbooru:/sbin/nologin' >> /idsrc/
     echo 'monbooru:x:1000:' >> /idsrc/group && \
     install -d -o 1000 -g 1000 /idsrc/home
 
-# ONNX Runtime shared library for the autotagger. onnxruntime_go v1.19.0
-# requests ORT API version 21, which requires ORT 1.21.x.
+# ONNX Runtime shared library for the autotagger.
 ARG ORT_VERSION=1.21.0
-ARG ORT_SHA256_X64=7485c7e7aac6501b27e353dcbe068e45c61ab51fbaf598d13970dfae669d20bf
-ARG ORT_SHA256_AARCH64=4508084bde1232ee1ab4b6fad2155be0ea2ccab1c1aae9910ddb3fb68a60805e
+ARG ORT_SHA256_LINUX_X64=7485c7e7aac6501b27e353dcbe068e45c61ab51fbaf598d13970dfae669d20bf
+ARG ORT_SHA256_LINUX_AARCH64=4508084bde1232ee1ab4b6fad2155be0ea2ccab1c1aae9910ddb3fb68a60805e
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
-      amd64) ONNX_ARCH="x64";     ORT_SHA="${ORT_SHA256_X64}" ;; \
-      arm64) ONNX_ARCH="aarch64"; ORT_SHA="${ORT_SHA256_AARCH64}" ;; \
+      amd64) ONNX_ARCH="x64";     ORT_SHA="${ORT_SHA256_LINUX_X64}" ;; \
+      arm64) ONNX_ARCH="aarch64"; ORT_SHA="${ORT_SHA256_LINUX_AARCH64}" ;; \
       *) echo "Unsupported arch: $ARCH" && exit 1 ;; \
     esac && \
     curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ONNX_ARCH}-${ORT_VERSION}.tgz" \

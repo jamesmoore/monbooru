@@ -43,8 +43,9 @@ func ComfyTermsPending(database *db.DB) (int, error) {
 	return n, err
 }
 
-// BackfillComfyTerms reads each chunk inside its write transaction, so a
-// concurrent re-extract cannot get the terms of this run's older read.
+// BackfillComfyTerms re-derives the terms and recipe columns of every row
+// behind ComfyTermsVersion. It reads each chunk inside its write
+// transaction, so a concurrent re-extract cannot get this run's older read.
 func BackfillComfyTerms(ctx context.Context, database *db.DB, progress func(processed, total int, message string)) (int, error) {
 	total, err := ComfyTermsPending(database)
 	if err != nil || total == 0 {
@@ -92,6 +93,15 @@ func backfillComfyTermsChunk(ctx context.Context, database *db.DB) (int, error) 
 		return 0, err
 	}
 	for _, p := range rows {
+		if m := metadata.ReparseComfyWorkflow(p.raw); m != nil {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE comfyui_metadata SET prompt = ?, model_checkpoint = ?, seed = ?, sampler = ?, steps = ?, cfg_scale = ?, generation_hash = ?
+				 WHERE image_id = ?`,
+				m.Prompt, m.ModelCheckpoint, m.Seed, m.Sampler, m.Steps, m.CFGScale, m.GenerationHash, p.id,
+			); err != nil {
+				return 0, fmt.Errorf("re-derive comfyui recipe: %w", err)
+			}
+		}
 		if err := writeComfyTerms(ctx, tx, p.id, p.raw); err != nil {
 			return 0, err
 		}

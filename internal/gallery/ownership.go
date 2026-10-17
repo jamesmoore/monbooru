@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // Files another user wrote (an rsync, rootless Podman's UID mapping)

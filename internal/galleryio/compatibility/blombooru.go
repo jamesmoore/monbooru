@@ -113,15 +113,7 @@ func blombooruTagTokens(names []string, catByTag map[string]string) []string {
 		if name == "" {
 			continue
 		}
-		switch {
-		case cat != "" && cat != "general":
-			out = append(out, cat+":"+name)
-		case strings.Contains(name, ":"):
-			// Bare, the importer would read the part before the colon as a category.
-			out = append(out, "general:"+name)
-		default:
-			out = append(out, name)
-		}
+		out = append(out, TagToken(cat, name))
 	}
 	return out
 }

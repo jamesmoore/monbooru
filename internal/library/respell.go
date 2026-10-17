@@ -8,12 +8,13 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // respellRelativeRows makes absolute the paths stored while the root was
-// relative, against the working directory the root was resolved in. It reads
-// only rows outside the root's prefix: two range scans, empty once done.
+// relative, against the working directory the root was resolved in. Every
+// absolute Unix path sorts between sep and sep+1; a Windows one is a
+// drive-letter or UNC path.
 func respellRelativeRows(database *db.DB, root string) error {
 	if !filepath.IsAbs(root) {
 		return nil
@@ -27,10 +28,10 @@ func respellRelativeRows(database *db.DB, root string) error {
 	rows, err := db.QueryAll(database.Write, db.ScanRow(func(r *pathRow) []any {
 		return []any{&r.id, &r.imageID, &r.path, &r.canonical}
 	}),
-		`SELECT id, image_id, path, is_canonical FROM image_paths WHERE path < ?
+		`SELECT id, image_id, path, is_canonical FROM image_paths WHERE path < ? AND path NOT GLOB '[A-Za-z]:[\/]*'
 		 UNION ALL
-		 SELECT id, image_id, path, is_canonical FROM image_paths WHERE path >= ?`,
-		root+string(sep), root+string(sep+1))
+		 SELECT id, image_id, path, is_canonical FROM image_paths WHERE path >= ? AND path NOT GLOB '[A-Za-z]:[\/]*'`,
+		string(sep), string(sep+1))
 	if err != nil {
 		return err
 	}

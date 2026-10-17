@@ -22,8 +22,8 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/monbooru/monbooru/internal/fsx"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type Config struct {
@@ -99,8 +99,8 @@ type ServerConfig struct {
 	BooruName   string   `toml:"name"`
 	Theme       string   `toml:"theme,omitempty"`
 	ThemeColor  string   `toml:"theme_color"`
-	// The browser-facing address; blank falls back to
-	// [monloader].api_url, the one the server calls.
+	// The browser-facing address; blank renders no link, since
+	// [monloader].api_url may be one a browser cannot resolve.
 	MonloaderURL string `toml:"monloader_url"`
 }
 
@@ -229,21 +229,19 @@ func ValidatePluginButtons(buttons []PluginButton) error {
 }
 
 func (cfg *Config) FindPairedToken(app string) *Token {
-	for i := range cfg.Auth.Tokens {
-		if cfg.Auth.Tokens[i].Paired == app {
-			return &cfg.Auth.Tokens[i]
-		}
+	i := slices.IndexFunc(cfg.Auth.Tokens, func(t Token) bool { return t.Paired == app })
+	if i < 0 {
+		return nil
 	}
-	return nil
+	return &cfg.Auth.Tokens[i]
 }
 
 func (cfg *Config) FindPlugin(name string) *PluginConfig {
-	for i := range cfg.Plugins {
-		if cfg.Plugins[i].Name == name {
-			return &cfg.Plugins[i]
-		}
+	i := slices.IndexFunc(cfg.Plugins, func(p PluginConfig) bool { return p.Name == name })
+	if i < 0 {
+		return nil
 	}
-	return nil
+	return &cfg.Plugins[i]
 }
 
 type PathsConfig struct {
@@ -280,9 +278,36 @@ type TaggerConfig struct {
 	Taggers                 []TaggerInstance     `toml:"taggers"`
 }
 
-var ValidExecutionProviders = []string{"cpu", "cuda", "directml", "tensorrt", "openvino", "coreml", "coremlv2"}
+// ExecutionProviders is every tagger.execution_provider value, in the
+// order Settings lists them, with the label it shows.
+var ExecutionProviders = []struct{ Name, Label string }{
+	{"cpu", "CPU"},
+	{"cuda", "CUDA"},
+	{"directml", "DirectML"},
+	{"tensorrt", "TensorRT"},
+	{"openvino", "OpenVINO"},
+	{"coreml", "CoreML"},
+	{"coremlv2", "CoreML V2"},
+}
+
+var ValidExecutionProviders = func() []string {
+	names := make([]string, len(ExecutionProviders))
+	for i, p := range ExecutionProviders {
+		names[i] = p.Name
+	}
+	return names
+}()
 
 func IsValidExecutionProvider(v string) bool { return slices.Contains(ValidExecutionProviders, v) }
+
+func ExecutionProviderLabel(name string) string {
+	for _, p := range ExecutionProviders {
+		if p.Name == name {
+			return p.Label
+		}
+	}
+	return name
+}
 
 type TaggerAggregationCfg struct {
 	MinHitFraction float64 `toml:"min_hit_fraction"`
@@ -351,14 +376,12 @@ func HashToken(secret string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func GenerateSecret() string {
-	buf := make([]byte, 16)
-	_, _ = rand.Read(buf)
-	return hex.EncodeToString(buf)
-}
+func GenerateSecret() string { return randomHex(16) }
 
-func newTokenID() string {
-	buf := make([]byte, 8)
+func newTokenID() string { return randomHex(8) }
+
+func randomHex(n int) string {
+	buf := make([]byte, n)
 	_, _ = rand.Read(buf)
 	return hex.EncodeToString(buf)
 }
@@ -627,8 +650,12 @@ func load(path, base string, seed func(*Config)) (*Config, error) {
 		// Cleared so the use_cuda migration tells an omitted key from "cpu".
 		cfg.Tagger.ExecutionProvider = ""
 		cfg.SetupDone = true
-		if _, err := toml.DecodeFile(path, cfg); err != nil {
+		md, err := toml.DecodeFile(path, cfg)
+		if err != nil {
 			return nil, fmt.Errorf("parsing config file %q: %w", path, err)
+		}
+		if keys := md.Undecoded(); len(keys) > 0 {
+			logx.Warnf("config: ignoring unknown key(s) in %s: %v", path, keys)
 		}
 		if base != "" && len(cfg.Galleries) == 0 {
 			cfg.Galleries = Default().Galleries
@@ -763,12 +790,11 @@ func portableForm(cfg *Config) *Config {
 }
 
 func (cfg *Config) FindGallery(name string) *Gallery {
-	for i := range cfg.Galleries {
-		if cfg.Galleries[i].Name == name {
-			return &cfg.Galleries[i]
-		}
+	i := slices.IndexFunc(cfg.Galleries, func(g Gallery) bool { return g.Name == name })
+	if i < 0 {
+		return nil
 	}
-	return nil
+	return &cfg.Galleries[i]
 }
 
 func (cfg *Config) RenameGalleryRefs(oldName, newName string) {
@@ -932,14 +958,14 @@ func validate(cfg *Config) error {
 	if !strings.Contains(cfg.Server.BindAddress, ":") {
 		return fmt.Errorf("server.bind_address %q is not a valid host:port", cfg.Server.BindAddress)
 	}
-	// An empty hash would let the password-update handler skip its
-	// current-password check.
-	if cfg.Auth.EnablePassword && strings.TrimSpace(cfg.Auth.PasswordHash) == "" {
-		return fmt.Errorf("auth.enable_password is true but auth.password_hash is empty - " +
-			"run `monbooru -hash-password 'your-password'` and paste the result into monbooru.toml")
-	}
 	if cfg.Auth.EnablePassword {
 		h := strings.TrimSpace(cfg.Auth.PasswordHash)
+		// An empty hash would let the password-update handler skip its
+		// current-password check.
+		if h == "" {
+			return fmt.Errorf("auth.enable_password is true but auth.password_hash is empty - " +
+				"run `monbooru -hash-password 'your-password'` and paste the result into monbooru.toml")
+		}
 		if !strings.HasPrefix(h, "$2a$") && !strings.HasPrefix(h, "$2b$") && !strings.HasPrefix(h, "$2y$") {
 			return fmt.Errorf("auth.password_hash does not look like a bcrypt hash - " +
 				"run `monbooru -hash-password 'your-password'` and paste the result into monbooru.toml")
@@ -982,9 +1008,7 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("gallery %q: %w", g.Name, err)
 		}
 	}
-	if cfg.DefaultGallery == "" {
-		cfg.DefaultGallery = cfg.Galleries[0].Name
-	} else if cfg.FindGallery(cfg.DefaultGallery) == nil {
+	if cfg.FindGallery(cfg.DefaultGallery) == nil {
 		cfg.DefaultGallery = cfg.Galleries[0].Name
 	}
 	if cfg.Schedule.Time == "" {

@@ -2,12 +2,12 @@ package web
 
 import (
 	"context"
-	"github.com/monbooru/monbooru/internal/monloader"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
+	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/plugins"
 )

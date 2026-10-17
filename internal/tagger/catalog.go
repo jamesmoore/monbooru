@@ -2,21 +2,26 @@ package tagger
 
 import (
 	"cmp"
-	"embed"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/registry"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
-//go:embed catalog_default.json
-var defaultCatalogJSON []byte
+const (
+	catalogSchemaVersion = 1
 
-//go:embed dispatch_default/*.json
-var defaultDispatchFS embed.FS
+	modelManifest = "model.json"
+	stockProfile  = "profile_default.json"
+	stockDispatch = "dispatch_default.json"
+)
 
 // Monbooru never fetches these URLs itself: Settings only renders the
 // commands, so the app makes no outbound request.
@@ -37,41 +42,84 @@ type CatalogFile struct {
 	Filename string `json:"filename"`
 }
 
-type catalogDoc struct {
-	Version int            `json:"version"`
-	Models  []CatalogEntry `json:"models"`
+type modelDoc struct {
+	Version int `json:"version"`
+	CatalogEntry
+}
+
+func Builtin(name string) bool { return slices.Contains(registry.Taggers, name) }
+
+func stockFile(modelPath, taggerName, file string) ([]byte, string, error) {
+	if Builtin(taggerName) {
+		data, err := registry.FS.ReadFile(path.Join(registry.TaggersDir, taggerName, file))
+		return data, "embedded " + taggerName, err
+	}
+	p := filepath.Join(modelPath, taggerName, file)
+	data, err := os.ReadFile(p)
+	return data, p, err
+}
+
+func loadModelDoc(modelPath, taggerName string) (CatalogEntry, bool) {
+	data, source, err := stockFile(modelPath, taggerName, modelManifest)
+	if err != nil {
+		return CatalogEntry{}, false
+	}
+	var doc modelDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		logx.Warnf("tagger: %s: parse failed: %v", source, err)
+		return CatalogEntry{}, false
+	}
+	if doc.Version != catalogSchemaVersion {
+		logx.Warnf("tagger: %s: schema version %d unsupported (want %d)", source, doc.Version, catalogSchemaVersion)
+		return CatalogEntry{}, false
+	}
+	doc.Name = taggerName
+	return doc.CatalogEntry, true
 }
 
 func LoadCatalog(modelPath string) []CatalogEntry {
-	var doc catalogDoc
-	if err := json.Unmarshal(defaultCatalogJSON, &doc); err != nil {
-		return nil
+	var out []CatalogEntry
+	for _, name := range registry.Taggers {
+		if e, ok := loadModelDoc(modelPath, name); ok {
+			out = append(out, e)
+		}
 	}
-	out := append([]CatalogEntry(nil), doc.Models...)
-
-	if data, err := os.ReadFile(filepath.Join(modelPath, "models.json")); err == nil {
-		var override catalogDoc
-		if err := json.Unmarshal(data, &override); err == nil {
-			byName := map[string]int{}
-			for i, e := range out {
-				byName[e.Name] = i
+	if dirs, err := os.ReadDir(modelPath); err == nil {
+		for _, d := range dirs {
+			name := d.Name()
+			if Builtin(name) || ValidateTaggerName(name) != nil {
+				continue
 			}
-			seen := map[string]bool{}
-			for _, e := range override.Models {
-				if i, ok := byName[e.Name]; ok {
-					if seen[e.Name] {
-						logx.Warnf("models.json: duplicate tagger name %q; keeping the last entry", e.Name)
-					}
-					out[i] = e
-				} else {
-					byName[e.Name] = len(out)
-					out = append(out, e)
-				}
-				seen[e.Name] = true
+			if e, ok := loadModelDoc(modelPath, name); ok {
+				out = append(out, e)
 			}
 		}
 	}
 	return out
+}
+
+func (c CatalogEntry) Missing(dir string) CatalogEntry {
+	out := c
+	out.Files = nil
+	for _, f := range c.Files {
+		if !regularFile(filepath.Join(dir, f.Filename)) && !regularFile(filepath.Join(dir, downloadName(f.URL))) {
+			out.Files = append(out.Files, f)
+		}
+	}
+	return out
+}
+
+func downloadName(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return path.Base(u.Path)
+}
+
+func regularFile(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // $HF_TOKEN sits in double quotes so the shell running the snippet expands it.

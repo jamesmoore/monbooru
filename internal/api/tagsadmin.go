@@ -82,7 +82,7 @@ func writeTagError(w http.ResponseWriter, err error) {
 		{tags.ErrImplicationSelf, http.StatusBadRequest, "invalid_request"},
 		{tags.ErrImplicationAlias, http.StatusBadRequest, "invalid_request"},
 	}) {
-		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		serverError(w, err)
 	}
 }
 

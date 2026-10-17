@@ -34,9 +34,6 @@ build() {
   cp LICENSE README.md "$dir/"
   if [ "$os" = windows ]; then
     cp packaging/icons/monbooru.ico "$dir/"
-  fi
-
-  if [ "$os" = windows ]; then
     rm -rf "$dir-setup"
     cp -r "$dir" "$dir-setup"
     compile installer "$dir-setup/$exe"

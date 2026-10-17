@@ -14,9 +14,6 @@ import (
 )
 
 func (s *Server) ptrLookupSearchPost(w http.ResponseWriter, r *http.Request) {
-	if !parseFormOK(w, r) {
-		return
-	}
 	s.startTagScopeRun(w, r, func(ids []int64) { s.ml.PTRTagSweep(s.tagSvc(), ids, "") })
 }
 

@@ -4,16 +4,19 @@ package plugins
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/procx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type Launch struct {
@@ -113,10 +116,7 @@ func (s *Supervisor) Stop(name string) {
 
 func (s *Supervisor) StopAll() {
 	s.mu.Lock()
-	names := make([]string, 0, len(s.managed))
-	for name := range s.managed {
-		names = append(names, name)
-	}
+	names := slices.Collect(maps.Keys(s.managed))
 	s.mu.Unlock()
 	for _, name := range names {
 		s.Stop(name)
@@ -189,12 +189,9 @@ func (m *managedPlugin) run() error {
 		m.mu.Unlock()
 		return err
 	}
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	cmd.Stderr = cmd.Stdout
+	out, pw := io.Pipe()
+	cmd.Stdout, cmd.Stderr = pw, pw
+	cmd.WaitDelay = time.Second
 	if err := cmd.Start(); err != nil {
 		m.mu.Unlock()
 		return err
@@ -203,21 +200,29 @@ func (m *managedPlugin) run() error {
 	m.mu.Unlock()
 	logx.Infof("plugin %s: started (pid %d)", m.name, cmd.Process.Pid)
 
-	// Drain before Wait: it closes the pipe out from under a live read.
-	scanner := bufio.NewScanner(out)
-	scanner.Buffer(nil, LogLineMax)
-	var last string
-	for scanner.Scan() {
-		last = scanner.Text()
-		logx.Infof("plugin %s: %s", m.name, last)
-	}
-	if scanner.Err() != nil {
-		// A line past the cap stops the scan; undrained, the child blocks
-		// on a full pipe and Wait never returns.
-		logx.Warnf("plugin %s: output dropped: %v", m.name, scanner.Err())
-		_, _ = io.Copy(io.Discard, out)
-	}
+	lastLine := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(out)
+		scanner.Buffer(nil, LogLineMax)
+		var last string
+		for scanner.Scan() {
+			last = scanner.Text()
+			logx.Infof("plugin %s: %s", m.name, last)
+		}
+		if scanner.Err() != nil {
+			// A line past the cap stops the scan; undrained, the child blocks
+			// on a full pipe and Wait never returns.
+			logx.Warnf("plugin %s: output dropped: %v", m.name, scanner.Err())
+			_, _ = io.Copy(io.Discard, out)
+		}
+		lastLine <- last
+	}()
 	err = cmd.Wait()
+	_ = pw.Close()
+	last := <-lastLine
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
 
 	m.mu.Lock()
 	m.proc, m.stdin, m.running = nil, nil, false

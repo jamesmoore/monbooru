@@ -12,7 +12,7 @@
       {{- $emptyQueue := and (eq .Counts.QueueOpen 0) (eq .Counts.QueueSkipped 0) -}}
       <div class="relations-header-row">
         <form hx-post="/relations/find-pairs" hx-target="#flash-relations" hx-swap="innerHTML"
-              hx-on::after-request="if(event.detail.successful){document.getElementById('job-status').setAttribute('hx-trigger','load');htmx.trigger('#job-status','load')}"
+              hx-on::after-request="if(event.detail.successful){refreshJobStatus()}"
               style="display:inline">
           <button type="submit" class="btn-sm{{if $emptyQueue}} btn-success{{end}}">Find new pairs</button>
         </form>
@@ -29,7 +29,7 @@
           <button type="submit" class="btn-sm"{{if eq .Counts.QueueSkipped 0}} disabled title="No skipped pairs to reset"{{end}}>Reset skipped{{if gt .Counts.QueueSkipped 0}} ({{.Counts.QueueSkipped}}){{end}}</button>
         </form>
         <form hx-post="/relations/find-pairs" hx-target="#flash-relations" hx-swap="innerHTML"
-              hx-on::after-request="if(event.detail.successful){document.getElementById('job-status').setAttribute('hx-trigger','load');htmx.trigger('#job-status','load')}"
+              hx-on::after-request="if(event.detail.successful){refreshJobStatus()}"
               hx-confirm="Wipe the existing pair queue and rescan from scratch?"
               data-confirm-danger="Skipped pairs and any queue work in progress are dropped."
               data-confirm-ok="Rebuild"
@@ -77,7 +77,7 @@
         <p class="field-hint">The same file saved at more than one path on disk.</p>
         <div class="relations-header-row">
           <a class="btn-sm" href="/relations/duplicates/sha256">Review duplicate files</a>
-          {{template "partials/bulk_delete_form.html" (dict "Action" "/relations/file-duplicates/remove" "Target" "#flash-relations" "Confirm" "Remove every non-canonical duplicate file?" "ConfirmDanger" "Their bytes are removed from disk. The canonical path stays." "ConfirmOK" "Remove all" "Label" "Delete all duplicate files" "All" true)}}
+          {{template "bulk_delete_dup_files" "#flash-relations"}}
         </div>
       </div>
       <div class="settings-sub">
@@ -85,7 +85,7 @@
         <p class="field-hint">Images you marked as duplicates of each other. <strong>{{.Counts.DupGroups}}</strong> group(s) declared via the Relations session or the detail-page panel.</p>
         <div class="relations-header-row">
           <a class="btn-sm" href="/relations/duplicates/marked">Review duplicate images</a>
-          {{template "partials/bulk_delete_form.html" (dict "Action" "/relations/duplicates/marked/delete-all" "Target" "#flash-relations" "Confirm" "Delete every non-original member of every duplicate-image group?" "ConfirmDanger" "Their files are removed from disk. This cannot be undone." "ConfirmOK" "Delete all" "Label" "Delete all duplicate images")}}
+          {{template "bulk_delete_dup_images" "#flash-relations"}}
         </div>
       </div>
     </div>

@@ -12,10 +12,9 @@ import (
 )
 
 const (
-	DefaultModelFile           = "model.onnx"
-	DefaultTagsFile            = "tags.csv"
-	DefaultTextTagsFile        = "tags.txt"
-	DefaultConfidenceThreshold = config.DefaultConfidenceThreshold
+	DefaultModelFile    = "model.onnx"
+	DefaultTagsFile     = "tags.csv"
+	DefaultTextTagsFile = "tags.txt"
 )
 
 // The name becomes a TOML key and a folder under the model path, which the
@@ -130,13 +129,19 @@ func SelectForGallery(cfg *config.Config, gallery, name string) ([]TaggerStatus,
 }
 
 func EnabledTaggersForGallery(cfg *config.Config, gallery string) []TaggerStatus {
-	return enabledTaggers(cfg, func(t TaggerStatus) bool { return t.AppliesToGallery(gallery) })
+	enabled, _, _ := GalleryTaggers(cfg, gallery)
+	return enabled
 }
 
-// Present separates "no tagger set up", which hides the auto-tag
-// controls, from "set up but unusable", which only disables them.
-func Present(cfg *config.Config) bool {
-	return buildSupportsInference() && len(DiscoverTaggers(cfg)) > 0
+// present separates "no tagger set up", which hides the auto-tag
+// controls, from "set up but unusable", which only disables them;
+// reason is UnavailableReason's.
+func GalleryTaggers(cfg *config.Config, gallery string) (enabled []TaggerStatus, present bool, reason string) {
+	if !buildSupportsInference() {
+		return nil, false, reasonFrom(nil)
+	}
+	all := DiscoverTaggers(cfg)
+	return enabledIn(all, func(t TaggerStatus) bool { return t.AppliesToGallery(gallery) }), len(all) > 0, reasonFrom(all)
 }
 
 // The unscoped listing passes no predicate: AppliesToGallery("") is false
@@ -145,8 +150,12 @@ func enabledTaggers(cfg *config.Config, extra func(TaggerStatus) bool) []TaggerS
 	if !buildSupportsInference() {
 		return nil
 	}
+	return enabledIn(DiscoverTaggers(cfg), extra)
+}
+
+func enabledIn(list []TaggerStatus, extra func(TaggerStatus) bool) []TaggerStatus {
 	var out []TaggerStatus
-	for _, t := range DiscoverTaggers(cfg) {
+	for _, t := range list {
 		if !t.Enabled || !t.Available {
 			continue
 		}
@@ -193,7 +202,13 @@ func resolveTaggerFiles(dir, explicitModel, explicitTags string) (string, string
 	return modelFile, tagsFile
 }
 
-func isTaggerSidecar(name string) bool { return name == "tagger.json" || name == "dispatch.json" }
+func isTaggerSidecar(name string) bool {
+	switch name {
+	case "tagger.json", "dispatch.json", modelManifest, stockProfile, stockDispatch:
+		return true
+	}
+	return false
+}
 
 func listTaggerFiles(dir string) (onnx, labels []string) {
 	entries, err := os.ReadDir(dir)
@@ -223,7 +238,7 @@ func SeedTaggerInstance(name string, enabled bool, catalog *CatalogEntry) config
 	t := config.TaggerInstance{
 		Name:                name,
 		Enabled:             enabled,
-		ConfidenceThreshold: DefaultConfidenceThreshold,
+		ConfidenceThreshold: config.DefaultConfidenceThreshold,
 	}
 	if catalog == nil {
 		return t

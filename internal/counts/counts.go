@@ -25,6 +25,7 @@ type Tallies struct {
 	inboxCount       atomic.Pointer[stampedCount]
 	tagCount         atomic.Pointer[stampedCount]
 	collectionsCount atomic.Pointer[stampedCount]
+	phashGen         atomic.Uint64
 	phashMissing     atomic.Pointer[stampedCount]
 }
 
@@ -35,8 +36,8 @@ type stampedCount struct {
 
 func New(database *db.DB) *Tallies { return &Tallies{db: database} }
 
-func (c *Tallies) cachedCount(slot *atomic.Pointer[stampedCount], sql string) (int, bool) {
-	gen := c.gen.Load()
+func (c *Tallies) cachedCount(slot *atomic.Pointer[stampedCount], stamp *atomic.Uint64, sql string) (int, bool) {
+	gen := stamp.Load()
 	if p := slot.Load(); p != nil && p.gen == gen {
 		return p.n, true
 	}
@@ -51,7 +52,7 @@ func (c *Tallies) cachedCount(slot *atomic.Pointer[stampedCount], sql string) (i
 // UntaggedVisibleCount must leave out the derived meta rows exactly as
 // the tagged: filter does, or the header count disagrees with the grid.
 func (c *Tallies) UntaggedVisibleCount() (int, bool) {
-	return c.cachedCount(&c.untaggedVisible,
+	return c.cachedCount(&c.untaggedVisible, &c.gen,
 		`SELECT COUNT(*) FROM images i
 		 WHERE is_missing = 0
 		   AND NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id
@@ -59,11 +60,11 @@ func (c *Tallies) UntaggedVisibleCount() (int, bool) {
 }
 
 func (c *Tallies) VisibleCount() (int, bool) {
-	return c.cachedCount(&c.visibleCount, `SELECT COUNT(*) FROM images WHERE is_missing = 0`)
+	return c.cachedCount(&c.visibleCount, &c.gen, `SELECT COUNT(*) FROM images WHERE is_missing = 0`)
 }
 
 func (c *Tallies) AutoUntaggedVisibleCount() (int, bool) {
-	return c.cachedCount(&c.autoUntaggedVisible,
+	return c.cachedCount(&c.autoUntaggedVisible, &c.gen,
 		`SELECT COUNT(*) FROM images i
 		 WHERE is_missing = 0
 		   AND NOT EXISTS (
@@ -73,25 +74,25 @@ func (c *Tallies) AutoUntaggedVisibleCount() (int, bool) {
 }
 
 func (c *Tallies) InboxCount() (int, bool) {
-	return c.cachedCount(&c.inboxCount, `SELECT COUNT(*) FROM images WHERE is_missing = 0 AND is_inbox = 1`)
+	return c.cachedCount(&c.inboxCount, &c.gen, `SELECT COUNT(*) FROM images WHERE is_missing = 0 AND is_inbox = 1`)
 }
 
 func (c *Tallies) TagCount() (int, bool) {
-	return c.cachedCount(&c.tagCount, `SELECT COUNT(*) FROM tags WHERE is_alias = 0`)
+	return c.cachedCount(&c.tagCount, &c.gen, `SELECT COUNT(*) FROM tags WHERE is_alias = 0`)
 }
 
 func (c *Tallies) CollectionsCount() (int, bool) {
-	return c.cachedCount(&c.collectionsCount, `SELECT COUNT(*) FROM collection_counts WHERE visible_count > 0`)
+	return c.cachedCount(&c.collectionsCount, &c.gen, `SELECT COUNT(*) FROM collection_counts WHERE visible_count > 0`)
 }
 
 func (c *Tallies) PhashMissing() (int, bool) {
-	return c.cachedCount(&c.phashMissing, `SELECT COUNT(*) FROM images WHERE phash IS NULL AND is_missing = 0`)
+	return c.cachedCount(&c.phashMissing, &c.phashGen, `SELECT COUNT(*) FROM images WHERE phash IS NULL AND is_missing = 0`)
 }
 
 // InvalidatePhashMissing is for phash writes that leave image membership
 // alone; anything else calls Invalidate.
 func (c *Tallies) InvalidatePhashMissing() {
-	c.gen.Add(1)
+	c.phashGen.Add(1)
 	c.phashMissing.Store(nil)
 }
 
@@ -158,12 +159,6 @@ func (c *Tallies) ReleaseIdleCountedTags(after time.Duration) bool {
 // Invalidate must follow every write that changes image_tags membership.
 func (c *Tallies) Invalidate() {
 	c.gen.Add(1)
-	c.untaggedVisible.Store(nil)
-	c.autoUntaggedVisible.Store(nil)
-	c.visibleCount.Store(nil)
+	c.phashGen.Add(1)
 	c.countedTags.Store(nil)
-	c.inboxCount.Store(nil)
-	c.tagCount.Store(nil)
-	c.collectionsCount.Store(nil)
-	c.phashMissing.Store(nil)
 }

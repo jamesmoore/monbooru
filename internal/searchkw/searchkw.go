@@ -112,6 +112,8 @@ var rangeKeys = map[string]bool{
 	"tagged": true, "autotagged": true, "via": true,
 }
 
+var listKeys = map[string]bool{"type": true, "mime": true, "ai": true}
+
 var boolSpellings = map[string]bool{
 	"true": true, "yes": true, "y": true, "on": true, "1": true,
 	"false": false, "no": false, "n": false, "off": false, "0": false,
@@ -129,8 +131,16 @@ func ValueKnown(key, val string) bool {
 		return true
 	}
 	boolRow := slices.Equal(vals, []string{"true", "false"})
-	for _, part := range strings.Split(strings.ToLower(val), ",") {
+	val = strings.ToLower(val)
+	parts := []string{val}
+	if listKeys[key] {
+		parts = strings.Split(val, ",")
+	}
+	for _, part := range parts {
 		part = strings.TrimSpace(part)
+		if key == "mime" {
+			part = strings.TrimPrefix(strings.TrimPrefix(part, "image/"), "video/")
+		}
 		if part == "" || slices.Contains(vals, part) {
 			continue
 		}

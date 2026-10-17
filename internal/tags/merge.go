@@ -144,13 +144,19 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 	if aliasID == canonicalID {
 		return ErrMergeIntoSelf
 	}
-	if s.isLockedRatingTag(aliasID) {
+	switch locked, err := s.isLockedRatingTag(aliasID); {
+	case err != nil:
+		return err
+	case locked:
 		return ErrRatingTagImmutable
 	}
-	ratingTarget := s.isRatingTag(canonicalID)
+	ratingTarget, err := s.isRatingTag(canonicalID)
+	if err != nil {
+		return err
+	}
 
 	var gained bool
-	err := s.inWriteTx(func(tx *sql.Tx) error {
+	err = s.inWriteTx(func(tx *sql.Tx) error {
 		var aliasExists bool
 		if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM tags WHERE id = ?)`, aliasID).Scan(&aliasExists); err != nil {
 			return err
@@ -169,7 +175,7 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 
 		// Images that gain the canonical here need its implications
 		// fanned out below.
-		newCarriers, err := db.QueryAll(tx, scanCarrier,
+		newCarriers, err := db.QueryAll(tx, db.ScanRow(func(c *carrier) []any { return []any{&c.imageID, &c.isAuto} }),
 			`SELECT image_id, is_auto FROM image_tags WHERE tag_id = ?
 			 AND image_id NOT IN (SELECT image_id FROM image_tags WHERE tag_id = ?)`,
 			aliasID, canonicalID,
@@ -234,6 +240,9 @@ func (s *Service) MergeTags(aliasID, canonicalID int64) error {
 			return err
 		}
 		if err := moveTagNoteTx(tx, aliasID, canonicalID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM folded_tag_pairs WHERE old_id = ? OR new_id = ?`, aliasID, aliasID); err != nil {
 			return err
 		}
 
@@ -314,12 +323,6 @@ func repointImplicationsToCanonicalTx(tx *sql.Tx, aliasID, canonicalID int64) (g
 type carrier struct {
 	imageID int64
 	isAuto  int
-}
-
-func scanCarrier(rows *sql.Rows) (carrier, error) {
-	var c carrier
-	err := rows.Scan(&c.imageID, &c.isAuto)
-	return c, err
 }
 
 // The graph was acyclic, so a new cycle runs through one alias edge.

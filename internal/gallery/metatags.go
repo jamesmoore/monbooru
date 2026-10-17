@@ -233,23 +233,21 @@ func resolveMetaNames(database *db.DB, metaCatID int64, names []string) (map[str
 	if len(names) == 0 {
 		return out, nil
 	}
+	type nameRow struct {
+		name string
+		id   int64
+	}
 	placeholders, args := db.InPlaceholders(names)
-	rows, err := database.Read.Query(
+	rows, err := db.QueryAll(database.Read, db.ScanRow(func(r *nameRow) []any { return []any{&r.name, &r.id} }),
 		`SELECT name, COALESCE(canonical_tag_id, id) FROM tags WHERE category_id = ? AND name IN (`+placeholders+`)`,
 		append([]any{metaCatID}, args...)...)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var name string
-		var id int64
-		if err := rows.Scan(&name, &id); err != nil {
-			return nil, err
-		}
-		out[name] = id
+	for _, r := range rows {
+		out[r.name] = r.id
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func metaFactsFor(database *db.DB, thumbnailsPath string, imageID int64) (metaFacts, error) {

@@ -14,22 +14,18 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/galleryio/compatibility"
 	"github.com/monbooru/monbooru/internal/library"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-// Tags are "name" in general and "category:name" elsewhere; the format
-// stays this small so other software can read and write it.
-type LightManifestImage struct {
-	SHA256 string   `json:"sha256"`
-	Path   string   `json:"path"`
-	Tags   []string `json:"tags"`
-}
+type LightManifestImage = compatibility.ManifestImage
 
 type LightManifest struct {
 	Version int                  `json:"version"`
@@ -50,15 +46,6 @@ func readLightManifest(path string) (LightManifest, error) {
 		return mf, fmt.Errorf("unsupported light export version %d (expected %d)", mf.Version, LightManifestVersion)
 	}
 	return mf, nil
-}
-
-// A general name holding a colon is qualified: bare, its prefix could read
-// as a category on the way back in.
-func tagToken(category, name string) string {
-	if (category == "general" || category == "") && !strings.Contains(name, ":") {
-		return name
-	}
-	return cmp.Or(category, "general") + ":" + name
 }
 
 // ImportSourceNative is the tagger_name of native imports; compat imports
@@ -92,18 +79,20 @@ func writeLightManifest(read *sql.DB, w io.Writer, sc exportScope, names map[int
 	bw.field("version", LightManifestVersion)
 	bw.arrayStart("images")
 	first := true
-	err := walkLightRows(read, sc, func(id int64, sha, relPath string, missing bool, tags []string) {
+	err := walkLightRows(read, sc, false, func(id int64, sha, relPath string, missing bool, tags []lightTag) error {
 		if missing {
-			return
+			return nil
 		}
 		// A tag-less image ships an empty array, not null.
-		if tags == nil {
-			tags = []string{}
+		tokens := make([]string, len(tags))
+		for i, tg := range tags {
+			tokens[i] = tg.token
 		}
 		if names != nil {
 			relPath = names[id]
 		}
-		bw.arrayItem(&first, LightManifestImage{SHA256: sha, Path: relPath, Tags: tags})
+		bw.arrayItem(&first, LightManifestImage{SHA256: sha, Path: relPath, Tags: tokens})
+		return nil
 	})
 	bw.arrayEnd()
 	bw.objEnd()
@@ -113,9 +102,20 @@ func writeLightManifest(read *sql.DB, w io.Writer, sc exportScope, names map[int
 	return bw.err
 }
 
+type lightTag struct {
+	token      string
+	isAuto     bool
+	taggerName string
+	confidence *float64
+}
+
 // Grouping depends on the ORDER BY i.id: an image closes when the id changes.
-func walkLightRows(read *sql.DB, sc exportScope, emit func(id int64, sha, relPath string, missing bool, tags []string)) error {
-	rows, err := read.Query(lightRowsQuery+sc.where("i.id")+" ORDER BY i.id, tc.name, t.name", sc.args()...)
+func walkLightRows(read *sql.DB, sc exportScope, directOnly bool, emit func(id int64, sha, relPath string, missing bool, tags []lightTag) error) error {
+	q := lightRowsQuery
+	if directOnly {
+		q = lightDirectRowsQuery
+	}
+	rows, err := read.Query(q+sc.where("i.id")+" ORDER BY i.id, tc.name, t.name", sc.args()...)
 	if err != nil {
 		return err
 	}
@@ -124,19 +124,23 @@ func walkLightRows(read *sql.DB, sc exportScope, emit func(id int64, sha, relPat
 	var curID int64
 	var curSHA, curPath string
 	var curMissing bool
-	var tags []string
+	var tags []lightTag
 	open := false
 	for rows.Next() {
 		var id int64
 		var sha, folder, canonical string
 		var missing bool
-		var tname, tcat sql.NullString
-		if err := rows.Scan(&id, &sha, &folder, &canonical, &missing, &tname, &tcat); err != nil {
+		var tname, tcat, tagger sql.NullString
+		var isAuto sql.NullBool
+		var conf sql.NullFloat64
+		if err := rows.Scan(&id, &sha, &folder, &canonical, &missing, &tname, &tcat, &isAuto, &tagger, &conf); err != nil {
 			return err
 		}
 		if !open || id != curID {
 			if open {
-				emit(curID, curSHA, curPath, curMissing, tags)
+				if err := emit(curID, curSHA, curPath, curMissing, tags); err != nil {
+					return err
+				}
 			}
 			curID, open = id, true
 			curSHA, curMissing = sha, missing
@@ -144,32 +148,42 @@ func walkLightRows(read *sql.DB, sc exportScope, emit func(id int64, sha, relPat
 			tags = nil
 		}
 		if tname.Valid {
-			tags = append(tags, tagToken(tcat.String, tname.String))
+			tg := lightTag{token: compatibility.TagToken(tcat.String, tname.String), isAuto: isAuto.Bool, taggerName: tagger.String}
+			if conf.Valid {
+				tg.confidence = &conf.Float64
+			}
+			tags = append(tags, tg)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	if open {
-		emit(curID, curSHA, curPath, curMissing, tags)
+		return emit(curID, curSHA, curPath, curMissing, tags)
 	}
 	return nil
 }
 
-// is_alias sits in the join, not a WHERE, so an alias row can't drop its image.
-const lightRowsQuery = `
-	SELECT i.id, i.sha256, i.folder_path, i.canonical_path, i.is_missing, t.name, tc.name
+// is_alias and is_implied sit in the joins, not a WHERE, so a skipped
+// row can't drop its image.
+const (
+	lightRowsSelect = `
+	SELECT i.id, i.sha256, i.folder_path, i.canonical_path, i.is_missing, t.name, tc.name, it.is_auto, it.tagger_name, it.confidence
 	FROM images i
-	LEFT JOIN image_tags it ON it.image_id = i.id
+	LEFT JOIN image_tags it ON it.image_id = i.id`
+	lightRowsJoins = `
 	LEFT JOIN tags t ON t.id = it.tag_id AND t.is_alias = 0
 	LEFT JOIN tag_categories tc ON tc.id = t.category_id`
+	lightRowsQuery       = lightRowsSelect + lightRowsJoins
+	lightDirectRowsQuery = lightRowsSelect + ` AND it.is_implied = 0` + lightRowsJoins
+)
 
-func replaceFromLightArchive(manifest *zip.File, files []translatedFile, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int) (int, error) {
+func replaceFromLightArchive(manifest *zip.File, files []translatedFile, dbPath, thumbsPath string, b *gallery.Boundary, maxFileSizeMB int, quiesce func() error) (int, error) {
 	mf, err := extractLightManifest(manifest, filepath.Dir(dbPath))
 	if err != nil {
 		return 0, err
 	}
-	return ApplyLightReplace(mf, files, dbPath, thumbsPath, b, ImportSourceNative, maxFileSizeMB)
+	return ApplyLightReplace(mf, files, dbPath, thumbsPath, b, ImportSourceNative, maxFileSizeMB, quiesce)
 }
 
 type translatedFile struct {
@@ -179,13 +193,13 @@ type translatedFile struct {
 
 // ApplyLightReplace rebuilds the gallery from mf and files; the count is
 // the files b leaves out.
-func ApplyLightReplace(mf LightManifest, files []translatedFile, dbPath, thumbsPath string, b *gallery.Boundary, source string, maxFileSizeMB int) (int, error) {
+func ApplyLightReplace(mf LightManifest, files []translatedFile, dbPath, thumbsPath string, b *gallery.Boundary, source string, maxFileSizeMB int, quiesce func() error) (int, error) {
 	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
 	dsts, err := planExtraction(b, files, maxBytes)
 	if err != nil {
 		return 0, err
 	}
-	if err := resetDBAndThumbs(dbPath, thumbsPath); err != nil {
+	if err := quiesce(); err != nil {
 		return 0, err
 	}
 	leftOut, err := extractPlanned(b, files, dsts, maxBytes)
@@ -285,14 +299,22 @@ func extractPlanned(b *gallery.Boundary, files []translatedFile, dsts []string, 
 	return leftOut, err
 }
 
-func resetDBAndThumbs(dbPath, thumbsPath string) error {
-	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+func removeSidecars(dbPath string) error {
+	for _, p := range []string{dbPath + "-wal", dbPath + "-shm"} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", p, err)
 		}
 	}
+	return nil
+}
+
+func resetThumbs(thumbsPath string) error {
 	if err := os.RemoveAll(thumbsPath); err != nil {
 		return fmt.Errorf("clear thumbnails: %w", err)
+	}
+	// The rebuilt database numbers ids from 1, which the cached pages are keyed by.
+	if err := os.RemoveAll(gallery.MangaCacheDir(thumbsPath)); err != nil {
+		return fmt.Errorf("clear manga cache: %w", err)
 	}
 	if err := os.MkdirAll(thumbsPath, 0o755); err != nil {
 		return fmt.Errorf("recreate thumbnails dir: %w", err)
@@ -300,29 +322,49 @@ func resetDBAndThumbs(dbPath, thumbsPath string) error {
 	return nil
 }
 
-func replaceFromLightManifest(srcPath, dbPath, thumbsPath string, b *gallery.Boundary) error {
+func replaceFromLightManifest(srcPath, dbPath, thumbsPath string, b *gallery.Boundary, quiesce func() error) error {
 	mf, err := readLightManifest(srcPath)
 	if err != nil {
 		return err
 	}
-	if err := resetDBAndThumbs(dbPath, thumbsPath); err != nil {
+	if err := quiesce(); err != nil {
 		return err
 	}
 	return rebuildFromLightManifest(dbPath, b, thumbsPath, mf.Images, ImportSourceNative)
 }
 
-// The caller clears the old db first.
-func rebuildFromLightManifest(dbPath string, b *gallery.Boundary, thumbsPath string, images []LightManifestImage, source string) error {
-	database, err := db.Open(dbPath)
+// The caller quiesces the gallery first: the build's manga pages land in the
+// live cache under the new ids, so it is cleared before and after a failure.
+func rebuildFromLightManifest(dbPath string, b *gallery.Boundary, thumbsPath string, images []LightManifestImage, source string) (err error) {
+	mangaCache := gallery.MangaCacheDir(thumbsPath)
+	if err := os.RemoveAll(mangaCache); err != nil {
+		return fmt.Errorf("clear manga cache: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			gallery.WaitPageThumbs(time.Minute)
+			_ = os.RemoveAll(mangaCache)
+		}
+	}()
+	tmp, err := os.CreateTemp(filepath.Dir(dbPath), "import-*.db")
 	if err != nil {
-		return fmt.Errorf("open new db: %w", err)
+		return fmt.Errorf("create temp db: %w", err)
 	}
-	defer func() { _ = database.Close() }()
-	if err := db.Bootstrap(database); err != nil {
-		return fmt.Errorf("bootstrap: %w", err)
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmpPath) }()
+	newThumbs, err := os.MkdirTemp(filepath.Dir(thumbsPath), "thumbnails-import-*")
+	if err != nil {
+		return fmt.Errorf("create temp thumbnails dir: %w", err)
 	}
-	ingestLightManifestEntries(database, b, thumbsPath, images, source)
-	return nil
+	defer func() { _ = os.RemoveAll(newThumbs) }()
+	return loadThenInstall(tmpPath, dbPath, thumbsPath, newThumbs, func() error { return nil }, func(database *db.DB) error {
+		if err := db.Bootstrap(database); err != nil {
+			return fmt.Errorf("bootstrap: %w", err)
+		}
+		ingestLightManifestEntries(database, b, newThumbs, images, source)
+		return nil
+	})
 }
 
 // An entry with no file on disk still gets an is_missing row to keep its tags.
@@ -337,7 +379,12 @@ func ingestLightManifestEntries(database *db.DB, b *gallery.Boundary, thumbsPath
 			logx.Warnf("light import: skipping entry %q: %v", r.Path, err)
 			continue
 		}
-		if _, err := os.Stat(path); err != nil || b.Excludes(path) {
+		_, statErr := os.Stat(path)
+		if statErr != nil && models.ExtFileType(path) == "" {
+			logx.Warnf("light import: skipping %q: its type cannot be told without the file, so its tags are not kept", r.Path)
+			continue
+		}
+		if statErr != nil || b.Excludes(path) {
 			imgID, err := insertMissingImageRow(database, r.SHA256, path, galleryPath, source)
 			if err != nil {
 				logx.Warnf("light import: record missing %q: %v", r.Path, err)
@@ -400,8 +447,9 @@ func insertMissingImageRow(database *db.DB, sha, path, galleryPath, origin strin
 type mergeRecord struct {
 	SHA256     string
 	Tags       []string
-	SourcePath string    // relative to gallery/
-	zipEntry   *zip.File // when set, extract into galleryPath/<unique SourcePath>
+	groups     []transferTagGroup // a native upload's rows, in place of Tags
+	SourcePath string             // relative to gallery/
+	zipEntry   *zip.File          // when set, extract into galleryPath/<unique SourcePath>
 }
 
 type MergeResult struct {
@@ -471,36 +519,130 @@ func (r MergeResult) Summary() string {
 }
 
 func mergeFromDB(ctx context.Context, cx *library.Gallery, tmpPath string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
-	records, err := readDBRecordsFromFile(tmpPath, "uploaded file is not a valid monbooru database")
-	if err != nil {
-		return MergeResult{}, err
-	}
-	return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
+	return mergeDBFile(ctx, cx, tmpPath, "uploaded file is not a valid monbooru database", nil, maxFileSizeMB, progress)
 }
 
-func readDBRecordsFromFile(path, invalidMsg string) ([]mergeRecord, error) {
+func mergeDBFile(ctx context.Context, cx *library.Gallery, path, invalidMsg string, files map[string]*zip.File, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
 	if err := validateSQLiteFile(path); err != nil {
-		return nil, fmt.Errorf("%s: %w", invalidMsg, err)
+		return MergeResult{}, fmt.Errorf("%s: %w", invalidMsg, err)
 	}
 	src, err := db.Open(path)
 	if err != nil {
-		return nil, err
+		return MergeResult{}, err
 	}
 	defer func() { _ = src.Close() }()
-	return readDBMergeRecords(src)
+	return mergeFromSourceDB(ctx, cx, src, files, maxFileSizeMB, progress)
 }
 
 func mergeFromJSON(ctx context.Context, cx *library.Gallery, tmpPath string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
-	f, err := os.Open(tmpPath)
+	return mergeJSONFile(ctx, cx, tmpPath, nil, maxFileSizeMB, progress)
+}
+
+// The document is loaded into a temp db by the replace's loader, so the
+// merge walks its rows rather than holding the whole document.
+func mergeJSONFile(ctx context.Context, cx *library.Gallery, path string, files map[string]*zip.File, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return MergeResult{}, fmt.Errorf("open json: %w", err)
 	}
 	defer func() { _ = f.Close() }()
-	records, err := readExportMergeRecords(f)
+	tmp, err := os.CreateTemp(filepath.Dir(cx.DBPath), "merge-*.db")
 	if err != nil {
+		return MergeResult{}, fmt.Errorf("create temp db: %w", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer func() {
+		for _, p := range []string{tmpPath, tmpPath + "-wal", tmpPath + "-shm"} {
+			_ = os.Remove(p)
+		}
+	}()
+	src, err := db.Open(tmpPath)
+	if err != nil {
+		return MergeResult{}, fmt.Errorf("open temp db: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+	if err := db.Bootstrap(src); err != nil {
+		return MergeResult{}, fmt.Errorf("bootstrap: %w", err)
+	}
+	if err := stripScratchSchema(src); err != nil {
 		return MergeResult{}, err
 	}
-	return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
+	if err := loadExportStream(src, f); err != nil {
+		return MergeResult{}, err
+	}
+	return mergeFromSourceDB(ctx, cx, src, files, maxFileSizeMB, progress)
+}
+
+// The temp db is walked once, by image id, so the live schema's
+// triggers and secondary indexes would only slow its load.
+func stripScratchSchema(d *db.DB) error {
+	drops, err := db.QueryAll(d.Read, func(rows *sql.Rows) (string, error) {
+		var typ, name string
+		err := rows.Scan(&typ, &name)
+		return "DROP " + typ + ` "` + name + `"`, err
+	}, `SELECT type, name FROM sqlite_master WHERE type = 'trigger' OR (type = 'index' AND sql IS NOT NULL)`)
+	if err != nil {
+		return fmt.Errorf("list temp db schema: %w", err)
+	}
+	for _, s := range drops {
+		if _, err := d.Write.Exec(s); err != nil {
+			return fmt.Errorf("strip temp db: %w", err)
+		}
+	}
+	return nil
+}
+
+// A missing row brings its tags but no file: a gallery made inside
+// another still takes the outer one's tags after its sync, and an
+// archive's file at that path is some other image's. Implied rows stay
+// behind: the target's own implications re-derive them.
+func mergeFromSourceDB(ctx context.Context, cx *library.Gallery, src *db.DB, files map[string]*zip.File, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
+	var total int
+	if err := src.Read.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&total); err != nil {
+		return MergeResult{}, fmt.Errorf("count images: %w", err)
+	}
+	// An uploaded .db is not upgraded, and one older than the column has
+	// only direct rows.
+	var hasImplied bool
+	if err := src.Read.QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_xinfo('image_tags') WHERE name = 'is_implied'`).Scan(&hasImplied); err != nil {
+		return MergeResult{}, fmt.Errorf("probe image_tags: %w", err)
+	}
+	m := newMerger(ctx, cx, ImportSourceNative, maxFileSizeMB)
+	done := 0
+	err := walkLightRows(src.Read, exportScope{}, hasImplied, func(_ int64, sha, relPath string, missing bool, tags []lightTag) error {
+		if missing {
+			relPath = ""
+		}
+		if progress != nil {
+			progress(done, total)
+		}
+		done++
+		return m.apply(mergeRecord{SHA256: sha, SourcePath: relPath, groups: mergeTagGroups(tags), zipEntry: files[relPath]})
+	})
+	return m.res, err
+}
+
+// Manual rows land as the import's; auto rows keep their tagger and score,
+// so a target's own auto row is not promoted to a manual one.
+func mergeTagGroups(tags []lightTag) []transferTagGroup {
+	groups := []transferTagGroup{{taggerName: ImportSourceNative}}
+	byTagger := map[string]int{}
+	for _, tg := range tags {
+		if !tg.isAuto {
+			groups[0].tokens = append(groups[0].tokens, tg.token)
+			continue
+		}
+		i, ok := byTagger[tg.taggerName]
+		if !ok {
+			i = len(groups)
+			byTagger[tg.taggerName] = i
+			groups = append(groups, transferTagGroup{isAuto: true, taggerName: tg.taggerName})
+		}
+		groups[i].tokens = append(groups[i].tokens, tg.token)
+		groups[i].confs = append(groups[i].confs, tg.confidence)
+	}
+	return groups
 }
 
 func mergeFromLightJSON(ctx context.Context, cx *library.Gallery, tmpPath string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
@@ -529,7 +671,6 @@ func mergeFromZip(ctx context.Context, cx *library.Gallery, tmpPath string, maxF
 		galleryFiles[tf.rel] = tf.file
 	}
 
-	var records []mergeRecord
 	dataDir := filepath.Dir(cx.DBPath)
 	switch {
 	case innerLight != nil && innerDB == nil && innerJSON == nil:
@@ -537,185 +678,116 @@ func mergeFromZip(ctx context.Context, cx *library.Gallery, tmpPath string, maxF
 		if err != nil {
 			return MergeResult{}, err
 		}
+		records := make([]mergeRecord, 0, len(mf.Images))
 		for _, img := range mf.Images {
-			records = append(records, mergeRecord{SHA256: img.SHA256, Tags: img.Tags, SourcePath: img.Path})
+			records = append(records, mergeRecord{SHA256: img.SHA256, Tags: img.Tags, SourcePath: img.Path, zipEntry: galleryFiles[img.Path]})
 		}
+		return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
 	case innerDB != nil:
 		inner, err := extractZipEntryToTemp(innerDB, dataDir)
 		if err != nil {
 			return MergeResult{}, err
 		}
 		defer func() { _ = os.Remove(inner) }()
-		records, err = readDBRecordsFromFile(inner, "inner db invalid")
-		if err != nil {
-			return MergeResult{}, err
-		}
+		return mergeDBFile(ctx, cx, inner, "inner db invalid", galleryFiles, maxFileSizeMB, progress)
 	case innerJSON != nil:
 		inner, err := extractZipEntryToTemp(innerJSON, dataDir)
 		if err != nil {
 			return MergeResult{}, err
 		}
 		defer func() { _ = os.Remove(inner) }()
-		f, err := os.Open(inner)
-		if err != nil {
-			return MergeResult{}, err
-		}
-		records, err = readExportMergeRecords(f)
-		_ = f.Close()
-		if err != nil {
-			return MergeResult{}, err
-		}
-	default:
-		if format := detectCompatFormat(zr.File); format != "" {
-			return mergeFromCompatArchive(ctx, cx, zr.File, format, maxFileSizeMB, progress)
-		}
-		return MergeResult{}, fmt.Errorf("archive missing monbooru.db, monbooru.json, or tags.json")
+		return mergeJSONFile(ctx, cx, inner, galleryFiles, maxFileSizeMB, progress)
 	}
-
-	for i := range records {
-		records[i].zipEntry = galleryFiles[records[i].SourcePath]
+	if format := compatibility.Detect(zr.File); format != "" {
+		return mergeFromCompatArchive(ctx, cx, zr.File, format, maxFileSizeMB, progress)
 	}
-	return applyMergeRecords(ctx, cx, records, ImportSourceNative, maxFileSizeMB, progress)
+	return MergeResult{}, fmt.Errorf("archive missing monbooru.db, monbooru.json, or tags.json")
 }
 
 func applyMergeRecords(ctx context.Context, cx *library.Gallery, records []mergeRecord, source string, maxFileSizeMB int, progress func(done, total int)) (MergeResult, error) {
-	var res MergeResult
-	generalID := LookupCategoryID(cx.DB, "general")
-	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
+	m := newMerger(ctx, cx, source, maxFileSizeMB)
 	for i, r := range records {
 		if progress != nil {
 			progress(i, len(records))
 		}
-		if err := ctx.Err(); err != nil {
-			return res, err
+		if err := m.apply(r); err != nil {
+			return m.res, err
 		}
-		imgID, err := gallery.ImageIDBySHA(cx.DB.Read, r.SHA256)
-		if err == nil {
-			applyImportTagsToImage(cx.DB, cx.TagSvc, imgID, r.Tags, generalID, source)
-			res.Tagged++
-			continue
-		}
-		if err != sql.ErrNoRows {
-			logx.Warnf("merge: lookup sha %s: %v", r.SHA256, err)
-			res.Skipped++
-			continue
-		}
-		if r.zipEntry == nil || r.SourcePath == "" {
-			res.Skipped++
-			continue
-		}
-		safeBase, err := SafeArchiveDest(cx.GalleryPath, r.SourcePath)
-		if err != nil {
-			logx.Warnf("merge: skipping entry %q: %v", r.SourcePath, err)
-			res.Skipped++
-			continue
-		}
-		// Suffix collisions within the entry's folder, not the root.
-		entry := r.zipEntry
-		landed, err := cx.Land(context.Background(), filepath.Dir(safeBase), filepath.Base(safeBase),
-			func(dst string) error { return copyZipFile(entry, dst, maxBytes) }, library.LandSpec{Origin: source})
-		if err != nil {
-			if library.LandStageOf(err) == library.LandPlace {
-				res.LeftOut++
-			} else {
-				logx.Warnf("merge: land %q: %v", r.SourcePath, err)
-				res.Skipped++
-			}
-			continue
-		}
-		applyImportTagsToImage(cx.DB, cx.TagSvc, landed.Image.ID, r.Tags, generalID, source)
-		// A record without a sha finds its image only once extracted.
-		if landed.Duplicate {
-			res.Tagged++
-			continue
-		}
-		res.Added++
 	}
-	return res, nil
+	return m.res, nil
 }
 
-// A missing row brings its tags but no file: a gallery made inside
-// another still takes the outer one's tags after its sync, and an
-// archive's file at that path is some other image's.
-func readDBMergeRecords(src *db.DB) ([]mergeRecord, error) {
-	var recs []mergeRecord
-	if err := walkLightRows(src.Read, exportScope{}, func(_ int64, sha, relPath string, missing bool, tags []string) {
-		if missing {
-			relPath = ""
-		}
-		recs = append(recs, mergeRecord{SHA256: sha, SourcePath: relPath, Tags: tags})
-	}); err != nil {
-		return nil, err
-	}
-	return recs, nil
+type merger struct {
+	ctx       context.Context
+	cx        *library.Gallery
+	source    string
+	generalID int64
+	maxBytes  int64
+	res       MergeResult
 }
 
-func readExportMergeRecords(r io.Reader) ([]mergeRecord, error) {
-	type tagRef struct {
-		categoryID int64
-		name       string
+func newMerger(ctx context.Context, cx *library.Gallery, source string, maxFileSizeMB int) *merger {
+	return &merger{ctx: ctx, cx: cx, source: source, generalID: LookupCategoryID(cx.DB, "general"), maxBytes: int64(maxFileSizeMB) * 1024 * 1024}
+}
+
+// apply returns only the ctx's error, which stops the merge before r.
+func (m *merger) apply(r mergeRecord) error {
+	if err := m.ctx.Err(); err != nil {
+		return err
 	}
-	version := 0
-	catByID := map[int64]string{}
-	tagByID := map[int64]tagRef{}
-	tagsOf := map[int64][]int64{}
-	var recs []mergeRecord
-	var imageIDs []int64
-	err := decodeSections(r, func(key string, dec *json.Decoder) error {
-		switch key {
-		case "version":
-			if err := decodeValue(dec, &version); err != nil {
-				return err
-			}
-			return checkExportVersion(version)
-		case "tag_categories":
-			return streamArray(dec, func(c TagCategoryRow) error {
-				catByID[c.ID] = c.Name
-				return nil
-			})
-		case "tags":
-			return streamArray(dec, func(t TagRow) error {
-				if t.IsAlias != 1 {
-					tagByID[t.ID] = tagRef{t.CategoryID, t.Name}
-				}
-				return nil
-			})
-		case "images":
-			return streamArray(dec, func(img ImageRow) error {
-				rec := mergeRecord{SHA256: img.SHA256}
-				if img.IsMissing == 0 {
-					rec.SourcePath = filepath.ToSlash(filepath.Join(img.FolderPath, storedBasename(img.CanonicalPath)))
-				}
-				recs = append(recs, rec)
-				imageIDs = append(imageIDs, img.ID)
-				return nil
-			})
-		case "image_tags":
-			return streamArray(dec, func(it ImageTagRow) error {
-				tagsOf[it.ImageID] = append(tagsOf[it.ImageID], it.TagID)
-				return nil
-			})
-		}
-		return skipValue(dec)
-	})
+	cx := m.cx
+	imgID, err := gallery.ImageIDBySHA(cx.DB.Read, r.SHA256)
+	if err == nil {
+		m.tag(imgID, r)
+		m.res.Tagged++
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		logx.Warnf("merge: lookup sha %s: %v", r.SHA256, err)
+		m.res.Skipped++
+		return nil
+	}
+	if r.zipEntry == nil || r.SourcePath == "" {
+		m.res.Skipped++
+		return nil
+	}
+	safeBase, err := SafeArchiveDest(cx.GalleryPath, r.SourcePath)
 	if err != nil {
-		return nil, err
+		logx.Warnf("merge: skipping entry %q: %v", r.SourcePath, err)
+		m.res.Skipped++
+		return nil
 	}
-	if err := checkExportVersion(version); err != nil {
-		return nil, err
-	}
-	tokens := make(map[int64]string, len(tagByID))
-	for id, t := range tagByID {
-		tokens[id] = tagToken(catByID[t.categoryID], t.name)
-	}
-	for i, id := range imageIDs {
-		for _, tagID := range tagsOf[id] {
-			if tok, ok := tokens[tagID]; ok {
-				recs[i].Tags = append(recs[i].Tags, tok)
-			}
+	// Suffix collisions within the entry's folder, not the root.
+	entry := r.zipEntry
+	landed, err := cx.Land(m.ctx, filepath.Dir(safeBase), filepath.Base(safeBase),
+		func(dst string) error { return copyZipFile(entry, dst, m.maxBytes) }, library.LandSpec{Origin: m.source})
+	if err != nil {
+		if library.LandStageOf(err) == library.LandPlace {
+			m.res.LeftOut++
+		} else {
+			logx.Warnf("merge: land %q: %v", r.SourcePath, err)
+			m.res.Skipped++
 		}
+		return nil
 	}
-	return recs, nil
+	m.tag(landed.Image.ID, r)
+	// A record without a sha finds its image only once extracted.
+	if landed.Duplicate {
+		m.res.Tagged++
+		return nil
+	}
+	m.res.Added++
+	return nil
+}
+
+func (m *merger) tag(imageID int64, r mergeRecord) {
+	if r.groups == nil {
+		applyImportTagsToImage(m.cx.DB, m.cx.TagSvc, imageID, r.Tags, m.generalID, m.source)
+		return
+	}
+	if err := applyTransferTags(m.cx.DB, m.cx.TagSvc, imageID, r.groups, m.generalID); err != nil {
+		logx.Warnf("merge: %v", err)
+	}
 }
 
 // Merged tags go through the tag service so aliases resolve and usage
@@ -764,7 +836,7 @@ func applyTransferTags(database *db.DB, tagSvc *tags.Service, imageID int64, gro
 		origin := cmp.Or(g.taggerName, "user")
 		tagIDs, confs := resolveTokenTagIDsConf(database, tagSvc, g.tokens, g.confs, generalID, false, origin)
 		if err := tagSvc.AddTagsToImageFromTaggerConf(imageID, tagIDs, confs, g.isAuto, g.taggerName); err != nil {
-			return fmt.Errorf("transfer tags to image %d: %w", imageID, err)
+			return fmt.Errorf("add tags to image %d: %w", imageID, err)
 		}
 	}
 	return nil

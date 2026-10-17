@@ -90,7 +90,7 @@
         </form>
         {{if and (not (or (eq .Image.FileType "mp4") (eq .Image.FileType "webm"))) (not .IsManga) (not .Image.IsMissing)}}
         <button type="button" class="btn-sm btn-view" title="View image (v)"
-                onclick="openLightbox(null, '/images/{{.Image.ID}}/view')">⛶</button>
+                onclick="lightbox.open(null, '/images/{{.Image.ID}}/view')">⛶</button>
         {{end}}
         <a href="/images/{{.Image.ID}}/file" download class="btn-sm" title="Download image">⤓</a>
       </div>
@@ -152,7 +152,7 @@
       var name = document.getElementById('generate-collection-input').value.trim();
       var err = document.getElementById('generate-collection-error');
       err.innerHTML = '';
-      if (!name) { err.innerHTML = '<div class="flash flash-err">Collection name required.</div>'; return; }
+      if (!name) { setFlashText(err, 'err', 'Collection name required.'); return; }
       postForm('/images/{{.Image.ID}}/generate-collection', {collection: name}, {
         okStatus: 202,
         dialogId: 'generate-collection-dialog',
@@ -268,8 +268,8 @@
           hx-on::after-request="if(event.detail.xhr.status === 202)document.getElementById('autotag-dialog').close()">
       <p>Auto-tag this image. Pick which tagger to run.</p>
       <div class="field">
-        <label style="display:block"><input type="radio" name="tagger_name" value="" checked> All enabled taggers</label>
-        {{range .EnabledTaggers}}<label style="display:block"><input type="radio" name="tagger_name" value="{{.Name}}"> {{.Name}}</label>{{end}}
+        <label><input type="radio" name="tagger_name" value="" checked> All enabled taggers</label>
+        {{range .EnabledTaggers}}<label><input type="radio" name="tagger_name" value="{{.Name}}"> {{.Name}}</label>{{end}}
       </div>
       <div id="autotag-error"></div>
       {{template "dialog_actions" dict "ID" "autotag-dialog" "Submit" "Auto-tag"}}
@@ -280,7 +280,6 @@
   <dialog id="relation-edit-dialog">
     <form hx-post="/relations/add"
           hx-target="#relation-edit-error"
-          hx-swap="innerHTML"
           hx-on::after-request="onRelationEditResponse(event)">
       <input type="hidden" name="direction" id="relation-edit-direction" value="ab">
       <p>Declare a <strong>relation</strong> between this image and another.</p>
@@ -337,7 +336,7 @@
         src.querySelector('.flash-ok, .flash-err');
       if (!answered) {
         if (overwrite) overwrite.hidden = true;
-        src.innerHTML = '<div class="flash flash-err">The relation was not saved.</div>';
+        setFlashText(src, 'err', 'The relation was not saved.');
         return;
       }
       var success = src.querySelector('.flash-ok');
@@ -504,7 +503,7 @@
         </a>
         {{else}}
         <div class="detail-media-frame">
-          <a href="/images/{{.Image.ID}}/view" target="_blank"{{if not .Image.IsMissing}} class="detail-img-link" onclick="return openLightbox(event, this.href)"{{end}}>
+          <a href="/images/{{.Image.ID}}/view" target="_blank"{{if not .Image.IsMissing}} class="detail-img-link" onclick="return lightbox.open(event, this.href)"{{end}}>
             <img src="/images/{{.Image.ID}}/view" alt="image {{.Image.ID}}" class="detail-img"
                  onerror="if(!this.dataset.fallback){this.dataset.fallback='1';this.src='/thumbnails/{{.ActiveGallery}}/{{.Image.ID}}.jpg';}else{this.onerror=null;}">
           </a>
@@ -614,7 +613,7 @@
       </div>
       {{end}}
 
-      {{template "partials/detail_danger_zone.html" (dict "ImageID" .Image.ID "ImageTags" .ImageTags "HasUserTags" .HasUserTags "HasStaleTags" .HasStaleTags "ImageTaggers" .ImageTaggers "ImageSources" .ImageSources "CanTransfer" (gt (len .Galleries) 1) "BackQuery" .BackQuery "BackSort" .BackSort "BackOrder" .BackOrder "BackPage" .BackPage "BackSeed" .BackSeed "Ref" .Ref "CurrentFolder" .Image.FolderPath "Filename" .Filename "ExtraPaths" .ExtraPaths)}}
+      {{template "partials/detail_danger_zone.html" (dict "ImageID" .Image.ID "ImageTags" .ImageTags "HasUserTags" .HasUserTags "HasStaleTags" .HasStaleTags "ImageTaggers" .ImageTaggers "ImageSources" .ImageSources "CanTransfer" (gt (len .Galleries) 1) "BackKVQS" .BackKVQS "Ref" .Ref "CurrentFolder" .Image.FolderPath "Filename" .Filename "ExtraPaths" .ExtraPaths "RewrittenBy" .RewrittenBy)}}
       {{if gt (len .Galleries) 1}}
       <dialog id="transfer-image-dialog">
         <p>Transfer this image to another gallery:</p>
@@ -677,7 +676,6 @@
         var dlg = document.getElementById('place-image-dialog');
         var folder = document.getElementById('place-image-folder');
         var name = document.getElementById('place-image-name');
-        if (!dlg || !folder || !name) return;
         folder.value = dlg.dataset.currentFolder || '';
         name.value = (dlg.dataset.filename || '').replace(/\.[^.]+$/, '');
         clearSlots('place-image-suggest', 'place-image-error', 'place-image-preview');
@@ -687,7 +685,6 @@
       }
       function openSourceDialog(site, post, url) {
         var dlg = document.getElementById('source-dialog');
-        if (!dlg) return;
         document.getElementById('source-has-prev').value = (site || url) ? '1' : '';
         document.getElementById('source-prev-site').value = site || '';
         document.getElementById('source-prev-post').value = post || '';
@@ -703,7 +700,6 @@
       }
       function openCollectionDialog(name, order) {
         var dlg = document.getElementById('collection-dialog');
-        if (!dlg) return;
         document.getElementById('collection-prev').value = name || '';
         document.getElementById('collection-name-input').value = name || '';
         document.getElementById('collection-order-input').value = order || '';
@@ -716,7 +712,6 @@
       }
       function openAnnotationDialog(id, x, y, w, h, body) {
         var dlg = document.getElementById('annotation-dialog');
-        if (!dlg) return;
         document.getElementById('annotation-id').value = id || '';
         document.getElementById('annotation-x').value = x || '';
         document.getElementById('annotation-y').value = y || '';
@@ -840,16 +835,9 @@
                   </span>
                   <span class="source-actions">
                     <span class="source-verbs">
-                      {{if gt $i 0}}<form method="POST" action="/images/{{$.Image.ID}}/sources/primary"
-                          hx-post="/images/{{$.Image.ID}}/sources/primary" hx-target="#detail-flash"
-                          style="display:inline">
-                      <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                      <input type="hidden" name="site" value="{{.Site}}">
-                      <input type="hidden" name="post_id" value="{{.PostID}}">
-                      <button type="submit" class="btn-link-accent" title="Make this the primary source">[set primary]</button>
-                    </form>{{end}}
+                      {{if gt $i 0}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "site" .Site "post_id" .PostID) "Action" "sources/primary" "Title" "Make this the primary source" "Label" "[set primary]"}}{{end}}
                       {{if not (isPTRSite .Site)}}<button type="button" class="btn-link-accent btn-edit-source" data-site="{{.Site}}" data-post="{{.PostID}}" data-url="{{.URL}}" title="Edit">[edit]</button>{{end}}
-                      {{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Site" .Site "PostID" .PostID "Action" "sources/remove" "Confirm" "Remove this source?" "Danger" "Its commentary, original link and pulled annotations go with it." "Title" "Remove this source"}}
+                      {{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "site" .Site "post_id" .PostID) "Action" "sources/remove" "Confirm" "Remove this source?" "Danger" "Its commentary, original link and pulled annotations go with it." "Title" "Remove this source"}}
                     </span>
                     <span class="source-verbs">
                       {{if and .URL $.MonloaderPaired}}<form hx-post="/images/{{$.Image.ID}}/sources/fetch"
@@ -874,15 +862,7 @@
                       <input type="hidden" name="post_id" value="{{.PostID}}">
                       <button type="submit" class="btn-link-accent monloader-accent" data-ml-title="Replace the local file with the one this source serves via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Replace the local file with the one this source serves via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[upgrade]</button>
                     </form>{{end}}
-                      {{if and $.MonloaderPaired .UpgradeKept}}<form method="POST" action="/images/{{$.Image.ID}}/sources/keep"
-                          hx-post="/images/{{$.Image.ID}}/sources/keep" hx-target="#detail-flash"
-                          style="display:inline">
-                      <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                      <input type="hidden" name="site" value="{{.Site}}">
-                      <input type="hidden" name="post_id" value="{{.PostID}}">
-                      <input type="hidden" name="keep" value="0">
-                      <button type="submit" class="btn-link-accent" title="Offer this upgrade again">[allow upgrade]</button>
-                    </form>{{end}}
+                      {{if and $.MonloaderPaired .UpgradeKept}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "site" .Site "post_id" .PostID "keep" "0") "Action" "sources/keep" "Title" "Offer this upgrade again" "Label" "[allow upgrade]"}}{{end}}
                     </span>
                   </span>
                 </li>
@@ -906,14 +886,7 @@
                 <li class="collection-item">
                   <a href="/?q={{urlQ (printf "collection:\"%s\"" (qval .Name))}}" class="meta-source-value" title="Search this collection">{{.Name}}</a>{{if .Order}} <span class="series-pill-order">#{{deref .Order}}</span>{{end}}
                   <button type="button" class="btn-link-accent btn-edit-collection" data-name="{{.Name}}" data-order="{{if .Order}}{{deref .Order}}{{end}}" title="Edit">[edit]</button>
-                  <form method="POST" action="/images/{{$.Image.ID}}/collections/remove"
-                        hx-post="/images/{{$.Image.ID}}/collections/remove" hx-target="#detail-flash"
-                        hx-confirm="Remove this image from {{.Name}}?" data-confirm-ok="Remove"
-                        style="display:inline">
-                    <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
-                    <input type="hidden" name="collection" value="{{.Name}}">
-                    <button type="submit" class="btn-link-accent" title="Remove from collection">[×]</button>
-                  </form>
+                  {{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "collection" .Name) "Action" "collections/remove" "Confirm" (printf "Remove this image from %s?" .Name) "Title" "Remove from collection"}}
                 </li>
                 {{end}}
               </ul>
@@ -1096,18 +1069,18 @@
                 {{end}}
               </ul>{{end}}
               <button type="button" class="btn-link-accent btn-edit-original" data-site="{{.Site}}" data-post="{{.PostID}}" data-original="{{.Original}}" title="{{if .Original}}Edit original source{{else}}Add original source{{end}}">{{if .Original}}[edit]{{else}}[+ add]{{end}}</button>
-              {{if .Original}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Site" .Site "PostID" .PostID "Action" "original/remove" "Confirm" "Remove this original source?" "Danger" "Nothing else records this link." "Title" "Remove original source"}}{{end}}
+              {{if .Original}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "site" .Site "post_id" .PostID) "Action" "original/remove" "Confirm" "Remove this original source?" "Danger" "Nothing else records this link." "Title" "Remove original source"}}{{end}}
             </td></tr>
             <tr><th>Commentary</th><td>
               {{if .Commentary}}<div class="commentary-body">{{.CommentaryHTML}}</div>{{end}}
               <button type="button" class="btn-link-accent btn-edit-commentary" data-site="{{.Site}}" data-post="{{.PostID}}" data-commentary="{{.Commentary}}" title="{{if .Commentary}}Edit commentary{{else}}Add commentary{{end}}">{{if .Commentary}}[edit]{{else}}[+ add]{{end}}</button>
-              {{if .Commentary}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Site" .Site "PostID" .PostID "Action" "commentary/remove" "Confirm" "Remove this commentary?" "Danger" "Nothing else stores this text." "Title" "Remove commentary"}}{{end}}
+              {{if .Commentary}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "site" .Site "post_id" .PostID) "Action" "commentary/remove" "Confirm" "Remove this commentary?" "Danger" "Nothing else stores this text." "Title" "Remove commentary"}}{{end}}
             </td></tr>
             {{if .HasTranslationRow}}
             <tr><th>Translation</th><td>
               {{if .CommentaryTranslated}}<div class="commentary-body">{{.TranslatedHTML}}</div>{{end}}
               <button type="button" class="btn-link-accent btn-edit-translation" data-site="{{.Site}}" data-post="{{.PostID}}" data-translation="{{.CommentaryTranslated}}" title="{{if .CommentaryTranslated}}Edit translation{{else}}Add translation{{end}}">{{if .CommentaryTranslated}}[edit]{{else}}[+ add]{{end}}</button>
-              {{if .CommentaryTranslated}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Site" .Site "PostID" .PostID "Action" "translation/remove" "Confirm" "Remove this translation?" "Danger" "Nothing else stores this text." "Title" "Remove translation"}}{{end}}
+              {{if .CommentaryTranslated}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "site" .Site "post_id" .PostID) "Action" "translation/remove" "Confirm" "Remove this translation?" "Danger" "Nothing else stores this text." "Title" "Remove translation"}}{{end}}
             </td></tr>
             {{end}}
             {{if .Annotations}}
@@ -1125,10 +1098,9 @@
     </details>
     {{end}}
     <div id="related-entries-panel"
-         hx-get="/internal/images/{{.Image.ID}}/related-entries?back_q={{urlQ .BackQuery}}&back_sort={{.BackSort}}&back_order={{.BackOrder}}{{if .BackPage}}&back_page={{.BackPage}}{{end}}{{if .BackSeed}}&back_seed={{.BackSeed}}{{end}}"
-         hx-trigger="load, relations-changed"
-         hx-swap="innerHTML"></div>
-    <div hx-get="/images/{{.Image.ID}}/related?back_q={{urlQ .BackQuery}}&back_sort={{.BackSort}}&back_order={{.BackOrder}}{{if .BackPage}}&back_page={{.BackPage}}{{end}}{{if .BackSeed}}&back_seed={{.BackSeed}}{{end}}" hx-trigger="load" hx-swap="outerHTML"></div>
+         hx-get="/internal/images/{{.Image.ID}}/related-entries{{.BackQS}}"
+         hx-trigger="load, relations-changed"></div>
+    <div hx-get="/images/{{.Image.ID}}/related{{.BackQS}}" hx-trigger="load" hx-swap="outerHTML"></div>
     </div>
   </div>
 </div>
@@ -1140,6 +1112,6 @@
 <li class="collection-item annotation-entry" data-ann-id="{{.Ann.ID}}">
   <span class="meta-annotation-body" title="{{.Ann.Text}}">{{if .Ann.Text}}{{.Ann.Text}}{{else}}(no text){{end}}</span>
   <button type="button" class="btn-link-accent btn-edit-annotation" data-id="{{.Ann.ID}}" data-x="{{.Ann.X}}" data-y="{{.Ann.Y}}" data-w="{{.Ann.W}}" data-h="{{.Ann.H}}" data-body="{{.Ann.Body}}" title="Edit">[edit]</button>
-  {{template "partials/source_remove_form.html" dict "ImageID" .ImageID "CSRFToken" .CSRFToken "AnnID" .Ann.ID "Action" "annotations/remove" "Confirm" "Remove this annotation?" "Danger" "The box and its text go with it." "Title" "Remove annotation"}}
+  {{template "partials/source_remove_form.html" dict "ImageID" .ImageID "CSRFToken" .CSRFToken "Fields" (dict "id" .Ann.ID) "Action" "annotations/remove" "Confirm" "Remove this annotation?" "Danger" "The box and its text go with it." "Title" "Remove annotation"}}
 </li>
 {{end}}

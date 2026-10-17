@@ -8,8 +8,8 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/desktop"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 type setupData struct {
@@ -26,7 +26,7 @@ type setupData struct {
 	Autostart    bool
 	Port         string
 	BindPinned   string
-	Integration  desktopIntegration
+	Integration  desktop.Integration
 }
 
 func (s *Server) setupPending() bool {
@@ -104,9 +104,10 @@ func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, d setupData
 	}
 	d.BooruName = s.booruName()
 	d.Title = d.BooruName + " setup"
-	d.CSRFToken = s.csrfToken(sessionFromContext(r.Context()))
-	d.BooruFavicon = s.booruFaviconURL()
-	d.Theme = s.activeTheme().Path != ""
+	d.CSRFToken = s.sessions.CSRFToken(sessionFromContext(r.Context()))
+	theme := s.activeTheme()
+	d.BooruFavicon = themeFaviconURL(theme)
+	d.Theme = theme.Path != ""
 	d.Port = port
 	d.BindPinned = s.envPinned("server.bind_address")
 	d.Integration = s.desktopIntegration()
@@ -156,16 +157,8 @@ func (s *Server) setupPost(w http.ResponseWriter, r *http.Request) {
 		s.renderSetup(w, r, form)
 		return
 	}
-	h := s.desktopHook()
-	if h.MenuSupported() {
-		if err := h.SetMenu(form.Menu); err != nil {
-			logx.Warnf("setup: could not write the menu entry: %v", err)
-		}
-	}
-	if h.AutostartSupported() {
-		if err := h.SetAutostart(form.Autostart); err != nil {
-			logx.Warnf("setup: could not write start at login: %v", err)
-		}
+	for _, f := range applyDesktopHooks(s.desktopHook(), form.Menu, form.Autostart) {
+		logx.Warnf("setup: could not write %s", f)
 	}
 	logx.Infof("setup: done, reachable from %s", map[bool]string{true: "the network", false: "this computer"}[!desktop.IsLoopbackAddr(bind)])
 	http.Redirect(w, r, "/", http.StatusSeeOther)

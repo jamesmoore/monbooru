@@ -8,15 +8,10 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 )
 
-func extractSDFromJPEG(path string) (*models.SDMetadata, error) {
-	x := decodeJPEGEXIF(path)
-	if x == nil {
-		return nil, nil
-	}
-	return sdFromEXIF(x), nil
-}
-
 func sdFromEXIF(x *exifData) *models.SDMetadata {
+	if x == nil {
+		return nil
+	}
 	tag, ok := x.tags[userCommentField]
 	if !ok {
 		return nil
@@ -161,15 +156,11 @@ func ParseSeed(s string) (int64, bool) {
 func eachA1111Param(paramLine string, fn func(key, val string)) {
 	paramLine = strings.ReplaceAll(paramLine, "\n", " ")
 	for _, part := range splitA1111Params(paramLine) {
-		kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
-		if len(kv) != 2 {
+		key, val, ok := strings.Cut(strings.TrimSpace(part), ":")
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		if !ok || key == "" {
 			continue
 		}
-		key := strings.TrimSpace(kv[0])
-		if key == "" {
-			continue
-		}
-		val := strings.TrimSpace(kv[1])
 		if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
 			var unquoted string
 			if json.Unmarshal([]byte(val), &unquoted) == nil {

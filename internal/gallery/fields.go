@@ -9,6 +9,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/lookup"
+	"github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
 )
 
@@ -99,10 +100,21 @@ func SetDimensions(ctx context.Context, database *db.DB, id int64, width, height
 	return err
 }
 
+// ReadComicInfo is nil, nil for an archive that carries none.
+func ReadComicInfo(path string) (*models.MangaMetadata, error) {
+	m, err := OpenManga(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = m.Close() }()
+	return metadata.ParseComicInfo(m.Reader())
+}
+
 // ApplyReExtract runs in one transaction, so a failure never leaves the
 // new source_type over missing metadata. A nil durationSec leaves the
-// column alone.
-func ApplyReExtract(ctx context.Context, database *db.DB, imageID int64, sourceType string, durationSec *float64, sd *models.SDMetadata, comfy *models.ComfyUIMetadata) error {
+// column alone, as a false rewriteManga leaves manga_metadata; a nil
+// manga with it set drops the row.
+func ApplyReExtract(ctx context.Context, database *db.DB, imageID int64, sourceType string, durationSec *float64, sd *models.SDMetadata, comfy *models.ComfyUIMetadata, manga *models.MangaMetadata, rewriteManga bool) error {
 	tx, err := database.Write.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -118,6 +130,17 @@ func ApplyReExtract(ctx context.Context, database *db.DB, imageID int64, sourceT
 	}
 	if err := replaceGenerationMetadata(ctx, tx, imageID, sd, comfy); err != nil {
 		return err
+	}
+	if rewriteManga {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM manga_metadata WHERE image_id = ?`, imageID); err != nil {
+			return fmt.Errorf("clear manga_metadata: %w", err)
+		}
+		if manga != nil {
+			manga.ImageID = imageID
+			if err := insertMangaMeta(tx, manga); err != nil {
+				return fmt.Errorf("insert manga_metadata: %w", err)
+			}
+		}
 	}
 	return tx.Commit()
 }

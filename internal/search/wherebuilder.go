@@ -2,7 +2,6 @@ package search
 
 import (
 	"cmp"
-	"database/sql"
 	"fmt"
 	"maps"
 	"math"
@@ -308,7 +307,7 @@ func pickAndDriverTag(database *db.DB, expr Expr, allowSingleLiteral bool) ([]an
 			continue
 		}
 		seenFilter[leaf] = true
-		ids, usage, ok := resolveFilterDriverCanonicals(database, leaf)
+		ids, usage, ok := resolveFilterDriverCanonicals(database, leaf.Key, tags.NormalizeTagName(leaf.Val))
 		if !ok {
 			continue
 		}
@@ -321,17 +320,9 @@ func pickAndDriverTag(database *db.DB, expr Expr, allowSingleLiteral bool) ([]an
 		return nil, false
 	}
 
-	smallestUsage := legs[0].usage
-	smallestIdx := 0
-	for i, leg := range legs {
-		if leg.usage < smallestUsage {
-			smallestUsage = leg.usage
-			smallestIdx = i
-		}
-	}
-
-	if smallestUsage <= andDriverThreshold {
-		return []andDriverLeg{{leaf: legs[smallestIdx].leaf, ids: legs[smallestIdx].ids}}, true
+	smallest := slices.MinFunc(legs, func(a, b resolved) int { return cmp.Compare(a.usage, b.usage) })
+	if smallest.usage <= andDriverThreshold {
+		return []andDriverLeg{{leaf: smallest.leaf, ids: smallest.ids}}, true
 	}
 
 	// Random sort temp-sorts every match anyway and a bucket caps the
@@ -379,40 +370,35 @@ func resolveDriverCanonicals(database *db.DB, leaf TagExpr) ([]int64, int64, boo
 	if !ok {
 		return nil, 0, false
 	}
-	rows, err := database.Read.Query(
+	return drainCanonicalUsage(database,
 		`SELECT canon.id, canon.usage_count
 		 FROM tags t
 		 JOIN tags canon ON canon.id = COALESCE(t.canonical_tag_id, t.id)
 		 WHERE `+pred,
 		arg,
 	)
-	if err != nil {
-		return nil, 0, false
-	}
-	defer func() { _ = rows.Close() }()
-	return drainCanonicalUsage(rows)
 }
 
-func resolveFilterDriverCanonicals(database *db.DB, leaf FilterExpr) ([]int64, int64, bool) {
-	if leaf.Key == "" || leaf.Val == "" {
+func resolveFilterDriverCanonicals(database *db.DB, category, name string) ([]int64, int64, bool) {
+	if category == "" || name == "" {
 		return nil, 0, false
 	}
-	rows, err := database.Read.Query(
+	return drainCanonicalUsage(database,
 		`SELECT DISTINCT COALESCE(t.canonical_tag_id, t.id), canon.usage_count
 		   FROM tags t
 		   JOIN tag_categories tc ON tc.id = t.category_id
 		   JOIN tags canon ON canon.id = COALESCE(t.canonical_tag_id, t.id)
 		  WHERE t.name = ? AND tc.name = ?`,
-		tags.NormalizeTagName(leaf.Val), leaf.Key,
+		name, category,
 	)
+}
+
+func drainCanonicalUsage(database *db.DB, query string, args ...any) ([]int64, int64, bool) {
+	rows, err := database.Read.Query(query, args...)
 	if err != nil {
 		return nil, 0, false
 	}
 	defer func() { _ = rows.Close() }()
-	return drainCanonicalUsage(rows)
-}
-
-func drainCanonicalUsage(rows *sql.Rows) ([]int64, int64, bool) {
 	seen := make(map[int64]bool)
 	var ids []int64
 	var usage int64
@@ -434,6 +420,12 @@ func drainCanonicalUsage(rows *sql.Rows) ([]int64, int64, bool) {
 	return ids, usage, true
 }
 
+func visibleWhere(src Source, expr Expr, legs []andDriverLeg) (where string, args []any, hasMissingFilter, ceilingRewrote bool) {
+	where, args, hasMissingFilter, ceilingRewrote = buildWhereDBDriverFull(expr, src, legs)
+	where, args = applyAndDriver(where, args, legs)
+	return andDefaultVisible(where, hasMissingFilter), args, hasMissingFilter, ceilingRewrote
+}
+
 func applyAndDriver(where string, args []any, legs []andDriverLeg) (string, []any) {
 	if len(legs) == 0 {
 		return where, args
@@ -451,12 +443,7 @@ func applyAndDriver(where string, args []any, legs []andDriverLeg) (string, []an
 			driverArgs = append(driverArgs, leg.idBoundHi)
 		}
 	}
-	var driverWhere string
-	if len(parts) == 1 {
-		driverWhere = "i.id IN (" + parts[0] + ")"
-	} else {
-		driverWhere = "i.id IN (" + strings.Join(parts, " INTERSECT ") + ")"
-	}
+	driverWhere := "i.id IN (" + strings.Join(parts, " INTERSECT ") + ")"
 	if where == "" || where == "1=1" {
 		return driverWhere, driverArgs
 	}
@@ -517,7 +504,7 @@ func (b *whereBuilder) resolveRatingIDs() {
 		`SELECT t.name, t.id, t.usage_count FROM tags t
 		 JOIN tag_categories tc ON tc.id = t.category_id
 		 WHERE tc.name = 'rating' AND t.is_alias = 0
-		   AND t.name IN ('general','sensitive','questionable','explicit')`,
+		   AND t.name IN ('` + strings.Join(tags.RatingLevels, "','") + `')`,
 	)
 	if err != nil {
 		return
@@ -544,20 +531,11 @@ func (b *whereBuilder) resolveRatingIDs() {
 }
 
 func (b *whereBuilder) resolveCategoryTagByName(category, name string) ([]int64, bool) {
-	if b.db == nil || category == "" || name == "" {
+	if b.db == nil {
 		return nil, false
 	}
-	ids, err := db.QueryIDs(b.db.Read,
-		`SELECT DISTINCT COALESCE(t.canonical_tag_id, t.id)
-		   FROM tags t
-		   JOIN tag_categories tc ON tc.id = t.category_id
-		  WHERE t.name = ? AND tc.name = ?`,
-		name, category,
-	)
-	if err != nil {
-		return nil, false
-	}
-	return ids, true
+	ids, _, ok := resolveFilterDriverCanonicals(b.db, category, name)
+	return ids, ok
 }
 
 func inlineImageTagsTagIDExists(ids []int64) string {
@@ -693,10 +671,7 @@ func (b *whereBuilder) buildTagExpr(e TagExpr) string {
 	if b.underOrNot == 0 && b.driverLeaves[e] {
 		return ""
 	}
-	pred, arg, ok := tagNamePredicate("name", e.Wildcard, e.Tag)
-	if !ok {
-		pred, arg = "name = ?", e.Tag
-	}
+	pred, arg, _ := tagNamePredicate("name", e.Wildcard, e.Tag)
 	b.args = append(b.args, arg)
 	// COALESCE maps an alias name onto its canonical, which is what
 	// image_tags rows carry.
@@ -734,10 +709,13 @@ func (b *whereBuilder) dualMetadataLike(sdCol, comfyCol, val string) string {
 }
 
 // Every file_type ingest stores: type: naming them all emits 1=1.
-var fileTypeBuckets = map[string]bool{
-	"jpeg": true, "png": true, "webp": true, "avif": true, "jxl": true,
-	"gif": true, "mp4": true, "webm": true, "cbz": true,
-}
+var fileTypeBuckets = func() map[string]bool {
+	all := map[string]bool{}
+	for _, ft := range models.FileTypes {
+		all[ft.Name] = true
+	}
+	return all
+}()
 
 // A nil tautologyCap keeps the IN list even when every bucket is named.
 func fileTypeInClause(seen, tautologyCap map[string]bool) string {
@@ -756,8 +734,8 @@ func fileTypeInClause(seen, tautologyCap map[string]bool) string {
 
 var filterBuilders = map[string]func(*whereBuilder, FilterExpr) string{
 	"system":     (*whereBuilder).buildSystemFilter,
-	"fav":        (*whereBuilder).buildFavFilter,
-	"inbox":      (*whereBuilder).buildInboxFilter,
+	"fav":        boolCol("i.is_favorited"),
+	"inbox":      boolCol("i.is_inbox"),
 	"ai":         (*whereBuilder).buildAIFilter,
 	"source":     (*whereBuilder).buildSourceFilter,
 	"cat":        (*whereBuilder).buildCatFilter,
@@ -770,31 +748,32 @@ var filterBuilders = map[string]func(*whereBuilder, FilterExpr) string{
 	// NULL page_count (not a manga) reads as 0, so pages:>=1 excludes images.
 	"pages":    comp("COALESCE(i.page_count, 0) %s ?", parseIntValue),
 	"name":     (*whereBuilder).buildNameFilter,
-	"size":     comp("i.file_size %s ?", parseSizeValueAny),
+	"size":     comp("i.file_size %s ?", parseSizeValue),
 	"mime":     (*whereBuilder).buildMimeFilter,
 	"ratio":    comp("(CAST(i.width AS REAL) / NULLIF(i.height, 0)) %s ?", parseFloatValue),
 	"tagcount": comp("i.tag_count %s ?", parseIntValue),
 	// Not COALESCE like pages:, or a non-video would match duration:<5 as
 	// a 0-second clip.
-	"duration":   comp("(i.duration_seconds IS NOT NULL AND i.duration_seconds %s ?)", parseFloatValue),
-	"hash":       (*whereBuilder).buildHashFilter,
-	"md5":        (*whereBuilder).buildMD5Filter,
-	"id":         (*whereBuilder).buildIDFilter,
-	"batch":      (*whereBuilder).buildBatchFilter,
+	"duration": comp("(i.duration_seconds IS NOT NULL AND i.duration_seconds %s ?)", parseFloatValue),
+	"hash":     (*whereBuilder).buildHashFilter,
+	"md5":      (*whereBuilder).buildMD5Filter,
+	"id":       intEq("i.id"),
+	// A token, not a time range: two batches can land in the same minute.
+	"batch":      intEq("i.upload_batch"),
 	"phash":      (*whereBuilder).buildPhashFilter,
 	"relation":   (*whereBuilder).buildRelationFilter,
 	"similar":    (*whereBuilder).buildSimilarFilter,
 	"comfyui":    (*whereBuilder).buildComfyUIFilter,
-	"prompt":     (*whereBuilder).buildPromptFilter,
-	"model":      (*whereBuilder).buildModelFilter,
-	"sampler":    (*whereBuilder).buildSamplerFilter,
+	"prompt":     dual("prompt", "prompt"),
+	"model":      dual("model", "model_checkpoint"),
+	"sampler":    dual("sampler", "sampler"),
 	"seed":       (*whereBuilder).buildSeedFilter,
-	"via":        (*whereBuilder).buildViaFilter,
+	"via":        nocaseEq("i.origin", "1=0"),
 	"tagged":     (*whereBuilder).buildTaggedFilter,
 	"autotagged": (*whereBuilder).buildAutotaggedFilter,
 	"stale":      (*whereBuilder).buildStaleFilter,
 	"folder":     (*whereBuilder).buildFolderFilter,
-	"folderonly": (*whereBuilder).buildFolderonlyFilter,
+	"folderonly": nocaseEq("i.folder_path", "i.folder_path = ''"),
 	"generated":  (*whereBuilder).buildGeneratedFilter,
 	"rating":     (*whereBuilder).buildRatingFilter,
 	"lookup":     (*whereBuilder).buildLookupFilter,
@@ -804,6 +783,32 @@ var filterBuilders = map[string]func(*whereBuilder, FilterExpr) string{
 func comp(sqlTemplate string, parseVal func(string) (any, bool)) func(*whereBuilder, FilterExpr) string {
 	return func(b *whereBuilder, e FilterExpr) string {
 		return b.buildCompFilter(sqlTemplate, e.Val, parseVal)
+	}
+}
+
+// Equality only: through comp, id:>5 would start matching.
+func intEq(col string) func(*whereBuilder, FilterExpr) string {
+	return func(b *whereBuilder, e FilterExpr) string {
+		n, ok := parseIntValue(e.Val)
+		return b.scalarComp(col+" %s ?", "=", n, ok)
+	}
+}
+
+func boolCol(col string) func(*whereBuilder, FilterExpr) string {
+	return func(_ *whereBuilder, e FilterExpr) string { return boolColumnFilter(col, e.Val) }
+}
+
+func dual(sdCol, comfyCol string) func(*whereBuilder, FilterExpr) string {
+	return func(b *whereBuilder, e FilterExpr) string { return b.dualMetadataLike(sdCol, comfyCol, e.Val) }
+}
+
+func nocaseEq(col, whenEmpty string) func(*whereBuilder, FilterExpr) string {
+	return func(b *whereBuilder, e FilterExpr) string {
+		if e.Val == "" {
+			return whenEmpty
+		}
+		b.args = append(b.args, e.Val)
+		return col + " = ? COLLATE NOCASE"
 	}
 }
 
@@ -833,14 +838,6 @@ func boolColumnFilter(col, val string) string {
 	return col + " = 0"
 }
 
-func (b *whereBuilder) buildFavFilter(e FilterExpr) string {
-	return boolColumnFilter("i.is_favorited", e.Val)
-}
-
-func (b *whereBuilder) buildInboxFilter(e FilterExpr) string {
-	return boolColumnFilter("i.is_inbox", e.Val)
-}
-
 // none never shares source_type with a tool, so it takes the equality that
 // can seek idx_images_source_type_visible; the four LIKEs can't use an index.
 func (b *whereBuilder) buildAIFilter(e FilterExpr) string {
@@ -857,8 +854,9 @@ func (b *whereBuilder) buildAIFilter(e FilterExpr) string {
 	if val == "none" {
 		return "i.source_type = 'none'"
 	}
-	b.args = append(b.args, val, "%,"+val, val+",%", "%,"+val+",%")
-	return "(i.source_type = ? OR i.source_type LIKE ? OR i.source_type LIKE ? OR i.source_type LIKE ?)"
+	esc := db.EscapeLike(val)
+	b.args = append(b.args, val, "%,"+esc, esc+",%", "%,"+esc+",%")
+	return `(i.source_type = ? OR i.source_type LIKE ? ESCAPE '\' OR i.source_type LIKE ? ESCAPE '\' OR i.source_type LIKE ? ESCAPE '\')`
 }
 
 // Uncorrelated on purpose: an EXISTS would probe image_sources once per
@@ -888,10 +886,9 @@ func (b *whereBuilder) buildMissingFilter(e FilterExpr) string {
 
 // archive is cbz alone: ingest stores zip archives as cbz too.
 func (b *whereBuilder) buildTypeFilter(e FilterExpr) string {
-	buckets := map[string][]string{
-		"image":    {"jpeg", "png", "webp", "avif", "jxl"},
-		"archive":  {"cbz"},
-		"animated": {"gif", "mp4", "webm"},
+	buckets := map[string][]string{}
+	for _, ft := range models.FileTypes {
+		buckets[ft.Kind] = append(buckets[ft.Kind], ft.Name)
 	}
 	seen := map[string]bool{}
 	for _, v := range strings.Split(strings.ToLower(e.Val), ",") {
@@ -950,14 +947,10 @@ func (b *whereBuilder) buildNameFilter(e FilterExpr) string {
 }
 
 func (b *whereBuilder) buildMimeFilter(e FilterExpr) string {
-	val := strings.TrimPrefix(strings.ToLower(e.Val), "image/")
-	val = strings.TrimPrefix(val, "video/")
-	if val == "" {
-		return "1=0"
-	}
 	seen := map[string]bool{}
-	for _, v := range strings.Split(val, ",") {
+	for _, v := range strings.Split(strings.ToLower(e.Val), ",") {
 		v = strings.TrimSpace(v)
+		v = strings.TrimPrefix(strings.TrimPrefix(v, "image/"), "video/")
 		if fileTypeBuckets[v] {
 			seen[v] = true
 		}
@@ -1002,37 +995,6 @@ func isHexDigest(s string, want int) bool {
 	return len(s) == want && !strings.ContainsFunc(s, func(r rune) bool { return (r < '0' || r > '9') && (r < 'a' || r > 'f') })
 }
 
-func (b *whereBuilder) buildIDFilter(e FilterExpr) string {
-	n, err := strconv.ParseInt(strings.TrimSpace(e.Val), 10, 64)
-	if err != nil {
-		return "1=0"
-	}
-	b.args = append(b.args, n)
-	return "i.id = ?"
-}
-
-// A token, not a time range: two batches can land in the same minute.
-func (b *whereBuilder) buildBatchFilter(e FilterExpr) string {
-	n, err := strconv.ParseInt(strings.TrimSpace(e.Val), 10, 64)
-	if err != nil {
-		return "1=0"
-	}
-	b.args = append(b.args, n)
-	return "i.upload_batch = ?"
-}
-
-func (b *whereBuilder) buildPromptFilter(e FilterExpr) string {
-	return b.dualMetadataLike("prompt", "prompt", e.Val)
-}
-
-func (b *whereBuilder) buildModelFilter(e FilterExpr) string {
-	return b.dualMetadataLike("model", "model_checkpoint", e.Val)
-}
-
-func (b *whereBuilder) buildSamplerFilter(e FilterExpr) string {
-	return b.dualMetadataLike("sampler", "sampler", e.Val)
-}
-
 // IN, not EXISTS: the IN seeks the seed indexes, where an EXISTS walks
 // images and probes each metadata table by image_id.
 func (b *whereBuilder) buildSeedFilter(e FilterExpr) string {
@@ -1044,20 +1006,9 @@ func (b *whereBuilder) buildSeedFilter(e FilterExpr) string {
 	return "(i.id IN (SELECT image_id FROM sd_metadata WHERE seed = ?) OR i.id IN (SELECT image_id FROM comfyui_metadata WHERE seed = ?))"
 }
 
-func (b *whereBuilder) buildViaFilter(e FilterExpr) string {
-	if e.Val == "" {
-		return "1=0"
-	}
-	b.args = append(b.args, e.Val)
-	return "i.origin = ? COLLATE NOCASE"
-}
-
 // The booleans leave out monbooru's derived meta tags, which nobody
 // tagged; tagged:monbooru still finds them through the ledger.
 func (b *whereBuilder) buildTaggedFilter(e FilterExpr) string {
-	if e.Val == "" {
-		return b.imageTagsPredicate(notDerivedMeta, false)
-	}
 	return b.boolTagsPredicate(notDerivedMeta, "", e.Val)
 }
 
@@ -1065,13 +1016,13 @@ func (b *whereBuilder) buildTaggedFilter(e FilterExpr) string {
 const notDerivedMeta = `it.tagger_name IS NOT '` + models.TagSourceMonbooru + `'`
 
 func (b *whereBuilder) buildAutotaggedFilter(e FilterExpr) string {
-	if e.Val == "" {
-		return b.imageTagsPredicate("it.is_auto = 1", false)
-	}
 	return b.boolTagsPredicate("it.is_auto = 1", "it.is_auto = 1", e.Val)
 }
 
 func (b *whereBuilder) boolTagsPredicate(boolExtra, ledgerExtra, val string) string {
+	if val == "" {
+		return b.imageTagsPredicate(boolExtra, false)
+	}
 	v, ok := searchkw.ParseBool(val)
 	if !ok {
 		b.args = append(b.args, val)
@@ -1185,14 +1136,6 @@ func (b *whereBuilder) buildFolderFilter(e FilterExpr) string {
 	return `(i.folder_path = ? COLLATE NOCASE OR i.folder_path LIKE ? ESCAPE '\' COLLATE NOCASE)`
 }
 
-func (b *whereBuilder) buildFolderonlyFilter(e FilterExpr) string {
-	if e.Val == "" {
-		return "i.folder_path = ''"
-	}
-	b.args = append(b.args, e.Val)
-	return "i.folder_path = ? COLLATE NOCASE"
-}
-
 func (b *whereBuilder) buildGeneratedFilter(e FilterExpr) string {
 	b.args = append(b.args, e.Val, e.Val)
 	sm := b.imageIDExists("sd_metadata sm", "sm", "sm.generation_hash = ?", false)
@@ -1285,20 +1228,15 @@ func parseDatePrecision(val string) (start time.Time, next func(time.Time) time.
 }
 
 // In ingested_at's stored UTC format, so the bounds compare as plain strings.
-func dateBoundStart(val string) string {
-	t, _, ok := parseDatePrecision(val)
-	if !ok {
-		return ""
-	}
-	return t.UTC().Format("2006-01-02T15:04:05") + "Z"
-}
-
-func dateBoundEnd(val string) string {
+func dateBound(val string, end bool) string {
 	t, next, ok := parseDatePrecision(val)
 	if !ok {
 		return ""
 	}
-	return next(t).Add(-time.Second).UTC().Format("2006-01-02T15:04:05") + "Z"
+	if end {
+		t = next(t).Add(-time.Second)
+	}
+	return t.UTC().Format("2006-01-02T15:04:05") + "Z"
 }
 
 func (b *whereBuilder) buildDateFilter(val string) string {
@@ -1313,10 +1251,7 @@ func (b *whereBuilder) buildDateFilter(val string) string {
 		if !dateFilterRe.MatchString(date) {
 			return "1=0"
 		}
-		bound := dateBoundStart(date)
-		if op == "<=" || op == ">" {
-			bound = dateBoundEnd(date)
-		}
+		bound := dateBound(date, op == "<=" || op == ">")
 		if bound == "" {
 			return "1=0"
 		}
@@ -1324,14 +1259,14 @@ func (b *whereBuilder) buildDateFilter(val string) string {
 		return "i.ingested_at " + op + " ?"
 	}
 	if s, ok := b.tryRangeComp("i.ingested_at %s ?", val,
-		dateRangeBound(dateBoundStart), dateRangeBound(dateBoundEnd)); ok {
+		dateRangeBound(false), dateRangeBound(true)); ok {
 		return s
 	}
 	val = strings.TrimPrefix(val, "=")
 	if !dateFilterRe.MatchString(val) {
 		return "1=0"
 	}
-	start, end := dateBoundStart(val), dateBoundEnd(val)
+	start, end := dateBound(val, false), dateBound(val, true)
 	if start == "" || end == "" {
 		return "1=0"
 	}
@@ -1355,10 +1290,10 @@ func compOf(val string, parse func(string) (any, bool)) (string, any, bool) {
 }
 
 // KB and KiB alike are 1024 bytes, the unit the UI displays.
-func parseSizeValue(raw string) (int64, bool) {
+func parseSizeValue(raw string) (any, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return 0, false
+		return nil, false
 	}
 	i := 0
 	for i < len(raw) {
@@ -1373,7 +1308,7 @@ func parseSizeValue(raw string) (int64, bool) {
 	unit := strings.TrimSpace(strings.ToLower(raw[i:]))
 	n, err := strconv.ParseFloat(numStr, 64)
 	if err != nil {
-		return 0, false
+		return nil, false
 	}
 	var mult int64
 	switch unit {
@@ -1388,14 +1323,14 @@ func parseSizeValue(raw string) (int64, bool) {
 	case "t", "tb", "tib":
 		mult = 1 << 40
 	default:
-		return 0, false
+		return nil, false
 	}
 	v := n * float64(mult)
 	switch {
 	case v >= math.MaxInt64:
-		return math.MaxInt64, true
+		return int64(math.MaxInt64), true
 	case v <= math.MinInt64:
-		return math.MinInt64, true
+		return int64(math.MinInt64), true
 	}
 	return int64(v), true
 }
@@ -1439,12 +1374,12 @@ func (b *whereBuilder) tryRangeComp(template, val string, parseFrom, parseTo fun
 	return fmt.Sprintf(template, "BETWEEN ? AND"), true
 }
 
-func dateRangeBound(bound func(string) string) func(string) (any, bool) {
+func dateRangeBound(end bool) func(string) (any, bool) {
 	return func(raw string) (any, bool) {
 		if !dateFilterRe.MatchString(raw) {
 			return "", false
 		}
-		v := bound(raw)
+		v := dateBound(raw, end)
 		return v, v != ""
 	}
 }
@@ -1460,14 +1395,6 @@ func parseIntValue(s string) (any, bool) {
 func parseFloatValue(s string) (any, bool) {
 	n, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	if err != nil {
-		return nil, false
-	}
-	return n, true
-}
-
-func parseSizeValueAny(s string) (any, bool) {
-	n, ok := parseSizeValue(s)
-	if !ok {
 		return nil, false
 	}
 	return n, true

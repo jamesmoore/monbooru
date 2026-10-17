@@ -4,25 +4,24 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
-	"github.com/monbooru/monbooru/internal/monloader"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/api"
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/plugins"
+	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/pairing"
 )
 
 // The pairing routes sit outside the api auth wrapper, since the operator's
 // approval is the gate, so they apply its CORS policy themselves.
 func (s *Server) pairCORS(w http.ResponseWriter, r *http.Request) bool {
-	if api.SetCORS(w, r, s.cfgSnapshot()) {
-		return true
-	}
-	api.WriteJSON(w, http.StatusForbidden, map[string]string{"code": "forbidden", "error": "CORS: origin not allowed"})
-	return false
+	return api.CORSOK(w, r, s.cfgSnapshot())
 }
 
 func (s *Server) pairedWith(app string) bool {
@@ -42,6 +41,7 @@ func (s *Server) pairRequest(w http.ResponseWriter, r *http.Request) {
 		PeerToken       string                `json:"peer_token"`
 		Version         string                `json:"version"`
 		Buttons         []config.PluginButton `json:"buttons"`
+		Contract        int                   `json:"contract"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil || body.App == "" {
 		api.WriteJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request", "error": "app and a JSON body are required"})
@@ -51,11 +51,18 @@ func (s *Server) pairRequest(w http.ResponseWriter, r *http.Request) {
 		api.WriteJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request", "error": err.Error()})
 		return
 	}
+	if body.Contract > plugins.Contract {
+		msg := fmt.Sprintf("%s speaks plugin contract %d, this monbooru speaks %d", body.App, body.Contract, plugins.Contract)
+		logx.Warnf("pairing: refused: %s", msg)
+		api.WriteJSON(w, http.StatusConflict, map[string]string{"code": "contract_unsupported", "error": msg})
+		return
+	}
 	// A re-pair is not a conflict: a replaced plugin comes back with no
 	// credentials. It still queues for approval.
 	repair := s.pairedWith(body.App)
 	id, ok := s.pairs.Create(peer.Req{
-		App: body.App, URL: body.URL, Source: clientIP(r), Scopes: peer.GrantedScopes(body.RequestedScopes),
+		Request:   pairing.Request{App: body.App, Source: clientIP(r), Scopes: peer.GrantedScopes(body.RequestedScopes)},
+		URL:       body.URL,
 		PeerToken: body.PeerToken, Version: body.Version, Buttons: body.Buttons, Repair: repair,
 	})
 	if !ok {
@@ -63,7 +70,7 @@ func (s *Server) pairRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logx.Infof("pairing: request from %s (%s)", body.App, body.URL)
-	api.WriteJSON(w, http.StatusOK, map[string]string{"request_id": id, "status": "pending"})
+	api.WriteJSON(w, http.StatusOK, map[string]string{"request_id": id, "status": string(pairing.Pending)})
 }
 
 func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
@@ -76,13 +83,13 @@ func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
 		api.WriteJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "error": "unknown pairing request"})
 		return
 	}
-	if req.State != peer.Approved {
+	if req.State != pairing.Approved {
 		api.WriteJSON(w, http.StatusOK, map[string]string{"status": string(req.State)})
 		return
 	}
 	claimed, won := s.pairs.Claim(id)
 	if !won {
-		api.WriteJSON(w, http.StatusOK, map[string]string{"status": "approved"})
+		api.WriteJSON(w, http.StatusOK, map[string]string{"status": string(pairing.Approved)})
 		return
 	}
 	secret, err := s.mintPairedToken(claimed)
@@ -92,7 +99,8 @@ func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.pairs.Remove(id)
-	api.WriteJSON(w, http.StatusOK, map[string]string{"status": "approved", "token": secret})
+	w.Header().Set("Cache-Control", "no-store")
+	api.WriteJSON(w, http.StatusOK, map[string]string{"status": string(pairing.Approved), "token": secret})
 }
 
 // Removes only locally: calling the peer back would loop.
@@ -171,7 +179,7 @@ func (s *Server) pluginPairApprove(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	req, ok := s.pairs.Get(id)
 	if !ok {
-		s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData(r))
+		s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData())
 		return
 	}
 	// A peer monbooru cannot reach would pair dead, so approval waits
@@ -184,13 +192,13 @@ func (s *Server) pluginPairApprove(w http.ResponseWriter, r *http.Request) {
 		if base != "" {
 			msg = req.App + " is unreachable at " + base + "; pairing not completed. Check the api url and that it is running."
 		}
-		s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData(r))
+		s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData())
 		writeFlashOOB(w, "flash-plugins", "warn", msg)
 		return
 	}
-	s.pairs.SetState(id, peer.Approved)
+	s.pairs.SetState(id, pairing.Approved)
 	logx.Infof("pairing: approved request %s from %s", id, clientIP(r))
-	s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData(r))
+	s.renderTemplate(w, "partials/plugin_pairing.html", s.pairViewData())
 	writeFlashOOB(w, "flash-plugins", "", "")
 }
 

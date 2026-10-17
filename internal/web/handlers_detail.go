@@ -17,11 +17,11 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/markup"
 	meta "github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
@@ -289,7 +289,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 	tagMode := readTagModeCookie(r)
 	isManga := img.FileType == models.FileTypeCBZ
 	misnamedExt := ""
-	if claimed := gallery.ExtFileType(img.CanonicalPath); claimed != "" && claimed != img.FileType {
+	if claimed := models.ExtFileType(img.CanonicalPath); claimed != "" && claimed != img.FileType {
 		misnamedExt = strings.ToLower(filepath.Ext(img.CanonicalPath))
 	}
 	var wg sync.WaitGroup
@@ -346,8 +346,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		comfyNodes = meta.ParseComfyWorkflowNodes(comfyMeta.RawWorkflow)
 	}
 
-	taggerCfg := s.cfgSnapshot()
-	enabledTaggers := tagger.EnabledTaggersForGallery(taggerCfg, s.activeGallery())
+	enabledTaggers, taggersPresent, taggerReason := tagger.GalleryTaggers(s.cfgSnapshot(), s.activeGallery())
 	imageTaggers := distinctTaggerNames(imageTags, true)
 	imageSources := distinctTaggerNames(imageTags, false)
 	hasUserTags, hasStaleTags := userAndStaleTags(imageTags)
@@ -456,8 +455,8 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		BackQS:            back.QueryString("?"),
 		BackKVQS:          back.QueryString("&"),
 		EnabledTaggers:    enabledTaggers,
-		TaggersPresent:    tagger.Present(taggerCfg),
-		TaggerReason:      tagger.UnavailableReason(taggerCfg),
+		TaggersPresent:    taggersPresent,
+		TaggerReason:      taggerReason,
 		ImageTaggers:      imageTaggers,
 		ImageSources:      imageSources,
 		HasUserTags:       hasUserTags,
@@ -496,11 +495,7 @@ func (s *Server) relatedImagesHandler(w http.ResponseWriter, r *http.Request) {
 		"Images":        related,
 		"ActiveGallery": s.activeGallery(),
 		"SourceID":      id,
-		"BackQuery":     back.Q,
-		"BackSort":      back.Sort,
-		"BackOrder":     back.Order,
-		"BackPage":      back.Page,
-		"BackSeed":      back.Seed,
+		"BackKVQS":      back.QueryString("&"),
 	})
 }
 
@@ -531,7 +526,7 @@ func (s *Server) pageHoldingMatch(ctx context.Context, sq search.Query, id int64
 		probe := sq
 		probe.Page, probe.Limit = page, pageSize
 		probe.SkipCount, probe.Cached = true, false
-		res, err := search.Execute(s.source(), probe)
+		res, err := search.Execute(ctx, s.source(), probe)
 		if err != nil {
 			return 0, false
 		}

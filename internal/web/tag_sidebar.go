@@ -12,8 +12,8 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -81,12 +81,12 @@ func readTagModeCookie(r *http.Request) string {
 	return normalizeTagMode(c.Value)
 }
 
-func writeTagModeCookie(w http.ResponseWriter, mode string) {
+func writeTagModeCookie(w http.ResponseWriter, r *http.Request, mode string) {
 	if mode == tagModeSource {
-		setPrefCookie(w, tagModeCookieName, tagModeSource)
+		setPrefCookie(w, r, tagModeCookieName, tagModeSource)
 		return
 	}
-	setPrefCookie(w, tagModeCookieName, "")
+	setPrefCookie(w, r, tagModeCookieName, "")
 }
 
 func (s *Server) buildTagSidebar(imageID int64, mode string, imageTags []models.ImageTag) tagSidebar {

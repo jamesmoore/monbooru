@@ -10,8 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -24,7 +25,10 @@ func ContribTag(tagSvc func() *tags.Service, id int64) (*models.Tag, bool) {
 }
 
 func (l *Link) ImageContribPreview(rctx context.Context, tagSvc func() *tags.Service, id int64, sha string) (*ContribPreview, error) {
-	_, imageTags, _ := tagSvc().GetImageTags(id)
+	_, imageTags, err := tagSvc().GetImageTags(id)
+	if err != nil {
+		return nil, err
+	}
 	ledger, err := tagSvc().TagSourcesForImage(id)
 	if err != nil {
 		logx.Warnf("TagSourcesForImage: %v", err)
@@ -34,7 +38,7 @@ func (l *Link) ImageContribPreview(rctx context.Context, tagSvc func() *tags.Ser
 	ctx, cancel := context.WithTimeout(rctx, 8*time.Second)
 	defer cancel()
 	sent, local := l.ptrSubmitSpellings(ctx, storage, byTag)
-	preview, err := l.PreviewContrib(ctx, sha, sent, implied)
+	preview, err := l.previewContrib(ctx, sha, sent, implied)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +66,8 @@ func (l *Link) ptrSubmitSpellings(ctx context.Context, storage []string, byTag m
 		return storage, nil
 	}
 	graph := map[string]PTRTagInfo{}
-	for start := 0; start < len(names); start += PTRLookupBatch {
-		part, err := l.PTRTagLookup(ctx, names[start:min(start+PTRLookupBatch, len(names))])
+	for start := 0; start < len(names); start += ptrLookupBatch {
+		part, err := l.PTRTagLookup(ctx, names[start:min(start+ptrLookupBatch, len(names))])
 		if err != nil {
 			return storage, nil
 		}
@@ -81,7 +85,7 @@ func (l *Link) ptrSubmitSpellings(ctx context.Context, storage []string, byTag m
 		}
 		// A spelling another tag on the image already occupies would go
 		// up twice and pair the wrong row with it.
-		if spelling, _, ok := ResolvePTRSpelling(graph, form, byTag[form]); ok && !taken[spelling] {
+		if spelling, _, ok := resolvePTRSpelling(graph, form, byTag[form]); ok && !taken[spelling] {
 			sent[i], taken[spelling], local[spelling] = spelling, true, form
 		}
 	}
@@ -139,7 +143,10 @@ func PTRUnattributed(tagSvc func() *tags.Service, id int64, preview *ContribPrev
 	if err != nil {
 		return nil
 	}
-	_, imageTags, _ := tagSvc().GetImageTags(id)
+	_, imageTags, err := tagSvc().GetImageTags(id)
+	if err != nil {
+		return nil
+	}
 	var out []string
 	for _, t := range imageTags {
 		name := tags.FormName(t.Category, t.TagName)
@@ -152,7 +159,7 @@ func PTRUnattributed(tagSvc func() *tags.Service, id int64, preview *ContribPrev
 	return out
 }
 
-func isPTRSource(src tags.TagSource) bool { return strings.EqualFold(src.Source, "ptr") }
+func isPTRSource(src tags.TagSource) bool { return strings.EqualFold(src.Source, contract.SourcePTR) }
 
 func MappingItems(sha string, adds, petitions []string, reason string) []map[string]any {
 	var items []map[string]any
@@ -184,14 +191,8 @@ func ReadContribReceipt(items []map[string]any, results []ContribSendResult) (Co
 		return ContribReceipt{}, false
 	}
 	var r ContribReceipt
-	for _, res := range results {
-		if res.Result == "staged" {
-			r.Sent++
-		} else {
-			r.Refused++
-		}
-	}
 	r.Adds, r.Petitions, r.RefusedRows = receiptRows(items, results)
+	r.Sent, r.Refused = len(r.Adds)+len(r.Petitions), len(r.RefusedRows)
 	return r, true
 }
 
@@ -256,7 +257,9 @@ type TagContribDiff struct {
 	IdealElsewhere string
 }
 
-func (l *Link) tagContribRows(ctx context.Context, tagSvc func() *tags.Service, id int64, tag *models.Tag) (*TagContribDiff, error) {
+func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Service, id int64, tag *models.Tag) (*TagContribDiff, error) {
+	ctx, cancel := context.WithTimeout(rctx, 8*time.Second)
+	defer cancel()
 	tagForm := tags.FormName(tag.CategoryName, tag.Name)
 	aliases, err := tagSvc().AliasesForTagIDs([]int64{id})
 	if err != nil {
@@ -287,12 +290,12 @@ func (l *Link) tagContribRows(ctx context.Context, tagSvc func() *tags.Service, 
 		localImplied[tags.FormName(im.ImpliedCategoryName, im.ImpliedName)] = true
 	}
 	names := append([]string{tagForm}, aliasForms...)
-	names = names[:min(len(names), PTRLookupBatch)]
+	names = names[:min(len(names), ptrLookupBatch)]
 	graph, err := l.PTRTagLookup(ctx, names)
 	if err != nil {
 		return nil, err
 	}
-	known, info, ok := ResolvePTRSpelling(graph, tagForm, aliasForms)
+	known, info, ok := resolvePTRSpelling(graph, tagForm, aliasForms)
 	if ok && known != tagForm {
 		d.KnownAs = known
 	}
@@ -376,10 +379,10 @@ func (l *Link) tagContribRows(ctx context.Context, tagSvc func() *tags.Service, 
 
 // Each preview is a monloader round trip and a hub tag has dozens, so a
 // few run at once; the first failure stops the rest.
-func (l *Link) pairPreviews(ctx context.Context, rows []*TagPairRow) ([]*PairPreview, error) {
+func (l *Link) pairPreviews(ctx context.Context, rows []*TagPairRow) ([]*pairPreview, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	out := make([]*PairPreview, len(rows))
+	out := make([]*pairPreview, len(rows))
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	var failed sync.Once
@@ -391,7 +394,7 @@ func (l *Link) pairPreviews(ctx context.Context, rows []*TagPairRow) ([]*PairPre
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			preview, err := l.PreviewPair(ctx, row.Kind, row.A, row.B)
+			preview, err := l.previewPair(ctx, row.Kind, row.A, row.B)
 			if err != nil {
 				failed.Do(func() {
 					firstErr = err
@@ -435,19 +438,11 @@ func heldByCluster(tagSvc func() *tags.Service, row TagPairRow, tagForm, known s
 func pullWouldAdd(tagSvc func() *tags.Service, tagID int64, info PTRTagInfo, tagForm string) bool {
 	svc := tagSvc()
 	free := func(n string) bool { return n != "" && n != tagForm && svc.FormFree(n) }
+	implies := func(forward bool) func(string) bool {
+		return func(im string) bool { return im != "" && im != tagForm && svc.WouldAddImplication(tagID, im, forward) }
+	}
 	return slices.ContainsFunc(info.Aliases, free) || free(info.Ideal) ||
-		slices.ContainsFunc(info.Implications, func(im string) bool {
-			return im != "" && im != tagForm && svc.WouldAddImplication(tagID, im, true)
-		}) ||
-		slices.ContainsFunc(info.ImpliedBy, func(im string) bool {
-			return im != "" && im != tagForm && svc.WouldAddImplication(tagID, im, false)
-		})
-}
-
-func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Service, id int64, tag *models.Tag) (*TagContribDiff, error) {
-	ctx, cancel := context.WithTimeout(rctx, 8*time.Second)
-	defer cancel()
-	return l.tagContribRows(ctx, tagSvc, id, tag)
+		slices.ContainsFunc(info.Implications, implies(true)) || slices.ContainsFunc(info.ImpliedBy, implies(false))
 }
 
 // Each value is a TagPairRow's Value: "kind a b".

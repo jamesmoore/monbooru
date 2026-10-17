@@ -10,15 +10,15 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/searchkw"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 var (
 	ErrInvalidTagName       = errors.New("invalid tag name")
 	ErrTagNotFound          = errors.New("tag not found")
 	ErrTagNameTaken         = errors.New("already exists in this category")
-	ErrTagImplied           = errors.New("this tag is implied by another tag on the image; remove the parent, or add it yourself first to take ownership of the row")
+	ErrTagImplied           = errors.New("this tag is implied by another tag on the image; remove the parent")
 	ErrCategoryNotFound     = errors.New("category not found")
 	ErrBuiltinCategory      = errors.New("cannot delete built-in category")
 	ErrBuiltinCategoryName  = errors.New("cannot rename a built-in category")
@@ -123,7 +123,9 @@ func New(database *db.DB, onChange func()) *Service {
 	).Scan(&s.ratingCatID); err != nil {
 		logx.Warnf("tags.New: rating category lookup failed: %v", err)
 	}
-	if id, ok, err := CategoryIDByName(database, "general"); ok && err == nil {
+	if id, ok, err := CategoryIDByName(database, "general"); err != nil {
+		logx.Warnf("tags.New: general category lookup failed: %v", err)
+	} else if ok {
 		s.generalCatID = id
 	}
 	return s

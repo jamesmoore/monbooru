@@ -9,7 +9,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // PhashStored must follow every phash write so a built tree stays in step
@@ -24,16 +24,24 @@ func PhashStored(database *db.DB, tree *BKTree, id, phash int64) {
 		}
 		return
 	}
-	if err := tree.EnsureBuilt(database); err != nil {
-		logx.Warnf("incremental probe %d: build the tree: %v", id, err)
-		return
+	probeTree := tree
+	if !tree.Built() && tree.unbuiltProbes.Add(1) <= unbuiltProbesBeforeBuild {
+		probeTree = nil
+	} else {
+		if err := tree.EnsureBuilt(database); err != nil {
+			logx.Warnf("incremental probe %d: build the tree: %v", id, err)
+			return
+		}
+		tree.Insert(id, phash)
 	}
-	tree.Insert(id, phash)
 	distance := int(IncrementalProbeDistance.Load())
-	if err := incrementalProbe(database, tree, id, phash, distance); err != nil {
+	if err := incrementalProbe(database, probeTree, id, phash, distance); err != nil {
 		logx.Debugf("incremental probe %d: %v", id, err)
 	}
 }
+
+// SQL spares a trickle of stores the build; a burst pays for one build.
+const unbuiltProbesBeforeBuild = 32
 
 func PhashCleared(tree *BKTree, id int64) {
 	if tree != nil && tree.Built() {
@@ -64,6 +72,8 @@ type BKTree struct {
 	idIndex  map[int64]int64 // id -> phash
 	built    atomic.Bool
 	lastUsed atomic.Int64
+
+	unbuiltProbes atomic.Int32
 }
 
 type bkNode struct {
@@ -111,6 +121,7 @@ func (t *BKTree) resetLocked() {
 	t.root = nil
 	t.idIndex = make(map[int64]int64)
 	t.built.Store(false)
+	t.unbuiltProbes.Store(0)
 }
 
 func (t *BKTree) BuildFromDB(database *db.DB) error {

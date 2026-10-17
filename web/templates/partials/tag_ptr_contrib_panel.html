@@ -1,3 +1,5 @@
+{{define "tag_ptr_new_line"}}<span class="ptr-contrib-plus">++</span> <span class="ptr-count" title="{{.NewTip}}">{{.NewCount}}</span> of this tag's relations {{if eq .NewCount 1}}is{{else}}are{{end}} new to the Public Tag Repository.{{end}}
+{{define "tag_ptr_petition_line"}}<span class="ptr-contrib-minus">--</span> the Public Tag Repository holds <span class="ptr-count" title="{{.PetitionTip}}">{{.PetitionCount}}</span> relation{{if gt .PetitionCount 1}}s{{end}} for this tag not declared here.{{end}}
 {{define "partials/tag_ptr_contrib_panel.html"}}
 <div class="ptr-contrib-card monloader-accent">
   <div class="ptr-contrib-head">
@@ -17,11 +19,11 @@
     <div class="ptr-contrib-lines">
       {{if and (gt .NewCount 0) (gt .PetitionCount 0)}}
       <ul>
-        <li><span class="ptr-contrib-plus">++</span> <span class="ptr-count" title="{{.NewTip}}">{{.NewCount}}</span> of this tag's relations {{if eq .NewCount 1}}is{{else}}are{{end}} new to the Public Tag Repository.</li>
-        <li><span class="ptr-contrib-minus">--</span> the Public Tag Repository holds <span class="ptr-count" title="{{.PetitionTip}}">{{.PetitionCount}}</span> relation{{if gt .PetitionCount 1}}s{{end}} for this tag not declared here.</li>
+        <li>{{template "tag_ptr_new_line" .}}</li>
+        <li>{{template "tag_ptr_petition_line" .}}</li>
       </ul>
-      {{else if gt .NewCount 0}}<p><span class="ptr-contrib-plus">++</span> <span class="ptr-count" title="{{.NewTip}}">{{.NewCount}}</span> of this tag's relations {{if eq .NewCount 1}}is{{else}}are{{end}} new to the Public Tag Repository.</p>
-      {{else if gt .PetitionCount 0}}<p><span class="ptr-contrib-minus">--</span> the Public Tag Repository holds <span class="ptr-count" title="{{.PetitionTip}}">{{.PetitionCount}}</span> relation{{if gt .PetitionCount 1}}s{{end}} for this tag not declared here.</p>
+      {{else if gt .NewCount 0}}<p>{{template "tag_ptr_new_line" .}}</p>
+      {{else if gt .PetitionCount 0}}<p>{{template "tag_ptr_petition_line" .}}</p>
       {{else if .Pullable}}<p class="field-hint">the Public Tag Repository has aliases or implications for this tag to pull.</p>
       {{else}}<p class="field-hint">nothing new to contribute for this tag.</p>{{end}}
     </div>

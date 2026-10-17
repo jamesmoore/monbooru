@@ -23,7 +23,6 @@
 <form id="implication-add-form" class="add-tag-form"
       hx-post="/tags/{{.Parent.ID}}/implications"
       hx-target="#implication-add-flash"
-      hx-swap="innerHTML"
       hx-on::after-request="handleImplicationAdded(event)">
   <div class="add-tag-input-wrap">
     {{template "multi_tag_suggest_input" dict "Name" "implied_id" "InputID" "implication-add-input" "SuggestID" "implication-add-suggest" "Placeholder" "Imply tag(s)..." "Required" true "ValsKey" "q"}}

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // Indexed is what a row recorded of the bytes at one of its paths; a zero
@@ -31,25 +31,24 @@ func AliasPathsFor(q db.Querier, ids []int64) (map[int64][]AliasCopy, error) {
 	if placeholders == "" {
 		return nil, nil
 	}
-	rows, err := q.Query(
-		`SELECT ip.image_id, ip.path, i.file_size, i.sha256, ip.mtime_unix, ip.mtime_nsec
+	type copyRow struct {
+		id int64
+		AliasCopy
+	}
+	rows, err := db.QueryAll(q, db.ScanRow(func(r *copyRow) []any {
+		return []any{&r.id, &r.Path, &r.Size, &r.SHA256, &r.Mtime, &r.MtimeNano}
+	}), `SELECT ip.image_id, ip.path, i.file_size, i.sha256, ip.mtime_unix, ip.mtime_nsec
 		   FROM image_paths ip
 		   JOIN images i ON i.id = ip.image_id
 		  WHERE ip.is_canonical = 0 AND ip.image_id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
 	out := map[int64][]AliasCopy{}
-	for rows.Next() {
-		var id int64
-		var c AliasCopy
-		if err := rows.Scan(&id, &c.Path, &c.Size, &c.SHA256, &c.Mtime, &c.MtimeNano); err != nil {
-			return nil, err
-		}
-		out[id] = append(out[id], c)
+	for _, r := range rows {
+		out[r.id] = append(out[r.id], r.AliasCopy)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // UnlinkAliasFiles takes the copies with the row, or the next sync ingests
@@ -71,7 +70,7 @@ var (
 // With the watcher off, a recorded path can hold another file written over
 // it since it was indexed. Only a file whose length and mtime both match
 // the row's skips the hash, so a touched file still goes.
-func changedSinceIndexed(path string, rec Indexed) error {
+func ChangedSinceIndexed(path string, rec Indexed) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil
@@ -149,7 +148,7 @@ func RemoveCopy(b *Boundary, path, canonical string, rec Indexed) (CopyOutcome, 
 	if isCanonicalEntry(path, canonical) {
 		return CopyForgotten, errors.New("it reaches the canonical file through a link")
 	}
-	if err := changedSinceIndexed(path, rec); err != nil {
+	if err := ChangedSinceIndexed(path, rec); err != nil {
 		return CopyKept, err
 	}
 	if CanonicalGone(b, canonical) {
@@ -199,7 +198,7 @@ func UnlinkImageFile(b *Boundary, path string, rec Indexed, id int64) (changed b
 		logx.Warnf("delete image %d: leaving %q alone: %v", id, path, err)
 		return false
 	}
-	if err := changedSinceIndexed(path, rec); err != nil {
+	if err := ChangedSinceIndexed(path, rec); err != nil {
 		logx.Warnf("delete image %d: %q %v - left alone", id, path, err)
 		return true
 	}

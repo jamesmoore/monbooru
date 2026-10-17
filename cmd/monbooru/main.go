@@ -6,7 +6,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,9 +14,9 @@ import (
 	_ "time/tzdata"
 
 	"github.com/monbooru/monbooru/internal/config"
-	"github.com/monbooru/monbooru/internal/desktop"
 	"github.com/monbooru/monbooru/internal/jobs"
-	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
+	"github.com/monbooru/monbooru/internal/shared/logx"
 	internalweb "github.com/monbooru/monbooru/internal/web"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -129,8 +128,8 @@ func main() {
 	srv, err := internalweb.NewServer(cfg, *configPath, jobManager, profile)
 	if err != nil {
 		if freshConfig && inContainer() {
-			log.Printf("monbooru wrote %s with default settings meant for the docker image.", *configPath)
-			log.Printf("edit gallery_path (your images), paths.data_path (db + thumbnails) and paths.model_path (optional auto-taggers), then run it again. docs: %s", internalweb.DocURL)
+			logx.Warnf("monbooru wrote %s with default settings meant for the docker image.", *configPath)
+			logx.Warnf("edit gallery_path (your images), paths.data_path (db + thumbnails) and paths.model_path (optional auto-taggers), then run it again. docs: %s", internalweb.DocURL)
 		}
 		fatalf("creating web server: %v", err)
 	}
@@ -177,16 +176,22 @@ func main() {
 	case <-srv.QuitRequested():
 		logx.Infof("shutting down on request...")
 	case err := <-srvErr:
-		logx.Errorf("FATAL HTTP server: %v", err)
-		exitCode = 1
+		msg := ""
 		if *desktopMode {
 			// Two launches can both probe an empty port; the one that
 			// lost the bind asks again and finds the winner.
-			if msg, _ := claimPort(cfg.Server.BindAddress, !*noBrowser); msg != "" {
-				reportFatal(msg)
+			if msg = bindFailure(cfg.Server.BindAddress, err, !*noBrowser); msg == "" {
+				logx.Infof("lost the bind to the %s already on %s", appName, cfg.Server.BindAddress)
+				break
 			}
 		}
+		logx.Errorf("FATAL HTTP server: %v", err)
+		exitCode = 1
+		if msg != "" {
+			reportFatal(msg)
+		}
 	}
+	signal.Stop(quit)
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	httpSrv.Shutdown(shutCtx) //nolint:errcheck

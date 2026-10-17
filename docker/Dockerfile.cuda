@@ -20,7 +20,7 @@ RUN apt-get update && apt-get upgrade -y && \
     rm -rf /usr/local/cuda/compat /var/lib/apt/lists/*
 
 ARG ORT_VERSION=1.21.0
-ARG ORT_SHA256_X64_GPU=ef37a33ba75e457aebfd0d7b342ab20424aa6126bc5f565d247f1201b66996cf
+ARG ORT_SHA256_LINUX_X64_GPU=ef37a33ba75e457aebfd0d7b342ab20424aa6126bc5f565d247f1201b66996cf
 ARG FFMPEG_BUILD=v8.1.3-mb1
 ARG FFMPEG_NAME=ffmpeg-8.1.3-mb1
 ARG FFMPEG_SHA256_LINUX64=2fc794c828a3f61836605f09f97bc9e59f906a52b971c6c170aaf480be63a216
@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils && \
     curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz" \
       -o /tmp/ort.tgz && \
-    echo "${ORT_SHA256_X64_GPU}  /tmp/ort.tgz" | sha256sum -c - && \
+    echo "${ORT_SHA256_LINUX_X64_GPU}  /tmp/ort.tgz" | sha256sum -c - && \
     tar -xzf /tmp/ort.tgz -C /tmp && \
     cp /tmp/onnxruntime-linux-x64-gpu-${ORT_VERSION}/lib/libonnxruntime*.so* /usr/lib/ && \
     ln -sf /usr/lib/libonnxruntime.so.${ORT_VERSION} /usr/lib/libonnxruntime.so && \
