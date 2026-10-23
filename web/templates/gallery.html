@@ -22,7 +22,7 @@
   <button type="button" id="select-mode-btn" aria-pressed="false" onclick="toggleSelectMode()" title="Select mode (V)">Select mode</button>
 </div>
 
-<div id="gallery-flash"></div>
+<div id="gallery-flash" data-action-flash></div>
 <div id="search-warning">{{if .SearchWarning}}<span class="field-hint">{{.SearchWarning}}</span>{{end}}</div>
 
 {{template "partials/gallery_status.html" .}}
@@ -32,12 +32,12 @@
   <button onclick="selectAll()">Select page</button>
   <button id="batch-invert" onclick="invertSelection()">Invert</button>
   <button id="batch-cancel" onclick="clearSelection()">Cancel</button>
-  <form id="batch-delete-form">
+  <span class="batch-actions">
     <span class="batch-bar-spacer"></span>
     <button type="button" onclick="openTagDialog('selection')">Add tags</button>
     <button type="button" onclick="openStripDialog('selection')">Remove tags</button>
     {{if .TaggersPresent}}<button type="button" class="btn-autotag"{{if not .EnabledTaggers}} disabled title="{{.TaggerReason}}"{{end}} onclick="openBatchAutotagDialog('selection')">Auto-tag</button>{{end}}
-    {{if .MonloaderPaired}}<button type="button" class="monloader-accent" data-ml-title=""{{if not .MonloaderUsable}} disabled title="{{monloaderOffReason .MonloaderConn}}"{{end}} onclick="openBatchLookupDialog('selection')">Find tags</button>{{end}}
+    {{if .MonloaderPaired}}<button type="button" class="peer-accent" data-peer-title=""{{if not .MonloaderUsable}} disabled title="{{monloaderOffReason .MonloaderConn}}"{{end}} onclick="openBatchLookupDialog('selection')">Find tags</button>{{end}}
     <span class="batch-bar-sep" aria-hidden="true"></span>
     <button type="button" onclick="openBatchDialog('batch-inbox', 'selection')">Inbox</button>
     <button type="button" onclick="openBatchDialog('batch-fav', 'selection')">Favorite</button>
@@ -47,7 +47,7 @@
     {{if gt (len .Galleries) 1}}<button type="button" id="batch-transfer" onclick="openBatchTransferDialog('selection')">Transfer</button>{{end}}
     <button type="button" onclick="openBatchPlaceDialog('selection')">Rename</button>
     <button type="button" class="btn-danger" onclick="openBatchDeleteDialog('selection')">Delete</button>
-  </form>
+  </span>
 </div>
 
 {{if .PluginSlot.Any}}
@@ -324,17 +324,17 @@ function updateBatchLookupSummary() {
   var n = 0, text = '';
   if (mode === 'refresh') {
     n = c.sourced;
-    text = n + ' image(s) will be refreshed from their declared sources.';
+    text = n + (n === 1 ? ' image' : ' images') + ' will be refreshed from their declared sources.';
   } else if (mode === 'hash') {
     n = unsourced.checked ? c.unsourced : c.total;
     var backends = [];
     if (ptr.checked) backends.push('PTR');
     if (booru.checked) backends.push('online');
     if (backends.length === 0) n = 0;
-    text = n + ' image(s) will be looked up' + (backends.length ? ': ' + backends.join(', ') : '') + '.';
+    text = n + (n === 1 ? ' image' : ' images') + ' will be looked up' + (backends.length ? ': ' + backends.join(', ') : '') + '.';
   } else {
     n = c.unsourced;
-    text = 'Applies to the ' + n + ' image(s) with no source.';
+    text = 'Applies to the ' + n + (n === 1 ? ' image' : ' images') + ' with no source.';
   }
   summary.textContent = text;
   submit.disabled = n === 0;
@@ -461,7 +461,7 @@ function countBatchDownload() {
       res.json().then(function(c) {
         _batchDownloadFiles = c.files;
         var text = c.files
-          ? c.files + ' file(s), about ' + c.size + '.'
+          ? c.files + (c.files === 1 ? ' file' : ' files') + ', about ' + c.size + '.'
           : 'Nothing to download: every file in the scope is missing on disk.';
         if (c.files && c.missing) text += ' ' + c.missing + (c.missing === 1 ? ' is' : ' are') + ' missing on disk and left out.';
         summary.textContent = text;
@@ -485,7 +485,7 @@ function confirmBatchDownload() {
   });
   document.getElementById('batch-download-form').submit();
   document.getElementById('batch-download-dialog').close();
-  showActionFlash('Packing ' + _batchDownloadFiles + ' file(s) into a zip. Your browser saves it as it arrives.', 'ok');
+  showActionFlash('Packing ' + _batchDownloadFiles + (_batchDownloadFiles === 1 ? ' file' : ' files') + ' into a zip. Your browser saves it as it arrives.', 'ok');
 }
 
 // Only a refusal loads into the frame; a zip downloads without navigating it.

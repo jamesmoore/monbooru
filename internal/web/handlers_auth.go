@@ -2,32 +2,38 @@ package web
 
 import (
 	"cmp"
+	"fmt"
+	"math"
 	"net/http"
 
+	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/session"
 	"golang.org/x/crypto/bcrypt"
 )
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 	if !s.authEnabled() {
-		s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{
+		s.renderTemplate(w, "webui/login_page", s.loginPageData(map[string]any{
 			"Error":        "Password authentication is disabled. Enable it from Settings → Authentication.",
 			"AuthDisabled": true,
 		}))
 		return
 	}
-	s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{"Next": loginNext(r.URL.Query().Get("next"))}))
+	s.renderTemplate(w, "webui/login_page", s.loginPageData(map[string]any{"Next": loginNext(r.URL.Query().Get("next"))}))
 }
 
 func loginNext(p string) string {
-	if localPath(p) {
+	if session.LocalPath(p) {
 		return p
 	}
 	return ""
 }
 
 func (s *Server) loginPageData(extra map[string]any) map[string]any {
-	return s.standalonePageData("Login - "+s.booruName(), extra)
+	data := s.standalonePageData("Login - "+s.booruName(), extra)
+	data["App"], data["Manifest"] = "monbooru", "/manifest.json"
+	return data
 }
 
 // Carries every field partials/head.html reads: these pages skip s.base().
@@ -35,7 +41,7 @@ func (s *Server) standalonePageData(title string, extra map[string]any) map[stri
 	theme := s.activeTheme()
 	data := map[string]any{
 		"Title":        title,
-		"CSRFToken":    s.sessions.CSRFToken("anon"),
+		"CSRFToken":    s.sessions.CSRFToken(session.Anon),
 		"BooruName":    s.booruName(),
 		"BooruFavicon": themeFaviconURL(theme),
 		"Theme":        theme.Path != "",
@@ -53,11 +59,12 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	next := loginNext(r.FormValue("next"))
-	ip := clientIP(r)
-	if !s.loginRL.check(ip) {
+	ip := session.ClientIP(r)
+	if wait := s.loginRL.Wait(ip); wait > 0 {
 		logx.Warnf("login rate-limited from %s", ip)
-		s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{
-			"Error": "Too many attempts. Please wait before trying again.",
+		secs := int(math.Ceil(wait.Seconds()))
+		s.renderTemplate(w, "webui/login_page", s.loginPageData(map[string]any{
+			"Error": fmt.Sprintf("Wait %d %s before trying again.", secs, models.Plural(secs, "second", "seconds")),
 			"Next":  next,
 		}))
 		return
@@ -67,15 +74,15 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	if err := bcrypt.CompareHashAndPassword(
 		[]byte(s.passwordHash()), []byte(password),
 	); err != nil {
-		s.loginRL.recordFailure(ip)
+		s.loginRL.Fail(ip)
 		logx.Warnf("login failed from %s", ip)
-		s.renderTemplate(w, "login.html", s.loginPageData(map[string]any{
+		s.renderTemplate(w, "webui/login_page", s.loginPageData(map[string]any{
 			"Error": "Invalid password",
 			"Next":  next,
 		}))
 		return
 	}
-	s.loginRL.recordSuccess(ip)
+	s.loginRL.Succeed(ip)
 	logx.Infof("login success from %s", ip)
 
 	s.setSessionCookie(w, r, s.sessions.Create(s.sessionLifetimeDays()))
@@ -83,34 +90,18 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, sessID string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "monbooru_session",
-		Value:    sessID,
-		Path:     "/",
-		MaxAge:   s.sessionLifetimeDays() * 86400,
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	session.SetCookie(w, r, sessionCookie, sessID, s.sessionLifetimeDays()*86400)
 }
 
 func (s *Server) logoutPost(w http.ResponseWriter, r *http.Request) {
-	sessID := sessionFromContext(r.Context())
+	sessID := session.FromContext(r.Context())
 	s.sessions.Delete(sessID)
-	http.SetCookie(w, &http.Cookie{
-		Name:     "monbooru_session",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	session.SetCookie(w, r, sessionCookie, "", -1)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 func (s *Server) renderAuthPasswordOOB(w http.ResponseWriter, r *http.Request) {
-	s.renderTemplate(w, "partials/auth_password_section.html", map[string]any{
+	s.renderTemplate(w, "webui/auth_password_section", map[string]any{
 		"AuthEnabled": s.authEnabled(),
 		"HasPassword": s.passwordHash() != "",
 		"OOB":         true,

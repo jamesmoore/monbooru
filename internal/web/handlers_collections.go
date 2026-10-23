@@ -212,7 +212,7 @@ func (s *Server) reorderCollectionPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusInternalServerError, "Could not reorder the collection.")
 		return
 	}
-	writeInlineFlash(w, "ok", fmt.Sprintf("Ordered %d image(s).", clicked))
+	writeInlineFlash(w, "ok", fmt.Sprintf("Ordered %d image%s.", clicked, plural(clicked)))
 }
 
 func (s *Server) startCollectionJob(w http.ResponseWriter, name string, run func([]int64)) {
@@ -268,10 +268,10 @@ func (s *Server) runRenameCollection(ids []int64, oldName, newName string) {
 			return gallery.RenameCollectionForImages(d, chunk, oldName, newName, posOffset, merging)
 		})
 	})
-	if err == nil {
+	if err == nil && !cancelled {
 		if e := cx.Edit(func(d *db.DB) error { return gallery.RenameCollectionFindRelations(d, oldName, newName, merging) }); e != nil {
 			logx.Debugf("rename collection find-relations flag: %v", e)
 		}
 	}
-	s.jobs.Finish(err, cancelled, fmt.Sprintf("rename cancelled (%d/%d processed)", processed, total), fmt.Sprintf("Renamed collection across %d image(s).", processed))
+	s.jobs.Finish(err, cancelled, fmt.Sprintf("rename cancelled (%d/%d processed)", processed, total), fmt.Sprintf("Renamed collection across %d image%s.", processed, plural(processed)))
 }

@@ -37,7 +37,7 @@
       {{end}}
       <button type="button" id="btn-detail-delete" class="btn-sm btn-danger" onclick="deleteThisTag(this)"
               data-name="{{.Tag.Name}}" data-category="{{.Tag.CategoryName}}"
-              title="{{if .IsRating}}Strip this rating from every image (the catalog row stays){{else}}Delete this tag from every image{{end}}">Delete</button>
+              title="{{if .IsRating}}Strip this rating from every image (the catalog row stays){{else}}Delete this tag from every image{{end}}">{{if .IsRating}}Strip{{else}}Delete{{end}}</button>
     </span>
   </h2>
 
@@ -52,7 +52,7 @@
     · last used {{if .Tag.LastUsedAt.IsZero}}<span class="origin-none">—</span>{{else}}<strong>{{.Tag.LastUsedAt.Format "2006-01-02"}}</strong>{{end}}
   </p>
 
-  <div id="tag-flash"></div>
+  <div id="tag-flash" data-action-flash></div>
 
   {{if .Tag.IsAlias}}
   <section class="tag-detail-section">
@@ -124,6 +124,7 @@
               <a href="/tags/{{.ParentID}}" style="color:{{catColor .ParentCategoryColor}}">{{.ParentName}}</a>
               <button class="tag-remove-btn"
                       hx-delete="/tags/{{.ParentID}}/implications/{{$.Tag.ID}}"
+                      hx-target="#tag-flash"
                       hx-confirm="Remove the implication that {{.ParentName}} implies {{$.Tag.Name}}?"
                       data-confirm-ok="Remove"
                       hx-on::after-request="if(event.detail.successful){pruneRelationRow(this)}"

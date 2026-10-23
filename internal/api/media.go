@@ -11,6 +11,7 @@ import (
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 func (h *Handler) serveImageFile(w http.ResponseWriter, r *http.Request) {
@@ -39,7 +40,7 @@ func (h *Handler) serveImageStill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if gallery.IsVideoType(fileType) || fileType == models.FileTypeCBZ {
-		apiError(w, http.StatusNotFound, "not_found", "image is a video or an archive")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image is a video or an archive")
 		return
 	}
 	if !gallery.IsFFmpegStill(fileType) {
@@ -62,7 +63,7 @@ func containedCanonical(w http.ResponseWriter, g *library.Gallery, id int64) (ca
 		`SELECT canonical_path, file_type FROM images WHERE id = ?`, id,
 	).Scan(&canonPath, &fileType)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && !gallery.NamedInside(g.GalleryPath, canonPath) {
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 		return "", "", false
 	}
 	if serverError(w, err) {
@@ -73,7 +74,7 @@ func containedCanonical(w http.ResponseWriter, g *library.Gallery, id int64) (ca
 
 func canonicalOnDisk(w http.ResponseWriter, canonPath string) bool {
 	if _, err := os.Stat(canonPath); err != nil {
-		apiError(w, http.StatusNotFound, "not_found", "image file not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image file not found")
 		return false
 	}
 	return true
@@ -86,7 +87,7 @@ func (h *Handler) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 	}
 	thumbPath := filepath.Join(g.ThumbnailsPath, strconv.FormatInt(id, 10)+".jpg")
 	if _, err := os.Stat(thumbPath); err != nil {
-		apiError(w, http.StatusNotFound, "not_found", "thumbnail not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "thumbnail not found")
 		return
 	}
 	http.ServeFile(w, r, thumbPath)
@@ -110,7 +111,7 @@ func (h *Handler) serveMangaPagePath(
 	}
 	n, err := strconv.Atoi(r.PathValue("n"))
 	if err != nil || n < 1 {
-		apiError(w, http.StatusBadRequest, "invalid_request", "invalid page number")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid page number")
 		return
 	}
 	canonPath, fileType, ok := containedCanonical(w, g, id)
@@ -118,12 +119,12 @@ func (h *Handler) serveMangaPagePath(
 		return
 	}
 	if fileType != models.FileTypeCBZ {
-		apiError(w, http.StatusNotFound, "not_found", "image is not a manga archive")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image is not a manga archive")
 		return
 	}
 	page, err := ensure(g.ThumbnailsPath, canonPath, id, n)
 	if err != nil {
-		apiError(w, http.StatusNotFound, "not_found", "page not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "page not found")
 		return
 	}
 	http.ServeFile(w, r, page)

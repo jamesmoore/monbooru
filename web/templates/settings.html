@@ -8,16 +8,10 @@
                   {{if .ConfirmDanger}}data-confirm-danger="{{.ConfirmDanger}}"
                   {{end}}data-confirm-ok="{{.ConfirmOK}}"
                   {{end}}style="display:inline">
-              <button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm{{if .Accent}} {{.Accent}}{{end}}"{{if .MlGated}} data-ml-title=""{{end}}{{if .Disabled}} disabled title="{{.DisabledReason}}"{{end}}>{{.Verb}}</button>
+              <button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm{{if .Accent}} {{.Accent}}{{end}}"{{if .MlGated}} data-peer-title=""{{end}}{{if .Disabled}} disabled title="{{.DisabledReason}}"{{end}}>{{.Verb}}</button>
             </form>
           </td>
         </tr>
-{{end}}
-{{define "settings_section_header"}}
-    <div class="settings-section-header">
-      <h3>{{.Title}}</h3>
-      <p class="field-hint">{{.Hint}}</p>
-    </div>
 {{end}}
 {{define "settings.html"}}
 {{template "layout_head" .}}
@@ -51,7 +45,7 @@
   {{if .DesktopProfile}}
   {{$dk := .Desktop}}
   <section id="desktop" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Desktop" "Hint" "Folders, launch options and the tray icon."}}
+    {{template "webui/settings_section_header" dict "Title" "Desktop" "Hint" "Folders, launch options and the tray icon."}}
     <div id="flash-desktop"></div>
     <form id="desktop-switches" hx-post="/settings/desktop" hx-target="#flash-desktop" hx-swap="innerHTML">
       <div class="settings-cols">
@@ -86,27 +80,14 @@
       </div>
     </form>
     <div class="desktop-actions">
-      <div class="desktop-power">
-        <form method="post" action="/settings/restart"
-              hx-confirm="Restart monbooru?" data-confirm-ok="Restart"
-              {{with .DesktopJobWarning}}data-confirm-danger="{{.}}"{{end}}>
-          <input type="hidden" name="_csrf" value="{{$csrf}}">
-          <button type="submit">Restart monbooru</button>
-        </form>
-        <form method="post" action="/settings/quit" class="desktop-quit"
-              hx-confirm="Stop monbooru?" data-confirm-ok="Stop"
-              {{with .DesktopJobWarning}}data-confirm-danger="{{.}}"{{end}}>
-          <input type="hidden" name="_csrf" value="{{$csrf}}">
-          <button type="submit" class="btn-danger">Stop monbooru</button>
-        </form>
-      </div>
+      {{template "partials/desktop_power.html" (dict "Warning" .DesktopJobWarning "CSRFToken" $csrf)}}
       {{if or $dk.Supported $dk.TraySupported}}<button type="submit" form="desktop-switches">Save</button>{{end}}
     </div>
   </section>
   {{end}}
 
   <section id="general" class="settings-section">
-    {{template "settings_section_header" dict "Title" "General" "Hint" "File handling, display options and meta tags."}}
+    {{template "webui/settings_section_header" dict "Title" "General" "Hint" "File handling, display options and meta tags."}}
     <div id="flash-general"></div>
     <form hx-post="/settings/general" hx-target="#flash-general" hx-swap="innerHTML">
       <div class="settings-cols">
@@ -231,7 +212,7 @@
   </script>
 
   <section id="galleries" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Galleries" "Hint" "Add, switch, export or import your galleries."}}
+    {{template "webui/settings_section_header" dict "Title" "Galleries" "Hint" "Add, switch, export or import your galleries."}}
     <div id="flash-galleries"></div>
     <div class="table-scroll">
     <table class="gallery-table">
@@ -404,7 +385,7 @@
         <label><input type="radio" name="format" value="json"> JSON (.json): human-readable dump, monbooru format</label>
       </div>
       <div class="field">
-        <label><input type="radio" name="format" value="light"> Light (.json): images<->tags only, no monbooru-specific data</label>
+        <label><input type="radio" name="format" value="light"> Light (.json): images<->tags only, no monbooru-specific data, missing images left out</label>
       </div>
       <div class="field">
         <label><input type="checkbox" name="with_images" value="true" id="gallery-export-with-images"> Include image files (bundled in a .zip)</label>
@@ -567,7 +548,7 @@
   </script>
 
   <section id="plugins" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Plugins" "Hint" "Plugins and themes."}}
+    {{template "webui/settings_section_header" dict "Title" "Plugins" "Hint" "Plugins and themes."}}
     <div id="flash-plugins"></div>
     <div class="settings-sub">
       <h4>Pairing requests</h4>
@@ -587,7 +568,7 @@
         <h4>Themes</h4>
         <p class="field-hint">Put a theme folder in <code>{{.ThemesDir}}</code>.</p>
       </div>
-      {{template "partials/theme_cluster.html" (dict "Names" $themes.Names "Active" $themes.Active)}}
+      {{template "webui/theme_cluster" (dict "Names" $themes.Names "Active" $themes.Active "PostURL" "/settings/plugins/theme")}}
     </div>
   </section>
 
@@ -597,7 +578,7 @@
       <p class="field-hint">Settings for the local tagging models.</p>
       {{template "partials/tagger_mode_badge.html" (dict "Provider" $cfg.Tagger.ExecutionProvider)}}
     </div>
-    <div id="flash-tagger"></div>
+    <div id="flash-tagger" data-action-flash></div>
     {{$taggers := .Taggers}}
     {{$rows := .TaggerRows}}
     <form hx-post="/settings/tagger" hx-target="#flash-tagger" hx-swap="innerHTML">
@@ -754,20 +735,6 @@
     {{end}}
 
   <script>
-  document.body.addEventListener('click', function(e) {
-    var tab = e.target.closest && e.target.closest('.dialog-tab');
-    if (!tab || !tab.dataset.panel) return;
-    var strip = tab.closest('.dialog-tabs');
-    var scope = strip && strip.parentElement;
-    if (!scope) return;
-    strip.querySelectorAll('.dialog-tab').forEach(function(t) {
-      t.classList.toggle('active', t === tab);
-    });
-    scope.querySelectorAll('.dialog-panel').forEach(function(p) {
-      p.hidden = p.id !== tab.dataset.panel;
-    });
-  });
-
   // Enter would implicitly submit the dialog's config form; the input
   // already searches on its search event.
   document.body.addEventListener('keydown', function(e) {
@@ -892,7 +859,7 @@
   </section>
 
   <section id="relations" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Relations" "Hint" "Settings for duplicate and similar image detection."}}
+    {{template "webui/settings_section_header" dict "Title" "Relations" "Hint" "Settings for duplicate and similar image detection."}}
     <div id="flash-relations-settings"></div>
     <form hx-post="/settings/relations" hx-target="#flash-relations-settings" hx-swap="innerHTML">
       <div class="settings-cols">
@@ -927,16 +894,17 @@
   </section>
 
   <section id="auth" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Authentication" "Hint" "UI password and API tokens."}}
+    {{template "webui/settings_section_header" dict "Title" "Authentication" "Hint" "UI password and API tokens."}}
     <div id="flash-auth"></div>
     <div class="settings-cols">
-      {{template "partials/auth_password_section.html" (dict "AuthEnabled" $cfg.Auth.EnablePassword "HasPassword" (ne $cfg.Auth.PasswordHash "") "Pinned" (or ($cfg.EnvPinned "auth.password_hash") ($cfg.EnvPinned "auth.enable_password")))}}
+      {{template "webui/auth_password_section" (dict "AuthEnabled" $cfg.Auth.EnablePassword "HasPassword" (ne $cfg.Auth.PasswordHash "") "Pinned" (or ($cfg.EnvPinned "auth.password_hash") ($cfg.EnvPinned "auth.enable_password")))}}
       <div class="settings-sub">
         <h4>API Tokens</h4>
         <p class="field-hint">Bearer tokens for the REST API. The secret is shown once, at creation.</p>
-        {{template "partials/auth_tokens.html" (dict "Tokens" $cfg.Auth.Tokens)}}
-        <form hx-post="/settings/auth/tokens" hx-target="#flash-auth" hx-swap="innerHTML" style="margin-top:8px">
-          <input type="text" id="token-name-input" name="name" placeholder="token name" maxlength="64" required>
+        {{template "webui/auth_tokens" (dict "Tokens" $cfg.Auth.Tokens)}}
+        <form hx-post="/settings/auth/tokens" hx-target="#flash-auth" hx-swap="innerHTML" style="margin-top:8px"
+              hx-on:token-created="this.reset()">
+          <input type="text" name="name" placeholder="token name" maxlength="64" required>
           <button type="submit">Create token</button>
         </form>
       </div>
@@ -944,7 +912,7 @@
   </section>
 
   <section id="maintenance" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Maintenance" "Hint" "Cleanup and rebuild tasks for the current gallery."}}
+    {{template "webui/settings_section_header" dict "Title" "Maintenance" "Hint" "Cleanup and rebuild tasks for the current gallery."}}
     <div id="flash-maintenance"></div>
     <div class="settings-cols">
       <div class="settings-col">
@@ -998,7 +966,7 @@
           <div class="table-scroll">
           <table class="maintenance-table">
             <tbody>
-              {{template "maintenance_row" dict "Title" "Look up unsourced images" "Accent" "monloader-accent" "Desc" "run the scheduled lookup now on the images that are due" "URL" "/settings/maintenance/lookup-due" "Verb" "Look up" "JobKick" true "Confirm" "Look up the images that are due now?" "ConfirmDanger" "Online lookups count against monloader's daily budget." "ConfirmOK" "Look up" "Disabled" (not .MonloaderUsable) "DisabledReason" (monloaderOffReason .MonloaderConn) "MlGated" true}}
+              {{template "maintenance_row" dict "Title" "Look up unsourced images" "Accent" "peer-accent" "Desc" "run the scheduled lookup now on the images that are due" "URL" "/settings/maintenance/lookup-due" "Verb" "Look up" "JobKick" true "Confirm" "Look up the images that are due now?" "ConfirmDanger" "Online lookups count against monloader's daily budget." "ConfirmOK" "Look up" "Disabled" (not .MonloaderUsable) "DisabledReason" (monloaderOffReason .MonloaderConn) "MlGated" true}}
             </tbody>
           </table>
           </div>
@@ -1057,7 +1025,7 @@
   {{$sched := $cfg.Schedule}}
   {{$schedSt := .ScheduleStatus}}
   <section id="schedule" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Schedule" "Hint" "Runs the selected actions once per day, one gallery after another."}}
+    {{template "webui/settings_section_header" dict "Title" "Schedule" "Hint" "Runs the selected actions once per day, one gallery after another."}}
     <div id="flash-schedule"></div>
     {{template "partials/schedule_status.html" (dict "Status" $schedSt)}}
     {{if $schedSt.LookupInfo}}
@@ -1082,10 +1050,10 @@
         {{if .MonloaderPaired}}
         <div class="field">
           <input type="hidden" name="lookup_switches" value="1">
-          <label class="monloader-accent{{if not .MonloaderUsable}} label-off{{end}}"{{if not .MonloaderUsable}} title="{{monloaderOffReason .MonloaderConn}}"{{else if .MonloaderPTRSyncing}} title="monloader's PTR index is still syncing"{{else if not .MonloaderPTR}} title="the PTR index is off on monloader"{{end}}><input type="checkbox" name="lookup_ptr"{{if $sched.LookupPTR}} checked{{end}}> Look up unsourced images in the Public Tag Repository</label>
+          <label class="peer-accent{{if not .MonloaderUsable}} label-off{{end}}"{{if not .MonloaderUsable}} title="{{monloaderOffReason .MonloaderConn}}"{{else if .MonloaderPTRSyncing}} title="monloader's PTR index is still syncing"{{else if not .MonloaderPTR}} title="the PTR index is off on monloader"{{end}}><input type="checkbox" name="lookup_ptr"{{if $sched.LookupPTR}} checked{{end}}> Look up unsourced images in the Public Tag Repository</label>
         </div>
         <div class="field">
-          <label class="monloader-accent{{if not .MonloaderUsable}} label-off{{end}}"{{if not .MonloaderUsable}} title="{{monloaderOffReason .MonloaderConn}}"{{end}}><input type="checkbox" name="lookup_booru"{{if $sched.LookupBooru}} checked{{end}}> Look up unsourced images on online boorus</label>
+          <label class="peer-accent{{if not .MonloaderUsable}} label-off{{end}}"{{if not .MonloaderUsable}} title="{{monloaderOffReason .MonloaderConn}}"{{end}}><input type="checkbox" name="lookup_booru"{{if $sched.LookupBooru}} checked{{end}}> Look up unsourced images on online boorus</label>
         </div>
         {{end}}
       </div>
@@ -1156,7 +1124,7 @@
 
   {{$stats := .Stats}}
   <section id="stats" class="settings-section">
-    {{template "settings_section_header" dict "Title" "Stats" "Hint" "Memory, database and disk usage."}}
+    {{template "webui/settings_section_header" dict "Title" "Stats" "Hint" "Memory, database and disk usage."}}
     <div class="stats-cols">
     <div class="settings-sub">
       <h4>Process memory</h4>
@@ -1264,10 +1232,7 @@
 </div>
 
 {{if .DesktopProfile}}
-<dialog id="dir-picker-dialog" class="dir-picker-dialog">
-  <h4>Choose a folder</h4>
-  <div id="dir-picker-body">Loading...</div>
-</dialog>
+{{template "webui/dir_picker_dialog"}}
 {{end}}
 
 {{template "layout_end" .}}

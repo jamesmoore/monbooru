@@ -14,23 +14,8 @@ import (
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/markup"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
-
-func validateVia(via string) error {
-	if via == "" {
-		return nil
-	}
-	if utf8.RuneCountInString(via) > 200 {
-		return fmt.Errorf("via must be 200 characters or less")
-	}
-	for _, r := range via {
-		switch r {
-		case ' ', '\t', '\n', '\r', '"', '\'', '<', '>', '[', ']', '\\':
-			return fmt.Errorf("via must not contain whitespace or any of: \" ' < > [ ] \\")
-		}
-	}
-	return nil
-}
 
 const (
 	maxImageSourceLen     = gallery.MaxSourceLabelLen
@@ -39,9 +24,9 @@ const (
 	maxImageOriginalLen   = gallery.MaxOriginalLen
 	maxAnnotationBodyLen  = gallery.MaxAnnotationBodyLen
 	maxAnnotations        = 500
-	maxSourceMD5Len       = 64
-	maxSourcePostIDLen    = 64
-	maxSourcePostExtLen   = 16
+	maxSourceMD5Len       = contract.MaxMD5
+	maxSourcePostIDLen    = contract.MaxPostID
+	maxSourcePostExtLen   = contract.MaxPostExt
 )
 
 func validateMaxLen(field, s string, max int) error {
@@ -67,43 +52,30 @@ func validateImageURL(s string) error {
 }
 
 func validateImageCollection(s string) error {
-	return validateMaxLen("collection", s, maxImageSourceLen)
+	return validateMaxLen("collection", s, contract.MaxCollection)
 }
 
 type provenanceJSON struct {
-	Source          string           `json:"source"`
-	PostID          string           `json:"post_id"`
-	URL             string           `json:"url"`
-	ParentURL       string           `json:"parent_url"`
-	Commentary      string           `json:"commentary"`
-	Translated      string           `json:"commentary_translated"`
-	CommentaryDText string           `json:"commentary_dtext"`
-	TranslatedDText string           `json:"commentary_translated_dtext"`
-	Original        string           `json:"original"`
-	Notes           []annotationJSON `json:"notes"`
-	PostWidth       int              `json:"post_width"`
-	PostHeight      int              `json:"post_height"`
-	PostSize        int64            `json:"post_size"`
-	PostExt         string           `json:"post_ext"`
+	contract.PostFields
 }
 
 func provenanceFromForm(r *http.Request) provenanceJSON {
-	p := provenanceJSON{
-		Source:          r.FormValue("source"),
-		PostID:          r.FormValue("post_id"),
-		URL:             r.FormValue("url"),
-		ParentURL:       r.FormValue("parent_url"),
-		Commentary:      r.FormValue("commentary"),
-		Translated:      r.FormValue("commentary_translated"),
-		CommentaryDText: r.FormValue("commentary_dtext"),
-		TranslatedDText: r.FormValue("commentary_translated_dtext"),
-		Original:        r.FormValue("original"),
-		PostWidth:       atoiOrZero(r.FormValue("post_width")),
-		PostHeight:      atoiOrZero(r.FormValue("post_height")),
-		PostSize:        int64(atoiOrZero(r.FormValue("post_size"))),
-		PostExt:         r.FormValue("post_ext"),
-	}
-	if raw := r.FormValue("notes"); strings.TrimSpace(raw) != "" {
+	p := provenanceJSON{contract.PostFields{
+		Source:                    r.FormValue(contract.FieldSource),
+		PostID:                    r.FormValue(contract.FieldPostID),
+		URL:                       r.FormValue(contract.FieldURL),
+		ParentURL:                 r.FormValue(contract.FieldParentURL),
+		Commentary:                r.FormValue(contract.FieldCommentary),
+		CommentaryTranslated:      r.FormValue(contract.FieldCommentaryTranslated),
+		CommentaryDText:           r.FormValue(contract.FieldCommentaryDText),
+		CommentaryTranslatedDText: r.FormValue(contract.FieldCommentaryTranslatedDText),
+		Original:                  r.FormValue(contract.FieldOriginal),
+		PostWidth:                 atoiOrZero(r.FormValue(contract.FieldPostWidth)),
+		PostHeight:                atoiOrZero(r.FormValue(contract.FieldPostHeight)),
+		PostSize:                  int64(atoiOrZero(r.FormValue(contract.FieldPostSize))),
+		PostExt:                   r.FormValue(contract.FieldPostExt),
+	}}
+	if raw := r.FormValue(contract.FieldNotes); strings.TrimSpace(raw) != "" {
 		if err := json.Unmarshal([]byte(raw), &p.Notes); err != nil {
 			p.Notes = nil
 		}
@@ -129,7 +101,7 @@ func (p provenanceJSON) read() (provenance, error) {
 	if err := validateMaxLen("commentary_dtext", p.CommentaryDText, maxImageCommentaryDTextLen); err != nil {
 		return provenance{}, err
 	}
-	if err := validateMaxLen("commentary_translated_dtext", p.TranslatedDText, maxImageCommentaryDTextLen); err != nil {
+	if err := validateMaxLen("commentary_translated_dtext", p.CommentaryTranslatedDText, maxImageCommentaryDTextLen); err != nil {
 		return provenance{}, err
 	}
 	v := provenance{
@@ -138,7 +110,7 @@ func (p provenanceJSON) read() (provenance, error) {
 		url:        strings.TrimSpace(p.URL),
 		parentURL:  strings.TrimSpace(p.ParentURL),
 		commentary: commentaryFromInput(p.Commentary, p.CommentaryDText),
-		translated: commentaryFromInput(p.Translated, p.TranslatedDText),
+		translated: commentaryFromInput(p.CommentaryTranslated, p.CommentaryTranslatedDText),
 		original:   strings.TrimSpace(p.Original),
 		postFile:   postFileFrom(p.PostWidth, p.PostHeight, p.PostSize, p.PostExt),
 	}
@@ -257,7 +229,7 @@ type annotationJSON struct {
 }
 
 // Without it only the 16 MiB body cap bounds the DText conversion.
-const maxImageCommentaryDTextLen = 4 * maxImageCommentaryLen
+const maxImageCommentaryDTextLen = contract.MaxDText
 
 // A note's HTML is cut before converting, for the same reason.
 const maxAnnotationBodyHTMLLen = 4 * maxAnnotationBodyLen
@@ -285,7 +257,7 @@ func commentaryFromInput(plain, dtext string) string {
 	return firstRunes(body, maxImageCommentaryLen)
 }
 
-func annotationsFromInput(in []annotationJSON, postURL string) []models.Annotation {
+func annotationsFromInput(in []contract.NoteBox, postURL string) []models.Annotation {
 	if len(in) > maxAnnotations {
 		in = in[:maxAnnotations]
 	}

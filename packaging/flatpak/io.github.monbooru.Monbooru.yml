@@ -56,12 +56,9 @@ modules:
       - |
         set -eu
         export GOTOOLCHAIN=go$(awk '/^go /{print $2; exit}' go.mod)
-        VERSION=$(tr -d '[:space:]' < VERSION.md)
-        REPO=$(tr -d '[:space:]' < REPOSITORY.md)
-        DOC=$(tr -d '[:space:]' < DOC.md)
-        MOD=github.com/monbooru/monbooru/internal/web
+        . ./packaging/release-env.sh
         CGO_ENABLED=1 go build -tags tagger \
-          -ldflags="-s -w -X '$MOD.Version=$VERSION' -X '$MOD.RepoURL=$REPO' -X '$MOD.DocURL=$DOC' -X '$MOD.Package=flatpak'" \
+          -ldflags="-s -w $LDFLAGS -X '$MOD.Package=flatpak'" \
           -o monbooru ./cmd/monbooru
         # The AppStream release entry is written from VERSION.md and the newest
         # changelog heading, so a release has one version to bump, not two.

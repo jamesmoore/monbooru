@@ -8,8 +8,10 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/desktop"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/session"
 )
 
 type setupData struct {
@@ -53,11 +55,8 @@ func (s *Server) setupMiddleware(next http.Handler) http.Handler {
 		// so it gets a JSON refusal.
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "monbooru has not been set up yet",
-				"code":  "setup_pending",
-			})
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(contract.Error{Error: "monbooru has not been set up yet", Code: contract.CodeSetupRequired})
 			return
 		}
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
@@ -71,7 +70,7 @@ func setupExempt(path string) bool {
 	}
 	// With auth on, the session gate sends /setup to /login, so gating
 	// the login here would loop.
-	return isStaticPath(path) || isPublicPath(path)
+	return isOpenPath(path)
 }
 
 func (s *Server) setupPage(w http.ResponseWriter, r *http.Request) {
@@ -100,11 +99,11 @@ func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, d setupData
 	s.cfgMu.RUnlock()
 	_, port, err := net.SplitHostPort(bind)
 	if err != nil {
-		port = "8455"
+		port = contract.PortMonbooru
 	}
 	d.BooruName = s.booruName()
 	d.Title = d.BooruName + " setup"
-	d.CSRFToken = s.sessions.CSRFToken(sessionFromContext(r.Context()))
+	d.CSRFToken = s.sessions.CSRFToken(session.FromContext(r.Context()))
 	theme := s.activeTheme()
 	d.BooruFavicon = themeFaviconURL(theme)
 	d.Theme = theme.Path != ""
@@ -117,7 +116,7 @@ func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, d setupData
 // The gallery goes first, the one input that can fail; SetupDone is saved
 // with the address, so a submit that fails midway leaves the wizard up.
 func (s *Server) setupPost(w http.ResponseWriter, r *http.Request) {
-	if !s.setupPending() || !s.desktopLocal(r) {
+	if !s.setupPending() {
 		http.NotFound(w, r)
 		return
 	}
@@ -157,7 +156,7 @@ func (s *Server) setupPost(w http.ResponseWriter, r *http.Request) {
 		s.renderSetup(w, r, form)
 		return
 	}
-	for _, f := range applyDesktopHooks(s.desktopHook(), form.Menu, form.Autostart) {
+	for _, f := range s.desktopHook().Apply(form.Menu, form.Autostart) {
 		logx.Warnf("setup: could not write %s", f)
 	}
 	logx.Infof("setup: done, reachable from %s", map[bool]string{true: "the network", false: "this computer"}[!desktop.IsLoopbackAddr(bind)])

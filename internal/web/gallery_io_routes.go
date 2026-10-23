@@ -41,7 +41,10 @@ func leftOutNote(leftOut int) string {
 	if leftOut == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" %d file(s) in the archive sit in folders this gallery leaves out and were not extracted.", leftOut)
+	if leftOut == 1 {
+		return " 1 file in the archive sits in a folder this gallery leaves out and was not extracted."
+	}
+	return fmt.Sprintf(" %d files in the archive sit in folders this gallery leaves out and were not extracted.", leftOut)
 }
 
 func (s *Server) replaceGalleryFromUpload(name, format string, upload io.Reader) (*library.Gallery, int, error) {
@@ -252,7 +255,7 @@ func (s *Server) transferImage(w http.ResponseWriter, r *http.Request) {
 	kept, err := galleryio.TransferOneImage(srcCx, dstCx, id, removeAfter)
 	if err != nil {
 		s.jobs.Fail(err.Error())
-		transferRefused(w, r, err.Error())
+		externalErr(w, r, err.Error(), http.StatusBadRequest)
 		return
 	}
 	msg := fmt.Sprintf("Transferred image to %s%s.", dstCx.Name, keptChanged(kept))
@@ -289,17 +292,8 @@ func (s *Server) transferTarget(w http.ResponseWriter, r *http.Request) (*librar
 			return dst, r.FormValue("remove_after") != "", true
 		}
 	}
-	transferRefused(w, r, msg)
+	externalErr(w, r, msg, http.StatusBadRequest)
 	return nil, false, false
-}
-
-// htmx swaps no 400, so the detail dialog's slot gets its refusal at 200.
-func transferRefused(w http.ResponseWriter, r *http.Request, msg string) {
-	code := http.StatusBadRequest
-	if isHTMXRequest(r) {
-		code = http.StatusOK
-	}
-	flashStatus(w, code, msg)
 }
 
 func (s *Server) runBatchTransfer(ids []int64, dstCx *library.Gallery, removeAfter bool) {
@@ -311,7 +305,7 @@ func (s *Server) runBatchTransfer(ids []int64, dstCx *library.Gallery, removeAft
 		keptFiles += kept
 		return err
 	})
-	summary := fmt.Sprintf("Transferred %d image(s) to %s", transferred, dstCx.Name)
+	summary := fmt.Sprintf("Transferred %d image%s to %s", transferred, plural(transferred), dstCx.Name)
 	if failed > 0 {
 		summary += fmt.Sprintf(", %d failed", failed)
 	}
@@ -355,7 +349,7 @@ func (s *Server) mergeGallery(name, format string, upload io.Reader) (galleryio.
 	switch {
 	case errors.Is(err, context.Canceled):
 		done := res.Added + res.Tagged + res.Skipped + res.LeftOut
-		err = fmt.Errorf("merge cancelled after %d of %d record(s): %s", done, total, res.Summary())
+		err = fmt.Errorf("merge cancelled after %d of %d record%s: %s", done, total, plural(total), res.Summary())
 		s.jobs.Complete(fmt.Sprintf("merge cancelled (%d/%d records)", done, total))
 	case err != nil:
 		s.jobs.Fail(err.Error())

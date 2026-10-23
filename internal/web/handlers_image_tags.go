@@ -21,6 +21,7 @@ import (
 type catTag struct {
 	catID int64
 	name  string
+	raw   string
 }
 
 func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
@@ -46,12 +47,12 @@ func (s *Server) parseTagInput(tagInput string) ([]catTag, []string, string) {
 		case f.CategoryID != 0 && f.Name == "":
 			rejected = append(rejected, "rejected: "+name+": "+tags.ErrEmptyFormName.Error())
 		case f.CategoryID != 0:
-			catTags = append(catTags, catTag{f.CategoryID, f.Name})
+			catTags = append(catTags, catTag{f.CategoryID, f.Name, name})
 		default:
 			if f.Namespace != "" && !slices.Contains(unknownCats, f.Namespace) {
 				unknownCats = append(unknownCats, f.Namespace)
 			}
-			catTags = append(catTags, catTag{generalID, f.Name})
+			catTags = append(catTags, catTag{generalID, f.Name, name})
 		}
 	}
 
@@ -130,6 +131,7 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	}
 	prepared := make([]resolved, 0, len(catTags))
 	seen := make(map[int64]bool, len(catTags))
+	resolvedRaw := map[string]int{}
 	for _, ct := range catTags {
 		tag, err := s.tagSvc().GetOrCreateTag(ct.name, ct.catID)
 		if err != nil {
@@ -137,6 +139,7 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 			rejected = append(rejected, ct.name+": "+err.Error())
 			continue
 		}
+		resolvedRaw[ct.raw]++
 		if seen[tag.ID] {
 			continue
 		}
@@ -198,7 +201,7 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	case parseErrMsg != "" && !mutated && len(rejected) == 0:
 		addErrMsg = parseErrMsg
 	case mutated && (len(rejected) > 0 || parseErrMsg != ""):
-		addWarnMsg = joinNonEmpty(parseErrMsg, addedPart, promotedPart, dupesPart, displacedPart, unknownPart, rejectedPart)
+		addWarnMsg = joinNonEmpty(addedPart, promotedPart, dupesPart, displacedPart, unknownPart, parseErrMsg, rejectedPart)
 	case len(rejected) > 0:
 		addErrMsg = joinNonEmpty(parseErrMsg, rejectedPart)
 	case len(dupes) > 0 && !mutated && parseErrMsg == "":
@@ -206,10 +209,29 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	default:
 		addOkMsg = joinNonEmpty(addedPart, promotedPart, dupesPart, displacedPart, unknownPart)
 	}
-	s.renderTagListWithSidebar(w, r, id, addErrMsg, addWarnMsg, addOkMsg, len(rejected) == 0 && parseErrMsg == "")
+	var input *string
+	switch {
+	case len(rejected) == 0 && parseErrMsg == "":
+		input = new(string)
+	case mutated:
+		// Only what failed stays to be fixed: resubmitting the rest would add it again.
+		tokens, _ := splitTagTokens(tagInput)
+		var left []string
+		for _, t := range tokens {
+			if resolvedRaw[t] > 0 {
+				resolvedRaw[t]--
+				continue
+			}
+			left = append(left, t)
+		}
+		refill := strings.Join(left, " ")
+		input = &refill
+	}
+	s.renderTagListWithSidebar(w, r, id, addErrMsg, addWarnMsg, addOkMsg, input)
 }
 
-func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request, id int64, errMsg, warnMsg, okMsg string, clearInput bool) {
+// A non-nil input replaces the add box's text; nil leaves it as typed.
+func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request, id int64, errMsg, warnMsg, okMsg string, input *string) {
 	folderPath, imageTags, _ := s.tagSvc().GetImageTags(id)
 	tagMode := readTagModeCookie(r)
 	if requested := r.URL.Query().Get("tagmode"); requested != "" {
@@ -238,6 +260,10 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 	if canonicalPath != "" {
 		filename = filepath.Base(canonicalPath)
 	}
+	inputText := ""
+	if input != nil {
+		inputText = *input
+	}
 	s.renderTemplate(w, "partials/tag_list.html", map[string]any{
 		"ImageID":          id,
 		"ImageTags":        imageTags,
@@ -256,7 +282,8 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 		"ErrMsg":           errMsg,
 		"WarnMsg":          warnMsg,
 		"OkMsg":            okMsg,
-		"ClearInput":       clearInput,
+		"SetInput":         input != nil,
+		"Input":            inputText,
 		"CurrentFolder":    folderPath,
 		"Filename":         filename,
 		"ExtraPaths":       extraPaths,
@@ -369,13 +396,13 @@ func (s *Server) removeImageTagsWithMsg(w http.ResponseWriter, r *http.Request, 
 	}
 	msg, err := remove(id)
 	if err != nil {
-		s.renderTagListWithSidebar(w, r, id, err.Error(), "", "", false)
+		s.renderTagListWithSidebar(w, r, id, err.Error(), "", "", nil)
 		return
 	}
 	if msg != "" {
 		w.Header().Set("HX-Trigger", "tags-changed")
 	}
-	s.renderTagListWithSidebar(w, r, id, "", "", msg, false)
+	s.renderTagListWithSidebar(w, r, id, "", "", msg, nil)
 }
 
 func (s *Server) removeTagFromImage(w http.ResponseWriter, r *http.Request) {
@@ -472,11 +499,7 @@ func (s *Server) changeTagCategory(w http.ResponseWriter, r *http.Request) {
 				template.HTMLEscapeString(svcErr.Error()), id, catID)
 			return
 		}
-		if isHTMXRequest(r) {
-			writeInlineFlash(w, "err", svcErr.Error())
-			return
-		}
-		http.Error(w, svcErr.Error(), tagCategoryStatus(svcErr))
+		externalErr(w, r, svcErr.Error(), tagCategoryStatus(svcErr))
 		return
 	}
 	if isHTMXRequest(r) {
@@ -495,5 +518,5 @@ func (s *Server) getImageTagsHandler(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.renderTagListWithSidebar(w, r, id, "", "", "", false)
+	s.renderTagListWithSidebar(w, r, id, "", "", "", nil)
 }

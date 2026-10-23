@@ -1,9 +1,10 @@
 {{define "setup.html"}}
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-app="monbooru">
 <head>
 {{template "partials/head.html" .}}
-  <script src="/static/htmx.min.js"></script>
+  <script src="/static/shared/htmx.min.js"></script>
+  <script src="/static/shared/base.js" defer></script>
   <script src="/static/main.js" defer></script>
 </head>
 <body>
@@ -50,10 +51,7 @@
   </form>
 </div>
 
-<dialog id="dir-picker-dialog" class="dir-picker-dialog">
-  <h4>Choose a folder</h4>
-  <div id="dir-picker-body">Loading...</div>
-</dialog>
+{{template "webui/dir_picker_dialog"}}
 </body>
 </html>
 {{end}}

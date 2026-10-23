@@ -1,10 +1,10 @@
 {{define "tag_ptr_new_line"}}<span class="ptr-contrib-plus">++</span> <span class="ptr-count" title="{{.NewTip}}">{{.NewCount}}</span> of this tag's relations {{if eq .NewCount 1}}is{{else}}are{{end}} new to the Public Tag Repository.{{end}}
 {{define "tag_ptr_petition_line"}}<span class="ptr-contrib-minus">--</span> the Public Tag Repository holds <span class="ptr-count" title="{{.PetitionTip}}">{{.PetitionCount}}</span> relation{{if gt .PetitionCount 1}}s{{end}} for this tag not declared here.{{end}}
 {{define "partials/tag_ptr_contrib_panel.html"}}
-<div class="ptr-contrib-card monloader-accent">
+<div class="ptr-contrib-card peer-accent">
   <div class="ptr-contrib-head">
     <span class="ptr-contrib-title">Public Tag Repository</span>
-    <button type="button" class="btn-link-accent monloader-accent btn-ptr-lookup"
+    <button type="button" class="btn-link-accent peer-accent btn-ptr-lookup"
             hx-get="/tags/{{.TagID}}/ptr-lookup-dialog"
             hx-target="#ptr-contrib-dialog-host" hx-swap="innerHTML"
             hx-on::after-request="var d=document.getElementById('ptr-lookup-dialog'); if(d){d.showModal(); d.querySelector('#ptr-lookup-as').focus();} else htmx.trigger(document.body,'ptr-contrib-closed');">[look up as...]</button>
@@ -29,7 +29,7 @@
     </div>
     <div class="ptr-contrib-actions">
       {{if .Pullable}}
-      <button type="button" class="btn-ptr-pull monloader-accent"
+      <button type="button" class="btn-ptr-pull peer-accent"
               onclick="pullTagPTR('Pull aliases and implications', 'Pull the PTR aliases and implications for this tag{{if .KnownAs}} (known there as {{.KnownAs}}){{end}}?')">Pull aliases and implications</button>
       {{end}}
       {{template "ptr_contrib_button" (dict "DialogURL" (printf "/tags/%d/ptr-contrib-dialog" .TagID) "CanContribute" .CanContribute "NewCount" .NewCount "PetitionCount" .PetitionCount "ContribHint" .ContribHint)}}

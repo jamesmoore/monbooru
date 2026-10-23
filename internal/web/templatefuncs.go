@@ -15,6 +15,7 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 	"github.com/monbooru/monbooru/internal/tags"
 	"github.com/monbooru/monbooru/internal/upgrade"
 )
@@ -40,7 +41,6 @@ func templateFuncs() template.FuncMap {
 			}
 			return r
 		},
-		"add": func(a, b int) int { return a + b },
 		// template.CSS to pass the style-attribute sanitizer;
 		// categoryColor admits only a validated colour.
 		"catColor":   func(color string) template.CSS { return template.CSS(categoryColor(color)) },
@@ -51,17 +51,8 @@ func templateFuncs() template.FuncMap {
 			return template.URL(url.QueryEscape(s))
 		},
 		"qval": search.QuoteValue,
-		"sub":  func(a, b int) int { return a - b },
 		"pct":  func(f float64) int { return int(math.Round(f * 100)) },
 		"list": func(vs ...any) []any { return vs },
-		"dict": func(pairs ...any) map[string]any {
-			m := make(map[string]any, len(pairs)/2)
-			for i := 0; i+1 < len(pairs); i += 2 {
-				k, _ := pairs[i].(string)
-				m[k] = pairs[i+1]
-			}
-			return m
-		},
 		"groupByCategory": func(tagList []models.Tag) []tagGroup {
 			return groupOrdered(tagList, nil,
 				func(t models.Tag) string { return t.CategoryName },
@@ -119,7 +110,6 @@ func templateFuncs() template.FuncMap {
 			}
 		},
 		"cancelTitle": cancelTitle,
-		"humanBytes":  humanBytesFmt,
 		"localTime": func(t time.Time) string {
 			return t.In(time.Local).Format("2006-01-02 15:04:05")
 		},
@@ -153,7 +143,7 @@ func templateFuncs() template.FuncMap {
 		"int64Duration": func(d time.Duration) int64 {
 			return int64(d)
 		},
-		"plural":      pluralWord,
+		"plural":      models.Plural,
 		"abbrevCount": abbrevCount,
 		// Always quoted: a term may carry spaces the parser would split on.
 		"comfySearch": func(term string) string {
@@ -308,7 +298,7 @@ func fileFacts(w, h int, ext string, size int64) string {
 		if line != "" {
 			line += " - "
 		}
-		line += humanBytesFmt(size)
+		line += webui.HumanBytes(size)
 	}
 	return line
 }
@@ -328,11 +318,4 @@ func categoryColor(color string) string {
 		return tags.SafeCategoryColor(color)
 	}
 	return "var(--cat-" + strings.ToLower(strings.TrimPrefix(color, "#")) + "," + color + ")"
-}
-
-func pluralWord(n int, one, many string) string {
-	if n == 1 {
-		return one
-	}
-	return many
 }

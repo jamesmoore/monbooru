@@ -5,6 +5,8 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+
+	"github.com/monbooru/monbooru/internal/shared/session"
 )
 
 type backContext struct {
@@ -50,15 +52,7 @@ func setPrefCookie(w http.ResponseWriter, r *http.Request, name, value string) {
 	if value == "" {
 		age = -1
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     name,
-		Value:    value,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		MaxAge:   age,
-		SameSite: http.SameSiteLaxMode,
-	})
+	session.SetCookie(w, r, name, value, age)
 }
 
 func (b backContext) URLValues() url.Values { return b.values("back_") }

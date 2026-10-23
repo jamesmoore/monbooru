@@ -653,7 +653,7 @@ func (w *Watcher) markFolderMissing(dir string) {
 	}
 	logx.Infof("watcher: %q left, marked %d image(s) missing", dir, marked)
 	if marked > 0 {
-		w.event(fmt.Sprintf("removed %d image(s) in %s", marked, filepath.Base(dir)))
+		w.event(fmt.Sprintf("removed %d %s in %s", marked, models.Plural(marked, "image", "images"), filepath.Base(dir)))
 	}
 	w.changed()
 }

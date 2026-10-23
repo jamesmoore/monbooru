@@ -12,11 +12,12 @@ import (
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
 // monloader's per-request cap for a batch lookup.
-const ptrLookupChunk = 100
+const ptrLookupChunk = contract.MaxPTRHashes
 
 func LookupMD5(ctx context.Context, cx *library.Gallery, imageID int64, stored string) (string, error) {
 	if stored != "" {
@@ -49,9 +50,9 @@ func (l *Link) runPTRLookupPhase(ctx context.Context, cx *library.Gallery) (chec
 		if len(batch) == 0 {
 			continue
 		}
-		images := make([]ptrLookupImage, len(batch))
+		images := make([]contract.PTRLookupImage, len(batch))
 		for i, c := range batch {
-			images[i] = ptrLookupImage{ImageID: c.ImageID, SHA256: c.SHA256}
+			images[i] = contract.PTRLookupImage{ImageID: c.ImageID, SHA256: c.SHA256}
 		}
 		results, answered, lerr := l.ptrBatchLookup(ctx, cx.Name, true, images)
 		if lerr != nil {

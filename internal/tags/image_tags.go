@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"slices"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 func (s *Service) AddTagToImage(imageID, tagID int64, isAuto bool, confidence *float64) error {
@@ -724,8 +724,6 @@ func removeAllTagsFromImageTx(tx *sql.Tx, imageID int64) error {
 // tags; other categories are distinctive enough to scan uncapped.
 const relatedGeneralTagsCap = 15
 
-func RatingRank(name string) int { return slices.Index(RatingLevels, name) }
-
 // A manual add replaces the image's rating even with a lower one; an auto
 // add keeps the highest, as search resolves several.
 func pruneRatingsAfterAddTx(tx *sql.Tx, ratingCatID, imageID, tagID int64, isAuto bool) ([]string, error) {
@@ -771,10 +769,10 @@ func pruneLowerRatingsTx(tx *sql.Tx, ratingCatID, imageID int64) error {
 	}
 	bestRank := -1
 	for _, r := range present {
-		bestRank = max(bestRank, RatingRank(r.name))
+		bestRank = max(bestRank, contract.RatingRank(r.name))
 	}
 	_, err = pruneRatingsTx(tx, imageID, present, func(r ratingRow) bool {
-		return RatingRank(r.name) >= bestRank
+		return contract.RatingRank(r.name) >= bestRank
 	})
 	if err != nil {
 		return fmt.Errorf("prune lower rating: %w", err)
@@ -814,11 +812,11 @@ func (s *Service) RatingTagIDsAbove(ceiling string) []int64 {
 	if s.ratingCatID == 0 {
 		return nil
 	}
-	rank := RatingRank(ceiling)
-	if rank < 0 || rank >= len(RatingLevels)-1 {
+	rank := contract.RatingRank(ceiling)
+	if rank < 0 || rank >= len(contract.RatingLevels)-1 {
 		return nil
 	}
-	above := RatingLevels[rank+1:]
+	above := contract.RatingLevels[rank+1:]
 	placeholders, nameArgs := db.InPlaceholders(above)
 	args := append([]any{s.ratingCatID}, nameArgs...)
 	ids, err := db.QueryIDs(s.db.Read,

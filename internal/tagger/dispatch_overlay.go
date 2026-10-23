@@ -9,7 +9,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/monbooru/monbooru/internal/fsx"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 )
 
 func MergedDispatchRules(modelPath, taggerName string) []DispatchEntry {
@@ -75,8 +75,5 @@ func SaveDispatchOverlay(modelPath, taggerName string, rules []DispatchEntry) er
 		return err
 	}
 	data = append(data, '\n')
-	return fsx.WriteAtomic(path, ".dispatch.json.*", func(f *os.File) error {
-		_, err := f.Write(data)
-		return err
-	})
+	return fsx.WriteFile(path, data)
 }

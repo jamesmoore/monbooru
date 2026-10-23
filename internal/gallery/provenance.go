@@ -7,6 +7,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -86,10 +87,10 @@ func MergeSource(database *db.DB, tagSvc *tags.Service, imageID int64, source, p
 		if err := writeSourceProvenance(database, imageID, source, postID, url, md5, parentURL, post); err != nil {
 			return sum, nil, err
 		}
-		if source != "" && !strings.EqualFold(source, "ptr") {
+		if source != "" && !strings.EqualFold(source, contract.SourcePTR) {
 			var primary string
 			if err := database.Read.QueryRow(`SELECT source FROM images WHERE id = ?`, imageID).Scan(&primary); err == nil &&
-				strings.EqualFold(strings.TrimSpace(primary), "ptr") {
+				strings.EqualFold(strings.TrimSpace(primary), contract.SourcePTR) {
 				if err := MakeSourcePrimary(database, imageID, source, postID); err != nil {
 					return sum, nil, err
 				}
@@ -123,7 +124,7 @@ func MergeSource(database *db.DB, tagSvc *tags.Service, imageID int64, source, p
 }
 
 func ApplyPTRTags(database *db.DB, tagSvc *tags.Service, imageID int64, tagNames []string) error {
-	_, _, err := MergeSource(database, tagSvc, imageID, "ptr", "", "", "", "", PostFile{}, tagNames)
+	_, _, err := MergeSource(database, tagSvc, imageID, contract.SourcePTR, "", "", "", "", PostFile{}, tagNames)
 	return err
 }
 

@@ -49,7 +49,7 @@ func (s *Server) findRelationPairsPost(w http.ResponseWriter, r *http.Request) {
 		})
 		_ = s.jobs.Settle(ctx, err,
 			fmt.Sprintf("find-pairs cancelled (%d added)", added),
-			fmt.Sprintf("find-pairs added %d candidate(s).", added))
+			fmt.Sprintf("find-pairs added %d candidate%s.", added, plural(added)))
 	})
 }
 
@@ -68,5 +68,5 @@ func (s *Server) resetSkippedPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeInlineFlash(w, "ok", fmt.Sprintf("Reset %d skipped pair(s).", n))
+	writeInlineFlash(w, "ok", fmt.Sprintf("Reset %d skipped pair%s.", n, plural(int(n))))
 }

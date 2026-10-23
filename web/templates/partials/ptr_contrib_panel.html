@@ -1,7 +1,7 @@
 {{define "ptr_contrib_new_line"}}<span class="ptr-contrib-plus">++</span> <span class="ptr-count" title="{{.NewTip}}">{{.NewCount}}</span> of this image's tags {{if eq .NewCount 1}}is{{else}}are{{end}} new to the Public Tag Repository{{if gt .UnknownCount 0}}, <span class="ptr-count" title="{{.UnknownTip}}">{{.UnknownCount}}</span> of them not {{if eq .UnknownCount 1}}a PTR tag{{else}}PTR tags{{end}}{{end}}.{{end}}
 {{define "ptr_contrib_petition_line"}}<span class="ptr-contrib-minus">--</span> the Public Tag Repository holds <span class="ptr-count" title="{{.PetitionTip}}">{{.PetitionCount}}</span> tag{{if gt .PetitionCount 1}}s{{end}} this image does not carry.{{end}}
 {{define "partials/ptr_contrib_panel.html"}}
-<div class="ptr-contrib-card monloader-accent">
+<div class="ptr-contrib-card peer-accent">
   <div class="ptr-contrib-head">
     <span class="ptr-contrib-title">Public Tag Repository</span>
   </div>
@@ -22,7 +22,7 @@
     </div>
     <div class="ptr-contrib-actions">
       {{if .CanPull}}
-      <button type="button" class="btn-ptr-pull monloader-accent"
+      <button type="button" class="btn-ptr-pull peer-accent"
               hx-post="/images/{{.ImageID}}/lookup" hx-vals='{"backend":"ptr"}'
               hx-target="#fetch-pending" hx-swap="innerHTML"
               hx-confirm="Pull this file's tags from the Public Tag Repository?"

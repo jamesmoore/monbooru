@@ -20,7 +20,7 @@ func Address(c *config.Config, p config.PluginConfig) string {
 	if u := strings.TrimSpace(p.APIURL); u != "" {
 		return strings.TrimRight(u, "/")
 	}
-	if t := c.FindPairedToken(p.Name); t != nil {
+	if t := c.Auth.Tokens.Paired(p.Name); t != nil {
 		return strings.TrimRight(t.PeerURL, "/")
 	}
 	return ""

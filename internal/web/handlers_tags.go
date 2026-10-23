@@ -363,7 +363,9 @@ func (s *Server) resolveCanonicalTagInput(input string, create bool) (canonicalR
 		var exists int
 		id, err := strconv.ParseInt(digits, 10, 64)
 		if err == nil {
-			err = s.db().Read.QueryRow(`SELECT COUNT(*) FROM tags WHERE id = ?`, id).Scan(&exists)
+			if err := s.db().Read.QueryRow(`SELECT COUNT(*) FROM tags WHERE id = ?`, id).Scan(&exists); err != nil {
+				return canonicalRef{}, "Tag lookup failed: " + err.Error()
+			}
 		}
 		if err != nil || exists == 0 {
 			return canonicalRef{}, "Tag not found: " + input
@@ -518,7 +520,7 @@ func (s *Server) addTagAliasPost(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case len(failures) == 0:
-		msg := strconv.Itoa(added) + " " + pluralWord(added, "alias", "aliases") + " created."
+		msg := strconv.Itoa(added) + " " + models.Plural(added, "alias", "aliases") + " created."
 		if note := unknownCategoryNote(unknownCats); note != "" {
 			msg += " " + note + "."
 		}
@@ -552,7 +554,7 @@ func (s *Server) removeTagAliasesDelete(w http.ResponseWriter, r *http.Request) 
 		}
 		removed++
 	}
-	setFlashHeader(w, strconv.Itoa(removed)+" "+pluralWord(removed, "alias", "aliases")+" removed.", "ok",
+	setFlashHeader(w, strconv.Itoa(removed)+" "+models.Plural(removed, "alias", "aliases")+" removed.", "ok",
 		map[string]any{"tag-relations-changed": ""})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -589,7 +591,7 @@ func (s *Server) runDeleteTagsByIDs(ids []int64) {
 		return true, nil
 	})
 
-	summary := skippedSuffix(fmt.Sprintf("deleted %d tag(s)", deleted), skipped)
+	summary := skippedSuffix(fmt.Sprintf("deleted %d tag%s", deleted, plural(deleted)), skipped)
 	s.finishTagScopeJob(deleted, reasons, cancelled, "delete tags", summary)
 }
 

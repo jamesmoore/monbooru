@@ -185,7 +185,7 @@ func (s *Server) queryNameBasenames(prefix string, limit int) []string {
 	if d == nil || prefix == "" {
 		return nil
 	}
-	low := strings.ToLower(prefix)
+	low := asciiLower(prefix)
 	return s.suggestLabels(d.Read, "name",
 		`SELECT DISTINCT basename_lower FROM images INDEXED BY idx_images_basename_lower_visible
 		 WHERE is_missing = 0 AND basename_lower != ''
@@ -620,6 +620,17 @@ func nextPrefix(prefix string) string {
 // Lowercased first: NOCASE folds to lower case, so a bound built from "Z"
 // would exclude every lower-case continuation.
 func nocasePrefixRange(prefix string) (lo, hi string) {
-	lo = strings.ToLower(prefix)
+	lo = asciiLower(prefix)
 	return lo, nextPrefix(lo)
+}
+
+// NOCASE and SQLite's lower() fold A-Z only, so a bound folding "É" to "é"
+// would miss the stored "É".
+func asciiLower(s string) string {
+	return strings.Map(func(r rune) rune {
+		if 'A' <= r && r <= 'Z' {
+			return r + 'a' - 'A'
+		}
+		return r
+	}, s)
 }

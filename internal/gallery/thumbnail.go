@@ -23,7 +23,7 @@ import (
 	"golang.org/x/image/webp"
 
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/fsx"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 

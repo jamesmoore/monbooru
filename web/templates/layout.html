@@ -1,9 +1,10 @@
 {{define "layout_head"}}
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-app="monbooru">
 <head>
 {{template "partials/head.html" .}}
-  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/shared/htmx.min.js" defer></script>
+  <script src="/static/shared/base.js" defer></script>
   <script src="/static/main.js" defer></script>
 </head>
 <body data-gallery="{{.ActiveGallery}}">
@@ -50,7 +51,7 @@
     ⚠ Gallery path is unreadable - sync and watch are disabled. Check your configuration.
   </div>
   {{end}}
-  <div id="page-notice" class="degraded-banner" hidden></div>
+  <div id="page-notice" class="degraded-banner" data-login-url="/login" hidden></div>
   <div id="main-layout"{{if .SidebarCollapsed}} class="sidebar-collapsed"{{end}}>
     <aside id="sidebar">
 {{end}}
@@ -91,18 +92,10 @@
       <span id="footer-hidden" class="footer-hidden">{{with .HiddenByCeiling}}<span class="footer-sep-strong">::</span>{{.}} hidden {{plural . "image" "images"}} in the current search{{end}}</span>
     </div>
     <div id="footer-right">
-      {{if .MonloaderPaired}}{{template "partials/monloader_light.html" .}} · {{end}}page loaded in <span id="page-load-ms">{{pageLoadMs .RequestStart}}</span> ms · <a href="{{.RepoURL}}" target="_blank" rel="noopener">monbooru{{if .Build}} ({{.Build}}){{end}}</a> {{.Version}} · <a href="#" id="footer-shortcuts" onclick="openShortcutSheet();return false">shortcuts</a> · <a href="{{.DocURL}}" target="_blank" rel="noopener">help</a> · <a href="/api/v1/docs" target="_blank" rel="noopener">API</a>
+      {{if .MonloaderPaired}}{{template "webui/peer_light" .MonloaderLight}} · {{end}}page loaded in <span id="page-load-ms">{{pageLoadMs .RequestStart}}</span> ms · <a href="{{.RepoURL}}" target="_blank" rel="noopener">monbooru{{if .Build}} ({{.Build}}){{end}}</a> {{.Version}} · <a href="#" id="footer-shortcuts" onclick="openShortcutSheet();return false">shortcuts</a> · <a href="{{.DocURL}}" target="_blank" rel="noopener">help</a> · <a href="/api/v1/docs" target="_blank" rel="noopener">API</a>
     </div>
   </footer>
-  <dialog id="confirm-dialog">
-    <p id="confirm-dialog-msg"></p>
-    <p id="confirm-dialog-danger" class="confirm-dialog-danger"></p>
-    <div class="dialog-actions">
-      <button type="button" id="confirm-dialog-ok" class="btn-danger">OK</button>
-      <button type="button" id="confirm-dialog-alt" hidden></button>
-      <button type="button" id="confirm-dialog-cancel">Cancel</button>
-    </div>
-  </dialog>
+  {{template "webui/confirm_dialog"}}
   <dialog id="shortcuts-help">
     <h3>Keyboard Shortcuts</h3>
     <div class="shortcuts-help-grid">
@@ -162,7 +155,7 @@
           <li data-when="#batch-bar.visible"><kbd>d</kbd><span>Download as a zip</span></li>
           <li data-when="#batch-bar.visible #batch-transfer"><kbd>T</kbd><span>Transfer</span></li>
           <li data-when="#batch-invert"><kbd>I</kbd><span>Invert</span></li>
-          <li data-when="#batch-bar.visible .monloader-accent:not([disabled])"><kbd>L</kbd><span>Find tags (monloader)</span></li>
+          <li data-when="#batch-bar.visible .peer-accent:not([disabled])"><kbd>L</kbd><span>Find tags (monloader)</span></li>
           <li data-when="#batch-bar.visible"><kbd>Delete</kbd><span>Delete</span></li>
           <li><kbd>Shift</kbd>+<kbd>click</kbd><span>Extend the selection</span></li>
           <li data-when=".plugin-card .plugin-btn, #plugin-batch-bar.visible .plugin-btn"><kbd>x</kbd><kbd>1-9</kbd><span>Run Nth plugin</span></li>

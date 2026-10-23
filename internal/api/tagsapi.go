@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"net/http"
 
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -41,7 +42,7 @@ func (h *Handler) getTag(w http.ResponseWriter, r *http.Request) {
 	if note.Links == nil {
 		note.Links = []string{}
 	}
-	WriteJSON(w, http.StatusOK, tagDetailResponse{tagResponse: toTagResponse(t), Note: note.Body, Links: note.Links})
+	contract.WriteJSON(w, http.StatusOK, tagDetailResponse{tagResponse: toTagResponse(t), Note: note.Body, Links: note.Links})
 }
 
 func (h *Handler) listTags(w http.ResponseWriter, r *http.Request) {

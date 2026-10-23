@@ -8,11 +8,12 @@ import (
 	"maps"
 
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
-const ptrLookupBatch = 500
+const ptrLookupBatch = contract.MaxPTRTags
 
 // Both halves share the job slot the caller already holds.
 // The spelling is exact, a bare one meaning general, as the PTR writes it.
@@ -268,7 +269,8 @@ func (l *Link) PTRTagSweep(svc *tags.Service, ids []int64, as string) {
 		}
 	}
 
-	msg := fmt.Sprintf("PTR: added %d alias(es) and %d implication(s) across %d tag(s)", aliases, implications, processed)
+	msg := fmt.Sprintf("PTR: added %d %s and %d %s across %d %s", aliases, models.Plural(aliases, "alias", "aliases"),
+		implications, models.Plural(implications, "implication", "implications"), processed, models.Plural(processed, "tag", "tags"))
 	if lookedUpAs != "" {
 		msg += ", looked up as " + lookedUpAs
 	}
@@ -276,13 +278,13 @@ func (l *Link) PTRTagSweep(svc *tags.Service, ids []int64, as string) {
 		msg += fmt.Sprintf("; %d unknown to the PTR", unknown)
 	}
 	if dropped > 0 {
-		msg += fmt.Sprintf("; %d spelling(s) not representable", dropped)
+		msg += fmt.Sprintf("; %d %s not representable", dropped, models.Plural(dropped, "spelling", "spellings"))
 	}
 	if aliased > 0 {
-		msg += fmt.Sprintf("; %d relation(s) skipped, an alias here points elsewhere", aliased)
+		msg += fmt.Sprintf("; %d %s skipped, an alias here points elsewhere", aliased, models.Plural(aliased, "relation", "relations"))
 	}
 	if retired > 0 {
-		msg += fmt.Sprintf("; %d relation(s) no longer on the PTR", retired)
+		msg += fmt.Sprintf("; %d %s no longer on the PTR", retired, models.Plural(retired, "relation", "relations"))
 	}
 	msg += "."
 	if unavailable && !cancelled {

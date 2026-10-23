@@ -19,21 +19,17 @@ func PhashStored(database *db.DB, tree *BKTree, id, phash int64) {
 		return
 	}
 	if !IncrementalProbeEnabled.Load() {
-		if tree.Built() {
-			tree.Insert(id, phash)
-		}
+		tree.store(id, &phash)
 		return
 	}
 	probeTree := tree
 	if !tree.Built() && tree.unbuiltProbes.Add(1) <= unbuiltProbesBeforeBuild {
 		probeTree = nil
-	} else {
-		if err := tree.EnsureBuilt(database); err != nil {
-			logx.Warnf("incremental probe %d: build the tree: %v", id, err)
-			return
-		}
-		tree.Insert(id, phash)
+	} else if err := tree.EnsureBuilt(database); err != nil {
+		logx.Warnf("incremental probe %d: build the tree: %v", id, err)
+		return
 	}
+	tree.store(id, &phash)
 	distance := int(IncrementalProbeDistance.Load())
 	if err := incrementalProbe(database, probeTree, id, phash, distance); err != nil {
 		logx.Debugf("incremental probe %d: %v", id, err)
@@ -44,8 +40,8 @@ func PhashStored(database *db.DB, tree *BKTree, id, phash int64) {
 const unbuiltProbesBeforeBuild = 32
 
 func PhashCleared(tree *BKTree, id int64) {
-	if tree != nil && tree.Built() {
-		tree.Remove(id)
+	if tree != nil {
+		tree.store(id, nil)
 	}
 }
 
@@ -124,15 +120,17 @@ func (t *BKTree) resetLocked() {
 	t.unbuiltProbes.Store(0)
 }
 
+// BuildFromDB holds mu from before its snapshot, so a store committed
+// after the snapshot waits in store and enters the finished tree.
 func (t *BKTree) BuildFromDB(database *db.DB) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	rows, err := database.Read.Query(`SELECT id, phash FROM images WHERE phash IS NOT NULL`)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = rows.Close() }()
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.root = nil
 	t.idIndex = make(map[int64]int64)
 	for rows.Next() {
@@ -148,6 +146,21 @@ func (t *BKTree) BuildFromDB(database *db.DB) error {
 	t.lastUsed.Store(time.Now().UnixNano())
 	t.built.Store(true)
 	return nil
+}
+
+// nil drops the id. An unbuilt tree takes nothing: its build reads the row.
+func (t *BKTree) store(id int64, phash *int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.built.Load() {
+		return
+	}
+	if prev, ok := t.idIndex[id]; ok {
+		t.removeIDLocked(id, prev)
+	}
+	if phash != nil {
+		t.insertLocked(id, *phash)
+	}
 }
 
 func (t *BKTree) Insert(id, phash int64) {

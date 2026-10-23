@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -12,9 +13,13 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/schedule"
+	"github.com/monbooru/monbooru/internal/shared/apitoken"
 	"github.com/monbooru/monbooru/internal/shared/desktop"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/session"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -211,8 +216,8 @@ var scheduleColumns = []scheduleColumn{
 	{Action: config.ActionRemoveOrphans, Label: "Orphans", Title: "Remove orphaned thumbnails"},
 	{Action: config.ActionRunAutoTaggers, Label: "Auto-tag", Title: "Run enabled auto-taggers", Accent: "tagger-accent"},
 	{Action: config.ActionFindRelationPairs, Label: "Pairs", Title: "Find relation pairs"},
-	{Action: config.ActionLookupPTR, Label: "PTR", Title: "Look up unsourced images in the Public Tag Repository", Accent: "monloader-accent"},
-	{Action: config.ActionLookupBooru, Label: "Boorus", Title: "Look up unsourced images on online boorus", Accent: "monloader-accent"},
+	{Action: config.ActionLookupPTR, Label: "PTR", Title: "Look up unsourced images in the Public Tag Repository", Accent: "peer-accent"},
+	{Action: config.ActionLookupBooru, Label: "Boorus", Title: "Look up unsourced images on online boorus", Accent: "peer-accent"},
 }
 
 // Shown with one gallery too while a list is set, or that list would
@@ -364,6 +369,10 @@ func (s *Server) settingsIgnorePost(w http.ResponseWriter, r *http.Request) {
 	if changed {
 		s.set.Redraw()
 		msg = "Saved. A sync applies the ignore list to what is already indexed."
+		if n := s.set.LeftOutBy(ignore); n > 0 {
+			msg = fmt.Sprintf("Saved. The next sync sets aside %d indexed %s this list leaves out. Tags are kept, and a file the list lets in again comes back with them.",
+				n, models.Plural(n, "image", "images"))
+		}
 	}
 	logx.Infof("settings: ignore list updated")
 	writeInlineFlash(w, "ok", msg)
@@ -374,12 +383,18 @@ func (s *Server) settingsMonloaderPost(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
+	webURL := strings.TrimSpace(r.FormValue("monloader_url"))
+	apiURL := strings.TrimSpace(r.FormValue("api_url"))
+	if !httpURLOrBlank(webURL) || !httpURLOrBlank(apiURL) {
+		writeInlineFlash(w, "err", "The monloader addresses must be http(s) URLs. Nothing was saved.")
+		return
+	}
 	if err := s.withConfig(func(c *config.Config) error {
 		if c.EnvPinned("server.monloader_url") == "" {
-			c.Server.MonloaderURL = strings.TrimSpace(r.FormValue("monloader_url"))
+			c.Server.MonloaderURL = webURL
 		}
 		if c.EnvPinned("monloader.api_url") == "" {
-			c.Monloader.APIURL = strings.TrimSpace(r.FormValue("api_url"))
+			c.Monloader.APIURL = apiURL
 		}
 		return nil
 	}); err != nil {
@@ -388,6 +403,14 @@ func (s *Server) settingsMonloaderPost(w http.ResponseWriter, r *http.Request) {
 	}
 	logx.Infof("settings: monloader link updated")
 	writeInlineFlash(w, "ok", "Saved.")
+}
+
+func httpURLOrBlank(s string) bool {
+	if s == "" {
+		return true
+	}
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
@@ -424,7 +447,7 @@ func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
-	logx.Infof("settings: password updated from %s", clientIP(r))
+	logx.Infof("settings: password updated from %s", session.ClientIP(r))
 	if !wasOn {
 		// The page's CSRF token is the anon one, so it reloads onto the new session.
 		sessID := s.sessions.Create(s.sessionLifetimeDays())
@@ -434,7 +457,7 @@ func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("HX-Refresh", "true")
 		return
 	}
-	s.sessions.ClearExcept(sessionFromContext(r.Context()))
+	s.sessions.ClearExcept(session.FromContext(r.Context()))
 	writeInlineFlash(w, "ok", "Password updated.")
 	s.renderAuthPasswordOOB(w, r)
 }
@@ -444,32 +467,28 @@ func (s *Server) settingsTokenCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(r.FormValue("name"))
-	if err := config.ValidateTokenName(name); err != nil {
+	if err := apitoken.ValidateName(name); err != nil {
 		writeInlineFlash(w, "err", err.Error())
 		return
 	}
-	tok, secret := config.GenerateToken(name, config.AllScopes)
+	tok, secret := apitoken.New(name, config.AllScopes)
 	if err := s.withConfig(func(c *config.Config) error {
-		if c.TokenNameExists(name) {
-			return fmt.Errorf("a token named %q already exists", name)
-		}
-		c.Auth.Tokens = append(c.Auth.Tokens, tok)
-		return nil
+		return c.Auth.Tokens.Add(tok)
 	}); err != nil {
 		writeInlineFlash(w, "err", err.Error())
 		return
 	}
-	logx.Infof("settings: API token %q created from %s", name, clientIP(r))
+	logx.Infof("settings: API token %q created from %s", name, session.ClientIP(r))
 	w.Header().Set("Cache-Control", "no-store")
-	s.renderTemplate(w, "partials/flash_token.html", map[string]any{"Token": secret})
+	w.Header().Set("HX-Trigger", "token-created")
+	s.renderTemplate(w, "webui/token_created", map[string]any{"Token": secret})
 	s.renderAuthTokensOOB(w, r)
-	_, _ = w.Write([]byte(`<script>(function(){var i=document.getElementById('token-name-input');if(i)i.value='';})();</script>`))
 }
 
 func (s *Server) tokenPaired(id string) bool {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
-	i := slices.IndexFunc(s.cfg.Auth.Tokens, func(t config.Token) bool { return t.ID == id })
+	i := slices.IndexFunc(s.cfg.Auth.Tokens, func(t apitoken.Token) bool { return t.ID == id })
 	return i >= 0 && s.cfg.Auth.Tokens[i].Paired != ""
 }
 
@@ -481,7 +500,7 @@ func (s *Server) settingsTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	var removed bool
 	if err := s.withConfig(func(c *config.Config) error {
-		removed = c.RemoveToken(id)
+		removed = c.Auth.Tokens.Remove(id)
 		return nil
 	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
@@ -491,7 +510,7 @@ func (s *Server) settingsTokenRevoke(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", "Token not found.")
 		return
 	}
-	logx.Infof("settings: API token %s revoked from %s", id, clientIP(r))
+	logx.Infof("settings: API token %s revoked from %s", id, session.ClientIP(r))
 	writeInlineFlash(w, "ok", "Token revoked.")
 	s.renderAuthTokensOOB(w, r)
 }
@@ -500,16 +519,10 @@ func (s *Server) renderAuthTokensOOB(w http.ResponseWriter, r *http.Request) {
 	s.cfgMu.RLock()
 	tokens := slices.Clone(s.cfg.Auth.Tokens)
 	s.cfgMu.RUnlock()
-	s.renderTemplate(w, "partials/auth_tokens.html", map[string]any{
+	s.renderTemplate(w, "webui/auth_tokens", map[string]any{
 		"Tokens": tokens,
 		"OOB":    true,
 	})
-}
-
-type tokenScopeRow struct {
-	Name    string
-	Desc    string
-	Checked bool
 }
 
 func (s *Server) settingsTokenPrivilegesGet(w http.ResponseWriter, r *http.Request) {
@@ -517,7 +530,7 @@ func (s *Server) settingsTokenPrivilegesGet(w http.ResponseWriter, r *http.Reque
 	s.cfgMu.RLock()
 	var scopes []string
 	var paired bool
-	i := slices.IndexFunc(s.cfg.Auth.Tokens, func(t config.Token) bool { return t.ID == id })
+	i := slices.IndexFunc(s.cfg.Auth.Tokens, func(t apitoken.Token) bool { return t.ID == id })
 	if i >= 0 {
 		scopes = slices.Clone(s.cfg.Auth.Tokens[i].Scopes)
 		paired = s.cfg.Auth.Tokens[i].Paired != ""
@@ -532,13 +545,9 @@ func (s *Server) settingsTokenPrivilegesGet(w http.ResponseWriter, r *http.Reque
 		config.ScopeWrite:  "write - create and modify",
 		config.ScopeDelete: "delete - destructive actions",
 	}
-	rows := make([]tokenScopeRow, 0, len(config.AllScopes))
-	for _, sc := range config.AllScopes {
-		rows = append(rows, tokenScopeRow{Name: sc, Desc: descs[sc], Checked: slices.Contains(scopes, sc)})
-	}
-	s.renderTemplate(w, "partials/token_privileges_dialog.html", map[string]any{
+	s.renderTemplate(w, "webui/token_privileges_dialog", map[string]any{
 		"ID":     id,
-		"Scopes": rows,
+		"Scopes": webui.ScopeRows(config.AllScopes, scopes, descs),
 		"Paired": paired,
 	})
 }
@@ -552,10 +561,10 @@ func (s *Server) settingsTokenPrivilegesPost(w http.ResponseWriter, r *http.Requ
 		writeInlineFlash(w, "err", "This token is managed by a pairing; its privileges can't be changed.")
 		return
 	}
-	scopes := config.FilterScopes(r.Form["scope"])
+	scopes := apitoken.Filter(r.Form["scope"], config.AllScopes)
 	var found bool
 	if err := s.withConfig(func(c *config.Config) error {
-		found = c.SetTokenScopes(id, scopes)
+		found = c.Auth.Tokens.SetScopes(id, scopes)
 		return nil
 	}); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
@@ -565,9 +574,9 @@ func (s *Server) settingsTokenPrivilegesPost(w http.ResponseWriter, r *http.Requ
 		writeInlineFlash(w, "err", "Token not found.")
 		return
 	}
-	logx.Infof("settings: API token %s privileges updated from %s", id, clientIP(r))
+	logx.Infof("settings: API token %s privileges updated from %s", id, session.ClientIP(r))
 	setDialogSavedTrigger(w, "token-saved", "token-cfg-"+id)
-	writeOOBSummaryFlash(w, "token-scopes-"+id, strings.Join(scopes, " "), "flash-auth", "Token privileges saved.")
+	s.renderTemplate(w, "webui/token_scopes_saved", map[string]string{"ID": id, "Scopes": strings.Join(scopes, " ")})
 }
 
 func (s *Server) settingsRemovePasswordPost(w http.ResponseWriter, r *http.Request) {
@@ -595,7 +604,7 @@ func (s *Server) settingsRemovePasswordPost(w http.ResponseWriter, r *http.Reque
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
-	logx.Infof("settings: password removed from %s", clientIP(r))
+	logx.Infof("settings: password removed from %s", session.ClientIP(r))
 	// Old sessions would otherwise stay valid when a password is set again.
 	s.sessions.Clear()
 	writeInlineFlash(w, "ok", "Password removed. Authentication is now disabled.")

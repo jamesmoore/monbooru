@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"html/template"
 	"io/fs"
+	"maps"
 	"mime"
 	"net/http"
 	"net/url"
@@ -37,9 +38,11 @@ import (
 	"github.com/monbooru/monbooru/internal/plugins"
 	"github.com/monbooru/monbooru/internal/schedule"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/desktop"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/shared/session"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"github.com/monbooru/monbooru/internal/tags"
 	webFS "github.com/monbooru/monbooru/web"
@@ -79,7 +82,7 @@ type Server struct {
 	jobs       *jobs.Manager
 	pairs      *peer.Store
 	sessions   *session.Store
-	loginRL    *loginRateLimiter
+	loginRL    *session.Backoff
 	tmpl       *template.Template
 	staticFS   fs.FS
 	done       chan struct{}
@@ -121,7 +124,12 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 		metadata.SetNodeOverlay(filepath.Join(filepath.Dir(configPath), "comfyui_nodes.json"))
 	}
 
-	tmpl, err := template.New("").Funcs(templateFuncs()).ParseFS(webFS.FS, "templates/*.html", "templates/partials/*.html")
+	funcs := templateFuncs()
+	maps.Copy(funcs, webui.Funcs())
+	tmpl, err := template.New("").Funcs(funcs).ParseFS(webFS.FS, "templates/*.html", "templates/partials/*.html")
+	if err == nil {
+		tmpl, err = tmpl.ParseFS(webui.Templates, "*.html")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +145,7 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 		jobs:         jobManager,
 		pairs:        peer.NewStore(),
 		sessions:     sessions,
-		loginRL:      newLoginRateLimiter(),
+		loginRL:      session.NewBackoff(),
 		tmpl:         tmpl,
 		staticFS:     staticFS,
 		done:         make(chan struct{}),
@@ -171,7 +179,7 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager, 
 			select {
 			case <-ticker.C:
 				sessions.SweepExpired()
-				s.loginRL.sweep()
+				s.loginRL.Sweep()
 			case <-s.done:
 				return
 			}
@@ -240,7 +248,7 @@ func (s *Server) runMemoryReclaim() {
 				if tagger.ReleaseIdle(time.Duration(mins) * time.Minute) {
 					after := readVmRSS()
 					if before > 0 && after > 0 && before > after {
-						logx.Infof("memory reclaim: released idle auto-tagger session (-%s)", humanBytesFmt(int64(before-after)))
+						logx.Infof("memory reclaim: released idle auto-tagger session (-%s)", webui.HumanBytes(int64(before-after)))
 					} else {
 						logx.Infof("memory reclaim: released idle auto-tagger session")
 					}
@@ -322,11 +330,11 @@ func (s *Server) Handler() http.Handler {
 	rt := s.newRoutes()
 	s.registerRoutes(rt)
 
-	// Outermost first: logging, session, first-run gate, CSRF.
 	var h http.Handler = rt.mux
-	h = s.cSRFMiddleware(h)
+	h = s.sessions.Guard(pluginMountOrigin(h), isPluginMount)
 	h = s.setupMiddleware(h)
-	h = s.sessionMiddleware(h)
+	h = s.sessions.Gate(h, sessionCookie, s.authEnabled, isOpenPath)
+	h = s.hostMiddleware(h)
 	h = loggingMiddleware(h)
 
 	return h
@@ -336,6 +344,7 @@ func (s *Server) registerRoutes(rt *routes) {
 	// The thumbnail route needs no lock: it takes only the directory from
 	// its context.
 	rt.free("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.staticFS))).ServeHTTP)
+	rt.free("GET /static/shared/", http.StripPrefix("/static/shared/", http.FileServer(http.FS(webui.Static))).ServeHTTP)
 	rt.free("GET /theme.css", s.serveThemeCSS)
 	rt.free("GET /theme.logo", s.serveThemeLogo)
 	rt.free("GET /theme.favicon", s.serveThemeFavicon)
@@ -354,8 +363,8 @@ func (s *Server) registerRoutes(rt *routes) {
 		w.WriteHeader(http.StatusOK)
 		// A second launch reads "app" to tell this instance from another
 		// program on the port.
-		_ = json.NewEncoder(w).Encode(map[string]any{"app": "monbooru", "status": "ok", "version": Version,
-			"api": peer.APIVersion, "min_peer_api": peer.MinPeerAPI})
+		_ = json.NewEncoder(w).Encode(contract.Health{App: contract.AppMonbooru, Status: "ok", Version: Version,
+			API: peer.APIVersion, MinPeerAPI: peer.MinPeerAPI})
 	})
 
 	rt.free("GET /login", s.loginPage)
@@ -476,12 +485,13 @@ func (s *Server) registerRoutes(rt *routes) {
 	rt.free("POST /settings/schedule/run", s.settingsScheduleRunPost)
 	rt.read("GET /setup", s.setupPage)
 	// The wizard's submit repoints the default gallery.
-	rt.write("POST /setup", s.setupPost)
-	rt.free("GET /internal/browse", s.browseDirs)
-	rt.free("POST /internal/open-folder", s.openFolder)
-	rt.free("POST /settings/desktop", s.settingsDesktopPost)
-	rt.free("POST /settings/quit", s.settingsQuit)
-	rt.free("POST /settings/restart", s.settingsRestart)
+	rt.write("POST /setup", s.localOnly(s.setupPost))
+	rt.free("GET /internal/browse", s.localOnly(s.browseDirs))
+	rt.free("POST /internal/open-folder", s.localOnly(s.openFolder))
+	rt.free("POST /settings/desktop", s.localOnly(s.settingsDesktopPost))
+	rt.free("POST /settings/quit", s.localOnly(s.settingsQuit))
+	rt.free("POST /settings/restart", s.localOnly(s.settingsRestart))
+	rt.free("GET /internal/desktop-power", s.localOnly(s.desktopPowerFragment))
 	rt.read("POST /settings/maintenance/prune-missing", s.pruneMissingImagesPost)
 	rt.read("POST /settings/maintenance/prune-orphaned-thumbnails", s.pruneOrphanedThumbnailsPost)
 	rt.read("POST /settings/maintenance/empty-folders", s.emptyFoldersScanPost)
@@ -696,8 +706,8 @@ type ratingLevel struct {
 }
 
 var ratingFooterLevels = func() []ratingLevel {
-	levels := make([]ratingLevel, len(tags.RatingLevels))
-	for i, name := range tags.RatingLevels {
+	levels := make([]ratingLevel, len(contract.RatingLevels))
+	for i, name := range contract.RatingLevels {
 		levels[i] = ratingLevel{Value: name, Label: name}
 	}
 	levels[0].Label = "sfw"
@@ -721,7 +731,6 @@ type baseData struct {
 	BooruName           string
 	BooruLogo           string
 	BooruFavicon        string
-	MonloaderURL        string
 	ActiveGallery       string
 	Galleries           []config.Gallery
 	VisibleCount        int
@@ -736,9 +745,7 @@ type baseData struct {
 	MonloaderPaired     bool
 	MonloaderUsable     bool
 	MonloaderConn       string
-	MonloaderVersion    string
-	MonloaderMismatch   string
-	MonloaderSeen       string
+	MonloaderLight      webui.PeerLight
 	MonloaderPTR        bool
 	MonloaderPTRSyncing bool
 	// The render gate, where MonloaderPTR is the live one: a paused or
@@ -755,7 +762,7 @@ func sidebarCollapsed(r *http.Request) bool {
 }
 
 func (s *Server) base(r *http.Request, nav, title string) baseData {
-	sessID := sessionFromContext(r.Context())
+	sessID := session.FromContext(r.Context())
 	cx := s.active()
 	degraded := false
 	visible, inbox, tagCount, collectionsCount := 0, 0, 0, 0
@@ -793,13 +800,10 @@ func (s *Server) base(r *http.Request, nav, title string) baseData {
 		BooruName:           s.booruName(),
 		BooruLogo:           themeLogoURL(theme),
 		BooruFavicon:        themeFaviconURL(theme),
-		MonloaderURL:        s.monloaderWebBase(),
 		MonloaderPaired:     paired,
 		MonloaderUsable:     monloaderUsable,
 		MonloaderConn:       ml.Conn,
-		MonloaderVersion:    ml.Version,
-		MonloaderMismatch:   ml.APIMismatch,
-		MonloaderSeen:       ml.Panels(),
+		MonloaderLight:      s.monloaderLight(ml.Conn, ml.Version, ml.APIMismatch, ml.Panels()),
 		MonloaderPTR:        ml.PTR,
 		MonloaderPTRSyncing: ml.PTRSyncing,
 		MonloaderPTRPresent: paired && (ml.PTR || ml.PTRSyncing || !monloaderUsable),
@@ -1031,7 +1035,7 @@ func (s *Server) monloaderLink() monloader.LinkConfig {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
 	c := monloader.LinkConfig{APIURL: s.cfg.Monloader.APIURL, Token: s.cfg.Monloader.APIToken, Paused: s.cfg.Monloader.Paused}
-	if t := s.cfg.FindPairedToken(monloader.App); t != nil {
+	if t := s.cfg.Auth.Tokens.Paired(monloader.App); t != nil {
 		c.PeerURL, c.Paired = t.PeerURL, true
 	}
 	return c

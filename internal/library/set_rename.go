@@ -10,6 +10,7 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
+	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
@@ -146,7 +147,7 @@ func (s *Set) NestingNote(name string) string {
 	if around != nil {
 		note += fmt.Sprintf(" It sits inside gallery %s, which leaves this folder to it from now on", around.Name)
 		if n := around.imagesUnder(name); n > 0 {
-			note += fmt.Sprintf(": %s's next sync marks the %d image(s) it holds there missing", around.Name, n)
+			note += fmt.Sprintf(": %s's next sync marks the %d %s it holds there missing", around.Name, n, models.Plural(n, "image", "images"))
 		}
 		note += "."
 	}
@@ -176,4 +177,33 @@ func (cx *Gallery) imagesUnder(inner string) int {
 		return n
 	}
 	return 0
+}
+
+// LeftOutBy counts the indexed images, over every gallery, that ignore leaves
+// out: the next sync marks them missing.
+func (s *Set) LeftOutBy(ignore []string) int {
+	n := 0
+	for name, b := range s.Draw(ignore) {
+		if cx := s.Get(name); cx != nil {
+			n += cx.imagesExcludedBy(b)
+		}
+	}
+	return n
+}
+
+func (cx *Gallery) imagesExcludedBy(b *gallery.Boundary) int {
+	rows, err := cx.DB.Read.Query(`SELECT canonical_path FROM images WHERE is_missing = 0`)
+	if err != nil {
+		logx.Warnf("gallery %q: count ignored images: %v", cx.Name, err)
+		return 0
+	}
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var p string
+		if rows.Scan(&p) == nil && b.Excludes(p) {
+			n++
+		}
+	}
+	return n
 }

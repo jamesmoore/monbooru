@@ -88,7 +88,7 @@ func (f *FetchLog) Clear(gallery string, id int64) {
 // SplitTrail parts a lookup trail into the PTR's entries and the online
 // backends', each in trail order.
 func SplitTrail(trail string) (ptr, online []string) {
-	for _, entry := range strings.Split(trail, "; ") {
+	for _, entry := range strings.Split(trail, contract.TrailSeparator) {
 		if strings.HasPrefix(entry, contract.TrailPTR+":") {
 			ptr = append(ptr, entry)
 		} else {
@@ -99,8 +99,8 @@ func SplitTrail(trail string) (ptr, online []string) {
 }
 
 func SimilarityRan(trail string) bool {
-	return slices.ContainsFunc(strings.Split(trail, "; "), func(entry string) bool {
+	return slices.ContainsFunc(strings.Split(trail, contract.TrailSeparator), func(entry string) bool {
 		name, reason, ok := strings.Cut(entry, ": ")
-		return ok && (name == contract.TrailIQDB || name == contract.TrailSauceNAO) && !strings.HasPrefix(reason, "skipped")
+		return ok && (name == contract.TrailIQDB || name == contract.TrailSauceNAO) && !strings.HasPrefix(reason, contract.TrailSkipped)
 	})
 }

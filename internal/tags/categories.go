@@ -133,8 +133,10 @@ func (s *Service) RenameCategory(id int64, newName string) error {
 	var isBuiltin int
 	if err := s.db.Read.QueryRow(
 		`SELECT is_builtin FROM tag_categories WHERE id = ?`, id,
-	).Scan(&isBuiltin); err != nil {
+	).Scan(&isBuiltin); err == sql.ErrNoRows {
 		return ErrCategoryNotFound
+	} else if err != nil {
+		return err
 	}
 	if isBuiltin == 1 {
 		return ErrBuiltinCategoryName

@@ -5,7 +5,7 @@
      hx-trigger="every 2s"
      hx-swap="outerHTML"
      {{if and $job $job.Running}}class="job-running"{{end}}
-     {{if $job}}data-job-type="{{$job.JobType}}" data-processed="{{$job.Processed}}" data-watcher-notices="{{$job.WatcherNotices}}"{{end}}
+     {{if $job}}data-job-type="{{$job.JobType}}" data-processed="{{$job.Processed}}" data-changes="{{$job.Changes}}"{{end}}
      {{if and $job $job.FinishedAt}}data-finished-at="{{$job.FinishedAt.UnixNano}}"{{end}}>
   {{with $job}}{{if .Running}}
     <span class="job-type">{{.JobType}}</span>
@@ -30,7 +30,7 @@
         <span class="job-progress">{{.Done}}/{{.Files}}</span>
         <span class="job-msg">{{humanBytes .Sent}} of {{humanBytes .Bytes}}</span>
       {{else}}
-        <span class="job-msg">preparing {{.Files}} file(s)...</span>
+        <span class="job-msg">preparing {{.Files}} {{plural .Files "file" "files"}}...</span>
       {{end}}
     </span>
   {{end}}

@@ -19,6 +19,7 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/relations"
 	"github.com/monbooru/monbooru/internal/searchkw"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 	"github.com/monbooru/monbooru/internal/upgrade"
 )
@@ -504,7 +505,7 @@ func (b *whereBuilder) resolveRatingIDs() {
 		`SELECT t.name, t.id, t.usage_count FROM tags t
 		 JOIN tag_categories tc ON tc.id = t.category_id
 		 WHERE tc.name = 'rating' AND t.is_alias = 0
-		   AND t.name IN ('` + strings.Join(tags.RatingLevels, "','") + `')`,
+		   AND t.name IN ('` + strings.Join(contract.RatingLevels, "','") + `')`,
 	)
 	if err != nil {
 		return
@@ -938,12 +939,22 @@ func (b *whereBuilder) buildNameFilter(e FilterExpr) string {
 		return `(i.id IN (SELECT rowid FROM image_basename_canonical_fts WHERE image_basename_canonical_fts MATCH ?) ` +
 			`OR i.id IN (SELECT image_id FROM image_paths WHERE id IN (SELECT rowid FROM image_basename_alias_fts WHERE image_basename_alias_fts MATCH ?)))`
 	}
-	pat := "%" + db.EscapeLike(strings.ToLower(e.Val)) + "%"
+	pat := "%" + db.EscapeLike(asciiLower(e.Val)) + "%"
 	// Pinned to the partial alias index; unpinned, the planner takes
 	// idx_image_paths_image and tests is_canonical per row.
 	b.args = append(b.args, pat, pat)
 	return `(i.basename_lower LIKE ? ESCAPE '\' ` +
 		`OR EXISTS (SELECT 1 FROM image_paths ip INDEXED BY idx_image_paths_aliases WHERE ip.image_id = i.id AND ip.is_canonical = 0 AND ip.basename_lower LIKE ? ESCAPE '\'))`
+}
+
+// basename_lower is SQLite's lower(), which folds A-Z only, and so does LIKE.
+func asciiLower(s string) string {
+	return strings.Map(func(r rune) rune {
+		if 'A' <= r && r <= 'Z' {
+			return r + 'a' - 'A'
+		}
+		return r
+	}, s)
 }
 
 func (b *whereBuilder) buildMimeFilter(e FilterExpr) string {
@@ -1146,7 +1157,7 @@ func (b *whereBuilder) buildGeneratedFilter(e FilterExpr) string {
 // Highest wins: rating:X also requires no higher rating on the image.
 func (b *whereBuilder) buildRatingFilter(e FilterExpr) string {
 	val := strings.ToLower(e.Val)
-	rank := tags.RatingRank(val)
+	rank := contract.RatingRank(val)
 	if rank < 0 {
 		return "1=0"
 	}
@@ -1161,8 +1172,8 @@ func (b *whereBuilder) buildRatingFilter(e FilterExpr) string {
 	}
 	b.args = append(b.args, selfID)
 	parts := []string{b.imageTagsPredicate("it.tag_id = ?", false)}
-	for i := rank + 1; i < len(tags.RatingLevels); i++ {
-		higherID, ok := b.ratingIDs[tags.RatingLevels[i]]
+	for i := rank + 1; i < len(contract.RatingLevels); i++ {
+		higherID, ok := b.ratingIDs[contract.RatingLevels[i]]
 		if !ok {
 			continue
 		}

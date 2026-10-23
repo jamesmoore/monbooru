@@ -6,8 +6,8 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
-	"github.com/monbooru/monbooru/internal/tags"
 )
 
 // Ceiling is shared by one request's goroutines; mu guards the lazy cache.
@@ -103,7 +103,7 @@ func (c *Ceiling) RankCeiling() (int, bool) {
 	if c == nil || !c.IsActive() {
 		return 0, false
 	}
-	return tags.RatingRank(c.level), true
+	return contract.RatingRank(c.level), true
 }
 
 func (c *Ceiling) RankFilter() gallery.RankCeiling {

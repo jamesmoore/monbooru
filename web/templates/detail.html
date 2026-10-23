@@ -23,7 +23,15 @@
     </form>
   </div>
 
-  {{if .Image.IsMissing}}
+  {{if and .Image.IsMissing .LeftOut}}
+  <div class="missing-banner">
+    <span>⚠ This file is still on disk, but the gallery leaves it out: {{.LeftOut}}. Its tags stay with it, and it comes back if the ignore list lets it in again.</span>
+  </div>
+  {{else if and .Image.IsMissing .OnDisk}}
+  <div class="missing-banner">
+    <span>⚠ This file is back on disk; the next sync restores it.</span>
+  </div>
+  {{else if .Image.IsMissing}}
   <div class="missing-banner">
     <span>⚠ This file is no longer present on disk.</span>
     <button class="btn-danger btn-sm"
@@ -39,7 +47,7 @@
   </div>
   {{end}}
 
-  <div id="detail-flash"></div>
+  <div id="detail-flash" data-action-flash></div>
   {{if .MonloaderPaired}}<div id="fetch-status" class="fetch-status"></div>{{end}}
 
   <div class="detail-topbar">
@@ -587,7 +595,7 @@
                   {{end}}onclick="clearSlots('autotag-error'); document.getElementById('autotag-dialog').showModal()">Auto-tag</button>
           {{end}}
           {{if .MonloaderPaired}}
-          <button type="button" class="btn-hash-lookup monloader-accent" data-ml-title="Find tags and sources for this file on online boorus via monloader"
+          <button type="button" class="btn-hash-lookup peer-accent" data-peer-title="Find tags and sources for this file on online boorus via monloader"
                   {{if .MonloaderUsable}}title="Find tags and sources for this file on online boorus via monloader"
                   {{else}}disabled title="{{monloaderOffReason .MonloaderConn}}"
                   {{end}}hx-post="/images/{{.Image.ID}}/lookup" hx-vals='{"backend":"booru"}'
@@ -816,7 +824,11 @@
             {{if .Image.AutoTaggedAt}}
             <tr><th>Auto-tagged</th><td>{{localTimePtr .Image.AutoTaggedAt}}</td></tr>
             {{end}}
-            {{if .Image.IsMissing}}
+            {{if and .Image.IsMissing .LeftOut}}
+            <tr><th>Status</th><td class="text-warning">⚠ Left out: {{.LeftOut}}</td></tr>
+            {{else if and .Image.IsMissing .OnDisk}}
+            <tr><th>Status</th><td class="text-warning">⚠ Back on disk, restored by the next sync</td></tr>
+            {{else if .Image.IsMissing}}
             <tr><th>Status</th><td class="text-warning">⚠ File missing from disk</td></tr>
             {{end}}
           </tbody>
@@ -844,23 +856,23 @@
                           hx-target="#fetch-status" hx-swap="innerHTML"
                           style="display:inline">
                       <input type="hidden" name="url" value="{{.URL}}">
-                      <button type="submit" class="btn-link-accent monloader-accent" data-ml-title="Refresh tags from this source via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from this source via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
+                      <button type="submit" class="btn-link-accent peer-accent" data-peer-title="Refresh tags from this source via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from this source via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
                     </form>{{else if and $.MonloaderPaired (isPTRSite .Site)}}<form hx-post="/images/{{$.Image.ID}}/lookup"
                           hx-target="#fetch-status" hx-swap="innerHTML"
                           style="display:inline">
                       <input type="hidden" name="backend" value="ptr">
-                      <button type="submit" class="btn-link-accent monloader-accent" data-ml-title="Refresh tags from the Public Tag Repository via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from the Public Tag Repository via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
+                      <button type="submit" class="btn-link-accent peer-accent" data-peer-title="Refresh tags from the Public Tag Repository via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Refresh tags from the Public Tag Repository via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[refresh]</button>
                     </form>{{end}}
                       {{if and $.MonloaderPaired (upgradable .)}}<form hx-post="/images/{{$.Image.ID}}/replace"
                           hx-target="#fetch-status" hx-swap="innerHTML"
                           hx-confirm="Replace the file with the {{if gt .Similarity 0.0}}original from {{if .Site}}{{.Site}}{{else}}this source{{end}} (~{{printf "%.0f" .Similarity}}% match){{else}}one {{if .Site}}{{.Site}}{{else}}this source{{end}} serves now{{end}}?{{upgradeCompare . $.Image}}"
                           data-confirm-danger="The current file is overwritten."
                           data-confirm-ok="Upgrade" data-confirm-alt="Keep local"
-                          data-confirm-alt-url="/images/{{$.Image.ID}}/sources/keep" data-confirm-alt-value="keep=1"
+                          data-confirm-alt-url="/images/{{$.Image.ID}}/sources/keep" data-confirm-alt-target="#detail-flash" data-confirm-alt-value="keep=1"
                           style="display:inline">
                       <input type="hidden" name="site" value="{{.Site}}">
                       <input type="hidden" name="post_id" value="{{.PostID}}">
-                      <button type="submit" class="btn-link-accent monloader-accent" data-ml-title="Replace the local file with the one this source serves via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Replace the local file with the one this source serves via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[upgrade]</button>
+                      <button type="submit" class="btn-link-accent peer-accent" data-peer-title="Replace the local file with the one this source serves via monloader"{{if not $.MonloaderUsable}} disabled{{end}} title="{{if $.MonloaderUsable}}Replace the local file with the one this source serves via monloader{{else}}{{monloaderOffReason $.MonloaderConn}}{{end}}">[upgrade]</button>
                     </form>{{end}}
                       {{if and $.MonloaderPaired .UpgradeKept}}{{template "partials/source_remove_form.html" dict "ImageID" $.Image.ID "CSRFToken" $.CSRFToken "Fields" (dict "site" .Site "post_id" .PostID "keep" "0") "Action" "sources/keep" "Title" "Offer this upgrade again" "Label" "[allow upgrade]"}}{{end}}
                     </span>
@@ -898,7 +910,7 @@
 
         {{if .SDMeta}}
         <details class="gen-details" open>
-          <summary>► Generation data (SD / Forge)</summary>
+          <summary>Generation data (SD / Forge)</summary>
           <div class="node-list">
             {{if .SDMeta.GenerationHash}}
             <div class="node-entry">
@@ -950,7 +962,7 @@
 
         {{if .GenericMeta}}
         <details class="gen-details">
-          <summary>► Other metadata</summary>
+          <summary>Other metadata</summary>
           <div class="node-list">
             <div class="node-entry">
               <table class="node-params">
@@ -967,7 +979,7 @@
 
         {{if .ComfyMeta}}
         <details class="gen-details" open>
-          <summary>► Generation data (ComfyUI)</summary>
+          <summary>Generation data (ComfyUI)</summary>
           {{if .ComfyMeta.GenerationHash}}
           <div class="node-list">
             <div class="node-entry">
@@ -1002,7 +1014,7 @@
 
         {{if .MangaMeta}}
         <details class="gen-details" open>
-          <summary>► Comic / manga metadata</summary>
+          <summary>Comic / manga metadata</summary>
           <div class="node-list">
             <div class="node-entry">
               <table class="node-params">

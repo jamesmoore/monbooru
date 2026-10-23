@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -42,7 +43,7 @@ func writeCategoryError(w http.ResponseWriter, err error) {
 	}
 	var collision *tags.ErrCategoryMoveCollision
 	if errors.As(err, &collision) {
-		apiError(w, http.StatusConflict, "conflict", err.Error())
+		contract.WriteError(w, http.StatusConflict, "conflict", err.Error())
 		return
 	}
 	serverError(w, err)
@@ -61,7 +62,7 @@ func (h *Handler) listCategories(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cats {
 		out = append(out, toCategoryResponse(c))
 	}
-	WriteJSON(w, http.StatusOK, out)
+	contract.WriteJSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +74,7 @@ func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
 		Name  string `json:"name"`
 		Color string `json:"color"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	color := cmp.Or(strings.TrimSpace(body.Color), "#888888")
@@ -82,7 +83,7 @@ func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
 		writeCategoryError(w, err)
 		return
 	}
-	WriteJSON(w, http.StatusCreated, toCategoryResponse(*cat))
+	contract.WriteJSON(w, http.StatusCreated, toCategoryResponse(*cat))
 }
 
 // The color is checked before the rename so a bad one can't leave a
@@ -96,15 +97,15 @@ func (h *Handler) patchCategory(w http.ResponseWriter, r *http.Request) {
 		Name  *string `json:"name"`
 		Color *string `json:"color"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if body.Name == nil && body.Color == nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "name or color is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "name or color is required")
 		return
 	}
 	if body.Color != nil && !tags.IsValidCategoryColor(strings.TrimSpace(*body.Color)) {
-		apiError(w, http.StatusBadRequest, "invalid_request", tags.ErrInvalidCategoryColor.Error())
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", tags.ErrInvalidCategoryColor.Error())
 		return
 	}
 	if body.Name != nil {
@@ -124,7 +125,7 @@ func (h *Handler) patchCategory(w http.ResponseWriter, r *http.Request) {
 		writeCategoryError(w, err)
 		return
 	}
-	WriteJSON(w, http.StatusOK, toCategoryResponse(cat))
+	contract.WriteJSON(w, http.StatusOK, toCategoryResponse(cat))
 }
 
 func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
@@ -138,12 +139,12 @@ func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
 	}
 	// An empty body is the default move to general.
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		refuseJSONBody(w, err)
+		contract.RefuseJSONBody(w, err, maxJSONBody)
 		return
 	}
 	action := cmp.Or(body.Action, "move")
 	if action != "move" && action != "delete_all" {
-		apiError(w, http.StatusBadRequest, "invalid_request", "action must be 'move' or 'delete_all'")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "action must be 'move' or 'delete_all'")
 		return
 	}
 	if err := g.TagSvc.DeleteCategoryMoveOrDelete(id, action, body.TargetID); err != nil {

@@ -6,10 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"slices"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/config"
@@ -23,8 +20,7 @@ const appName = "monbooru"
 // Stamped "true" at link time (-X) by the desktop artifacts.
 var defaultDesktop string
 
-// A loopback request to a process that answers at once or is not there.
-const probeTimeout = 500 * time.Millisecond
+const bindWait = 45 * time.Second
 
 // A portable install keeps the config package's relative paths: OS-native
 // ones would pin the folder to the machine it was first run on.
@@ -70,56 +66,6 @@ func seedGalleryDir(l desktop.Layout) string {
 	return dir
 }
 
-// claimPort returns a diagnostic rather than exiting: the shutdown path
-// still owes the database and watchers a close.
-func claimPort(addr string, openBrowser bool) (string, bool) {
-	local := desktop.LoopbackAddr(addr)
-	inst, found := desktop.Probe(local, probeTimeout)
-	if !found {
-		return "", true
-	}
-	if inst.App == appName {
-		// stdout: a -no-browser launch from a terminal shows nothing else.
-		fmt.Printf("%s is already running on http://%s\n", appName, local)
-		if openBrowser {
-			if err := desktop.OpenBrowser("http://" + local); err != nil {
-				logx.Warnf("could not open a browser: %v", err)
-			}
-		}
-		return "", false
-	}
-	other := cmp.Or(inst.App, "another program")
-	return fmt.Sprintf("%s is already serving %s; free the port or set server.bind_address to another one", other, local), false
-}
-
-// bindFailure returns "" when the bind was lost to a running monbooru.
-func bindFailure(addr string, err error, openBrowser bool) string {
-	msg, proceed := claimPort(addr, openBrowser)
-	if msg == "" && proceed {
-		return fmt.Sprintf("could not listen on %s: %v; free the port or set server.bind_address to another one", addr, err)
-	}
-	return msg
-}
-
-// -no-browser is added: the page that asked for the restart reloads itself.
-func relaunch() {
-	exe := desktop.Program()
-	if exe == "" {
-		logx.Errorf("restart: locating this executable")
-		return
-	}
-	args := os.Args[1:]
-	if !slices.Contains(args, "-no-browser") {
-		args = append(slices.Clone(args), "-no-browser")
-	}
-	cmd := exec.Command(exe, args...)
-	if err := cmd.Start(); err != nil {
-		logx.Errorf("restart: %v", err)
-		return
-	}
-	_ = cmd.Process.Release()
-}
-
 // A shortcut launch on Windows has no console, so a startup failure must
 // reach a message box.
 var dialogOnFatal bool
@@ -155,27 +101,12 @@ func versionLine() string {
 	return line
 }
 
-func openWhenServing(addr string) {
-	local := desktop.LoopbackAddr(addr)
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if inst, found := desktop.Probe(local, probeTimeout); found && inst.App == appName {
-			if err := desktop.OpenBrowser("http://" + local); err != nil {
-				logx.Warnf("could not open a browser: %v", err)
-			}
-			return
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	logx.Warnf("the server did not answer in time; open http://%s yourself", local)
-}
-
 func runTray(ctx context.Context, srv *internalweb.Server, bindAddr string) {
 	local := desktop.LoopbackAddr(bindAddr)
 	hook := srv.DesktopHook()
 	err := desktop.RunTray(ctx, desktop.TrayMenu{
 		Title:    hook.Name,
-		IconPath: trayIconPath(),
+		IconPath: desktop.TrayIcon(appName),
 		Open: func() {
 			if err := desktop.OpenBrowser("http://" + local); err != nil {
 				logx.Warnf("could not open a browser: %v", err)
@@ -187,20 +118,4 @@ func runTray(ctx context.Context, srv *internalweb.Server, bindAddr string) {
 	if err != nil {
 		logx.Infof("tray: %v", err)
 	}
-}
-
-// Windows only: elsewhere the tray names its icon from the desktop theme.
-func trayIconPath() string {
-	if runtime.GOOS != "windows" {
-		return ""
-	}
-	dir := desktop.ExeDir()
-	if dir == "" {
-		return ""
-	}
-	p := filepath.Join(dir, appName+".ico")
-	if _, err := os.Stat(p); err != nil {
-		return ""
-	}
-	return p
 }

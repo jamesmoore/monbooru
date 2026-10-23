@@ -152,6 +152,10 @@ type detailData struct {
 	PreviewMaxDim  int
 	PluginSlot     pluginSlotView
 	RewrittenBy    int64
+	// Set for a row marked missing whose file is still there: LeftOut says
+	// why the gallery leaves it out, empty when the next sync restores it.
+	OnDisk  bool
+	LeftOut string
 }
 
 // External links go by sha because an image id can be reused after a delete.
@@ -418,6 +422,16 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 			mangaHint = cmp.Or(strings.TrimSpace(mangaMeta.Series), strings.TrimSpace(mangaMeta.Title), mangaHint)
 		}
 	}
+	var onDisk bool
+	var leftOut string
+	if img.IsMissing {
+		if _, err := os.Stat(img.CanonicalPath); err == nil {
+			onDisk = true
+			if err := s.active().Boundary().Check(img.CanonicalPath); err != nil {
+				leftOut = err.Error()
+			}
+		}
+	}
 	data := detailData{
 		baseData:          s.base(r, "gallery", fmt.Sprintf("%s - %s", titleName, s.booruName())),
 		Image:             *img,
@@ -469,6 +483,8 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		PreviewScaled:     previewScaled,
 		PreviewMaxDim:     gallery.ViewMaxDim,
 		RewrittenBy:       gallery.RewrittenBy(s.db().Read, img.ID),
+		OnDisk:            onDisk,
+		LeftOut:           leftOut,
 		PluginSlot:        s.pluginSlot(r, config.SlotDetailActions, id, img.FileType),
 	}
 	s.renderTemplate(w, "detail.html", data)

@@ -174,6 +174,15 @@ func gatherTaggerStats(s *Server) taggerCacheStats {
 	return out
 }
 
+func usageStats(total, free uint64) mountStats {
+	used := total - min(free, total)
+	pct := 0
+	if total > 0 {
+		pct = int((used * 100) / total)
+	}
+	return mountStats{TotalSize: int64(total), FreeSize: int64(free), UsedSize: int64(used), UsedPct: pct}
+}
+
 func gatherMemStats() memStats {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)

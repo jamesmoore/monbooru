@@ -24,6 +24,39 @@ type sha256DuplicateRow struct {
 	AliasPath     string
 }
 
+// A copy the gallery leaves out is another gallery's file, and only Go can
+// tell, so every row is scanned; total counts the kept ones and only the
+// window [offset, offset+limit) is held.
+func duplicatePaths(r *http.Request, cx *library.Gallery, offset, limit int) (window []sha256DuplicateRow, total int, err error) {
+	query := `SELECT i.id, i.canonical_path, ip.id, ip.path FROM images i
+		JOIN image_paths ip ON ip.image_id = i.id AND ip.is_canonical = 0`
+	args := []any{}
+	if where, wargs := resolveCeiling(r, cx).WhereOne("i.id"); where != "" {
+		query += ` WHERE ` + where
+		args = append(args, wargs...)
+	}
+	rows, err := cx.DB.Read.Query(query+` ORDER BY i.id, ip.id`, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	bound := cx.Boundary()
+	for rows.Next() {
+		var dr sha256DuplicateRow
+		if err := rows.Scan(&dr.ImageID, &dr.CanonicalPath, &dr.PathID, &dr.AliasPath); err != nil {
+			return nil, 0, err
+		}
+		if bound.Excludes(dr.AliasPath) {
+			continue
+		}
+		if total >= offset && total < offset+limit {
+			window = append(window, dr)
+		}
+		total++
+	}
+	return window, total, rows.Err()
+}
+
 type markedDuplicateRow struct {
 	GroupID         int64
 	OriginalID      int64
@@ -179,19 +212,19 @@ func (s *Server) sha256WalkerRemoveOnePost(w http.ResponseWriter, r *http.Reques
 	}
 	pathID, err := strconv.ParseInt(r.FormValue("path_id"), 10, 64)
 	if err != nil {
-		flashStatus(w, http.StatusBadRequest, "Invalid path id.")
+		flashHeaderErr(w, http.StatusBadRequest, "Invalid path id.")
 		return
 	}
 	var aliasPath string
 	if err := s.db().Read.QueryRow(
 		`SELECT path FROM image_paths WHERE id = ? AND is_canonical = 0`, pathID,
 	).Scan(&aliasPath); err != nil {
-		flashStatus(w, http.StatusNotFound, "Not a non-canonical path.")
+		flashHeaderErr(w, http.StatusNotFound, "Not a non-canonical path.")
 		return
 	}
 	res, err := s.active().DeleteCopies(context.Background(), []int64{pathID}, nil)
 	if err != nil {
-		flashStatus(w, http.StatusInternalServerError, err.Error())
+		flashHeaderErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if len(res.Kept) > 0 {
@@ -207,7 +240,7 @@ func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Reques
 	}
 	imageID, err := strconv.ParseInt(r.FormValue("image_id"), 10, 64)
 	if err != nil {
-		flashStatus(w, http.StatusBadRequest, "Invalid image id.")
+		flashHeaderErr(w, http.StatusBadRequest, "Invalid image id.")
 		return
 	}
 	cx, ok := s.requireActive(w)
@@ -226,10 +259,10 @@ func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Reques
 	).Scan(&originalID, &originalMissing, &originalPath)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		flashStatus(w, http.StatusNotFound, fmt.Sprintf("Image #%d is not a marked duplicate.", imageID))
+		flashHeaderErr(w, http.StatusNotFound, fmt.Sprintf("Image #%d is not a marked duplicate.", imageID))
 		return
 	case err != nil:
-		flashStatus(w, http.StatusInternalServerError, err.Error())
+		flashHeaderErr(w, http.StatusInternalServerError, err.Error())
 		return
 	case originalID == imageID:
 		flashStatus(w, http.StatusConflict, fmt.Sprintf("Image #%d is its group's original, so it was kept.", imageID))
@@ -240,11 +273,11 @@ func (s *Server) markedWalkerDeleteOnePost(w http.ResponseWriter, r *http.Reques
 	}
 	res, err := cx.DeleteImages(context.Background(), []int64{imageID}, library.DeleteOptions{}, nil)
 	if err != nil {
-		flashStatus(w, http.StatusInternalServerError, err.Error())
+		flashHeaderErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if len(res.Deleted) == 0 {
-		flashStatus(w, http.StatusNotFound, fmt.Sprintf("Image #%d is already gone.", imageID))
+		flashHeaderErr(w, http.StatusNotFound, fmt.Sprintf("Image #%d is already gone.", imageID))
 		return
 	}
 	hxDone(w, r, fmt.Sprintf("Deleted image #%d%s.", imageID, keptChanged(res.Changed)), "", "/relations/duplicates/marked")
@@ -267,7 +300,7 @@ func (s *Server) markedWalkerDeleteAllPost(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if len(members) == 0 {
-		writeInlineFlash(w, "ok", "Removed 0 marked duplicate(s).")
+		writeInlineFlash(w, "ok", "Removed 0 marked duplicates.")
 		return
 	}
 	s.goJob(w, models.JobTypeDelete, "Marked duplicate removal started.", func(ctx context.Context) {
@@ -285,7 +318,7 @@ func (s *Server) markedWalkerDeleteAllPost(w http.ResponseWriter, r *http.Reques
 			s.jobs.Update(done, total, "removing…")
 		})
 		removed := len(res.Deleted)
-		done := fmt.Sprintf("Removed %d marked duplicate(s)", removed)
+		done := fmt.Sprintf("Removed %d marked duplicate%s", removed, plural(removed))
 		if kept > 0 {
 			done += fmt.Sprintf("; kept %d whose original is missing", kept)
 		}

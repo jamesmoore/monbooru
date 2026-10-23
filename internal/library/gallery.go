@@ -65,8 +65,13 @@ type Gallery struct {
 }
 
 // Sync drops the caches itself, so no caller has to remember InvalidateCaches.
-func (cx *Gallery) Sync(ctx context.Context, maxFileSizeMB int, naming gallery.Naming, progress func(processed, total int, message string)) (gallery.SyncResult, error) {
-	result, err := gallery.Sync(ctx, cx.Handle, maxFileSizeMB, naming, progress, cx.InvalidateCaches, cx.phashSink())
+// changed runs before a progress tick that follows rows changing.
+func (cx *Gallery) Sync(ctx context.Context, maxFileSizeMB int, naming gallery.Naming, progress func(processed, total int, message string), changed func()) (gallery.SyncResult, error) {
+	onChange := func() {
+		cx.InvalidateCaches()
+		changed()
+	}
+	result, err := gallery.Sync(ctx, cx.Handle, maxFileSizeMB, naming, progress, onChange, cx.phashSink())
 	cx.InvalidateCaches()
 	return result, err
 }

@@ -1,8 +1,8 @@
-{{define "message_page.html"}}
+{{define "webui/message_page"}}
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-app="{{.App}}">
 <head>
-{{template "partials/head.html" .}}
+{{template "webui/head" .}}
 {{if .Poll}}<meta http-equiv="refresh" content="60;url=/">{{end}}
 </head>
 <body>
@@ -14,9 +14,7 @@
   </div>
   {{if .Poll}}
   <script>
-    // Reload once the new process answers: after a refused probe, or
-    // after 8 probes in case the restart was too quick to see. The meta
-    // refresh is the no-script fallback.
+    // After 8 probes even without a refusal, in case the restart was too quick to see.
     (function () {
       var down = false, tries = 0;
       var probe = function () {

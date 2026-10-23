@@ -11,13 +11,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/api"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/galleryio"
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 )
 
 type downloadRow struct {
@@ -137,10 +138,10 @@ func (s *Server) batchDownloadCount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	api.WriteJSON(w, http.StatusOK, map[string]any{
+	contract.WriteJSON(w, http.StatusOK, map[string]any{
 		"files":   len(plan.rows),
 		"bytes":   plan.bytes,
-		"size":    humanBytesFmt(plan.bytes),
+		"size":    webui.HumanBytes(plan.bytes),
 		"missing": plan.missing,
 	})
 }

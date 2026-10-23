@@ -17,6 +17,7 @@ import (
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
@@ -58,7 +59,7 @@ func autotagMemoryMark() func(scope string) {
 		}
 		var parts []string
 		if peak := readPeakRSS("self"); peak > baseline {
-			parts = append(parts, "+"+humanBytesFmt(int64(peak-baseline)))
+			parts = append(parts, "+"+webui.HumanBytes(int64(peak-baseline)))
 		}
 		if pid, ok := tagger.WorkerPID(); ok {
 			p, base := strconv.Itoa(pid), uint64(0)
@@ -66,7 +67,7 @@ func autotagMemoryMark() func(scope string) {
 				base = workerBase
 			}
 			if peak := readPeakRSS(p); peak > base {
-				parts = append(parts, "worker +"+humanBytesFmt(int64(peak-base)))
+				parts = append(parts, "worker +"+webui.HumanBytes(int64(peak-base)))
 			}
 		}
 		if len(parts) > 0 {
@@ -96,7 +97,7 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	for _, fh := range files {
 		totalBytes += fh.Size
 	}
-	logx.Infof("upload: ingesting %d file(s) (%s)", len(files), humanBytesFmt(totalBytes))
+	logx.Infof("upload: ingesting %d file(s) (%s)", len(files), webui.HumanBytes(totalBytes))
 
 	var addedIDs []int64
 	var dupeIDs []int64
@@ -167,7 +168,7 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	var msg strings.Builder
 	fmt.Fprintf(&msg, "%d added", added)
 	if dupes > 0 {
-		fmt.Fprintf(&msg, ", %d duplicate(s)", dupes)
+		fmt.Fprintf(&msg, ", %d duplicate%s", dupes, plural(dupes))
 		if len(dupeIDs) > 0 {
 			msg.WriteString(" (")
 			for i, id := range dupeIDs {
@@ -187,7 +188,7 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	}
 	failed := unsupported + ignored + unsaved
 	if failed > 0 {
-		fmt.Fprintf(&msg, ", %d error(s): %s", failed, uploadErrorReasons(unsupported, ignored, unsaved, refused))
+		fmt.Fprintf(&msg, ", %d error%s: %s", failed, plural(failed), uploadErrorReasons(unsupported, ignored, unsaved, refused))
 	}
 	if abandoned > 0 {
 		fmt.Fprintf(&msg, ", %d not saved: the gallery changed during the upload", abandoned)
@@ -268,7 +269,7 @@ func uploadErrorReasons(unsupported, ignored, unsaved int, refused []string) str
 		n             int
 		bare, counted string
 	}{
-		{unsupported, "unsupported file type", "%d unsupported file type(s)"},
+		{unsupported, "unsupported file type", "%d unsupported file type" + plural(unsupported)},
 		{ignored, "on the ignore list", "%d on the ignore list"},
 		{unsaved, "could not be saved", "%d could not be saved"},
 	} {
@@ -319,7 +320,7 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 	s.spawnAutoTagJob(ids, selected, 0)
 
 	if isHTMXRequest(r) {
-		setFlashHeader(w, fmt.Sprintf("Auto-tagger started for %d image(s).", len(ids)), "ok", nil)
+		setFlashHeader(w, fmt.Sprintf("Auto-tagger started for %d image%s.", len(ids), plural(len(ids))), "ok", nil)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}

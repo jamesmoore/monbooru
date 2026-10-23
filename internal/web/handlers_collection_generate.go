@@ -15,6 +15,7 @@ import (
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
@@ -30,9 +31,9 @@ func (s *Server) generateMangaCollection(w http.ResponseWriter, r *http.Request)
 	s.goGenerationJob(func(ctx context.Context) (string, error) {
 		done, created, err := s.runMangaCollection(ctx, cx, img, name, writeDir, naming)
 		if created == 0 {
-			return fmt.Sprintf("These %d page(s) are already in collection %q; nothing new was created.", done, name), err
+			return fmt.Sprintf("%s already in collection %q; nothing new was created.", pagesAre(done), name), err
 		}
-		return fmt.Sprintf("Generated %d page(s) into collection %q.", created, name), err
+		return fmt.Sprintf("Generated %d page%s into collection %q.", created, plural(created), name), err
 	})
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -152,11 +153,11 @@ type collectionCBZResult struct {
 
 func (r collectionCBZResult) summary() string {
 	if r.Existing != "" {
-		return fmt.Sprintf("These %d page(s) are already packed as %s; nothing new was created.", r.Pages, r.Existing)
+		return fmt.Sprintf("%s already packed as %s; nothing new was created.", pagesAre(r.Pages), r.Existing)
 	}
-	msg := fmt.Sprintf("Generated %d image(s) as %s.", r.Pages, r.Filename)
+	msg := fmt.Sprintf("Generated %d image%s as %s.", r.Pages, plural(r.Pages), r.Filename)
 	if r.Skipped > 0 {
-		msg += fmt.Sprintf(" %d member(s) skipped (missing files).", r.Skipped)
+		msg += fmt.Sprintf(" %d member%s skipped (missing files).", r.Skipped, plural(r.Skipped))
 	}
 	return msg
 }
@@ -209,7 +210,7 @@ func shortHash(hash string) string { return hash[:min(8, len(hash))] }
 const maxCBZStemBytes = 180
 
 func sanitizeCollectionFilename(name string) string {
-	out := gallery.TruncateFilename(gallery.SanitizeFilename(name), maxCBZStemBytes)
+	out := gallery.TruncateFilename(fsx.SanitizeFilename(name), maxCBZStemBytes)
 	if out == "" {
 		return "collection"
 	}
@@ -238,4 +239,11 @@ func (s *Server) extractMangaPageToGallery(ctx context.Context, cx *library.Gall
 		}
 	}
 	return page.ID, !folded, nil
+}
+
+func pagesAre(n int) string {
+	if n == 1 {
+		return "This page is"
+	}
+	return fmt.Sprintf("These %d pages are", n)
 }

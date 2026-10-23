@@ -10,6 +10,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/desktop"
 )
 
@@ -46,5 +47,5 @@ func resolveHealthAddr(configPath string) string {
 			addr = mc.Server.BindAddress
 		}
 	}
-	return desktop.LoopbackAddr(cmp.Or(addr, "127.0.0.1:8455"))
+	return desktop.LoopbackAddr(cmp.Or(addr, "127.0.0.1:"+contract.PortMonbooru))
 }

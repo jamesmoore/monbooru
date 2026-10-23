@@ -10,6 +10,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -188,7 +189,7 @@ func (s *Server) tagPtrLookupSearch(w http.ResponseWriter, r *http.Request) {
 	if isTypeahead {
 		mode := ""
 		if query.Get("anywhere") != "" {
-			mode = "contains"
+			mode = contract.SearchContains
 		}
 		clusters, truncated, err = s.ml.PTRSpellingSearch(ctx, q, mode, monloader.PTRSearchLimit)
 	} else {
@@ -272,16 +273,16 @@ func (s *Server) tagPtrLookupPreview(w http.ResponseWriter, r *http.Request) {
 		groups[i] = ptrLookupGroupView(g, tagForm, color)
 	}
 	aliasAdds, implAdds, declared, skipped := 0, 0, 0, 0
-	for _, g := range groups {
-		for _, row := range g.Rows {
-			switch row.Class {
-			case "ptr-row-staged":
-				if g.Title == "aliases" {
-					aliasAdds++
-				} else {
-					implAdds++
-				}
-			case "ptr-row-ctx":
+	for _, g := range found {
+		if g.Kind == monloader.LookupAliases {
+			aliasAdds += g.Adds
+		} else {
+			implAdds += g.Adds
+		}
+		for _, r := range g.Rows {
+			switch {
+			case r.Adds:
+			case r.Standing == monloader.StandingHeld:
 				declared++
 			default:
 				skipped++
