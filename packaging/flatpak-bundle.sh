@@ -3,8 +3,8 @@
 
 set -eu
 
-app=io.github.monbooru.Monbooru
-VERSION=$(tr -d '[:space:]' < VERSION.md)
+. ./packaging/release-env.sh
+app=io.github.monbooru.$(echo "$APP" | awk '{print toupper(substr($0, 1, 1)) substr($0, 2)}')
 
 runtime=$(awk -F"'" '/^runtime-version:/ {print $2}' "packaging/flatpak/$app.yml")
 
@@ -60,5 +60,5 @@ flatpak-builder --user --disable-rofiles-fuse --force-clean --repo=repo \
   build-dir "packaging/flatpak/$app.yml"
 
 flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
-  repo "dist/monbooru_${VERSION#v}_x86_64.flatpak" "$app"
+  repo "dist/${APP}_${VERSION#v}_x86_64.flatpak" "$app"
 ls -la dist

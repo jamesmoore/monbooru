@@ -10,6 +10,7 @@ Image=ghcr.io/monbooru/monbooru:latest
 #GroupAdd=993
 
 PublishPort=127.0.0.1:8455:8455
+Network=monbooru.network
 
 NoNewPrivileges=true
 ## Drop all capabilities. CHOWN + DAC_OVERRIDE are only needed if your
@@ -33,8 +34,13 @@ HealthInterval=30s
 HealthRetries=3
 HealthStartPeriod=10s
 HealthTimeout=5s
-HealthOnFailure=kill
+HealthOnFailure=restart
 
-# To install monloader, check https://github.com/monbooru/monloader
-# install it alongside this unit to pull from supported booru sites.
-#Network=monbooru.network
+# To pull from supported booru sites, install monloader's unit
+# (https://github.com/monbooru/monloader) beside this one and monbooru.network.
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

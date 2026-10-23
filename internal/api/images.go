@@ -81,14 +81,6 @@ func linkFirstSource(g *library.Gallery, source, derivative int64) {
 	}
 }
 
-type enrichRequest struct {
-	provenanceJSON
-	Tags       []string `json:"tags"`
-	SourceMD5  string   `json:"source_md5"`
-	Verify     bool     `json:"verify"`
-	Similarity float64  `json:"similarity"`
-}
-
 func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 	g, id, ok := h.galleryAndID(w, r)
 	if !ok {
@@ -97,17 +89,17 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 	var canonPath, storedMD5 string
 	switch err := g.DB.Read.QueryRow(`SELECT canonical_path, md5 FROM images WHERE id = ?`, id).Scan(&canonPath, &storedMD5); {
 	case errors.Is(err, sql.ErrNoRows):
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	case err != nil:
 		serverError(w, err)
 		return
 	}
-	var body enrichRequest
-	if !decodeJSON(w, r, &body) {
+	var body contract.EnrichRequest
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
-	prov, err := body.read()
+	prov, err := provenanceJSON{body.PostFields}.read()
 	if badRequest(w, err) {
 		return
 	}
@@ -142,7 +134,7 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 						logx.Warnf("api enrich: record md5 verdict: %v", err)
 					}
 					h.recordFetch(g, id, "mismatch", "the source returned a different file (hash mismatch); no tags applied")
-					apiError(w, http.StatusConflict, "hash_mismatch", "the source returned a different file")
+					contract.WriteError(w, http.StatusConflict, contract.CodeHashMismatch, "the source returned a different file")
 					return
 				}
 				verified = false
@@ -180,7 +172,7 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 	h.recordFetch(g, id, "ok", fetchSummary(sum, len(body.Tags)))
 	// A hash lookup reports its hit by enriching.
 	recordLookupHit(g, id, prov.source)
-	WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"merge": sum, "verified": verified}, tagWarnings))
+	contract.WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"merge": sum, "verified": verified}, tagWarnings))
 }
 
 func applySourceProvenance(g *library.Gallery, id int64, p provenance) (string, error) {
@@ -219,21 +211,21 @@ func (h *Handler) fetchStatusReport(w http.ResponseWriter, r *http.Request) {
 		Kind    string `json:"kind"`
 		Backend string `json:"backend"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if strings.TrimSpace(body.State) == "" {
-		apiError(w, http.StatusBadRequest, "invalid_request", "state is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "state is required")
 		return
 	}
 	h.recordFetch(g, id, body.State, firstRunes(body.Message, maxFetchMessageLen))
 	recordLookupTerminal(g, id, body.Kind, body.Backend, body.State)
-	WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	contract.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func recordLookupHit(g *library.Gallery, imageID int64, source string) {
 	backend := lookup.BackendBooru
-	if strings.EqualFold(strings.TrimSpace(source), "ptr") {
+	if strings.EqualFold(strings.TrimSpace(source), contract.SourcePTR) {
 		backend = lookup.BackendPTR
 	}
 	if err := g.Edit(func(d *db.DB) error { return lookup.RecordInFlight(d, imageID, backend, lookup.ResultHit, time.Now()) }); err != nil {
@@ -276,14 +268,14 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 		`SELECT sha256, file_type, width, height, file_size, canonical_path FROM images WHERE id = ?`, id,
 	).Scan(&curSHA, &fileType, &oldW, &oldH, &oldSize, &canonical); {
 	case errors.Is(err, sql.ErrNoRows):
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	case err != nil:
 		serverError(w, err)
 		return
 	}
 	if gallery.IsVideoType(fileType) || fileType == models.FileTypeCBZ {
-		h.refuse(w, g, id, "this file type cannot be replaced", http.StatusConflict, "wrong_type", "only image rows can have their file replaced")
+		h.refuse(w, g, id, "this file type cannot be replaced", http.StatusConflict, contract.CodeWrongType, "only image rows can have their file replaced")
 		return
 	}
 	if !gallery.NamedInside(g.GalleryPath, canonical) {
@@ -295,28 +287,32 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isMultipart(r.Header.Get("Content-Type")) {
-		apiError(w, http.StatusBadRequest, "invalid_request", "multipart body required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "multipart body required")
 		return
 	}
-	file, fh, err := r.FormFile("file")
+	file, fh, err := r.FormFile(contract.FieldFile)
 	if err != nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "missing file field")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "missing file field")
 		return
 	}
 	defer func() { _ = file.Close() }()
+	if maxMB := int64(h.cfg().Gallery.MaxFileSizeMB); maxMB > 0 && fh.Size > maxMB<<20 {
+		h.refuse(w, g, id, "the file is over the gallery's size cap", http.StatusRequestEntityTooLarge, contract.CodeFileTooLarge, fmt.Sprintf("file exceeds max size (%d MB)", maxMB))
+		return
+	}
 
 	prov, err := provenanceFromForm(r).read()
 	if badRequest(w, err) {
 		return
 	}
-	claimedMD5 := strings.TrimSpace(r.FormValue("md5"))
+	claimedMD5 := strings.TrimSpace(r.FormValue(contract.FieldMD5))
 	if err := validateMaxLen("md5", claimedMD5, maxSourceMD5Len); badRequest(w, err) {
 		return
 	}
 	var tags []string
-	if tagsJSON := r.FormValue("tags"); tagsJSON != "" {
+	if tagsJSON := r.FormValue(contract.FieldTags); tagsJSON != "" {
 		if err := json.Unmarshal([]byte(tagsJSON), &tags); err != nil {
-			apiError(w, http.StatusBadRequest, "invalid_request", "tags must be a JSON array of names")
+			contract.WriteError(w, http.StatusBadRequest, "invalid_request", "tags must be a JSON array of names")
 			return
 		}
 	}
@@ -325,7 +321,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	// half-written file.
 	staged, err := os.CreateTemp(g.ThumbnailsPath, "replace-*"+filepath.Ext(fh.Filename))
 	if err != nil {
-		apiError(w, http.StatusInternalServerError, "internal_error", "failed to stage upload")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to stage upload")
 		return
 	}
 	stagedPath := staged.Name()
@@ -334,12 +330,13 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(io.MultiWriter(staged, shaH, md5H), file); err != nil {
 		_ = staged.Close()
 		discardStaged()
-		apiError(w, http.StatusInternalServerError, "internal_error", "failed to save upload")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to save upload")
 		return
 	}
 	_ = staged.Close()
 	newSHA := hex.EncodeToString(shaH.Sum(nil))
 	newMD5 := hex.EncodeToString(md5H.Sum(nil))
+	upstreamMD5, rescued := newMD5, false
 
 	applyMeta := func() (gallery.MergeSummary, []string, bool) {
 		sum, tagWarnings, err := h.mergeSource(g, id, prov.source, prov.postID, prov.url, claimedMD5, prov.parentURL, prov.postFile, tags, "api")
@@ -353,7 +350,12 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 			return sum, tagWarnings, false
 		}
 		if prov.source != "" {
-			if err := g.Edit(func(d *db.DB) error { return gallery.MarkSourceExact(d, id, prov.source, prov.postID, newMD5) }); err != nil {
+			if err := g.Edit(func(d *db.DB) error {
+				if rescued {
+					return gallery.MarkSourceRescued(d, id, prov.source, prov.postID, upstreamMD5)
+				}
+				return gallery.MarkSourceExact(d, id, prov.source, prov.postID, newMD5)
+			}); err != nil {
 				h.refuse(w, g, id, "replace failed while recording the source state", http.StatusInternalServerError, "internal_error", err.Error())
 				return sum, tagWarnings, false
 			}
@@ -372,7 +374,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 			msg += " " + fetchSummary(sum, len(tags))
 		}
 		h.recordFetch(g, id, "ok", msg)
-		WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"replaced": false, "merge": sum}, tagWarnings))
+		contract.WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"replaced": false, "merge": sum}, tagWarnings))
 		return
 	}
 
@@ -389,9 +391,9 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 				logx.Debugf("api replace: duplicate link %d - %d skipped: %v", id, otherID, err)
 			}
 		}
-		h.recordFetch(g, id, "already_exists",
+		h.recordFetch(g, id, contract.CodeAlreadyExists,
 			fmt.Sprintf("You already hold the original as image %d.", otherID))
-		apiError(w, http.StatusConflict, "already_exists",
+		contract.WriteError(w, http.StatusConflict, contract.CodeAlreadyExists,
 			fmt.Sprintf("the original already exists as image %d", otherID))
 		return true
 	}
@@ -410,11 +412,11 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if gallery.IsVideoType(newType) || newType == models.FileTypeCBZ {
 		discardStaged()
-		h.refuse(w, g, id, "the source serves a video or archive; only image files can replace an image", http.StatusConflict, "wrong_type", "the replacement must be an image file")
+		h.refuse(w, g, id, "the source serves a video or archive; only image files can replace an image", http.StatusConflict, contract.CodeWrongType, "the replacement must be an image file")
 		return
 	}
 	if !gallery.IsFFmpegStill(newType) && !canDecodeImage(stagedPath) {
-		rescued := newType == models.FileTypeJPEG && jpegBytes(stagedPath) &&
+		rescued = newType == models.FileTypeJPEG && jpegBytes(stagedPath) &&
 			gallery.NormalizeImage(stagedPath) == nil && canDecodeImage(stagedPath)
 		if !rescued {
 			discardStaged()
@@ -460,7 +462,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 		msg += " " + fetchSummary(sum, len(tags))
 	}
 	h.recordFetch(g, id, "ok", msg)
-	WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"replaced": true, "merge": sum}, tagWarnings))
+	contract.WriteJSON(w, http.StatusOK, withWarnings(map[string]any{"replaced": true, "merge": sum}, tagWarnings))
 }
 
 func dimsLabel(w, h *int) string {
@@ -513,12 +515,13 @@ func undecodableJPEG(f io.ReadSeeker) bool {
 
 // The rescue runs in dir, outside the watched gallery, so the watcher
 // never sees the bytes it replaces. The caller removes the file.
-func rescueJPEG(dir string, src io.Reader) (*os.File, error) {
+func rescueJPEG(dir string, src io.Reader) (*os.File, string, error) {
 	staged, err := os.CreateTemp(dir, "rescue-*.jpg")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	_, err = io.Copy(staged, src)
+	md5H := md5.New()
+	_, err = io.Copy(io.MultiWriter(staged, md5H), src)
 	_ = staged.Close()
 	if err == nil {
 		err = gallery.NormalizeImage(staged.Name())
@@ -529,11 +532,11 @@ func rescueJPEG(dir string, src io.Reader) (*os.File, error) {
 	if err == nil {
 		var rescued *os.File
 		if rescued, err = os.Open(staged.Name()); err == nil {
-			return rescued, nil
+			return rescued, hex.EncodeToString(md5H.Sum(nil)), nil
 		}
 	}
 	_ = os.Remove(staged.Name())
-	return nil, err
+	return nil, "", err
 }
 
 func (h *Handler) buildImageResponse(g *library.Gallery, imageID int64) (*imageResponse, error) {
@@ -629,13 +632,13 @@ func (h *Handler) getImage(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.buildImageResponse(g, id)
 	if errors.Is(err, sql.ErrNoRows) {
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	}
 	if serverError(w, err) {
 		return
 	}
-	WriteJSON(w, http.StatusOK, resp)
+	contract.WriteJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
@@ -654,7 +657,7 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 		ScheduledLookup    *bool   `json:"scheduled_lookup"`
 		ScheduledLookupPTR *bool   `json:"scheduled_lookup_ptr"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 
@@ -700,11 +703,11 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 		if body.CollectionOrder != nil {
 			n := *body.CollectionOrder
 			if n < 1 {
-				apiError(w, http.StatusBadRequest, "invalid_request", "collection_order must be 1 or higher")
+				contract.WriteError(w, http.StatusBadRequest, "invalid_request", "collection_order must be 1 or higher")
 				return
 			}
 			if homeName == "" {
-				apiError(w, http.StatusBadRequest, "invalid_request", "collection_order requires a non-empty collection")
+				contract.WriteError(w, http.StatusBadRequest, "invalid_request", "collection_order requires a non-empty collection")
 				return
 			}
 			homeOrder = &n
@@ -717,7 +720,7 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 	flags := map[gallery.ImageFlag]*bool{gallery.FlagFavorited: body.IsFavorited, gallery.FlagInbox: body.IsInbox}
 	lookups := map[string]*bool{lookup.BackendBooru: body.ScheduledLookup, lookup.BackendPTR: body.ScheduledLookupPTR}
 	if body.IsFavorited == nil && body.IsInbox == nil && body.ScheduledLookup == nil && body.ScheduledLookupPTR == nil && !setHome && !setSrc {
-		apiError(w, http.StatusBadRequest, "invalid_request", "no editable fields supplied")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "no editable fields supplied")
 		return
 	}
 
@@ -725,7 +728,7 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 	if setSrc {
 		if err := g.Edit(func(d *db.DB) error { return gallery.SetPrimarySource(d, id, srcSite, srcURL) }); err != nil {
 			if errors.Is(err, gallery.ErrSourceIdentityExists) {
-				apiError(w, http.StatusConflict, "conflict", err.Error())
+				contract.WriteError(w, http.StatusConflict, "conflict", err.Error())
 				return
 			}
 			serverError(w, err)
@@ -754,13 +757,13 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.buildImageResponse(g, id)
 	if errors.Is(err, sql.ErrNoRows) {
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	}
 	if serverError(w, err) {
 		return
 	}
-	WriteJSON(w, http.StatusOK, resp)
+	contract.WriteJSON(w, http.StatusOK, resp)
 }
 
 func atoiOrZero(v string) int {
@@ -801,6 +804,7 @@ type createInput struct {
 	taggerName      string
 	via             string
 	md5             string // md5 the source claimed
+	rescuedMD5      string // md5 of the pushed bytes a rescue re-encoded
 	collection      string
 	collectionOrder *int
 	naming          gallery.Naming
@@ -812,9 +816,9 @@ type createInput struct {
 
 func (h *Handler) parseCreateMultipart(w http.ResponseWriter, r *http.Request, g *library.Gallery) (createInput, bool) {
 	var in createInput
-	file, fh, err := r.FormFile("file")
+	file, fh, err := r.FormFile(contract.FieldFile)
 	if err != nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "missing file field")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "missing file field")
 		return in, false
 	}
 	in.closeUpload = func() { _ = file.Close() }
@@ -825,25 +829,25 @@ func (h *Handler) parseCreateMultipart(w http.ResponseWriter, r *http.Request, g
 		}
 	}()
 
-	in.folder = strings.TrimSpace(r.FormValue("folder"))
+	in.folder = strings.TrimSpace(r.FormValue(contract.FieldFolder))
 	in.autotag = isTrue(r.FormValue("autotag"))
 	in.taggerName = strings.TrimSpace(r.FormValue("tagger_name"))
-	in.via = strings.TrimSpace(r.FormValue("via"))
-	if badRequest(w, validateVia(in.via)) {
+	in.via = strings.TrimSpace(r.FormValue(contract.FieldVia))
+	if badRequest(w, contract.ValidateVia(in.via)) {
 		return in, false
 	}
-	in.md5 = strings.TrimSpace(r.FormValue("md5"))
-	if tagsJSON := r.FormValue("tags"); tagsJSON != "" {
+	in.md5 = strings.TrimSpace(r.FormValue(contract.FieldMD5))
+	if tagsJSON := r.FormValue(contract.FieldTags); tagsJSON != "" {
 		if err := json.Unmarshal([]byte(tagsJSON), &in.initialTags); err != nil {
-			apiError(w, http.StatusBadRequest, "invalid_request", "tags must be a JSON array of names")
+			contract.WriteError(w, http.StatusBadRequest, "invalid_request", "tags must be a JSON array of names")
 			return in, false
 		}
 	}
-	in.collection = strings.TrimSpace(r.FormValue("collection"))
-	if raw := strings.TrimSpace(r.FormValue("collection_order")); raw != "" {
+	in.collection = strings.TrimSpace(r.FormValue(contract.FieldCollection))
+	if raw := strings.TrimSpace(r.FormValue(contract.FieldCollectionOrder)); raw != "" {
 		n, convErr := strconv.Atoi(raw)
 		if convErr != nil {
-			apiError(w, http.StatusBadRequest, "invalid_request", "collection_order must be an integer")
+			contract.WriteError(w, http.StatusBadRequest, "invalid_request", "collection_order must be an integer")
 			return in, false
 		}
 		in.collectionOrder = &n
@@ -863,9 +867,9 @@ func (h *Handler) parseCreateMultipart(w http.ResponseWriter, r *http.Request, g
 
 	in.upload = file
 	if undecodableJPEG(file) {
-		rescued, err := rescueJPEG(g.ThumbnailsPath, file)
+		rescued, upstreamMD5, err := rescueJPEG(g.ThumbnailsPath, file)
 		if err != nil {
-			apiError(w, http.StatusUnsupportedMediaType, "unsupported_type", "file does not decode as an image")
+			contract.WriteError(w, http.StatusUnsupportedMediaType, "unsupported_type", "file does not decode as an image")
 			return in, false
 		}
 		in.closeUpload = func() {
@@ -874,6 +878,7 @@ func (h *Handler) parseCreateMultipart(w http.ResponseWriter, r *http.Request, g
 			_ = os.Remove(rescued.Name())
 		}
 		in.upload = rescued
+		in.rescuedMD5 = upstreamMD5
 	}
 	in.uploadName = gallery.SanitizeReceivedName(fh.Filename)
 	in.destDir = destDir
@@ -895,11 +900,11 @@ func (h *Handler) parseCreateJSON(w http.ResponseWriter, r *http.Request, g *lib
 		Collection      string   `json:"collection"`
 		CollectionOrder *int     `json:"collection_order"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return in, false
 	}
 	if body.Path == "" {
-		apiError(w, http.StatusBadRequest, "invalid_request", "path is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "path is required")
 		return in, false
 	}
 	imgPath := body.Path
@@ -908,7 +913,7 @@ func (h *Handler) parseCreateJSON(w http.ResponseWriter, r *http.Request, g *lib
 	in.autotag = body.Autotag
 	in.taggerName = strings.TrimSpace(body.TaggerName)
 	in.via = strings.TrimSpace(body.Via)
-	if badRequest(w, validateVia(in.via)) {
+	if badRequest(w, contract.ValidateVia(in.via)) {
 		return in, false
 	}
 	in.md5 = strings.TrimSpace(body.MD5)
@@ -930,31 +935,38 @@ func (h *Handler) parseCreateJSON(w http.ResponseWriter, r *http.Request, g *lib
 	// operator never meant to manage.
 	absPath, absErr := filepath.Abs(imgPath)
 	if absErr != nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "invalid path")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid path")
 		return in, false
 	}
 	galleryAbs, gErr := filepath.Abs(g.GalleryPath)
 	if gErr != nil {
-		apiError(w, http.StatusInternalServerError, "internal_error", "gallery path unresolvable")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "gallery path unresolvable")
 		return in, false
 	}
 	rel, relErr := filepath.Rel(galleryAbs, absPath)
 	if relErr != nil || !filepath.IsLocal(rel) {
-		apiError(w, http.StatusBadRequest, "invalid_request", "path must be inside the gallery root")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "path must be inside the gallery root")
 		return in, false
 	}
 	in.imgPath = filepath.Join(galleryAbs, rel)
 	if err := g.Boundary().Check(in.imgPath); err != nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "path is not this gallery's: "+err.Error())
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "path is not this gallery's: "+err.Error())
 		return in, false
 	}
 
 	// A fixed message, so the response never echoes the filesystem layout.
 	if _, statErr := os.Stat(in.imgPath); os.IsNotExist(statErr) {
-		apiError(w, http.StatusBadRequest, "not_found", "file not found")
+		contract.WriteError(w, http.StatusBadRequest, "not_found", "file not found")
 		return in, false
 	}
 	return in, true
+}
+
+func markRescued(g *library.Gallery, id int64, in createInput) error {
+	if in.rescuedMD5 == "" || in.source == "" {
+		return nil
+	}
+	return g.Edit(func(d *db.DB) error { return gallery.MarkSourceRescued(d, id, in.source, in.postID, in.rescuedMD5) })
 }
 
 func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
@@ -1006,15 +1018,15 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch library.LandStageOf(err) {
 		case library.LandPlace:
-			apiError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			contract.WriteError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		case library.LandWrite:
-			apiError(w, http.StatusInternalServerError, "internal_error", "failed to save upload")
+			contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to save upload")
 		case library.LandSize:
-			apiError(w, http.StatusRequestEntityTooLarge, "file_too_large", fmt.Sprintf("file exceeds max size (%d MB)", maxMB))
+			contract.WriteError(w, http.StatusRequestEntityTooLarge, contract.CodeFileTooLarge, fmt.Sprintf("file exceeds max size (%d MB)", maxMB))
 		case library.LandType:
-			apiError(w, http.StatusBadRequest, "unsupported_type", "unsupported or unrecognised file type")
+			contract.WriteError(w, http.StatusBadRequest, "unsupported_type", "unsupported or unrecognised file type")
 		case library.LandCheck:
-			apiError(w, http.StatusUnsupportedMediaType, "unsupported_type", "file does not decode as an image")
+			contract.WriteError(w, http.StatusUnsupportedMediaType, "unsupported_type", "file does not decode as an image")
 		default:
 			logx.Warnf("api createImage ingest: %v", err)
 			serverError(w, err)
@@ -1030,13 +1042,18 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 		sum, tagWarnings, mergeErr := h.mergeSource(g, img.ID, in.source, in.postID, in.url, in.md5, in.parentURL, in.postFile, in.initialTags, in.via)
 		if mergeErr != nil {
 			logx.Warnf("api createImage merge: %v", mergeErr)
-			apiError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+mergeErr.Error())
+			contract.WriteError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+mergeErr.Error())
 			return
 		}
 		linkParentRelations(g, img.ID, in.url, in.parentURL)
 		if step, err := applySourceProvenance(g, img.ID, in.provenance); err != nil {
 			logx.Warnf("api createImage %s: %v", step, err)
-			apiError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+err.Error())
+			contract.WriteError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+err.Error())
+			return
+		}
+		if err := markRescued(g, img.ID, in); err != nil {
+			logx.Warnf("api createImage rescue mark: %v", err)
+			contract.WriteError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+err.Error())
 			return
 		}
 		if in.collection != "" {
@@ -1046,16 +1063,16 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 				return gallery.AddCollectionMembership(d, img.ID, in.collection, in.collectionOrder)
 			}); err != nil {
 				logx.Warnf("api createImage collection: %v", err)
-				apiError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+err.Error())
+				contract.WriteError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+err.Error())
 				return
 			}
 		}
 		resp, respErr := h.buildImageResponse(g, img.ID)
 		if respErr != nil {
-			apiError(w, http.StatusInternalServerError, "internal_error", "failed to build response")
+			contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to build response")
 			return
 		}
-		WriteJSON(w, http.StatusOK, withWarnings(map[string]any{
+		contract.WriteJSON(w, http.StatusOK, withWarnings(map[string]any{
 			"image":       resp,
 			"alias_added": aliasAdded,
 			"merge":       sum,
@@ -1067,7 +1084,12 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 		return gallery.ApplyCreateProvenance(d, img.ID, in.source, in.postID, in.url, in.md5, in.parentURL, in.collection, in.commentary, in.translated, in.original, in.postFile, in.collectionOrder)
 	}); err != nil {
 		logx.Warnf("api createImage provenance: %v", err)
-		apiError(w, http.StatusInternalServerError, "internal_error", "failed to set provenance fields")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to set provenance fields")
+		return
+	}
+	if err := markRescued(g, img.ID, in); err != nil {
+		logx.Warnf("api createImage rescue mark: %v", err)
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to set provenance fields")
 		return
 	}
 	linkParentRelations(g, img.ID, in.url, in.parentURL)
@@ -1087,7 +1109,7 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 	_, tagWarnings, err := h.applyInitialTags(g, img.ID, in.initialTags, tagVia)
 	if err != nil {
 		logx.Warnf("api createImage tags: %v", err)
-		apiError(w, http.StatusInternalServerError, "internal_error", "failed to apply tags")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to apply tags")
 		return
 	}
 
@@ -1123,7 +1145,7 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.buildImageResponse(g, img.ID)
 	if err != nil {
-		apiError(w, http.StatusInternalServerError, "internal_error", "failed to build response")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "failed to build response")
 		return
 	}
 
@@ -1132,10 +1154,10 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 		if autotagNote != "" {
 			envelope["autotag"] = autotagNote
 		}
-		WriteJSON(w, http.StatusCreated, envelope)
+		contract.WriteJSON(w, http.StatusCreated, envelope)
 		return
 	}
-	WriteJSON(w, http.StatusCreated, resp)
+	contract.WriteJSON(w, http.StatusCreated, resp)
 }
 
 func isTrue(v string) bool {
@@ -1159,7 +1181,7 @@ func (h *Handler) deleteImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(res.Deleted) == 0 {
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 		return
 	}
 
@@ -1172,7 +1194,7 @@ func (h *Handler) deleteImage(w http.ResponseWriter, r *http.Request) {
 		body["kept_changed_files"] = res.Changed
 	}
 	if len(body) > 0 {
-		WriteJSON(w, http.StatusOK, body)
+		contract.WriteJSON(w, http.StatusOK, body)
 		return
 	}
 
@@ -1320,7 +1342,7 @@ func (h *Handler) listImageTags(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	WriteJSON(w, http.StatusOK, loadImageTagsJSON(g, id))
+	contract.WriteJSON(w, http.StatusOK, loadImageTagsJSON(g, id))
 }
 
 func (h *Handler) addImageTags(w http.ResponseWriter, r *http.Request) {
@@ -1333,16 +1355,16 @@ func (h *Handler) addImageTags(w http.ResponseWriter, r *http.Request) {
 		Tags []string `json:"tags"`
 		Via  string   `json:"via"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if len(body.Tags) == 0 {
-		apiError(w, http.StatusBadRequest, "invalid_request",
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request",
 			"`tags` is required and must contain at least one name")
 		return
 	}
 	via := strings.TrimSpace(body.Via)
-	if err := validateVia(via); badRequest(w, err) {
+	if err := contract.ValidateVia(via); badRequest(w, err) {
 		return
 	}
 
@@ -1357,13 +1379,13 @@ func (h *Handler) addImageTags(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) writeImageTagsResponse(w http.ResponseWriter, g *library.Gallery, id int64, tagWarnings []string) {
 	tags := loadImageTagsJSON(g, id)
 	if len(tagWarnings) > 0 {
-		WriteJSON(w, http.StatusOK, map[string]any{
+		contract.WriteJSON(w, http.StatusOK, map[string]any{
 			"tags":         tags,
 			"tag_warnings": tagWarnings,
 		})
 		return
 	}
-	WriteJSON(w, http.StatusOK, tags)
+	contract.WriteJSON(w, http.StatusOK, tags)
 }
 
 // Not the full image response: its provenance, collection and lookup
@@ -1435,11 +1457,11 @@ func (h *Handler) removeImageTags(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Tags []string `json:"tags"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if len(body.Tags) == 0 {
-		apiError(w, http.StatusBadRequest, "invalid_request",
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request",
 			"`tags` is required and must contain at least one name")
 		return
 	}
@@ -1448,7 +1470,7 @@ func (h *Handler) removeImageTags(w http.ResponseWriter, r *http.Request) {
 	for _, tagName := range body.Tags {
 		tagID, err := h.resolveImageTagID(g, id, tagName)
 		if errors.Is(err, errTagAmbiguous) {
-			apiError(w, http.StatusConflict, "conflict", err.Error())
+			contract.WriteError(w, http.StatusConflict, "conflict", err.Error())
 			return
 		}
 		if serverError(w, err) {
@@ -1462,7 +1484,7 @@ func (h *Handler) removeImageTags(w http.ResponseWriter, r *http.Request) {
 	if len(tagIDs) > 0 {
 		err := g.TagSvc.RemoveTagsFromOneImage(id, tagIDs)
 		if errors.Is(err, tags.ErrTagImplied) {
-			apiError(w, http.StatusConflict, "tag_implied", err.Error())
+			contract.WriteError(w, http.StatusConflict, "tag_implied", err.Error())
 			return
 		}
 		if serverError(w, err) {

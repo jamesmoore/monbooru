@@ -5,16 +5,18 @@ package lookup
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 const (
-	BackendPTR   = "ptr"
-	BackendBooru = "booru"
+	BackendPTR   = contract.LookupPTR
+	BackendBooru = contract.LookupBooru
 )
 
 // Backends lists the history rows a lookup on monloader's backend covers.
 func Backends(name string) []string {
-	if name == "all" {
+	if name == contract.LookupAll {
 		return []string{BackendPTR, BackendBooru}
 	}
 	return []string{name}

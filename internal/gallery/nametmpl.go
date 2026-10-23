@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
@@ -252,7 +253,7 @@ func (t *NameTemplate) Render(f NameFacts) (string, error) {
 			// The row's own directory is already root-bounded, and
 			// tidyNamePath cleans each of its segments.
 			if v = p.value(f); p.tok != tokFolder {
-				v = SanitizeFilename(v)
+				v = fsx.SanitizeFilename(v)
 			}
 			if v == "" {
 				// The separator before an empty token goes with it:
@@ -353,7 +354,7 @@ func tidyNamePath(s string) string {
 	for _, seg := range segs {
 		// Literal text reaches the path too, so each segment is
 		// sanitized, not only the tokens.
-		seg = strings.Trim(SanitizeFilename(seg), "-_ ")
+		seg = strings.Trim(fsx.SanitizeFilename(seg), "-_ ")
 		if seg = TruncateFilename(seg, maxNameBytes); seg != "" {
 			kept = append(kept, seg)
 		}
@@ -365,29 +366,13 @@ func trimSeparatorSuffix(b []byte) []byte {
 	return []byte(strings.TrimRight(string(b), "-_ "))
 }
 
-// SanitizeFilename folds only what a filesystem refuses, so a name in any
-// script keeps its letters. It uses Windows' set, as galleries are often
-// shared over SMB, and trims the trailing dots and spaces Windows drops.
-func SanitizeFilename(s string) string {
-	return strings.Trim(foldFilename(s), " .")
-}
+// A browser percent-encodes these in a multipart filename (WHATWG form encoding).
+var formFilenameEscapes = strings.NewReplacer("%22", "\"", "%0A", "\n", "%0D", "\r")
 
 // SanitizeReceivedName keeps a sender's leading dots, which the ignore list
 // matches dotfiles by.
 func SanitizeReceivedName(s string) string {
-	return strings.TrimRight(foldFilename(s), " .")
-}
-
-func foldFilename(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f || strings.ContainsRune(`<>:"/\|?*`, r) {
-			b.WriteRune('_')
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
+	return strings.TrimRight(fsx.FoldFilename(formFilenameEscapes.Replace(s)), " .")
 }
 
 func TruncateFilename(s string, max int) string {

@@ -22,7 +22,7 @@ const (
 func writeFetchPending(w http.ResponseWriter, id, n int64) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprintf(w,
-		`<span class="fetch-status-msg monloader-accent" hx-get="/internal/images/%d/fetch-status?n=%d" hx-trigger="load delay:%dms" hx-swap="outerHTML">Fetching data via monloader...</span>`,
+		`<span class="fetch-status-msg peer-accent" hx-get="/internal/images/%d/fetch-status?n=%d" hx-trigger="load delay:%dms" hx-swap="outerHTML">Fetching data via monloader...</span>`,
 		id, n+1, fetchPollDelayMs)
 }
 
@@ -100,7 +100,7 @@ func lookupMissBody(trail, hashes string) string {
 			// A PTR match sets no source URL, so the lookup reports a
 			// miss even though its tags landed.
 			b.WriteString("<div>" + html.EscapeString(entry))
-			if strings.HasPrefix(entry, contract.TrailPTR+": match") {
+			if strings.HasPrefix(entry, contract.TrailPTR+contract.TrailMatch) {
 				b.WriteString(" (reload the page to see them)")
 			}
 			b.WriteString("</div>")

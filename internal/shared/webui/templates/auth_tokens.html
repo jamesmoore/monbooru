@@ -1,9 +1,9 @@
-{{define "partials/auth_tokens.html"}}
+{{define "webui/auth_tokens"}}
 <div id="auth-tokens"{{if .OOB}} hx-swap-oob="true"{{end}}>
   {{if .Tokens}}
   <div class="table-scroll">
-  <table class="gallery-table">
-    <thead><tr><th>Name</th><th>Created</th><th>Scopes</th><th>Config</th><th>Revoke</th></tr></thead>
+  <table class="data-table">
+    <thead><tr><th>Name</th><th>Created</th><th>Scopes</th><th>Config</th><th class="cell-action">Revoke</th></tr></thead>
     <tbody>
       {{range .Tokens}}
       <tr>
@@ -17,7 +17,7 @@
                   hx-trigger="click once"
                   onclick="document.getElementById('token-cfg-{{.ID}}').showModal()">Config</button>
         </td>
-        <td>
+        <td class="cell-action">
           {{if .Paired}}<span class="field-hint">via pairing</span>{{else}}
           <button class="btn-sm btn-danger"
                   hx-delete="/settings/auth/tokens/{{.ID}}"

@@ -9,6 +9,7 @@
     <a href="/tags/{{.ImpliedID}}" class="tag-chip-name" title="Tag details">{{.ImpliedName}}</a>
     <button class="tag-remove-btn"
             hx-delete="/tags/{{.ParentID}}/implications/{{.ImpliedID}}"
+            hx-target="#tag-flash"
             hx-confirm="Remove the implication that {{$.Parent.Name}} implies {{.ImpliedName}}?"
             data-confirm-ok="Remove"
             hx-on::after-request="if(event.detail.successful){pruneRelationRow(this)}"

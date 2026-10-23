@@ -162,20 +162,8 @@ func mountUsage(path string) (mountStats, uint64, bool) {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return mountStats{}, 0, false
 	}
-	bsize := uint64(st.Bsize)
-	total := st.Blocks * bsize
 	// Bavail, as df reports it: Bfree also counts the root-reserved blocks.
-	free := st.Bavail * bsize
-	used := total - min(free, total)
-	pct := 0
-	if total > 0 {
-		pct = int((used * 100) / total)
-	}
+	bsize := uint64(st.Bsize)
 	fsid := uint64(uint32(st.Fsid.X__val[0]))<<32 | uint64(uint32(st.Fsid.X__val[1]))
-	return mountStats{
-		TotalSize: int64(total),
-		FreeSize:  int64(free),
-		UsedSize:  int64(used),
-		UsedPct:   pct,
-	}, fsid, true
+	return usageStats(st.Blocks*bsize, st.Bavail*bsize), fsid, true
 }

@@ -3,10 +3,6 @@
 package config
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
@@ -16,14 +12,16 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/monbooru/monbooru/internal/fsx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/apitoken"
+	"github.com/monbooru/monbooru/internal/shared/contract"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/pairing"
 )
 
 type Config struct {
@@ -160,15 +158,12 @@ const (
 
 var PluginVars = []string{PluginVarImageID, PluginVarGallery, PluginVarBackURL}
 
-var (
-	pluginNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
-	pluginVarRe  = regexp.MustCompile(`\{[^}]*\}`)
-)
+var pluginVarRe = regexp.MustCompile(`\{[^}]*\}`)
 
 var reservedPluginNames = []string{"monbooru", "api", "default"}
 
 func ValidatePluginName(name string) error {
-	if !pluginNameRe.MatchString(name) {
+	if !pairing.ValidApp(name) {
 		return fmt.Errorf("plugin name %q must match [A-Za-z0-9_-]{1,32}", name)
 	}
 	if slices.Contains(reservedPluginNames, strings.ToLower(name)) {
@@ -226,14 +221,6 @@ func ValidatePluginButtons(buttons []PluginButton) error {
 		}
 	}
 	return nil
-}
-
-func (cfg *Config) FindPairedToken(app string) *Token {
-	i := slices.IndexFunc(cfg.Auth.Tokens, func(t Token) bool { return t.Paired == app })
-	if i < 0 {
-		return nil
-	}
-	return &cfg.Auth.Tokens[i]
 }
 
 func (cfg *Config) FindPlugin(name string) *PluginConfig {
@@ -335,121 +322,19 @@ func (t TaggerInstance) AppliesToGallery(name string) bool {
 }
 
 type AuthConfig struct {
-	EnablePassword      bool    `toml:"enable_password"`
-	PasswordHash        string  `toml:"password_hash"`
-	SessionLifetimeDays int     `toml:"session_lifetime_days"`
-	Tokens              []Token `toml:"tokens,omitempty"`
+	EnablePassword      bool          `toml:"enable_password"`
+	PasswordHash        string        `toml:"password_hash"`
+	SessionLifetimeDays int           `toml:"session_lifetime_days"`
+	Tokens              apitoken.List `toml:"tokens,omitempty"`
 }
 
 const (
-	ScopeRead   = "read"
-	ScopeWrite  = "write"
+	ScopeRead   = contract.ScopeRead
+	ScopeWrite  = contract.ScopeWrite
 	ScopeDelete = "delete"
 )
 
 var AllScopes = []string{ScopeRead, ScopeWrite, ScopeDelete}
-
-func FilterScopes(in []string) []string {
-	var out []string
-	for _, sc := range AllScopes {
-		if slices.Contains(in, sc) {
-			out = append(out, sc)
-		}
-	}
-	return out
-}
-
-type Token struct {
-	ID        string   `toml:"id"`
-	Name      string   `toml:"name"`
-	TokenHash string   `toml:"token_hash"`
-	Scopes    []string `toml:"scopes"`
-	CreatedAt string   `toml:"created_at"`
-	Paired    string   `toml:"paired,omitempty"`
-	PeerURL   string   `toml:"peer_url,omitempty"`
-}
-
-func (t Token) HasScope(scope string) bool { return slices.Contains(t.Scopes, scope) }
-
-func HashToken(secret string) string {
-	sum := sha256.Sum256([]byte(secret))
-	return hex.EncodeToString(sum[:])
-}
-
-func GenerateSecret() string { return randomHex(16) }
-
-func newTokenID() string { return randomHex(8) }
-
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	_, _ = rand.Read(buf)
-	return hex.EncodeToString(buf)
-}
-
-// An operator's token must not pass for one the pairing flow minted.
-func reservedTokenName(name string) bool {
-	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(name)), "(paired)")
-}
-
-func ValidateTokenName(name string) error {
-	n := strings.TrimSpace(name)
-	if n == "" {
-		return fmt.Errorf("token name must not be empty")
-	}
-	if reservedTokenName(n) {
-		return fmt.Errorf("token names ending in \"(paired)\" are reserved")
-	}
-	return nil
-}
-
-// GenerateToken belongs outside a replayed config mutation, so the id,
-// secret and timestamp stay stable.
-func GenerateToken(name string, scopes []string) (Token, string) {
-	secret := GenerateSecret()
-	return Token{
-		ID:        newTokenID(),
-		Name:      name,
-		TokenHash: HashToken(secret),
-		Scopes:    scopes,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-	}, secret
-}
-
-func (cfg *Config) TokenNameExists(name string) bool {
-	n := strings.ToLower(strings.TrimSpace(name))
-	return slices.ContainsFunc(cfg.Auth.Tokens, func(t Token) bool { return strings.ToLower(t.Name) == n })
-}
-
-func (cfg *Config) FindTokenByHash(hash string) *Token {
-	for i := range cfg.Auth.Tokens {
-		if subtle.ConstantTimeCompare([]byte(cfg.Auth.Tokens[i].TokenHash), []byte(hash)) == 1 {
-			return &cfg.Auth.Tokens[i]
-		}
-	}
-	return nil
-}
-
-func (cfg *Config) findTokenIndex(id string) int {
-	return slices.IndexFunc(cfg.Auth.Tokens, func(t Token) bool { return t.ID == id })
-}
-
-func (cfg *Config) RemoveToken(id string) bool {
-	i := cfg.findTokenIndex(id)
-	if i < 0 {
-		return false
-	}
-	cfg.Auth.Tokens = append(cfg.Auth.Tokens[:i], cfg.Auth.Tokens[i+1:]...)
-	return true
-}
-
-func (cfg *Config) SetTokenScopes(id string, scopes []string) bool {
-	i := cfg.findTokenIndex(id)
-	if i < 0 {
-		return false
-	}
-	cfg.Auth.Tokens[i].Scopes = scopes
-	return true
-}
 
 type UIConfig struct {
 	PageSize     int    `toml:"page_size"`
@@ -552,11 +437,9 @@ func Default() *Config {
 			Name:        "default",
 			GalleryPath: "/gallery",
 		}},
-		// Not 8080, which collides too often; monloader takes 8456. The
-		// images bind 8455 too, on a wildcard host.
 		Server: ServerConfig{
-			BindAddress: "127.0.0.1:8455",
-			BaseURL:     "http://localhost:8455",
+			BindAddress: "127.0.0.1:" + contract.PortMonbooru,
+			BaseURL:     "http://localhost:" + contract.PortMonbooru,
 		},
 		Paths: PathsConfig{
 			DataPath:  "/data",
@@ -703,31 +586,11 @@ func absent(path string, portable bool) (bool, error) {
 }
 
 func resolveIn(cfg *Config, base string) {
-	cfg.Paths.DataPath = absIn(cfg.Paths.DataPath, base)
-	cfg.Paths.ModelPath = absIn(cfg.Paths.ModelPath, base)
+	cfg.Paths.DataPath = fsx.AbsIn(cfg.Paths.DataPath, base)
+	cfg.Paths.ModelPath = fsx.AbsIn(cfg.Paths.ModelPath, base)
 	for i := range cfg.Galleries {
-		cfg.Galleries[i].GalleryPath = absIn(cfg.Galleries[i].GalleryPath, base)
+		cfg.Galleries[i].GalleryPath = fsx.AbsIn(cfg.Galleries[i].GalleryPath, base)
 	}
-}
-
-func absIn(path, base string) string {
-	if path == "" || filepath.IsAbs(path) {
-		return path
-	}
-	return filepath.Join(base, path)
-}
-
-// A path outside base, such as a gallery on another disk, stays absolute
-// rather than moving with the folder.
-func relIn(path, base string) string {
-	if path == "" || base == "" {
-		return path
-	}
-	rel, err := filepath.Rel(base, path)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return path
-	}
-	return filepath.ToSlash(rel)
 }
 
 // A use_cuda = true config with no execution_provider migrates to "cuda".
@@ -743,10 +606,6 @@ func migrateTaggerProvider(cfg *Config) {
 }
 
 func Save(cfg *Config, path string) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating config directory: %w", err)
-	}
 	out := cfg
 	if len(cfg.envPins) > 0 {
 		out = fileForm(cfg)
@@ -754,17 +613,12 @@ func Save(cfg *Config, path string) error {
 	if cfg.portableBase != "" {
 		out = portableForm(out)
 	}
-	if err := fsx.WriteAtomic(path, ".monbooru.toml.*", func(f *os.File) error {
+	return fsx.WriteDurable(path, func(f *os.File) error {
 		if err := toml.NewEncoder(f).Encode(out); err != nil {
 			return fmt.Errorf("encoding config: %w", err)
 		}
-		// Flushed: unlike a thumbnail, a torn config does not regenerate.
-		return f.Sync()
-	}); err != nil {
-		return err
-	}
-	fsx.SyncDir(dir)
-	return nil
+		return nil
+	})
 }
 
 // A copy with the file's own values under the keys the environment set.
@@ -780,11 +634,11 @@ func fileForm(cfg *Config) *Config {
 // absolute paths.
 func portableForm(cfg *Config) *Config {
 	out := *cfg
-	out.Paths.DataPath = relIn(cfg.Paths.DataPath, cfg.portableBase)
-	out.Paths.ModelPath = relIn(cfg.Paths.ModelPath, cfg.portableBase)
+	out.Paths.DataPath = fsx.RelIn(cfg.Paths.DataPath, cfg.portableBase)
+	out.Paths.ModelPath = fsx.RelIn(cfg.Paths.ModelPath, cfg.portableBase)
 	out.Galleries = slices.Clone(cfg.Galleries)
 	for i := range out.Galleries {
-		out.Galleries[i].GalleryPath = relIn(out.Galleries[i].GalleryPath, cfg.portableBase)
+		out.Galleries[i].GalleryPath = fsx.RelIn(out.Galleries[i].GalleryPath, cfg.portableBase)
 	}
 	return &out
 }

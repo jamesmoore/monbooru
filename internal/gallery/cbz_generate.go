@@ -9,9 +9,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/monbooru/monbooru/internal/fsx"
 	"github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 

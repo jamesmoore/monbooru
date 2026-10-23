@@ -3,3 +3,9 @@ version: "2"
 formatters:
   enable:
     - gofmt
+
+linters:
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives

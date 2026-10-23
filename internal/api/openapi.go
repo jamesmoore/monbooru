@@ -7,9 +7,11 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/peer"
 )
 
 func buildSpec(baseURL string) map[string]any {
@@ -17,8 +19,8 @@ func buildSpec(baseURL string) map[string]any {
 		"openapi": "3.0.3",
 		"info": map[string]any{
 			"title":       "Monbooru API",
-			"description": "REST API for monbooru image library. Any operation can answer 500 internal_error on a server-side failure, and every authenticated one 503 api_disabled while no API token exists.",
-			"version":     "1.1.0",
+			"description": "REST API for monbooru image library. Any operation can answer 500 internal_error on a server-side failure, and every authenticated one 503 api_disabled while no API token exists. On a desktop install whose first-run setup is not finished, every /api/v1 path answers 409 setup_required.",
+			"version":     strconv.Itoa(peer.APIVersion),
 		},
 		"servers": []map[string]any{
 			{"url": baseURL + "/api/v1", "description": "This server"},
@@ -91,6 +93,21 @@ func buildSpec(baseURL string) map[string]any {
 					"version": map[string]any{"type": "string", "description": "monbooru version"},
 					"docs":    map[string]any{"type": "string"},
 					"openapi": map[string]any{"type": "string"},
+				}),
+				"Health": objectSchema(nil, map[string]any{
+					"app":          map[string]any{"type": "string", "description": "Always monbooru, so a second launch can tell its own instance from another program on the port"},
+					"status":       map[string]any{"type": "string"},
+					"version":      map[string]any{"type": "string", "description": "monbooru version"},
+					"api":          map[string]any{"type": "integer", "description": "The API version this monbooru speaks"},
+					"min_peer_api": map[string]any{"type": "integer", "description": "The oldest monloader API version it works with"},
+				}),
+				"PairAccepted": objectSchema(nil, map[string]any{
+					"request_id": map[string]any{"type": "string", "description": "The id to poll GET /pair/status with"},
+					"status":     map[string]any{"type": "string", "enum": []string{"pending"}},
+				}),
+				"PairStatus": objectSchema(nil, map[string]any{
+					"status": map[string]any{"type": "string", "enum": []string{"pending", "approved", "denied"}},
+					"token":  map[string]any{"type": "string", "description": "The issued token, on the first poll after approval only"},
 				}),
 				"DeleteImageResponse": objectSchema(nil, map[string]any{
 					"folder_deleted":     map[string]any{"type": "boolean", "description": "True when delete_empty_folder removed the emptied folder"},
@@ -798,6 +815,54 @@ func buildSpec(baseURL string) map[string]any {
 						"409": resp("A moved tag collides with a same-named tag in the target category", "#/components/schemas/Error"),
 					}),
 			},
+			"/health": map[string]any{
+				"servers": []map[string]any{{"url": baseURL, "description": "This server, outside /api/v1"}},
+				"get": withoutAuth(op("Liveness and API version", "health",
+					nil,
+					map[string]any{
+						"200": resp("Running", "#/components/schemas/Health"),
+					})),
+			},
+			"/pair/request": map[string]any{
+				"post": withoutAuth(opBody("Offer a pairing", "pairRequest",
+					nil,
+					jsonBodySchema(true, objectSchema([]string{"app"}, map[string]any{
+						"app":              map[string]any{"type": "string", "description": "The client's name, shown to the operator: [A-Za-z0-9_-]{1,32}; monbooru, api and default are reserved. A plugin's name; monloader pairs as monloader"},
+						"url":              map[string]any{"type": "string", "description": "Where monbooru reaches the client"},
+						"requested_scopes": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Scopes asked for; none asks for read and write"},
+						"peer_token":       map[string]any{"type": "string", "description": "The client's own token for monbooru's calls back"},
+						"version":          map[string]any{"type": "string", "description": "The client's version, shown on its pairing card"},
+						"buttons":          map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "A plugin's buttons"},
+						"contract":         map[string]any{"type": "integer", "description": "The plugin contract the client speaks"},
+					})),
+					map[string]any{
+						"200": resp("Filed for the operator to approve in Settings", "#/components/schemas/PairAccepted"),
+						"400": resp("No JSON body or app, or an invalid offer (invalid_request)", "#/components/schemas/Error"),
+						"403": resp("CORS: origin not allowed (forbidden)", "#/components/schemas/Error"),
+						"409": resp("A plugin contract newer than this monbooru's (contract_unsupported)", "#/components/schemas/Error"),
+						"429": resp("Too many pending pairing requests (too_many_requests)", "#/components/schemas/Error"),
+					})),
+			},
+			"/pair/status": map[string]any{
+				"get": withoutAuth(op("Poll a pairing request", "pairStatus",
+					[]map[string]any{queryParam("id", "The request_id POST /pair/request answered")},
+					map[string]any{
+						"200": resp("The request's state, and the token once on approval", "#/components/schemas/PairStatus"),
+						"403": resp("CORS: origin not allowed (forbidden)", "#/components/schemas/Error"),
+						"404": resp("Unknown or expired request (not_found)", "#/components/schemas/Error"),
+						"500": resp("The token could not be saved (mint_failed)", "#/components/schemas/Error"),
+					})),
+			},
+			"/pair/remove": map[string]any{
+				"post": op("Remove the pairing from the client's side", "pairRemove",
+					nil,
+					map[string]any{
+						"200": map[string]any{"description": "Removed: {\"status\": \"removed\"}", "content": map[string]any{"application/json": map[string]any{"schema": objectSchema(nil, map[string]any{"status": map[string]any{"type": "string", "enum": []string{"removed"}}})}}},
+						"401": resp("The bearer is not a paired token (unauthorized)", "#/components/schemas/Error"),
+						"403": resp("CORS: origin not allowed (forbidden)", "#/components/schemas/Error"),
+						"500": resp("The pairing could not be removed (remove_failed)", "#/components/schemas/Error"),
+					}),
+			},
 			"/galleries": map[string]any{
 				"get": op("List configured galleries", "listGalleries",
 					nil,
@@ -815,9 +880,12 @@ func buildSpec(baseURL string) map[string]any {
 func declareRequestErrors(paths map[string]any) {
 	for _, item := range paths {
 		for _, raw := range item.(map[string]any) {
-			op := raw.(map[string]any)
+			op, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
 			body, _ := op["requestBody"].(map[string]any)
-			if content, _ := body["content"].(map[string]any); content["application/json"] != nil {
+			if content, _ := body["content"].(map[string]any); content["application/json"] != nil && !isWithoutAuth(op) {
 				declareJSONBodyCap(op["responses"].(map[string]any))
 			}
 			params, _ := op["parameters"].([]map[string]any)
@@ -854,6 +922,16 @@ func declareJSONBodyCap(responses map[string]any) {
 		return
 	}
 	responses["413"] = resp("JSON body exceeds 16 MiB", "#/components/schemas/Error")
+}
+
+func withoutAuth(op map[string]any) map[string]any {
+	op["security"] = []map[string]any{}
+	return op
+}
+
+func isWithoutAuth(op map[string]any) bool {
+	sec, ok := op["security"].([]map[string]any)
+	return ok && len(sec) == 0
 }
 
 func opBody(summary, id string, params []map[string]any, body, responses map[string]any) map[string]any {
@@ -1026,6 +1104,11 @@ func extractDocsView(spec map[string]any) docsView {
 	sortedPaths := slices.Sorted(maps.Keys(paths))
 	for _, p := range sortedPaths {
 		methods, _ := paths[p].(map[string]any)
+		shown := p
+		if servers, ok := methods["servers"].([]map[string]any); ok && len(servers) > 0 {
+			base, _ := servers[0]["url"].(string)
+			shown = base + p
+		}
 		for _, m := range methodOrder {
 			op, ok := methods[m].(map[string]any)
 			if !ok {
@@ -1034,7 +1117,7 @@ func extractDocsView(spec map[string]any) docsView {
 			e := endpointView{
 				Method:      strings.ToUpper(m),
 				MethodLower: m,
-				Path:        p,
+				Path:        shown,
 				Anchor:      m + "-" + anchorize(p),
 			}
 			e.Summary, _ = op["summary"].(string)
@@ -1143,7 +1226,7 @@ func anchorize(s string) string {
 }
 
 var docsTemplate = template.Must(template.New("api-docs").Parse(`<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-app="monbooru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

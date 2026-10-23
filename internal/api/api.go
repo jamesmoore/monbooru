@@ -3,18 +3,16 @@ package api
 
 import (
 	"cmp"
-	"encoding/json"
 	"errors"
-	"math"
 	"net"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/library"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 // ResolverFunc resolves an empty name to the active gallery.
@@ -49,7 +47,7 @@ func (h *Handler) recordFetch(g *library.Gallery, imageID int64, state, message 
 
 func (h *Handler) refuse(w http.ResponseWriter, g *library.Gallery, imageID int64, fetchMsg string, status int, code, msg string) {
 	h.recordFetch(g, imageID, "error", fetchMsg)
-	apiError(w, status, code, msg)
+	contract.WriteError(w, status, code, msg)
 }
 
 // WithMemoryMark: mark runs at an auto-tag job's start, and the func it
@@ -66,7 +64,7 @@ func (h *Handler) WithGalleryLock(lock func() (unlock func())) *Handler {
 	return h
 }
 
-// The file cap is LandSpec's; the slack only bounds a push's metadata fields.
+// The file cap is checked by each upload route; the slack only bounds a push's metadata fields.
 const multipartMetaSlack = 8 << 20
 
 const maxJSONBody = 16 << 20
@@ -81,9 +79,9 @@ func (h *Handler) bodyThenLock(next http.HandlerFunc) http.HandlerFunc {
 			}
 			if err := r.ParseMultipartForm(32 << 20); err != nil {
 				if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-					apiError(w, http.StatusRequestEntityTooLarge, "file_too_large", "file exceeds max size")
+					contract.WriteError(w, http.StatusRequestEntityTooLarge, contract.CodeFileTooLarge, "file exceeds max size")
 				} else {
-					apiError(w, http.StatusBadRequest, "invalid_request", "invalid multipart body")
+					contract.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid multipart body")
 				}
 				return
 			}
@@ -105,29 +103,13 @@ func (h *Handler) resolveGallery(w http.ResponseWriter, r *http.Request) (*libra
 	g, ok := h.resolver(name)
 	if !ok {
 		if name == "" {
-			apiError(w, http.StatusServiceUnavailable, "api_disabled", "no active gallery")
+			contract.WriteError(w, http.StatusServiceUnavailable, "api_disabled", "no active gallery")
 		} else {
-			apiError(w, http.StatusBadRequest, "invalid_gallery", "unknown gallery: "+name)
+			contract.WriteError(w, http.StatusBadRequest, "invalid_gallery", "unknown gallery: "+name)
 		}
 		return nil, false
 	}
 	return g, true
-}
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody)).Decode(dst); err != nil {
-		refuseJSONBody(w, err)
-		return false
-	}
-	return true
-}
-
-func refuseJSONBody(w http.ResponseWriter, err error) {
-	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-		apiError(w, http.StatusRequestEntityTooLarge, "file_too_large", "JSON body exceeds 16 MiB")
-		return
-	}
-	apiError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 }
 
 func (h *Handler) galleryAndID(w http.ResponseWriter, r *http.Request) (*library.Gallery, int64, bool) {
@@ -135,7 +117,7 @@ func (h *Handler) galleryAndID(w http.ResponseWriter, r *http.Request) (*library
 	if !ok {
 		return nil, 0, false
 	}
-	id, ok := apiPathInt64(w, r, "id")
+	id, ok := contract.PathInt64(w, r, "id")
 	if !ok {
 		return nil, 0, false
 	}
@@ -154,7 +136,7 @@ func (h *Handler) galleryAndExistingID(w http.ResponseWriter, r *http.Request) (
 		return nil, 0, false
 	}
 	if !exists {
-		apiError(w, http.StatusNotFound, "not_found", "image not found")
+		contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 		return nil, 0, false
 	}
 	return g, id, true
@@ -208,10 +190,10 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/v1/", h.auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/" {
-			apiError(w, http.StatusNotFound, "not_found", "endpoint not found: "+r.Method+" "+r.URL.Path)
+			contract.WriteError(w, http.StatusNotFound, "not_found", "endpoint not found: "+r.Method+" "+r.URL.Path)
 			return
 		}
-		WriteJSON(w, http.StatusOK, map[string]any{
+		contract.WriteJSON(w, http.StatusOK, map[string]any{
 			"api":     "monbooru",
 			"version": h.version,
 			"docs":    "/api/v1/docs",
@@ -219,13 +201,13 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 		})
 	}))
 	mux.HandleFunc("/api/v1/", h.auth(func(w http.ResponseWriter, r *http.Request) {
-		apiError(w, http.StatusNotFound, "not_found", "endpoint not found: "+r.Method+" "+r.URL.Path)
+		contract.WriteError(w, http.StatusNotFound, "not_found", "endpoint not found: "+r.Method+" "+r.URL.Path)
 	}))
 }
 
 func requireID(w http.ResponseWriter, v int64, name string) bool {
 	if v == 0 {
-		apiError(w, http.StatusBadRequest, "invalid_request", name+" required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", name+" required")
 		return false
 	}
 	return true
@@ -252,7 +234,7 @@ func CORSOK(w http.ResponseWriter, r *http.Request, cfg *config.Config) bool {
 	if SetCORS(w, r, cfg) {
 		return true
 	}
-	apiError(w, http.StatusForbidden, "forbidden", "CORS: origin not allowed")
+	contract.WriteError(w, http.StatusForbidden, "forbidden", "CORS: origin not allowed")
 	return false
 }
 
@@ -311,25 +293,8 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if len(cfg.Auth.Tokens) == 0 {
-			apiError(w, http.StatusServiceUnavailable, "api_disabled",
-				"API is disabled: generate an API token in Settings to enable it")
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(auth, prefix) {
-			apiError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid authorization header")
-			return
-		}
-		tok := cfg.FindTokenByHash(config.HashToken(auth[len(prefix):]))
-		if tok == nil {
-			apiError(w, http.StatusUnauthorized, "unauthorized", "invalid bearer token")
-			return
-		}
-		scope := scopeForMethod(r.Method)
-		if !tok.HasScope(scope) {
-			apiError(w, http.StatusForbidden, "insufficient_scope", "token lacks the "+scope+" scope")
+		if _, status, code, msg := cfg.Auth.Tokens.Authorize(r.Header.Get("Authorization"), scopeForMethod(r.Method)); status != 0 {
+			contract.WriteError(w, status, code, msg)
 			return
 		}
 
@@ -348,26 +313,11 @@ func scopeForMethod(method string) string {
 	}
 }
 
-func apiPathInt64(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
-	v, err := strconv.ParseInt(r.PathValue(name), 10, 64)
-	if err != nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "invalid "+name)
-		return 0, false
-	}
-	return v, true
-}
-
-func apiError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg, "code": code})
-}
-
 func serverError(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return false
 	}
-	apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
+	contract.WriteError(w, http.StatusInternalServerError, "internal_error", err.Error())
 	return true
 }
 
@@ -375,14 +325,8 @@ func badRequest(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return false
 	}
-	apiError(w, http.StatusBadRequest, "invalid_request", err.Error())
+	contract.WriteError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	return true
-}
-
-func WriteJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }
 
 func withWarnings(m map[string]any, warnings []string) map[string]any {
@@ -393,7 +337,7 @@ func withWarnings(m map[string]any, warnings []string) map[string]any {
 }
 
 func writePage(w http.ResponseWriter, page, limit, total int, results any) {
-	WriteJSON(w, http.StatusOK, map[string]any{
+	contract.WriteJSON(w, http.StatusOK, map[string]any{
 		"page":    page,
 		"limit":   limit,
 		"total":   total,
@@ -402,21 +346,7 @@ func writePage(w http.ResponseWriter, page, limit, total int, results any) {
 }
 
 func parsePage(r *http.Request, defaultLimit, maxLimit int) (offset, limit int) {
-	page := 1
-	limit = defaultLimit
 	q := r.URL.Query()
-	if p := q.Get("page"); p != "" {
-		if n, err := strconv.Atoi(p); err == nil && n > 0 {
-			page = n
-		}
-	}
-	l := cmp.Or(q.Get("limit"), q.Get("page_size"))
-	if l != "" {
-		if n, err := strconv.Atoi(l); err == nil && n > 0 {
-			limit = min(n, maxLimit)
-		}
-	}
-	// Past this the offset wraps negative and serves the first page.
-	page = min(page, math.MaxInt/limit)
+	page, limit := contract.PageParams(q.Get("page"), cmp.Or(q.Get("limit"), q.Get("page_size")), min(defaultLimit, maxLimit), maxLimit)
 	return (page - 1) * limit, limit
 }

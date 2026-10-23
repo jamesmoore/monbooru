@@ -12,12 +12,14 @@ import (
 	"unicode/utf8"
 
 	"github.com/monbooru/monbooru/internal/config"
+	"github.com/monbooru/monbooru/internal/shared/apitoken"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/pairing"
 )
 
 // Companion is the companion's name in pairing records; its credential and
 // pause live in [monloader], every other peer's in a [[plugin]] block.
-const Companion = "monloader"
+const Companion = contract.AppMonloader
 
 type Req struct {
 	pairing.Request
@@ -68,7 +70,7 @@ func CallbackURL(advertised, source string) string {
 }
 
 func Repoint(c *config.Config, app, url string) {
-	if t := c.FindPairedToken(app); t != nil {
+	if t := c.Auth.Tokens.Paired(app); t != nil {
 		t.PeerURL = url
 	}
 }
@@ -76,22 +78,23 @@ func Repoint(c *config.Config, app, url string) {
 // The request stores the grant, so the approval card shows what the
 // token will carry.
 func GrantedScopes(requested []string) []string {
-	if scopes := config.FilterScopes(requested); len(scopes) > 0 {
+	if scopes := apitoken.Filter(requested, config.AllScopes); len(scopes) > 0 {
 		return scopes
 	}
 	return []string{config.ScopeRead, config.ScopeWrite}
 }
 
 // Grant stores tok, minted for req, and the peer's own credential.
-func Grant(c *config.Config, req Req, tok config.Token) {
+func Grant(c *config.Config, req Req, tok apitoken.Token) {
 	// A re-pair replaces the credentials: the copy that held the old
 	// token is gone.
-	c.Auth.Tokens = slices.DeleteFunc(c.Auth.Tokens, func(t config.Token) bool { return t.Paired == req.App })
+	c.Auth.Tokens = slices.DeleteFunc(c.Auth.Tokens, func(t apitoken.Token) bool { return t.Paired == req.App })
 	c.Auth.Tokens = append(c.Auth.Tokens, tok)
 	if req.App == Companion {
 		if c.EnvPinned("monloader.api_token") == "" {
 			c.Monloader.APIToken = req.PeerToken
 		}
+		c.Monloader.Paused = false
 		return
 	}
 	p := c.FindPlugin(req.App)
@@ -115,7 +118,7 @@ func SetPaused(c *config.Config, app string, paused bool) {
 // Keeps the configured api_url so an operator's URL survives an unpair
 // and re-pair.
 func Revoke(c *config.Config, app string) {
-	c.Auth.Tokens = slices.DeleteFunc(c.Auth.Tokens, func(t config.Token) bool { return t.Paired == app })
+	c.Auth.Tokens = slices.DeleteFunc(c.Auth.Tokens, func(t apitoken.Token) bool { return t.Paired == app })
 	if app == Companion {
 		if c.EnvPinned("monloader.api_token") == "" {
 			c.Monloader.APIToken = ""

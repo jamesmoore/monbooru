@@ -1,12 +1,10 @@
 package web
 
 import (
-	"cmp"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -14,6 +12,7 @@ import (
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/shared/desktop"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/session"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
@@ -25,59 +24,33 @@ func (s *Server) desktopLocal(r *http.Request) bool {
 
 const maxBrowseEntries = 500
 
-// The value lands in an attribute the picker's script reads: identifiers only.
-var browseIntoRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-
-type browseData struct {
-	Into      string
-	Path      string
-	Parent    string
-	Entries   []desktop.Dir
-	Roots     []desktop.Dir
-	Sandboxed bool
-	Err       string
-	Truncated bool
-	Limit     int
+// 404 rather than 403, so the controls do not advertise themselves.
+func (s *Server) localOnly(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.desktopLocal(r) {
+			http.NotFound(w, r)
+			return
+		}
+		h(w, r)
+	}
 }
 
 func (s *Server) browseDirs(w http.ResponseWriter, r *http.Request) {
-	if !s.desktopLocal(r) {
-		http.NotFound(w, r)
-		return
-	}
-	into := r.URL.Query().Get("into")
-	if !browseIntoRe.MatchString(into) {
+	l, ok := desktop.Browse(r.URL.Query().Get("into"), r.URL.Query().Get("path"), maxBrowseEntries)
+	if !ok {
 		http.Error(w, "bad target", http.StatusBadRequest)
 		return
 	}
-	data := browseData{Into: into, Sandboxed: desktop.Sandboxed(), Limit: maxBrowseEntries}
-	for _, root := range desktop.Roots() {
-		data.Roots = append(data.Roots, desktop.Dir{Name: root, Path: root})
-	}
-
-	home, _ := os.UserHomeDir()
-	path := cmp.Or(strings.TrimSpace(r.URL.Query().Get("path")), home, string(filepath.Separator))
-	data.Path = filepath.Clean(path)
-	if parent := filepath.Dir(data.Path); parent != data.Path {
-		data.Parent = parent
-	}
-
-	var err error
-	data.Entries, data.Truncated, err = desktop.ListDirs(data.Path, maxBrowseEntries)
-	if err != nil {
-		data.Err = "cannot read this folder"
-	}
-	s.renderTemplate(w, "partials/dir_picker.html", data)
+	s.renderTemplate(w, "webui/dir_picker", struct {
+		desktop.Listing
+		Route string
+	}{l, "/internal/browse"})
 }
 
 // A kind, never a path, so no operator string reaches the launcher.
 var openFolderKinds = []string{"config", "data", "gallery", "logs", "models"}
 
 func (s *Server) openFolder(w http.ResponseWriter, r *http.Request) {
-	if !s.desktopLocal(r) {
-		http.NotFound(w, r)
-		return
-	}
 	if !parseFormOK(w, r) {
 		return
 	}
@@ -172,30 +145,11 @@ func (s *Server) TrayEnabled() bool {
 	return s.cfg.Desktop.Tray
 }
 
-func applyDesktopHooks(h desktop.Hook, menu, autostart bool) []string {
-	var failures []string
-	if h.MenuSupported() {
-		if err := h.SetMenu(menu); err != nil {
-			failures = append(failures, "menu entry: "+err.Error())
-		}
-	}
-	if h.AutostartSupported() {
-		if err := h.SetAutostart(autostart); err != nil {
-			failures = append(failures, "start at login: "+err.Error())
-		}
-	}
-	return failures
-}
-
 func (s *Server) settingsDesktopPost(w http.ResponseWriter, r *http.Request) {
-	if !s.desktopLocal(r) {
-		http.NotFound(w, r)
-		return
-	}
 	if !parseFormOK(w, r) {
 		return
 	}
-	failures := applyDesktopHooks(s.desktopHook(), r.FormValue("menu_entry") == "on", r.FormValue("start_at_login") == "on")
+	failures := s.desktopHook().Apply(r.FormValue("menu_entry") == "on", r.FormValue("start_at_login") == "on")
 	if desktop.TrayAvailable() {
 		tray := r.FormValue("tray") == "on"
 		if err := s.withConfig(func(c *config.Config) error {
@@ -206,7 +160,7 @@ func (s *Server) settingsDesktopPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(failures) > 0 {
-		flashStatus(w, http.StatusInternalServerError, strings.Join(failures, "; "))
+		writeInlineFlash(w, "err", strings.Join(failures, "; "))
 		return
 	}
 	writeInlineFlash(w, "ok", "Saved.")
@@ -218,6 +172,13 @@ func (s *Server) desktopJobWarning() string {
 		return ""
 	}
 	return runningJobName(st.JobType) + " is running and will not resume."
+}
+
+func (s *Server) desktopPowerFragment(w http.ResponseWriter, r *http.Request) {
+	s.renderTemplate(w, "partials/desktop_power.html", map[string]any{
+		"Warning":   s.desktopJobWarning(),
+		"CSRFToken": s.sessions.CSRFToken(session.FromContext(r.Context())),
+	})
 }
 
 // quitDelay lets the flushed page reach the browser before the listener closes.
@@ -239,12 +200,9 @@ func (s *Server) settingsRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stopAfterRender(w http.ResponseWriter, r *http.Request, page map[string]any, verb string, then func()) {
-	if !s.desktopLocal(r) {
-		http.NotFound(w, r)
-		return
-	}
 	heading, _ := page["Heading"].(string)
-	s.renderTemplate(w, "message_page.html", s.standalonePageData(heading, page))
+	page["App"] = "monbooru"
+	s.renderTemplate(w, "webui/message_page", s.standalonePageData(heading, page))
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}

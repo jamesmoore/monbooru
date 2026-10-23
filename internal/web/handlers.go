@@ -17,13 +17,14 @@ import (
 	"github.com/monbooru/monbooru/internal/gallery"
 	meta "github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/session"
 )
 
 func setFlashHeader(w http.ResponseWriter, text, kind string, extras map[string]any) {
 	kind = cmp.Or(kind, "ok")
 	// The client renders this through innerHTML, so the text is escaped here.
 	triggers := map[string]any{
-		"monbooru:flash": map[string]any{"text": html.EscapeString(text), "kind": kind},
+		"action-flash": map[string]any{"text": html.EscapeString(text), "kind": kind},
 	}
 	for k, v := range extras {
 		triggers[k] = v
@@ -96,7 +97,7 @@ func writeFlashOOB(w http.ResponseWriter, id, kind, text string) {
 }
 
 func (s *Server) notFoundHandler(w http.ResponseWriter, r *http.Request) {
-	if p := strings.TrimRight(r.URL.Path, "/"); p != "" && p != r.URL.Path && localPath(p) {
+	if p := strings.TrimRight(r.URL.Path, "/"); p != "" && p != r.URL.Path && session.LocalPath(p) {
 		if r.URL.RawQuery != "" {
 			p += "?" + r.URL.RawQuery
 		}

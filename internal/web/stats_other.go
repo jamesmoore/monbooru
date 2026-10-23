@@ -2,9 +2,17 @@
 
 package web
 
+import "github.com/monbooru/monbooru/internal/shared/desktop"
+
 func procRSS() (rssBreakdown, bool) { return rssBreakdown{}, false }
 
-func mountUsage(_ string) (mountStats, uint64, bool) { return mountStats{}, 0, false }
+func mountUsage(path string) (mountStats, uint64, bool) {
+	total, free, err := desktop.DiskUsage(path)
+	if err != nil {
+		return mountStats{}, 0, false
+	}
+	return usageStats(total, free), 0, true
+}
 
 func readVmRSS() uint64 { return 0 }
 

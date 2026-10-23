@@ -9,6 +9,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -36,7 +37,7 @@ func resolveCategoryID(w http.ResponseWriter, g *library.Gallery, name string) (
 		return 0, false
 	}
 	if !found {
-		apiError(w, http.StatusBadRequest, "invalid_request", "unknown category: "+name)
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "unknown category: "+name)
 		return 0, false
 	}
 	return id, true
@@ -51,7 +52,7 @@ type sentinelStatus struct {
 func writeSentinelError(w http.ResponseWriter, err error, table []sentinelStatus) bool {
 	for _, e := range table {
 		if errors.Is(err, e.err) {
-			apiError(w, e.status, e.code, err.Error())
+			contract.WriteError(w, e.status, e.code, err.Error())
 			return true
 		}
 	}
@@ -61,7 +62,7 @@ func writeSentinelError(w http.ResponseWriter, err error, table []sentinelStatus
 func writeTagError(w http.ResponseWriter, err error) {
 	var coll *tags.ErrCategoryCollision
 	if errors.As(err, &coll) {
-		apiError(w, http.StatusConflict, "conflict", err.Error())
+		contract.WriteError(w, http.StatusConflict, "conflict", err.Error())
 		return
 	}
 	if !writeSentinelError(w, err, []sentinelStatus{
@@ -95,11 +96,11 @@ func (h *Handler) createTag(w http.ResponseWriter, r *http.Request) {
 		Name     string `json:"name"`
 		Category string `json:"category"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if strings.TrimSpace(body.Name) == "" {
-		apiError(w, http.StatusBadRequest, "invalid_request", "name is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "name is required")
 		return
 	}
 	catID, ok := resolveCategoryID(w, g, body.Category)
@@ -115,7 +116,7 @@ func (h *Handler) createTag(w http.ResponseWriter, r *http.Request) {
 	if serverError(w, err) {
 		return
 	}
-	WriteJSON(w, http.StatusCreated, toTagResponse(full))
+	contract.WriteJSON(w, http.StatusCreated, toTagResponse(full))
 }
 
 func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
@@ -127,11 +128,11 @@ func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
 		Name     *string `json:"name"`
 		Category *string `json:"category"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if body.Name == nil && body.Category == nil {
-		apiError(w, http.StatusBadRequest, "invalid_request", "name or category is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "name or category is required")
 		return
 	}
 	var catID int64
@@ -158,7 +159,7 @@ func (h *Handler) patchTag(w http.ResponseWriter, r *http.Request) {
 		writeTagError(w, err)
 		return
 	}
-	WriteJSON(w, http.StatusOK, toTagResponse(full))
+	contract.WriteJSON(w, http.StatusOK, toTagResponse(full))
 }
 
 func (h *Handler) deleteTag(w http.ResponseWriter, r *http.Request) {
@@ -183,15 +184,15 @@ func (h *Handler) createAlias(w http.ResponseWriter, r *http.Request) {
 		Category    string `json:"category"`
 		CanonicalID int64  `json:"canonical_id"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if strings.TrimSpace(body.Name) == "" {
-		apiError(w, http.StatusBadRequest, "invalid_request", "name is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "name is required")
 		return
 	}
 	if body.CanonicalID == 0 {
-		apiError(w, http.StatusBadRequest, "invalid_request", "canonical_id is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "canonical_id is required")
 		return
 	}
 	catID, ok := resolveCategoryID(w, g, body.Category)
@@ -203,7 +204,7 @@ func (h *Handler) createAlias(w http.ResponseWriter, r *http.Request) {
 		writeTagError(w, err)
 		return
 	}
-	WriteJSON(w, http.StatusCreated, toTagResponse(alias))
+	contract.WriteJSON(w, http.StatusCreated, toTagResponse(alias))
 }
 
 func (h *Handler) mergeTags(w http.ResponseWriter, r *http.Request) {
@@ -215,11 +216,11 @@ func (h *Handler) mergeTags(w http.ResponseWriter, r *http.Request) {
 		AliasID     int64 `json:"alias_id"`
 		CanonicalID int64 `json:"canonical_id"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if body.AliasID == 0 || body.CanonicalID == 0 {
-		apiError(w, http.StatusBadRequest, "invalid_request", "alias_id and canonical_id are required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "alias_id and canonical_id are required")
 		return
 	}
 	if err := g.TagSvc.MergeTags(body.AliasID, body.CanonicalID); err != nil {
@@ -231,7 +232,7 @@ func (h *Handler) mergeTags(w http.ResponseWriter, r *http.Request) {
 		writeTagError(w, err)
 		return
 	}
-	WriteJSON(w, http.StatusOK, toTagResponse(canon))
+	contract.WriteJSON(w, http.StatusOK, toTagResponse(canon))
 }
 
 type implicationJSON struct {
@@ -263,7 +264,7 @@ func (h *Handler) listImplications(w http.ResponseWriter, r *http.Request) {
 			ImpliedCategory: im.ImpliedCategoryName,
 		})
 	}
-	WriteJSON(w, http.StatusOK, out)
+	contract.WriteJSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) addImplication(w http.ResponseWriter, r *http.Request) {
@@ -274,11 +275,11 @@ func (h *Handler) addImplication(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ImpliedID int64 `json:"implied_id"`
 	}
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if body.ImpliedID == 0 {
-		apiError(w, http.StatusBadRequest, "invalid_request", "implied_id is required")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "implied_id is required")
 		return
 	}
 	isNew, err := g.TagSvc.AddImplicationFrom(parentID, body.ImpliedID, "api")
@@ -298,7 +299,7 @@ func (h *Handler) removeImplication(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	impliedID, ok := apiPathInt64(w, r, "impliedID")
+	impliedID, ok := contract.PathInt64(w, r, "impliedID")
 	if !ok {
 		return
 	}

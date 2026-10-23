@@ -230,11 +230,19 @@ func (m *Manager) Dismiss() {
 	m.clearStateLocked()
 }
 
+func (m *Manager) NoteChange() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state != nil && m.state.Running {
+		m.state.Changes++
+	}
+}
+
 func (m *Manager) SetWatcherMessage(msg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.state != nil && m.state.Running {
-		m.state.WatcherNotices++
+		m.state.Changes++
 		return
 	}
 	now := time.Now().UTC()

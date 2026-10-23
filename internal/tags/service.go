@@ -11,6 +11,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/searchkw"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
@@ -65,17 +66,11 @@ func SafeCategoryColor(s string) string {
 	return "#888888"
 }
 
-var (
-	// Search keywords and "system" (the search-bar cheat sheet) already
-	// own the "name:" prefix.
-	reservedCategoryList = append(append([]string{}, searchkw.Keywords...), "system")
+// Search keywords and "system" (the search-bar cheat sheet) already own the
+// "name:" prefix.
+var reservedCategoryList = append(append([]string{}, searchkw.Keywords...), "system")
 
-	// RatingLevels runs low to high; highest-wins resolution and the
-	// rating ceiling rely on the order.
-	RatingLevels = []string{"general", "sensitive", "questionable", "explicit"}
-)
-
-func IsCanonicalRating(name string) bool { return RatingRank(name) >= 0 }
+func IsCanonicalRating(name string) bool { return contract.RatingRank(name) >= 0 }
 
 func isReservedCategoryName(name string) bool { return slices.Contains(reservedCategoryList, name) }
 

@@ -9,7 +9,7 @@
       <strong class="walker-page-title">Relations session</strong>
       {{if .Pair}}
       <span class="detail-nav-sep">·</span>
-      <span class="field-hint"><strong>{{.Remaining}}</strong> pair(s) remaining</span>
+      <span class="field-hint"><strong>{{.Remaining}}</strong> {{plural .Remaining "pair" "pairs"}} remaining</span>
       {{end}}
     </div>
     {{if .TagPairs}}
@@ -28,13 +28,13 @@
     </form>
   </div>
 
-  <div id="flash-relations"></div>
+  <div id="flash-relations" data-action-flash></div>
 
   {{if not .Pair}}
   <section class="session-empty">
     {{if gt .HiddenByCeiling 0}}
     <h3>No pairs at your <strong>{{.Ceiling}}</strong> rating ceiling.</h3>
-    <p class="field-hint"><strong>{{.HiddenByCeiling}}</strong> pair(s) are hidden because one or both sides exceed the current ceiling.</p>
+    <p class="field-hint"><strong>{{.HiddenByCeiling}}</strong> {{plural .HiddenByCeiling "pair is" "pairs are"}} hidden because one or both sides exceed the current ceiling.</p>
     <form hx-post="/internal/rating-ceiling?level=explicit" hx-swap="none"
           hx-on::after-request="if(event.detail.successful){window.location.reload()}"
           style="display:inline">
@@ -42,7 +42,7 @@
     </form>
     {{else if gt .Skipped 0}}
     <h3>Nothing left to review.</h3>
-    <p class="field-hint"><strong>{{.Skipped}}</strong> pair(s) you skipped are still queued. <a href="/relations">Reset skipped</a> puts them back.</p>
+    <p class="field-hint"><strong>{{.Skipped}}</strong> {{plural .Skipped "pair" "pairs"}} you skipped {{plural .Skipped "is" "are"}} still queued. <a href="/relations">Reset skipped</a> puts them back.</p>
     {{else if and .TagPairs (ne .Detector "both")}}
     <h3>No pairs from this detector.</h3>
     <p class="field-hint">Nothing in the queue was found by {{if eq .Detector "phash"}}image{{else}}rare tag{{end}} similarity. Switch <strong>Found by</strong> back to <a href="/relations/session?detector=both">Both</a>, or run <a href="/relations">Find new pairs</a>.</p>
@@ -80,7 +80,7 @@
           <span class="session-distance-line"></span>
           {{if eq .Pair.Source "tags"}}
           <span class="session-distance-label">rare tag similarity <strong class="session-source-tags">~{{.Pair.ScorePercent}}%</strong></span>
-          <span class="session-distance-sub">{{.SharedTagsTotal}} shared tag(s)</span>
+          <span class="session-distance-sub">{{.SharedTagsTotal}} shared {{plural .SharedTagsTotal "tag" "tags"}}</span>
           {{else if eq .Pair.Source "both"}}
           <span class="session-distance-label">phash distance <strong>{{.Pair.Distance}}</strong> &middot;</span>
           <span class="session-distance-label">rare tag similarity <strong class="session-source-tags">~{{.Pair.ScorePercent}}%</strong></span>
@@ -445,7 +445,7 @@
         onOK: function(res) {
           // A raw fetch does not process HX-Trigger, so the flash is stashed
           // for the reload by hand.
-          var f = JSON.parse(res.headers.get('HX-Trigger') || '{}')['monbooru:flash'];
+          var f = JSON.parse(res.headers.get('HX-Trigger') || '{}')['action-flash'];
           if (f) stashActionFlash(f.text, f.kind);
           pdDone();
         },

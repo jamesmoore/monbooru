@@ -19,6 +19,7 @@ import (
 	meta "github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
 
@@ -29,7 +30,7 @@ func (s *Server) pruneMissingImagesPost(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if len(missing) == 0 {
-		writeInlineFlash(w, "ok", "Removed 0 missing image(s).")
+		writeInlineFlash(w, "ok", "Removed 0 missing images.")
 		return
 	}
 
@@ -42,9 +43,9 @@ func (s *Server) pruneMissingImagesPost(w http.ResponseWriter, r *http.Request) 
 			s.jobs.Update(done, total, "pruning…")
 		})
 		removed := len(res.Deleted)
-		summary := fmt.Sprintf("Removed %d missing image(s).", removed)
+		summary := fmt.Sprintf("Removed %d missing image%s.", removed, plural(removed))
 		if res.Kept > 0 {
-			summary = fmt.Sprintf("Removed %d missing image(s); kept %d whose file is still on disk.", removed, res.Kept)
+			summary = fmt.Sprintf("Removed %d missing image%s; kept %d whose file is still on disk.", removed, plural(removed), res.Kept)
 		}
 		total := len(missing) - res.Kept
 		s.jobs.Finish(err, res.Cancelled, fmt.Sprintf("prune cancelled (%d/%d removed)", removed, total), summary)
@@ -63,7 +64,7 @@ func (s *Server) pruneOrphanedThumbnailsPost(w http.ResponseWriter, r *http.Requ
 		})
 		s.jobs.Finish(err, ctx.Err() != nil,
 			fmt.Sprintf("orphan sweep cancelled (%d/%d scanned, %d removed)", processed, total, removed),
-			fmt.Sprintf("Removed %d orphaned thumbnail(s).", removed))
+			fmt.Sprintf("Removed %d orphaned thumbnail%s.", removed, plural(removed)))
 	})
 }
 
@@ -111,13 +112,13 @@ func (s *Server) emptyFoldersRemovePost(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	removed := gallery.RemoveEmptyDirs(s.boundary(), paths)
-	s.jobs.Complete(fmt.Sprintf("Removed %d empty folder(s).", removed))
+	s.jobs.Complete(fmt.Sprintf("Removed %d empty folder%s.", removed, plural(removed)))
 	kept := ""
 	if n := len(paths) - removed; n > 0 {
 		kept = fmt.Sprintf(", %d no longer empty", n)
 	}
 	writeFlashOOB(w, "flash-empty-folders", "", "")
-	writeInlineFlash(w, "ok", fmt.Sprintf("Removed %d empty folder(s)%s.", removed, kept))
+	writeInlineFlash(w, "ok", fmt.Sprintf("Removed %d empty folder%s%s.", removed, plural(removed), kept))
 }
 
 func (s *Server) recalcTagsPost(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +127,7 @@ func (s *Server) recalcTagsPost(w http.ResponseWriter, r *http.Request) {
 		writeInlineFlash(w, "err", fmt.Sprintf("Recalc partially completed (%d updated): %s", updated, err.Error()))
 		return
 	}
-	writeInlineFlash(w, "ok", fmt.Sprintf("Recalculated %d tag count(s).", updated))
+	writeInlineFlash(w, "ok", fmt.Sprintf("Recalculated %d tag count%s.", updated, plural(int(updated))))
 }
 
 func (s *Server) tagCategoryConflictsPost(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +163,7 @@ func (s *Server) findFoldedDuplicatesPost(w http.ResponseWriter, r *http.Request
 			s.jobs.Fail(err.Error())
 			return
 		}
-		s.jobs.Complete(fmt.Sprintf("Found %d folded duplicate(s).", n))
+		s.jobs.Complete(fmt.Sprintf("Found %d folded duplicate%s.", n, plural(n)))
 	})
 }
 
@@ -196,7 +197,7 @@ func (s *Server) removeDuplicatesPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(pathIDs) == 0 {
-		writeInlineFlash(w, "ok", "Removed 0 duplicate path(s).")
+		writeInlineFlash(w, "ok", "Removed 0 duplicate paths.")
 		return
 	}
 
@@ -234,9 +235,9 @@ func copiesSummary(res library.CopiesResult) string {
 		kept = append(kept, fmt.Sprintf("%d that could not be removed", failed))
 	}
 	if len(kept) == 0 {
-		return fmt.Sprintf("Removed %d duplicate path(s).", res.Removed)
+		return fmt.Sprintf("Removed %d duplicate path%s.", res.Removed, plural(res.Removed))
 	}
-	return fmt.Sprintf("Removed %d duplicate path(s); kept %s.", res.Removed, strings.Join(kept, ", "))
+	return fmt.Sprintf("Removed %d duplicate path%s; kept %s.", res.Removed, plural(res.Removed), strings.Join(kept, ", "))
 }
 
 func (s *Server) rebuildThumbnailsPost(w http.ResponseWriter, r *http.Request) {
@@ -305,7 +306,7 @@ func (s *Server) startRebuildThumbsJob(cx *library.Gallery) error {
 			}
 			processed++
 		}
-		s.jobs.Complete(fmt.Sprintf("[%s] rebuilt %d thumbnail(s)%s.", galleryName, rebuilt, failedNote()))
+		s.jobs.Complete(fmt.Sprintf("[%s] rebuilt %d thumbnail%s%s.", galleryName, rebuilt, plural(rebuilt), failedNote()))
 	}()
 	return nil
 }
@@ -326,8 +327,8 @@ func (s *Server) computeHashesPost(w http.ResponseWriter, r *http.Request) {
 			s.jobs.Update(p, total, "MD5…")
 		})
 		_ = s.jobs.Settle(ctx, err, fmt.Sprintf("hashes cancelled (%d phash, %d md5)", phashUpdated, sumUpdated),
-			fmt.Sprintf("Computed %d perceptual hash(es) of %d and %d md5 digest(s) of %d.",
-				phashUpdated, phashed, sumUpdated, summed))
+			fmt.Sprintf("Computed %d perceptual %s of %d and %d md5 digest%s of %d.",
+				phashUpdated, models.Plural(phashUpdated, "hash", "hashes"), phashed, sumUpdated, plural(sumUpdated), summed))
 	})
 }
 
@@ -338,7 +339,7 @@ func (s *Server) generateMetaTagsPost(w http.ResponseWriter, r *http.Request) {
 			s.jobs.Update(p, total, cmp.Or(msg, "Meta tags…"))
 		})
 		_ = s.jobs.Settle(ctx, err, fmt.Sprintf("meta tags cancelled (%d processed, %d updated)", processed, updated),
-			fmt.Sprintf("Derived meta tags for %d image(s); %d changed.", processed, updated))
+			fmt.Sprintf("Derived meta tags for %d image%s; %d changed.", processed, plural(processed), updated))
 	})
 }
 
@@ -354,7 +355,7 @@ func (s *Server) indexWorkflowsPost(w http.ResponseWriter, r *http.Request) {
 			return err
 		})
 		_ = s.jobs.Settle(ctx, err, fmt.Sprintf("workflow index cancelled (%d indexed)", indexed),
-			fmt.Sprintf("Indexed %d ComfyUI workflow(s).", indexed))
+			fmt.Sprintf("Indexed %d ComfyUI workflow%s.", indexed, plural(indexed)))
 	})
 }
 
@@ -364,8 +365,8 @@ func (s *Server) removeMetaTagsPost(w http.ResponseWriter, r *http.Request) {
 		processed, removed, err := gallery.RemoveMetaTags(ctx, active.Handle, func(p, total int, msg string) {
 			s.jobs.Update(p, total, cmp.Or(msg, "Meta tags…"))
 		})
-		_ = s.jobs.Settle(ctx, err, fmt.Sprintf("removal cancelled (%d image(s), %d tag(s) removed)", processed, removed),
-			fmt.Sprintf("Removed %d generated tag(s) from %d image(s).", removed, processed))
+		_ = s.jobs.Settle(ctx, err, fmt.Sprintf("removal cancelled (%d image%s, %d tag%s removed)", processed, plural(processed), removed, plural(removed)),
+			fmt.Sprintf("Removed %d generated tag%s from %d image%s.", removed, plural(removed), processed, plural(processed)))
 	})
 }
 
@@ -381,7 +382,7 @@ func (s *Server) vacuumDBPost(w http.ResponseWriter, r *http.Request) {
 		}
 		afterSize := dbFileSize(cx.DBPath)
 		freed := max(beforeSize-afterSize, 0)
-		s.jobs.Complete(fmt.Sprintf("Vacuumed (reclaimed %s).", humanBytesFmt(freed)))
+		s.jobs.Complete(fmt.Sprintf("Vacuumed (reclaimed %s).", webui.HumanBytes(freed)))
 	})
 }
 
@@ -404,7 +405,7 @@ func (s *Server) freeMemoryPost(w http.ResponseWriter, r *http.Request) {
 	tagger.ReleaseAll()
 	after := readVmRSS()
 	if before > 0 && after > 0 && before > after {
-		writeInlineFlash(w, "ok", "Freed "+humanBytesFmt(int64(before-after))+".")
+		writeInlineFlash(w, "ok", "Freed "+webui.HumanBytes(int64(before-after))+".")
 		return
 	}
 	writeInlineFlash(w, "ok", "Memory caches released.")
@@ -420,19 +421,6 @@ func dbFileSize(path string) int64 {
 		}
 	}
 	return total
-}
-
-func humanBytesFmt(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 func sameSeed(a, b *int64) bool {
@@ -547,6 +535,6 @@ func (s *Server) reExtractMetadataPost(w http.ResponseWriter, r *http.Request) {
 				logx.Debugf("re-extract meta tags %d: %v", img.ID, err)
 			}
 		}
-		s.jobs.Complete(fmt.Sprintf("Re-extracted metadata for %d image(s) (%d updated).", processed, updated))
+		s.jobs.Complete(fmt.Sprintf("Re-extracted metadata for %d image%s (%d updated).", processed, plural(processed), updated))
 	})
 }

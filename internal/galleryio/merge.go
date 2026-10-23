@@ -508,7 +508,7 @@ func MergeGallery(ctx context.Context, cx *library.Gallery, format string, uploa
 // Summary states Added even at 0: the dialog promises new images, which
 // only a .zip can bring.
 func (r MergeResult) Summary() string {
-	parts := []string{fmt.Sprintf("%d image(s) added", r.Added), fmt.Sprintf("%d tagged", r.Tagged)}
+	parts := []string{fmt.Sprintf("%d %s added", r.Added, models.Plural(r.Added, "image", "images")), fmt.Sprintf("%d tagged", r.Tagged)}
 	if r.Skipped > 0 {
 		parts = append(parts, fmt.Sprintf("%d not in this gallery", r.Skipped))
 	}

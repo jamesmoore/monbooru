@@ -6,9 +6,9 @@
   <h2>Categories</h2>
   <p class="field-hint">Categories group tags (artist, character, ...) and set their color.</p>
 
-  <div id="cat-flash"></div>
+  <div id="cat-flash" data-action-flash></div>
   <div class="table-scroll">
-  <table class="cat-table">
+  <table class="grid-table cat-table">
     <thead><tr><th>Name</th><th>Color</th><th>Actions</th></tr></thead>
     <tbody id="cat-list">
       {{range .Categories}}
@@ -142,9 +142,9 @@ function openCatDeleteDialog(catId, catName) {
         deleteAllBtn.textContent = 'Delete category';
         moveBtn.style.display = 'none';
       } else {
-        var what = [count ? count + ' tag(s)' : '', aliases ? aliases + ' alias(es)' : ''].filter(Boolean).join(', ');
+        var what = [count ? count + (count === 1 ? ' tag' : ' tags') : '', aliases ? aliases + (aliases === 1 ? ' alias' : ' aliases') : ''].filter(Boolean).join(', ');
         info.textContent = what + ' will be affected.' +
-          (linked ? ' Deleting them also deletes ' + linked + ' alias(es) in other categories that point at these tags.' : '');
+          (linked ? ' Deleting them also deletes ' + linked + (linked === 1 ? ' alias' : ' aliases') + ' in other categories that point at these tags.' : '');
         moveSection.style.display = '';
         deleteAllBtn.textContent = 'Delete all ' + what + ' & category';
         moveBtn.style.display = '';

@@ -41,7 +41,7 @@ func (s *Server) syncTrigger(w http.ResponseWriter, r *http.Request) {
 	maxFileSizeMB := s.maxFileSizeMB()
 	go func() {
 		ctx := s.jobs.Context()
-		result, err := cx.Sync(ctx, maxFileSizeMB, s.ingestNaming(cx.Name), s.jobs.Update)
+		result, err := cx.Sync(ctx, maxFileSizeMB, s.ingestNaming(cx.Name), s.jobs.Update, s.jobs.NoteChange)
 		_ = s.jobs.Settle(ctx, err, "sync cancelled", result.Summary())
 	}()
 

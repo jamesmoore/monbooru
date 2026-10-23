@@ -49,7 +49,7 @@ services:
       - MONBOORU_SERVER_BIND_ADDRESS=0.0.0.0:8455
       # Monbooru browser URL (The one you use to reach monbooru from the browser)
       - MONBOORU_SERVER_BASE_URL=http://localhost:8455
-      # If Monloader enabled: how you reach monloader in the browser
+      # How you reach monloader in the browser.
       # - MONBOORU_SERVER_MONLOADER_URL=http://localhost:8456
       # - TZ=Etc/UTC
     restart: unless-stopped
@@ -60,6 +60,7 @@ services:
   monloader:
     image: ghcr.io/monbooru/monloader:latest
     container_name: monloader
+    # Image runs as uid/gid 1000; set this to your host uid:gid.
     user: "1000:1000"
     ports:
       - "127.0.0.1:8456:8456"
@@ -69,15 +70,15 @@ services:
       - ALL
     volumes:
       - /path/to/monloader/config:/config
-      # If you want to enable the Public Tag Repository syncing (>70GB required)
+      # Required to enable the Public Tag Repository syncing (>70GB required)
       # - /path/to/monloader/ptr:/ptr
     environment:
       - MONLOADER_SERVER_BIND_ADDRESS=0.0.0.0:8456
-      - MONLOADER_SERVER_BASE_URL=http://localhost:8456
       # Internal URL: how the container reaches monbooru on the network
       - MONLOADER_MONBOORU_API_URL=http://monbooru:8455
       # Browser URL: how you reach monbooru in the browser
       - MONLOADER_MONBOORU_WEB_URL=http://localhost:8455
+      # - TZ=Etc/UTC
     depends_on:
       - monbooru
     restart: unless-stopped

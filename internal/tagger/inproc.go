@@ -39,14 +39,32 @@ type loadedTagger struct {
 }
 
 type loadedSession struct {
-	modelFile string
-	tagsFile  string
-	profileFP string
-	session   *ort.DynamicAdvancedSession
-	labels    []tagLabel
-	profile   Profile
-	inputSize int
+	modelFile  string
+	tagsFile   string
+	modelStamp fileStamp
+	tagsStamp  fileStamp
+	profileFP  string
+	session    *ort.DynamicAdvancedSession
+	labels     []tagLabel
+	profile    Profile
+	inputSize  int
 }
+
+// A file overwritten under the same name moves its size or mtime.
+type fileStamp struct {
+	size    int64
+	modTime time.Time
+}
+
+func stampOf(path string) (fileStamp, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}, false
+	}
+	return fileStamp{fi.Size(), fi.ModTime()}, true
+}
+
+func (a fileStamp) same(b fileStamp) bool { return a.size == b.size && a.modTime.Equal(b.modTime) }
 
 type inprocBackend struct {
 	mu          sync.Mutex
@@ -85,6 +103,11 @@ func (b *inprocBackend) satisfies(modelPath string, taggers []TaggerStatus, prov
 			return false
 		}
 		if s.modelFile != t.ModelFile || s.tagsFile != t.TagsFile {
+			return false
+		}
+		model, okModel := stampOf(filepath.Join(modelPath, t.Name, t.ModelFile))
+		tags, okTags := stampOf(filepath.Join(modelPath, t.Name, t.TagsFile))
+		if !okModel || !okTags || !model.same(s.modelStamp) || !tags.same(s.tagsStamp) {
 			return false
 		}
 		profile, err := ResolveProfile(modelPath, t.Name, t.TagsFile)
@@ -184,6 +207,9 @@ func (b *inprocBackend) ensure(req RunRequest) (err error) {
 	for _, t := range taggers {
 		onnxPath := filepath.Join(req.ModelPath, t.Name, t.ModelFile)
 		tagsPath := filepath.Join(req.ModelPath, t.Name, t.TagsFile)
+		// Before the reads: a write landing during the load then reloads.
+		modelStamp, _ := stampOf(onnxPath)
+		tagsStamp, _ := stampOf(tagsPath)
 		profile, err := ResolveProfile(req.ModelPath, t.Name, t.TagsFile)
 		if err != nil {
 			return fmt.Errorf("resolve profile for %q: %w", t.Name, err)
@@ -219,13 +245,15 @@ func (b *inprocBackend) ensure(req RunRequest) (err error) {
 			return fmt.Errorf("create ort session for %q: %w", t.Name, err)
 		}
 		b.sessions[t.Name] = &loadedSession{
-			modelFile: t.ModelFile,
-			tagsFile:  t.TagsFile,
-			profileFP: profile.fingerprint(),
-			session:   session,
-			labels:    labels,
-			profile:   profile,
-			inputSize: inputSize,
+			modelFile:  t.ModelFile,
+			tagsFile:   t.TagsFile,
+			modelStamp: modelStamp,
+			tagsStamp:  tagsStamp,
+			profileFP:  profile.fingerprint(),
+			session:    session,
+			labels:     labels,
+			profile:    profile,
+			inputSize:  inputSize,
 		}
 	}
 	logx.Infof("tagger: cache ready in %s", time.Since(loadStart).Round(10*time.Millisecond))

@@ -7,11 +7,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -98,12 +98,12 @@ func (s *Server) ptrContribPanel(w http.ResponseWriter, r *http.Request) {
 	hasKnown := false
 	for _, t := range preview.ToAdd {
 		switch t.Status {
-		case "new":
+		case contract.PreviewNew:
 			newTags = append(newTags, t.Tag)
 			if t.UnknownTag {
 				unknownTags = append(unknownTags, t.Tag)
 			}
-		case "known":
+		case contract.PreviewKnown:
 			hasKnown = true
 		}
 	}
@@ -149,11 +149,11 @@ func (s *Server) ptrContribDialog(w http.ResponseWriter, r *http.Request) {
 	for _, t := range preview.ToAdd {
 		t.Color = color(t.Tag)
 		switch t.Status {
-		case "new":
+		case contract.PreviewNew:
 			actionable = append(actionable, t)
-		case "known":
+		case contract.PreviewKnown:
 			known = append(known, t)
-		case "unsent":
+		case contract.PreviewUnsent:
 			queued = append(queued, t)
 		default:
 			ineligible = append(ineligible, t)
@@ -205,12 +205,12 @@ func (s *Server) ptrContribSend(w http.ResponseWriter, r *http.Request) {
 	s.sendContribItems(w, r, "image "+strconv.FormatInt(id, 10), items)
 }
 
-func (s *Server) sendContribItems(w http.ResponseWriter, r *http.Request, scope string, items []map[string]any) {
+func (s *Server) sendContribItems(w http.ResponseWriter, r *http.Request, scope string, items []contract.ContribItem) {
 	if len(items) == 0 {
 		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{"Err": "nothing selected"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), contract.ContribSendBudget)
 	defer cancel()
 	resp, err := s.ml.SendContrib(ctx, scope, items)
 	if err != nil {
@@ -225,7 +225,7 @@ func (s *Server) sendContribItems(w http.ResponseWriter, r *http.Request, scope 
 	s.renderContribReceipt(w, items, resp)
 }
 
-func (s *Server) renderContribReceipt(w http.ResponseWriter, items []map[string]any, resp *monloader.ContribSendResponse) {
+func (s *Server) renderContribReceipt(w http.ResponseWriter, items []contract.ContribItem, resp *monloader.ContribSendResponse) {
 	receipt, ok := monloader.ReadContribReceipt(items, resp.Results)
 	if !ok {
 		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{
@@ -258,12 +258,12 @@ func (s *Server) tagPtrContribPanel(w http.ResponseWriter, r *http.Request) {
 	}
 	var newTags, petitionTags []string
 	for _, p := range diff.Local {
-		if p.Direction == "suggest" {
+		if p.Direction == contract.PairSuggest {
 			newTags = append(newTags, p.Label())
 		}
 	}
 	for _, p := range diff.PTROnly {
-		if p.Direction == "petition" {
+		if p.Direction == contract.PairPetition {
 			petitionTags = append(petitionTags, p.Label())
 		}
 	}
@@ -306,11 +306,11 @@ func (s *Server) tagPtrContribDialog(w http.ResponseWriter, r *http.Request) {
 	for _, p := range diff.Local {
 		p = paint(p)
 		switch p.Direction {
-		case "suggest":
+		case contract.PairSuggest:
 			actionable = append(actionable, p)
-		case "pending":
+		case contract.PairPending:
 			pending = append(pending, p)
-		case "petition", "covered":
+		case contract.PairPetition, contract.PairCovered:
 			// Held on the PTR too, directly or through the child's parent
 			// closure.
 			inSync = append(inSync, p)
@@ -321,7 +321,7 @@ func (s *Server) tagPtrContribDialog(w http.ResponseWriter, r *http.Request) {
 	var petitionable, petitioned []monloader.TagPairRow
 	for _, p := range diff.PTROnly {
 		p = paint(p)
-		if p.Direction == "petition" {
+		if p.Direction == contract.PairPetition {
 			petitionable = append(petitionable, p)
 		} else {
 			petitioned = append(petitioned, p)
@@ -359,7 +359,7 @@ func (s *Server) tagPtrContribSend(w http.ResponseWriter, r *http.Request) {
 		s.renderTemplate(w, "partials/ptr_contrib_flash.html", map[string]any{"Err": "a reason is required"})
 		return
 	}
-	items := monloader.PairItems(r.Form["pair"], "suggest", suggestReason)
-	items = append(items, monloader.PairItems(r.Form["pair_petition"], "petition", petitionReason)...)
+	items := monloader.PairItems(r.Form["pair"], contract.PairSuggest, suggestReason)
+	items = append(items, monloader.PairItems(r.Form["pair_petition"], contract.PairPetition, petitionReason)...)
 	s.sendContribItems(w, r, "tag "+strconv.FormatInt(id, 10), items)
 }

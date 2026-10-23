@@ -16,12 +16,12 @@ import (
 
 	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/db"
-	"github.com/monbooru/monbooru/internal/fsx"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 )
@@ -459,7 +459,7 @@ func (s *Scheduler) findRelationPairs(r *jobs.Reservation, cx *library.Gallery) 
 	added, err := cx.FindPairs(ctx, opts, s.jobs.Update)
 	return s.jobs.Settle(ctx, err,
 		fmt.Sprintf("[%s] find-pairs cancelled (%d added)", cx.Name, added),
-		fmt.Sprintf("[%s] find-pairs added %d candidate(s).", cx.Name, added))
+		fmt.Sprintf("[%s] find-pairs added %d %s.", cx.Name, added, models.Plural(added, "candidate", "candidates")))
 }
 
 func (s *Scheduler) sync(r *jobs.Reservation, cx *library.Gallery) error {
@@ -467,7 +467,7 @@ func (s *Scheduler) sync(r *jobs.Reservation, cx *library.Gallery) error {
 	if err != nil {
 		return err
 	}
-	result, err := cx.Sync(ctx, s.host.Config().Gallery.MaxFileSizeMB, s.host.Naming(cx.Name), s.jobs.Update)
+	result, err := cx.Sync(ctx, s.host.Config().Gallery.MaxFileSizeMB, s.host.Naming(cx.Name), s.jobs.Update, s.jobs.NoteChange)
 	if err := s.jobs.Settle(ctx, err,
 		fmt.Sprintf("[%s] sync cancelled (%s)", cx.Name, result.Summary()),
 		fmt.Sprintf("[%s] %s", cx.Name, result.Summary())); err != nil {
@@ -487,7 +487,7 @@ func (s *Scheduler) removeOrphans(r *jobs.Reservation, cx *library.Gallery) erro
 	})
 	s.jobs.Finish(err, ctx.Err() != nil,
 		fmt.Sprintf("[%s] orphan sweep cancelled (%d/%d scanned, %d removed)", cx.Name, processed, total, removed),
-		fmt.Sprintf("[%s] removed %d orphaned thumbnail(s)", cx.Name, removed))
+		fmt.Sprintf("[%s] removed %d orphaned %s", cx.Name, removed, models.Plural(removed, "thumbnail", "thumbnails")))
 	if err != nil {
 		logx.Warnf("scheduler orphans %q: %v", cx.Name, err)
 		return err
@@ -496,11 +496,14 @@ func (s *Scheduler) removeOrphans(r *jobs.Reservation, cx *library.Gallery) erro
 	return nil
 }
 
+// A stamped image was tagged before, so tags the operator stripped since
+// stay stripped.
+func autotagCandidates(d *db.DB) ([]int64, error) {
+	return db.QueryIDs(d.Read, `SELECT id FROM images WHERE is_missing = 0 AND auto_tagged_at IS NULL`)
+}
+
 func (s *Scheduler) autotag(r *jobs.Reservation, cx *library.Gallery) error {
-	ids, err := db.QueryIDs(cx.DB.Read,
-		`SELECT i.id FROM images i WHERE i.is_missing = 0
-		 AND NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.is_auto = 1)`,
-	)
+	ids, err := autotagCandidates(cx.DB)
 	if err != nil {
 		logx.Warnf("scheduler autotag %q: %v", cx.Name, err)
 		return err

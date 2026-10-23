@@ -423,7 +423,35 @@ func readPlaceholder(h Handle, fi syncFileInfo, bySHA map[string]syncBySHARow, o
 	onPhash.Stored(row.id, phash)
 }
 
+// ReadPlaceholder reads an import placeholder's file, now on disk at its
+// path, into the row.
+func ReadPlaceholder(h Handle, path string) (*int64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	sha, err := HashFile(path)
+	if err != nil {
+		return nil, err
+	}
+	sum, err := Md5File(path)
+	if err != nil {
+		return nil, err
+	}
+	return applyInPlaceEdit(h, path, sha, sum, fi.ModTime().Unix(), fi.ModTime().UnixNano(), fi.Size())
+}
+
 func reconcileNewFile(h Handle, fi syncFileInfo, bySHA map[string]syncBySHARow, result *SyncResult, onPhash PhashSink) int64 {
+	// The size and mtime shortcut carries no md5: the row it matched keeps
+	// its own, but a split-off alias becomes a new row needing one.
+	if fi.md5 == "" {
+		sum, err := Md5File(fi.path)
+		if err != nil {
+			logx.Warnf("sync: md5 %q: %v", fi.path, err)
+			return 0
+		}
+		fi.md5 = sum
+	}
 	img, _, ingestErr := ingestWithHash(h, fi.path, fi.sha256, fi.md5, "")
 	if ingestErr != nil {
 		logx.Warnf("ingest failed for %q: %v", fi.path, ingestErr)
@@ -656,9 +684,11 @@ func applyInPlaceEdit(h Handle, path, newSHA, newMD5 string, newMtime, newMtimeN
 	if err := db.InWriteTx(database.Write, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(
 			// duration_seconds is written for every type, or a former video
-			// keeps matching the duration: filter.
-			`UPDATE images SET sha256 = ?, md5 = ?, file_size = ?, file_type = ?, width = ?, height = ?, page_count = ?, duration_seconds = ?, source_type = ?, phash = NULL WHERE id = ?`,
-			newSHA, newMD5, newSize, fileType, facts.width, facts.height, facts.pageCount, facts.durationSec, facts.sourceType, imageID,
+			// keeps matching the duration: filter. A placeholder read keeps
+			// its auto-tag stamp: its bytes did not change.
+			`UPDATE images SET sha256 = ?, md5 = ?, file_size = ?, file_type = ?, width = ?, height = ?, page_count = ?, duration_seconds = ?, source_type = ?, phash = NULL,
+			        auto_tagged_at = CASE WHEN sha256 = ? THEN auto_tagged_at END WHERE id = ?`,
+			newSHA, newMD5, newSize, fileType, facts.width, facts.height, facts.pageCount, facts.durationSec, facts.sourceType, newSHA, imageID,
 		); err != nil {
 			return fmt.Errorf("update images row: %w", err)
 		}

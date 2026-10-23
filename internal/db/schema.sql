@@ -350,6 +350,7 @@ CREATE INDEX IF NOT EXISTS idx_tags_category     ON tags(category_id);
 CREATE INDEX IF NOT EXISTS idx_tags_usage        ON tags(usage_count DESC);
 CREATE INDEX IF NOT EXISTS idx_tags_active_usage ON tags(usage_count DESC, name) WHERE is_alias = 0;
 CREATE INDEX IF NOT EXISTS idx_tags_alias_canonical ON tags(canonical_tag_id, name) WHERE is_alias = 1;
+CREATE INDEX IF NOT EXISTS idx_tags_canonical ON tags(canonical_tag_id) WHERE canonical_tag_id IS NOT NULL;
 -- image_id makes tag seeks covering, and tag_id = ? AND image_id >= ? a range.
 CREATE INDEX IF NOT EXISTS idx_image_tags_tag_image ON image_tags(tag_id, image_id);
 CREATE INDEX IF NOT EXISTS idx_image_tags_image  ON image_tags(image_id);

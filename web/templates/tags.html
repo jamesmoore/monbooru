@@ -138,7 +138,7 @@
     <button type="button" id="btn-create-alias" class="btn-sm">Create alias…</button>
   </h2>
 
-  <div id="tag-flash"></div>
+  <div id="tag-flash" data-action-flash></div>
   <div id="tag-ptr-review"></div>
 
   <div id="tag-batch-bar" data-total="{{.Total}}" hidden>
@@ -152,12 +152,12 @@
     {{if .Folded}}<button type="button" id="btn-batch-merge-folded" class="btn-sm">Merge into corrected spelling</button>{{end}}
     <button type="button" id="btn-batch-alias" class="btn-sm">Alias to…</button>
     <button type="button" id="btn-batch-imply" class="btn-sm">Imply…</button>
-    {{if .MonloaderPTRPresent}}<button type="button" id="btn-batch-ptr" class="btn-sm monloader-accent"{{if not .MonloaderPTR}} disabled title="{{if .MonloaderPTRSyncing}}the Public Tag Repository index is still syncing{{else}}{{monloaderOffReason .MonloaderConn}}{{end}}"{{end}}>Find aliases and implications</button>{{end}}
+    {{if .MonloaderPTRPresent}}<button type="button" id="btn-batch-ptr" class="btn-sm peer-accent"{{if not .MonloaderPTR}} disabled title="{{if .MonloaderPTRSyncing}}the Public Tag Repository index is still syncing{{else}}{{monloaderOffReason .MonloaderConn}}{{end}}"{{end}}>Find aliases and implications</button>{{end}}
     <button type="button" id="btn-batch-delete" class="btn-sm btn-danger">Delete</button>
   </div>
 
   <div class="table-scroll">
-  <table class="tag-table">
+  <table class="grid-table tag-table">
     {{$nameOrder := "asc"}}{{if and (eq $sort "name") (eq $order "asc")}}{{$nameOrder = "desc"}}{{end}}
     {{$usageOrder := "desc"}}{{if and (eq $sort "usage") (eq $order "desc")}}{{$usageOrder = "asc"}}{{end}}
     {{$createdOrder := "desc"}}{{if and (eq $sort "created") (eq $order "desc")}}{{$createdOrder = "asc"}}{{end}}
@@ -251,7 +251,7 @@
             {{end}}
             <button class="btn-sm btn-danger btn-delete-tag"
                     title="{{if eq .CategoryName "rating"}}Strip this rating from every image (the catalog row stays){{else}}Delete this tag from every image{{end}}"
-                    data-id="{{.ID}}" data-name="{{.Name}}" data-category="{{.CategoryName}}">Delete</button>
+                    data-id="{{.ID}}" data-name="{{.Name}}" data-category="{{.CategoryName}}">{{if eq .CategoryName "rating"}}Strip{{else}}Delete{{end}}</button>
           </div>
         </td>
       </tr>
@@ -389,7 +389,7 @@
   <p style="color:var(--fg-dim);font-size:12px">Aliases and implications the Public Tag Repository declares are added to the catalog.</p>
   <div id="ptr-lookup-search-flash"></div>
   <div class="dialog-actions">
-    <button type="button" class="monloader-accent" onclick="confirmPTRLookupSearch()">Find</button>
+    <button type="button" class="peer-accent" onclick="confirmPTRLookupSearch()">Find</button>
     <button type="button" onclick="document.getElementById('ptr-lookup-search-dialog').close()">Cancel</button>
   </div>
 </dialog>

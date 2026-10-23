@@ -115,6 +115,17 @@ func (cx *Gallery) ReplaceFile(id int64, staged, sha, md5, fileType string) erro
 	return nil
 }
 
+// ReadPlaceholder also feeds the index the file's phash.
+func (cx *Gallery) ReadPlaceholder(id int64, path string) error {
+	defer cx.InvalidateCaches()
+	phash, err := gallery.ReadPlaceholder(cx.Handle, path)
+	if err != nil {
+		return err
+	}
+	cx.phashSink().Stored(id, phash)
+	return nil
+}
+
 func (cx *Gallery) PlaceImage(id int64, folder, name *string) (*gallery.MoveImageResult, error) {
 	defer cx.InvalidateCaches()
 	return gallery.PlaceImage(cx.DB, cx.Boundary(), id, folder, name)

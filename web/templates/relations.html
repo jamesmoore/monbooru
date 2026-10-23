@@ -3,7 +3,7 @@
 
 <div id="relations-page">
   <h2>Relations</h2>
-  <div id="flash-relations"></div>
+  <div id="flash-relations" data-action-flash></div>
 
   <div class="relations-hub-cols">
     <section id="find" class="settings-section">
@@ -41,7 +41,7 @@
       </div>
       <p class="field-hint">
         Queue: <strong>{{.Counts.QueueOpen}}</strong> unresolved, <strong>{{.Counts.QueueSkipped}}</strong> skipped
-        {{if gt .Counts.PhashMissing 0}}· <a href="/?q=-phash:" title="Search images without a phash"><strong>{{.Counts.PhashMissing}}</strong></a> image(s) without a phash{{end}}
+        {{if gt .Counts.PhashMissing 0}}· <a href="/?q=-phash:" title="Search images without a phash"><strong>{{.Counts.PhashMissing}}</strong></a> {{plural .Counts.PhashMissing "image" "images"}} without a phash{{end}}
       </p>
       {{if .Counts.QueueBySource}}
       <p class="field-hint">
@@ -58,10 +58,10 @@
       <h3>Browse relations</h3>
       <p class="field-hint">Review every relation already declared, grouped by kind. Dissolve groups, merge groups, unlink edges, or jump back to the images.</p>
       <p class="field-hint">
-        <strong>{{.Counts.DupGroups}}</strong> same-image group(s) ·
-        <strong>{{.Counts.AltGroups}}</strong> variant group(s) ·
-        <strong>{{.Counts.VersionChains}}</strong> revision chain(s) ·
-        <strong>{{.Counts.DerivativeTrees}}</strong> based-on tree(s)
+        <strong>{{.Counts.DupGroups}}</strong> same-image {{plural .Counts.DupGroups "group" "groups"}} ·
+        <strong>{{.Counts.AltGroups}}</strong> variant {{plural .Counts.AltGroups "group" "groups"}} ·
+        <strong>{{.Counts.VersionChains}}</strong> revision {{plural .Counts.VersionChains "chain" "chains"}} ·
+        <strong>{{.Counts.DerivativeTrees}}</strong> based-on {{plural .Counts.DerivativeTrees "tree" "trees"}}
       </p>
       <div class="relations-header-row">
         <a class="btn-sm" href="/relations/browse">Browse relations</a>
@@ -82,7 +82,7 @@
       </div>
       <div class="settings-sub">
         <h4>Duplicate images</h4>
-        <p class="field-hint">Images you marked as duplicates of each other. <strong>{{.Counts.DupGroups}}</strong> group(s) declared via the Relations session or the detail-page panel.</p>
+        <p class="field-hint">Images you marked as duplicates of each other. <strong>{{.Counts.DupGroups}}</strong> {{plural .Counts.DupGroups "group" "groups"}} declared via the Relations session or the detail-page panel.</p>
         <div class="relations-header-row">
           <a class="btn-sm" href="/relations/duplicates/marked">Review duplicate images</a>
           {{template "bulk_delete_dup_images" "#flash-relations"}}

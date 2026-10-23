@@ -1,5 +1,32 @@
 # Changelog
 
+## [v1.22.3] - 2026-10-23
+### Changed
+- A loopback bind answers only loopback names and the `server.base_url` host.
+- The monloader addresses in Settings must be http(s) URLs.
+- The nightly auto-tag takes only images never auto-tagged, so stripped tags stay stripped.
+- Settings -> Stats shows free space on Windows too.
+- A refused login says how many seconds remain before the next try.
+- Deleting or merging tags is faster on large libraries.
+
+### Fixed
+- Refused saves, deletes and implication removals show their reason instead of failing silently.
+- Search names an unterminated quote or unreadable comparison instead of showing no results.
+- A tagger whose files are overwritten in place reloads; a gallery with no tagger says so.
+- EXIF text keeps its UTF-8, and a bad ComicInfo number no longer drops later fields.
+- Re-pairing monloader resumes a paused link; setup and refused lookups are reported as such.
+- The monloader client no longer follows redirects and caps answers at 16 MiB.
+- The API answers an oversized replace with 413 and holds its default page size to the cap.
+- Renaming a tag clears its stale pairs from the Folded listing.
+- Tag suggestions match names with non-ASCII capitals.
+- An image hashed while the similarity index builds is found by later searches.
+- An image the ignore list leaves out reads as ignored, not missing, without Remove from library.
+- A sync refreshes the gallery grid only when rows changed, not on every tick.
+- Stop and Restart warn of a job started after the page loaded.
+
+### Internal
+- Building from source needs Go 1.27.3 or newer.
+
 ## [v1.22.2] - 2026-10-17
 ### Added
 - PixAI v1 in the tagger catalog. ([#143](https://github.com/monbooru/monbooru/issues/143))

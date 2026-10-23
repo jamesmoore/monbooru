@@ -210,11 +210,11 @@ func (x *exifData) loadSubIFD(data []byte, order binary.ByteOrder, pointer strin
 }
 
 func (t *exifTag) intAt(i int) (int64, bool) {
-	vals := t.ints()
-	if vals == nil || i >= len(vals) {
+	width, signed := t.intWidth()
+	if width == 0 || i < 0 || i >= int(t.count) {
 		return 0, false
 	}
-	return vals[i], true
+	return t.intElem(i, width, signed), true
 }
 
 func (t *exifTag) stringVal() (string, bool) {
@@ -275,6 +275,10 @@ func decodeUTF16(b []byte) string {
 			order = binary.LittleEndian
 		}
 	}
+	return utf16Text(order, b)
+}
+
+func utf16Text(order binary.ByteOrder, b []byte) string {
 	units := make([]uint16, 0, len(b)/2)
 	for i := 0; i+1 < len(b); i += 2 {
 		units = append(units, order.Uint16(b[i:]))
@@ -282,42 +286,51 @@ func decodeUTF16(b []byte) string {
 	return strings.TrimRight(string(utf16.Decode(units)), "\x00")
 }
 
-func (t *exifTag) ints() []int64 {
-	width, signed := 0, false
+// intWidth is 0 for a type that holds no integers.
+func (t *exifTag) intWidth() (width int, signed bool) {
 	switch t.typ {
 	case exifByte:
-		width = 1
+		return 1, false
 	case exifSByte:
-		width, signed = 1, true
+		return 1, true
 	case exifShort:
-		width = 2
+		return 2, false
 	case exifSShort:
-		width, signed = 2, true
+		return 2, true
 	case exifLong:
-		width = 4
+		return 4, false
 	case exifSLong:
-		width, signed = 4, true
-	default:
+		return 4, true
+	}
+	return 0, false
+}
+
+func (t *exifTag) intElem(i, width int, signed bool) int64 {
+	b := t.val[i*width:]
+	var u uint64
+	switch width {
+	case 1:
+		u = uint64(b[0])
+	case 2:
+		u = uint64(t.order.Uint16(b))
+	case 4:
+		u = uint64(t.order.Uint32(b))
+	}
+	if signed {
+		shift := 64 - width*8
+		return int64(u<<shift) >> shift
+	}
+	return int64(u)
+}
+
+func (t *exifTag) ints() []int64 {
+	width, signed := t.intWidth()
+	if width == 0 {
 		return nil
 	}
 	out := make([]int64, t.count)
 	for i := range out {
-		b := t.val[i*width:]
-		var u uint64
-		switch width {
-		case 1:
-			u = uint64(b[0])
-		case 2:
-			u = uint64(t.order.Uint16(b))
-		case 4:
-			u = uint64(t.order.Uint32(b))
-		}
-		if signed {
-			shift := 64 - width*8
-			out[i] = int64(u<<shift) >> shift
-			continue
-		}
-		out[i] = int64(u)
+		out[i] = t.intElem(i, width, signed)
 	}
 	return out
 }
@@ -366,6 +379,10 @@ func (t *exifTag) render() string {
 	if t.typ == exifASCII || t.typ == exifUndefined {
 		return quotePrintable(t.val)
 	}
+	// Windows' XP tags are BYTE-typed UTF-16LE text.
+	if t.typ == exifByte && t.id >= 0x9C9B && t.id <= 0x9C9F {
+		return quotePrintable([]byte(utf16Text(binary.LittleEndian, t.val)))
+	}
 	parts := make([]string, 0, t.count)
 	switch t.typ {
 	case exifRational, exifSRational:
@@ -384,19 +401,17 @@ func (t *exifTag) render() string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
-// Bytes are dropped one at a time, which can split a rune, so an invalid
-// UTF-8 result renders as empty.
 func quotePrintable(in []byte) string {
+	if !utf8.Valid(in) {
+		return `""`
+	}
 	var b strings.Builder
 	b.WriteByte('"')
-	for _, c := range in {
-		if unicode.IsPrint(rune(c)) {
-			b.WriteByte(c)
+	for _, r := range string(in) {
+		if unicode.IsPrint(r) {
+			b.WriteRune(r)
 		}
 	}
 	b.WriteByte('"')
-	if s := b.String(); utf8.ValidString(s) {
-		return s
-	}
-	return `""`
+	return b.String()
 }

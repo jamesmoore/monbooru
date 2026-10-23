@@ -65,44 +65,45 @@ var ErrSearchUnbounded = errors.New("a substring search needs a category")
 
 // monbooru only enqueues, keeping its single-egress model: every fetch
 // runs on monloader.
-func (l *Link) enqueue(ctx context.Context, path string, payload map[string]any, onConflict error) (int64, error) {
+func (l *Link) enqueue(ctx context.Context, path string, payload any, onConflict error) (int64, error) {
 	resp, err := l.client.Post(ctx, path, payload)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if onConflict != nil && resp.StatusCode == http.StatusConflict {
+		if setupRequired(resp) {
+			return 0, peer.StatusError{Peer: App, Status: resp.Status, Code: contract.CodeSetupRequired}
+		}
 		return 0, onConflict
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return 0, errBudgetSpent
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return 0, peer.StatusError{Peer: App, Status: resp.Status}
+		return 0, refused(resp)
 	}
-	var out struct {
-		JobID int64 `json:"job_id"`
-	}
+	var out contract.JobAccepted
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return out.JobID, nil
 }
 
 func (l *Link) EnqueueMetadataFetch(ctx context.Context, imageID int64, gallery, url string) error {
 	_, err := l.enqueue(ctx, "/api/v1/metadata",
-		map[string]any{"image_id": imageID, "gallery": gallery, "url": url}, nil)
+		contract.ImageJobRequest{ImageID: imageID, Gallery: gallery, URL: url}, nil)
 	return err
 }
 
 func (l *Link) EnqueueReplace(ctx context.Context, imageID int64, gallery, url string) error {
 	_, err := l.enqueue(ctx, "/api/v1/replace",
-		map[string]any{"image_id": imageID, "gallery": gallery, "url": url}, nil)
+		contract.ImageJobRequest{ImageID: imageID, Gallery: gallery, URL: url}, nil)
 	return err
 }
 
 func (l *Link) enqueueHashLookup(ctx context.Context, imageID int64, gallery, backend, md5, sha256 string, background, budgeted bool) (int64, error) {
-	return l.enqueue(ctx, "/api/v1/lookup", map[string]any{
-		"image_id": imageID, "gallery": gallery, "backend": backend, "md5": md5, "sha256": sha256,
-		"background": background, "budgeted": budgeted,
+	return l.enqueue(ctx, "/api/v1/lookup", contract.LookupRequest{
+		ImageID: imageID, Gallery: gallery, Backend: backend, MD5: md5, SHA256: sha256,
+		Background: background, Budgeted: budgeted,
 	}, ErrPTRUnavailable)
 }
 
@@ -112,13 +113,13 @@ func (l *Link) GalleryRenamed(ctx context.Context, oldName, newName string) erro
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	resp, err := l.client.Post(ctx, "/api/v1/galleries/rename", map[string]any{"from": oldName, "to": newName})
+	resp, err := l.client.Post(ctx, "/api/v1/galleries/rename", contract.GalleryRename{From: oldName, To: newName})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return peer.StatusError{Peer: App, Status: resp.Status}
+		return refused(resp)
 	}
 	return nil
 }
@@ -135,14 +136,9 @@ func (l *Link) Teardown(remove func()) error {
 	return err
 }
 
-type ptrLookupImage struct {
-	ImageID int64  `json:"image_id"`
-	SHA256  string `json:"sha256"`
-}
-
-func (l *Link) ptrBatchLookup(ctx context.Context, gallery string, scheduled bool, images []ptrLookupImage) (map[string][]string, uint64, error) {
-	resp, err := l.client.Post(ctx, "/api/v1/ptr/lookup", map[string]any{
-		"images": images, "gallery": gallery, "scheduled": scheduled,
+func (l *Link) ptrBatchLookup(ctx context.Context, gallery string, scheduled bool, images []contract.PTRLookupImage) (map[string][]string, uint64, error) {
+	resp, err := l.client.Post(ctx, "/api/v1/ptr/lookup", contract.PTRLookupRequest{
+		Images: images, Gallery: gallery, Scheduled: scheduled,
 	})
 	if err != nil {
 		return nil, 0, err
@@ -155,12 +151,9 @@ func (l *Link) ptrBatchLookup(ctx context.Context, gallery string, scheduled boo
 		return nil, 0, errPTRBatchUnsupported
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, peer.StatusError{Peer: App, Status: resp.Status}
+		return nil, 0, refused(resp)
 	}
-	var out struct {
-		Index   uint64              `json:"index"`
-		Results map[string][]string `json:"results"`
-	}
+	var out contract.PTRLookupResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, 0, err
 	}
@@ -174,7 +167,7 @@ func (l *Link) ptrIndexCursor(ctx context.Context) (uint64, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0, peer.StatusError{Peer: App, Status: resp.Status}
+		return 0, refused(resp)
 	}
 	var out ptrStatus
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -197,6 +190,15 @@ type ptrStatus struct {
 	} `json:"contrib"`
 }
 
+type queueJob struct {
+	Status  string `json:"status"`
+	Backend string `json:"backend"`
+	Items   []struct {
+		Outcome   string `json:"outcome"`
+		ErrorCode string `json:"error_code"`
+	} `json:"items"`
+}
+
 // false leaves the row in flight. An empty result is inconclusive: moving
 // the ladder on it would walk an image to "nothing found" while monloader
 // is down.
@@ -216,14 +218,7 @@ func (l *Link) jobOutcome(ctx context.Context, jobID int64) (string, bool) {
 	if resp.StatusCode != http.StatusOK {
 		return "", false
 	}
-	var job struct {
-		Status  string `json:"status"`
-		Backend string `json:"backend"`
-		Items   []struct {
-			Outcome   string `json:"outcome"`
-			ErrorCode string `json:"error_code"`
-		} `json:"items"`
-	}
+	var job queueJob
 	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
 		return "", false
 	}
@@ -249,7 +244,7 @@ func (l *Link) jobOutcome(ctx context.Context, jobID int64) (string, bool) {
 	return lookup.ResultError, true
 }
 
-func postJSON[T any](l *Link, ctx context.Context, path string, payload map[string]any) (*T, error) {
+func postJSON[T any](l *Link, ctx context.Context, path string, payload any) (*T, error) {
 	body, _ := json.Marshal(payload)
 	resp, err := l.client.Do(ctx, http.MethodPost, path, body)
 	if err != nil {
@@ -257,14 +252,12 @@ func postJSON[T any](l *Link, ctx context.Context, path string, payload map[stri
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusConflict {
-		var refusal struct {
-			Code string `json:"code"`
-		}
+		var refusal contract.Error
 		_ = json.NewDecoder(resp.Body).Decode(&refusal)
 		return nil, conflict{refusal.Code}
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return nil, peer.StatusError{Peer: App, Status: resp.Status}
+		return nil, refused(resp)
 	}
 	var out T
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -273,33 +266,18 @@ func postJSON[T any](l *Link, ctx context.Context, path string, payload map[stri
 	return &out, nil
 }
 
-// Names are in monbooru form (bare or category:name).
-type PTRTagInfo struct {
-	Known        bool     `json:"known"`
-	Ideal        string   `json:"ideal"`
-	Aliases      []string `json:"aliases"`
-	Implications []string `json:"implications"`
-	ImpliedBy    []string `json:"implied_by"`
-}
+type PTRTagInfo = contract.PTRTagInfo
 
 // The caller keeps a call's names under monloader's request limit.
 func (l *Link) PTRTagLookup(ctx context.Context, names []string) (map[string]PTRTagInfo, error) {
-	out, err := postJSON[struct {
-		Results map[string]PTRTagInfo `json:"results"`
-	}](l, ctx, "/api/v1/ptr/tags", map[string]any{"tags": names})
+	out, err := postJSON[contract.PTRTagsResponse](l, ctx, "/api/v1/ptr/tags", contract.PTRTagsRequest{Tags: names})
 	if err != nil {
 		return nil, err
 	}
 	return out.Results, nil
 }
 
-type PTRCluster struct {
-	Ideal        string   `json:"ideal"`
-	Matched      []string `json:"matched"`
-	Aliases      int      `json:"aliases"`
-	Implications int      `json:"implications"`
-	ImpliedBy    int      `json:"implied_by"`
-}
+type PTRCluster = contract.PTRCluster
 
 func (l *Link) PTRSpellingSearch(ctx context.Context, q, mode string, limit int) (clusters []PTRCluster, truncated bool, err error) {
 	v := url.Values{"q": {q}, "limit": {strconv.Itoa(limit)}}
@@ -320,12 +298,9 @@ func (l *Link) PTRSpellingSearch(ctx context.Context, q, mode string, limit int)
 	case http.StatusConflict:
 		return nil, false, ErrPTRUnavailable
 	default:
-		return nil, false, peer.StatusError{Peer: App, Status: resp.Status}
+		return nil, false, refused(resp)
 	}
-	var out struct {
-		Clusters  []PTRCluster `json:"clusters"`
-		Truncated bool         `json:"truncated"`
-	}
+	var out contract.PTRSearchResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, false, err
 	}
@@ -333,12 +308,8 @@ func (l *Link) PTRSpellingSearch(ctx context.Context, q, mode string, limit int)
 }
 
 type ContribPreviewToAdd struct {
-	Tag        string `json:"tag"`
-	PTR        string `json:"ptr"`
-	Status     string `json:"status"`
-	Note       string `json:"note"`
-	UnknownTag bool   `json:"unknown_tag"`
-	Color      string `json:"-"`
+	contract.ContribToAdd
+	Color string `json:"-"`
 	// Sent is the spelling the row goes up under; Tag is the one the
 	// operator sees.
 	Sent string `json:"-"`
@@ -347,10 +318,8 @@ type ContribPreviewToAdd struct {
 func (t ContribPreviewToAdd) PTRDiffers() bool { return strings.ReplaceAll(t.Tag, "_", " ") != t.PTR }
 
 type ContribPreviewPTROnly struct {
-	Tag          string `json:"tag"`
-	PTR          string `json:"ptr"`
-	Petitionable bool   `json:"petitionable"`
-	Color        string `json:"-"`
+	contract.ContribPTROnly
+	Color string `json:"-"`
 }
 
 type ContribPreview struct {
@@ -365,23 +334,17 @@ func (l *Link) previewContrib(ctx context.Context, sha256 string, tags, implied 
 		tags = []string{}
 	}
 	return postJSON[ContribPreview](l, ctx, "/api/v1/ptr/contrib/preview",
-		map[string]any{"sha256": sha256, "tags": tags, "implied": implied})
+		contract.ContribPreviewRequest{SHA256: sha256, Tags: tags, Implied: implied})
 }
 
-type ContribSendResult struct {
-	Kind   string `json:"kind"`
-	Result string `json:"result"`
-	Note   string `json:"note"`
-}
+type ContribSendResult = contract.ContribResult
 
-type ContribSendResponse struct {
-	Results []ContribSendResult `json:"results"`
-	JobID   int64               `json:"job_id"`
-}
+type ContribSendResponse = contract.ContribResponse
 
-func (l *Link) SendContrib(ctx context.Context, origin string, items []map[string]any) (*ContribSendResponse, error) {
+func (l *Link) SendContrib(ctx context.Context, origin string, items []contract.ContribItem) (*ContribSendResponse, error) {
+	commit := true
 	out, err := postJSON[ContribSendResponse](l, ctx, "/api/v1/ptr/contrib",
-		map[string]any{"commit": true, "origin": origin, "items": items})
+		contract.ContribRequest{Commit: &commit, Origin: origin, Items: items})
 	var c conflict
 	if errors.As(err, &c) {
 		if reason, ok := contribRefusals[c.code]; ok {
@@ -391,15 +354,7 @@ func (l *Link) SendContrib(ctx context.Context, origin string, items []map[strin
 	return out, err
 }
 
-type pairPreview struct {
-	APtr        string `json:"a_ptr"`
-	BPtr        string `json:"b_ptr"`
-	Direction   string `json:"direction"`
-	Note        string `json:"note"`
-	Provisional bool   `json:"provisional"`
-}
-
-func (l *Link) previewPair(ctx context.Context, kind, a, b string) (*pairPreview, error) {
-	return postJSON[pairPreview](l, ctx, "/api/v1/ptr/contrib/pair-preview",
-		map[string]any{"kind": kind, "a": a, "b": b})
+func (l *Link) previewPair(ctx context.Context, kind, a, b string) (*contract.PairPreviewResponse, error) {
+	return postJSON[contract.PairPreviewResponse](l, ctx, "/api/v1/ptr/contrib/pair-preview",
+		contract.PairPreviewRequest{Kind: kind, A: a, B: b})
 }

@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/monbooru/monbooru/internal/relations"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 type relationsResponse struct {
@@ -60,7 +61,7 @@ func (h *Handler) relationsForImage(w http.ResponseWriter, r *http.Request) {
 	if resp.DerivativeSources == nil {
 		resp.DerivativeSources = []int64{}
 	}
-	WriteJSON(w, http.StatusOK, resp)
+	contract.WriteJSON(w, http.StatusOK, resp)
 }
 
 type relationsAddBody struct {
@@ -76,11 +77,11 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body relationsAddBody
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if body.A == 0 || body.B == 0 {
-		apiError(w, http.StatusBadRequest, "invalid_request", "missing a or b")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "missing a or b")
 		return
 	}
 	for _, id := range []int64{body.A, body.B} {
@@ -89,7 +90,7 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !exists {
-			apiError(w, http.StatusNotFound, "not_found", "image not found")
+			contract.WriteError(w, http.StatusNotFound, "not_found", "image not found")
 			return
 		}
 	}
@@ -98,12 +99,12 @@ func (h *Handler) addRelation(w http.ResponseWriter, r *http.Request) {
 		left, right = right, left
 	}
 	if g.RelationsSvc == nil {
-		apiError(w, http.StatusInternalServerError, "internal_error", "relations not wired")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "relations not wired")
 		return
 	}
 	add, known := relationAdders[body.Type]
 	if !known {
-		apiError(w, http.StatusBadRequest, "invalid_request", "unknown type")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "unknown type")
 		return
 	}
 	if err := add(g.RelationsSvc, left, right); err != nil {
@@ -136,11 +137,11 @@ func (h *Handler) removeRelation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body relationsRemoveBody
-	if !decodeJSON(w, r, &body) {
+	if !contract.DecodeJSON(w, r, &body, maxJSONBody) {
 		return
 	}
 	if g.RelationsSvc == nil {
-		apiError(w, http.StatusInternalServerError, "internal_error", "relations not wired")
+		contract.WriteError(w, http.StatusInternalServerError, "internal_error", "relations not wired")
 		return
 	}
 	var err error
@@ -196,7 +197,7 @@ func (h *Handler) removeRelation(w http.ResponseWriter, r *http.Request) {
 		}
 		err = g.RelationsSvc.PromoteToOriginal(body.GroupID, body.ImageID)
 	default:
-		apiError(w, http.StatusBadRequest, "invalid_request", "unknown type")
+		contract.WriteError(w, http.StatusBadRequest, "invalid_request", "unknown type")
 		return
 	}
 	if err != nil {
@@ -208,7 +209,7 @@ func (h *Handler) removeRelation(w http.ResponseWriter, r *http.Request) {
 
 func writeRelationError(w http.ResponseWriter, err error) {
 	if fe := relations.FriendlyErrorFor(err); fe != nil {
-		apiError(w, fe.Status, fe.Code, fe.Message)
+		contract.WriteError(w, fe.Status, fe.Code, fe.Message)
 		return
 	}
 	serverError(w, err)

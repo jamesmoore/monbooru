@@ -1,10 +1,4 @@
 {{define "partials/head.html"}}
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.Title}}</title>
-  <meta name="csrf-token" content="{{.CSRFToken}}">
-  <link rel="icon" type="image/png" href="{{.BooruFavicon}}">
+{{template "webui/head" .}}
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/main.css">
-  {{if .Theme}}<link rel="stylesheet" href="/theme.css">{{end}}
 {{end}}

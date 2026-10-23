@@ -45,19 +45,19 @@ func (s *Server) settingsRelationsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := strconv.Atoi(r.FormValue("default_distance"))
 	if err != nil || d < 0 || d > config.MaxPhashDistance {
-		flashStatus(w, http.StatusBadRequest, "Distance must be an integer 0..12.")
+		writeInlineFlash(w, "err", "Distance must be an integer 0..12.")
 		return
 	}
 	order := r.FormValue("default_session_order")
 	if !validOrderModes[order] {
-		flashStatus(w, http.StatusBadRequest, "Unknown session order.")
+		writeInlineFlash(w, "err", "Unknown session order.")
 		return
 	}
 	threshold := config.DefaultTagPairThreshold
 	if raw := r.FormValue("tag_pair_threshold"); raw != "" {
 		v, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
-			flashStatus(w, http.StatusBadRequest, "Match strength must be a number between 70 and 100.")
+			writeInlineFlash(w, "err", "Match strength must be a number between 70 and 100.")
 			return
 		}
 		threshold = config.ClampTagPairThreshold(v / 100)
@@ -74,14 +74,14 @@ func (s *Server) settingsRelationsPost(w http.ResponseWriter, r *http.Request) {
 		rc = c.Relations
 		return nil
 	}); err != nil {
-		flashStatus(w, http.StatusInternalServerError, err.Error())
+		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
 	applyRelationsConfig(rc)
 	pruned := ""
 	if before.DefaultDistance != d || before.TagPairs != tagPairs || before.TagPairThreshold != threshold {
 		if n := s.pruneRelationQueues(r.Context(), rc); n > 0 {
-			pruned = fmt.Sprintf(" %d stale pair(s) dropped.", n)
+			pruned = fmt.Sprintf(" %d stale pair%s dropped.", n, plural(n))
 		}
 	}
 	logx.Infof("settings: relations { distance=%d order=%s tag_pairs=%v threshold=%.2f }", d, order, tagPairs, threshold)

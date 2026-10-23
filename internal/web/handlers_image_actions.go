@@ -20,6 +20,7 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/upgrade"
 )
@@ -134,11 +135,11 @@ func (s *Server) deleteImage(w http.ResponseWriter, r *http.Request) {
 	res, err := s.active().DeleteImages(context.Background(), []int64{id}, library.DeleteOptions{}, nil)
 	if err != nil {
 		logx.Errorf("delete image %d: %v", id, err)
-		flashStatus(w, http.StatusInternalServerError, "Delete failed; check server log.")
+		flashHeaderErr(w, http.StatusInternalServerError, "Delete failed; check server log.")
 		return
 	}
 	if len(res.Deleted) == 0 {
-		http.NotFound(w, r)
+		flashHeaderErr(w, http.StatusNotFound, fmt.Sprintf("Image #%d is already gone.", id))
 		return
 	}
 
@@ -174,21 +175,13 @@ func (s *Server) deleteImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) promoteCanonical(w http.ResponseWriter, r *http.Request) {
-	fail := func(msg string, code int) {
-		if isHTMXRequest(r) {
-			setFlashHeader(w, msg, "err", nil)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		http.Error(w, msg, code)
-	}
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
 		return
 	}
 	requested := r.FormValue("path")
 	if requested == "" {
-		fail("path required", http.StatusBadRequest)
+		flashHeaderErr(w, http.StatusBadRequest, "path required")
 		return
 	}
 
@@ -199,15 +192,15 @@ func (s *Server) promoteCanonical(w http.ResponseWriter, r *http.Request) {
 		id, requested,
 	).Scan(&newCanonical)
 	if errors.Is(err, sql.ErrNoRows) {
-		fail("path is not an alias of this image", http.StatusBadRequest)
+		flashHeaderErr(w, http.StatusBadRequest, "path is not an alias of this image")
 		return
 	}
 	if err != nil {
-		fail(err.Error(), http.StatusInternalServerError)
+		flashHeaderErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if _, statErr := os.Stat(newCanonical); statErr != nil {
-		fail("cannot set canonical: file is missing on disk", http.StatusBadRequest)
+		flashHeaderErr(w, http.StatusBadRequest, "cannot set canonical: file is missing on disk")
 		return
 	}
 
@@ -216,7 +209,7 @@ func (s *Server) promoteCanonical(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, new(gallery.Exclusion)) {
 			code = http.StatusBadRequest
 		}
-		fail(err.Error(), code)
+		flashHeaderErr(w, code, err.Error())
 		return
 	}
 	hxDone(w, r, "Canonical path updated.", "", fmt.Sprintf("/images/%d", id))
@@ -232,7 +225,7 @@ const (
 )
 
 func (s *Server) setSource(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -278,7 +271,7 @@ func (s *Server) setSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sourceMembershipAction(w http.ResponseWriter, r *http.Request, successMsg string, action func(id int64, site, postID string) error) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -311,7 +304,7 @@ func (s *Server) keepLocalFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fetchSource(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -338,7 +331,7 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	backend := r.FormValue("backend")
-	if backend != "all" && backend != "ptr" && backend != "booru" {
+	if backend != contract.LookupAll && backend != contract.LookupPTR && backend != contract.LookupBooru {
 		externalErr(w, r, "unknown lookup backend", http.StatusBadRequest)
 		return
 	}
@@ -412,7 +405,7 @@ func (s *Server) replaceImage(w http.ResponseWriter, r *http.Request) {
 
 // Free routes hold no lock across a peer call, so they snapshot the name.
 func (s *Server) imageAndGallery(w http.ResponseWriter, r *http.Request) (int64, *library.Gallery, string, bool) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return 0, nil, "", false
 	}
@@ -425,22 +418,6 @@ func (s *Server) imageAndGallery(w http.ResponseWriter, r *http.Request) (int64,
 		return 0, nil, "", false
 	}
 	return id, cx, cx.Name, true
-}
-
-func imageIDForm(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	id, ok := pathInt64(w, r, "id")
-	if !ok {
-		return 0, false
-	}
-	if err := r.ParseForm(); err != nil {
-		externalErr(w, r, "bad form", http.StatusBadRequest)
-		return 0, false
-	}
-	return id, true
-}
-
-func externalErr(w http.ResponseWriter, r *http.Request, msg string, code int) {
-	hxErr(w, r, msg, msg, code)
 }
 
 func (s *Server) imageEditDone(w http.ResponseWriter, r *http.Request, id int64, msg string) {
@@ -474,17 +451,8 @@ func (s *Server) imageExists(id int64) bool {
 	return s.db().Read.QueryRow(`SELECT 1 FROM images WHERE id = ?`, id).Scan(&one) == nil
 }
 
-func hxErr(w http.ResponseWriter, r *http.Request, htmxMsg, plainMsg string, code int) {
-	if isHTMXRequest(r) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		flashStatus(w, http.StatusOK, htmxMsg)
-		return
-	}
-	http.Error(w, plainMsg, code)
-}
-
 func (s *Server) setNote(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -505,7 +473,7 @@ func (s *Server) setNote(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setSourceText(w http.ResponseWriter, r *http.Request, field, label string, maxLen int, successMsg string, setter func(id int64, site, postID, val string) error) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -563,7 +531,7 @@ func (s *Server) removeSourceOriginal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setAnnotation(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -616,7 +584,7 @@ func (s *Server) setAnnotation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeAnnotation(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -629,7 +597,7 @@ func (s *Server) removeAnnotation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) previewMarkup(w http.ResponseWriter, r *http.Request) {
-	if _, ok := imageIDForm(w, r); !ok {
+	if _, ok := idAndForm(w, r); !ok {
 		return
 	}
 	s.renderTemplate(w, "partials/markup_preview.html", s.renderMarkup(r.FormValue("body")))
@@ -644,7 +612,7 @@ func annotationCoord(r *http.Request, field string) (int, bool) {
 }
 
 func (s *Server) setCollection(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
@@ -683,7 +651,7 @@ func (s *Server) setCollection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeCollection(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}
