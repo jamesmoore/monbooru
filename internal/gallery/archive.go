@@ -11,8 +11,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/monbooru/monbooru/internal/fsx"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 )
 
 type MangaPage struct {

@@ -228,7 +228,7 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 	data := galleryData{
 		baseData:          s.base(r, "gallery", "Images - "+s.booruName()),
 		Query:             queryStr,
-		SearchWarning:     searchWarning(expr),
+		SearchWarning:     searchWarning(queryStr, expr),
 		Sort:              sortStr,
 		Order:             orderStr,
 		ThumbnailFit:      s.thumbnailFit(),
@@ -461,12 +461,15 @@ func filterActive(expr search.Expr, key string, match func(string) bool) bool {
 	return found
 }
 
-func searchWarning(expr search.Expr) string {
-	unknown := unknownFilterValues(expr)
-	if len(unknown) == 0 {
-		return ""
+func searchWarning(query string, expr search.Expr) string {
+	var parts []string
+	if unreadable := search.Unreadable(query); len(unreadable) > 0 {
+		parts = append(parts, "Could not read: "+strings.Join(unreadable, ", "))
 	}
-	return "Unknown filter value: " + strings.Join(unknown, ", ")
+	if unknown := unknownFilterValues(expr); len(unknown) > 0 {
+		parts = append(parts, "Unknown filter value: "+strings.Join(unknown, ", "))
+	}
+	return strings.Join(parts, ". ")
 }
 
 func unknownFilterValues(expr search.Expr) []string {

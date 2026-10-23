@@ -79,6 +79,17 @@ func PruneOrphanThumbnails(ctx context.Context, database *db.DB, thumbnailsPath 
 			removed++
 		}
 	}
+	// An auto-tag killed mid-chunk leaves its page folder; the sweep holds
+	// the job lane, so none is in use.
+	dataDir := filepath.Dir(thumbnailsPath)
+	siblings, _ := os.ReadDir(dataDir)
+	for _, e := range siblings {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "autotag-") {
+			if err := os.RemoveAll(filepath.Join(dataDir, e.Name())); err == nil {
+				removed++
+			}
+		}
+	}
 	report(total)
 	return removed, processed, total, nil
 }

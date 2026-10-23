@@ -904,6 +904,9 @@ func (s *Service) renameTagTx(tx *sql.Tx, id int64, normalized string, keepAlias
 	if _, err := tx.Exec(`UPDATE tags SET name = ? WHERE id = ?`, normalized, id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM folded_tag_pairs WHERE old_id = ? OR new_id = ?`, id, id); err != nil {
+		return err
+	}
 	if !keepAlias {
 		return nil
 	}
@@ -964,7 +967,10 @@ func (s *Service) changeTagCategoryTx(tx *sql.Tx, tagID, newCategoryID int64) er
 	var catExists int
 	if err := tx.QueryRow(
 		`SELECT COUNT(*) FROM tag_categories WHERE id = ?`, newCategoryID,
-	).Scan(&catExists); err != nil || catExists == 0 {
+	).Scan(&catExists); err != nil {
+		return err
+	}
+	if catExists == 0 {
 		return ErrCategoryNotFound
 	}
 	existing, err := nameTaken(tx, name, newCategoryID, tagID)

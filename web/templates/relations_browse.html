@@ -26,7 +26,7 @@
     </div>
   </div>
 
-  <div id="flash-relations"></div>
+  <div id="flash-relations" data-action-flash></div>
 
   <nav class="browse-tabs">
     <a href="/relations/browse?kind=duplicate"   class="browse-tab{{if eq .Kind "duplicate"}}   browse-tab-active{{end}}">Same image <span class="field-hint">({{.Counts.DupGroups}})</span></a>
@@ -71,7 +71,7 @@
           <input type="checkbox" name="group_id" value="{{.GroupID}}" class="merge-checkbox" data-original-id="{{.Original}}">
         </label>
         <strong>Duplicate group #{{.GroupID}}</strong>
-        ({{len .Members}} member(s), original #{{.Original}})
+        ({{len .Members}} {{plural (len .Members) "member" "members"}}, original #{{.Original}})
         <form hx-post="/relations/dup-group/{{.GroupID}}/copy-tags"
               hx-target="#flash-relations" hx-swap="innerHTML"
               hx-confirm="Copy tags from the duplicates onto the original? Rating tags are excluded."
@@ -88,7 +88,7 @@
           <input type="checkbox" name="group_id" value="{{.GroupID}}" class="merge-checkbox">
         </label>
         <strong>Alternate group #{{.GroupID}}</strong>
-        ({{len .Members}} member(s))
+        ({{len .Members}} {{plural (len .Members) "member" "members"}})
         {{template "relation_remove_form" dict "Confirm" "Dissolve this variant group?" "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-alt" "group_id" .GroupID)}}
         {{if eq (len .Members) 2}}
         {{template "relation_remove_form" dict "Confirm" "Dissolve this group and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "alternate" "group_id" .GroupID)}}
@@ -98,7 +98,7 @@
           <input type="checkbox" value="{{index .Members 0}}" class="merge-checkbox">
         </label>
         <strong>Version chain #{{index .Members 0}}</strong>
-        ({{len .Members}} image(s), oldest #{{index .Members 0}} → newest #{{index .Members (sub (len .Members) 1)}})
+        ({{len .Members}} {{plural (len .Members) "image" "images"}}, oldest #{{index .Members 0}} → newest #{{index .Members (sub (len .Members) 1)}})
         {{template "relation_remove_form" dict "Confirm" (printf "Dissolve this version chain? Every edge between the %d images is dropped." (len .Members)) "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-version" "root_id" (index .Members 0))}}
         {{if eq (len .Members) 2}}
         {{template "relation_remove_form" dict "Confirm" "Unlink this revision edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "version" "a" (index .Members 0) "b" (index .Members 1))}}
@@ -108,7 +108,7 @@
           <input type="checkbox" value="{{index .Members 0}}" class="merge-checkbox">
         </label>
         <strong>Derivative tree</strong>
-        ({{len .Members}} image(s), source{{if gt (len .Roots) 1}}s{{end}}{{range .Roots}} #{{.}}{{end}})
+        ({{len .Members}} {{plural (len .Members) "image" "images"}}, source{{if gt (len .Roots) 1}}s{{end}}{{range .Roots}} #{{.}}{{end}})
         {{template "relation_remove_form" dict "Confirm" (printf "Dissolve this derivative tree? Every edge between the %d images is dropped." (len .Members)) "OK" "Dissolve" "Label" "dissolve" "Reload" true "Fields" (dict "type" "dissolve-derivative" "root_id" (index .Members 0))}}
         {{if eq (len .Members) 2}}
         {{template "relation_remove_form" dict "Confirm" "Unlink this derivative edge and queue the pair for the session?" "OK" "Review again" "Label" "review again" "Fields" (dict "type" "review-again" "kind" "derivative" "a" (index .Members 0) "b" (index .Members 1))}}
@@ -256,12 +256,13 @@
     var sel = selectedCheckboxes();
     if (!sel.length) return;
     var n = sel.length;
+    var s = n === 1 ? '' : 's';
     var prompt = {
-      duplicate: 'Dissolve ' + n + ' same-image group(s)?',
-      alternate: 'Dissolve ' + n + ' variant group(s)?',
-      version: 'Dissolve ' + n + ' revision chain(s)? Every edge in each chain is dropped.',
-      derivative: 'Dissolve ' + n + ' derivative tree(s)? Every edge in each tree is dropped.'
-    }[kind] || 'Unlink ' + n + ' not-related pair(s)? They can resurface in find-pairs.';
+      duplicate: 'Dissolve ' + n + ' same-image group' + s + '?',
+      alternate: 'Dissolve ' + n + ' variant group' + s + '?',
+      version: 'Dissolve ' + n + ' revision chain' + s + '? Every edge in each chain is dropped.',
+      derivative: 'Dissolve ' + n + ' derivative tree' + s + '? Every edge in each tree is dropped.'
+    }[kind] || 'Unlink ' + n + ' not-related pair' + s + '? They can resurface in find-pairs.';
     showConfirm(prompt, function() {
       submitDissolve(kind, sel.map(function(cb) { return cb.value; }));
     }, '', 'Remove');

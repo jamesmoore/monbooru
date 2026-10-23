@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/monbooru/monbooru/internal/procx"
+	"github.com/monbooru/monbooru/internal/shared/desktop"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
@@ -181,7 +181,7 @@ func (m *managedPlugin) run() error {
 		return nil
 	}
 	cmd := exec.Command(m.command, m.args...)
-	procx.HideConsole(cmd)
+	desktop.HideConsole(cmd)
 	cmd.Dir = m.dir
 	cmd.Env = append(os.Environ(), m.env...)
 	stdin, err := cmd.StdinPipe()

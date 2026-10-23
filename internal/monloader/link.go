@@ -114,12 +114,12 @@ func (l *Link) Probe(ctx context.Context) Status {
 	if !up {
 		return Status{Conn: peer.ConnDown}
 	}
-	st := Status{Conn: peer.ConnOK, Version: h.Version, APIMismatch: h.APIMismatch()}
+	st := Status{Conn: peer.ConnOK, Version: h.Version, APIMismatch: h.APIMismatch(contract.AppMonbooru, peer.APIVersion, peer.MinPeerAPI)}
 	tok := l.cfg().Token
 	if tok != "" {
 		if qresp, qerr := l.client.Do(ctx, http.MethodGet, "/api/v1/queue?limit=1", nil); qerr == nil {
 			defer func() { _ = qresp.Body.Close() }()
-			if c := qresp.StatusCode; c == http.StatusUnauthorized || c == http.StatusForbidden || c == http.StatusServiceUnavailable {
+			if c := qresp.StatusCode; c == http.StatusUnauthorized || c == http.StatusForbidden || c == http.StatusServiceUnavailable || setupRequired(qresp) {
 				st.Conn = peer.ConnRejected
 				return st
 			}
@@ -136,7 +136,7 @@ func (l *Link) Probe(ctx context.Context) Status {
 			}
 			// monloader refuses every PTR read until its index is caught up.
 			// One that predates queryable answers only while ready.
-			st.PTR = on && (p.Queryable || p.State == "ready")
+			st.PTR = on && (p.Queryable || p.State == contract.PTRReady)
 			st.PTRSyncing = on && !st.PTR
 			// Gated on a synced index so nothing is contributed against a
 			// stale copy.

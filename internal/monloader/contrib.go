@@ -2,7 +2,6 @@ package monloader
 
 import (
 	"context"
-	"fmt"
 	"maps"
 	"slices"
 	"sort"
@@ -109,8 +108,8 @@ func foldAliasedPTRTags(preview *ContribPreview, byAlias map[string]string) {
 	}
 	preview.PTROnly = kept
 	for i, t := range preview.ToAdd {
-		if t.Status == "new" && carried[t.Tag] {
-			preview.ToAdd[i].Status = "known"
+		if t.Status == contract.PreviewNew && carried[t.Tag] {
+			preview.ToAdd[i].Status = contract.PreviewKnown
 		}
 	}
 }
@@ -132,7 +131,7 @@ func imageTagAliases(tagSvc func() *tags.Service, imageTags []models.ImageTag) (
 func PTRUnattributed(tagSvc func() *tags.Service, id int64, preview *ContribPreview) []string {
 	known := map[string]bool{}
 	for _, t := range preview.ToAdd {
-		if t.Status == "known" {
+		if t.Status == contract.PreviewKnown {
 			known[t.Tag] = true
 		}
 	}
@@ -161,15 +160,13 @@ func PTRUnattributed(tagSvc func() *tags.Service, id int64, preview *ContribPrev
 
 func isPTRSource(src tags.TagSource) bool { return strings.EqualFold(src.Source, contract.SourcePTR) }
 
-func MappingItems(sha string, adds, petitions []string, reason string) []map[string]any {
-	var items []map[string]any
+func MappingItems(sha string, adds, petitions []string, reason string) []contract.ContribItem {
+	var items []contract.ContribItem
 	for _, tag := range adds {
-		items = append(items, map[string]any{"kind": "mapping_add", "sha256": sha, "tag": tag})
+		items = append(items, contract.ContribItem{Kind: contract.ContribMappingAdd, SHA256: sha, Tag: tag})
 	}
 	for _, tag := range petitions {
-		items = append(items, map[string]any{
-			"kind": "mapping_petition", "sha256": sha, "tag": tag, "reason": reason,
-		})
+		items = append(items, contract.ContribItem{Kind: contract.ContribMappingPetition, SHA256: sha, Tag: tag, Reason: reason})
 	}
 	return items
 }
@@ -186,7 +183,7 @@ type ContribReceipt struct {
 
 // Verdicts pair with items by position, so a count mismatch would
 // mislabel them: it answers false.
-func ReadContribReceipt(items []map[string]any, results []ContribSendResult) (ContribReceipt, bool) {
+func ReadContribReceipt(items []contract.ContribItem, results []ContribSendResult) (ContribReceipt, bool) {
 	if len(results) != len(items) {
 		return ContribReceipt{}, false
 	}
@@ -196,27 +193,27 @@ func ReadContribReceipt(items []map[string]any, results []ContribSendResult) (Co
 	return r, true
 }
 
-func receiptRows(items []map[string]any, results []ContribSendResult) (adds, petitions, refused []ContribReceiptRow) {
+func receiptRows(items []contract.ContribItem, results []ContribSendResult) (adds, petitions, refused []ContribReceiptRow) {
 	for i := 0; i < min(len(items), len(results)); i++ {
-		kind, _ := items[i]["kind"].(string)
+		kind := items[i].Kind
 		var label string
-		switch {
-		case strings.HasPrefix(kind, "mapping"):
-			label, _ = items[i]["tag"].(string)
-		case strings.HasPrefix(kind, "sibling"):
-			label = fmt.Sprintf("%v -> %v", items[i]["bad"], items[i]["good"])
+		switch kind {
+		case contract.ContribMappingAdd, contract.ContribMappingPetition:
+			label = items[i].Tag
+		case contract.ContribSibling, contract.ContribSiblingPetition:
+			label = items[i].Bad + " -> " + items[i].Good
 		default:
-			label = fmt.Sprintf("%v => %v", items[i]["child"], items[i]["parent"])
+			label = items[i].Child + " => " + items[i].Parent
 		}
 		row := ContribReceiptRow{Label: label}
 		switch {
-		case results[i].Result != "staged":
+		case results[i].Result != contract.ContribStaged:
 			row.Note = results[i].Result
 			if results[i].Note != "" {
 				row.Note += " - " + results[i].Note
 			}
 			refused = append(refused, row)
-		case strings.Contains(kind, "petition"):
+		case kind == contract.ContribMappingPetition || kind == contract.ContribSiblingPetition || kind == contract.ContribParentPetition:
 			petitions = append(petitions, row)
 		default:
 			adds = append(adds, row)
@@ -241,7 +238,7 @@ type TagPairRow struct {
 func (p TagPairRow) Value() string { return p.Kind + " " + p.A + " " + p.B }
 
 func (p TagPairRow) Label() string {
-	if p.Kind == "sibling" {
+	if p.Kind == contract.ContribSibling {
 		return p.A + " -> " + p.B
 	}
 	return p.A + " => " + p.B
@@ -278,15 +275,15 @@ func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Servi
 	var aliasForms []string
 	for _, a := range aliases[id] {
 		form := tags.FormName(a.CategoryName, a.Name)
-		d.Local = append(d.Local, TagPairRow{Kind: "sibling", A: form, B: tagForm, Rel: "alias of this"})
+		d.Local = append(d.Local, TagPairRow{Kind: contract.ContribSibling, A: form, B: tagForm, Rel: "alias of this"})
 		localAlias[form] = true
 		aliasForms = append(aliasForms, form)
 	}
 	for _, im := range impliedBy {
-		d.Local = append(d.Local, TagPairRow{Kind: "parent", A: tags.FormName(im.ParentCategoryName, im.ParentName), B: tagForm, Rel: "implied by"})
+		d.Local = append(d.Local, TagPairRow{Kind: contract.ContribParent, A: tags.FormName(im.ParentCategoryName, im.ParentName), B: tagForm, Rel: "implied by"})
 	}
 	for _, im := range implications {
-		d.Local = append(d.Local, TagPairRow{Kind: "parent", A: tagForm, B: tags.FormName(im.ImpliedCategoryName, im.ImpliedName), Rel: "implies"})
+		d.Local = append(d.Local, TagPairRow{Kind: contract.ContribParent, A: tagForm, B: tags.FormName(im.ImpliedCategoryName, im.ImpliedName), Rel: "implies"})
 		localImplied[tags.FormName(im.ImpliedCategoryName, im.ImpliedName)] = true
 	}
 	names := append([]string{tagForm}, aliasForms...)
@@ -305,7 +302,7 @@ func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Servi
 		// local relation as new; those the cluster already carries would
 		// propose flipping the ideal, so they fold as covered.
 		if d.KnownAs != "" && heldByCluster(tagSvc, d.Local[i], tagForm, known, info) {
-			d.Local[i].Direction = "covered"
+			d.Local[i].Direction = contract.PairCovered
 			continue
 		}
 		toPreview = append(toPreview, &d.Local[i])
@@ -333,7 +330,7 @@ func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Servi
 		if a == "" || a == known || localAlias[localForm(tagSvc, a)] {
 			continue
 		}
-		candidates = append(candidates, TagPairRow{Kind: "sibling", A: a, B: known, Rel: "alias of this"})
+		candidates = append(candidates, TagPairRow{Kind: contract.ContribSibling, A: a, B: known, Rel: "alias of this"})
 	}
 	// The ideal is never a petition row: a pull adopts it as an alias
 	// here, or leaves it alone when another tag here holds the name.
@@ -349,7 +346,7 @@ func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Servi
 		if row, ok := tagSvc().FormRow(im); ok && row.IsAlias {
 			continue
 		}
-		candidates = append(candidates, TagPairRow{Kind: "parent", A: known, B: im, Rel: "implies"})
+		candidates = append(candidates, TagPairRow{Kind: contract.ContribParent, A: known, B: im, Rel: "implies"})
 	}
 	toPreview = toPreview[:0]
 	for i := range candidates {
@@ -368,7 +365,7 @@ func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Servi
 		return nil, err
 	}
 	for i, row := range toPreview {
-		if previews[i].Direction != "petition" && previews[i].Direction != "pending" {
+		if previews[i].Direction != contract.PairPetition && previews[i].Direction != contract.PairPending {
 			continue
 		}
 		row.Direction, row.Note = previews[i].Direction, previews[i].Note
@@ -379,10 +376,10 @@ func (l *Link) TagContribPreview(rctx context.Context, tagSvc func() *tags.Servi
 
 // Each preview is a monloader round trip and a hub tag has dozens, so a
 // few run at once; the first failure stops the rest.
-func (l *Link) pairPreviews(ctx context.Context, rows []*TagPairRow) ([]*pairPreview, error) {
+func (l *Link) pairPreviews(ctx context.Context, rows []*TagPairRow) ([]*contract.PairPreviewResponse, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	out := make([]*pairPreview, len(rows))
+	out := make([]*contract.PairPreviewResponse, len(rows))
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	var failed sync.Once
@@ -424,7 +421,7 @@ func heldByCluster(tagSvc func() *tags.Service, row TagPairRow, tagForm, known s
 		return slices.ContainsFunc(list, func(n string) bool { return localForm(tagSvc, n) == row.A })
 	}
 	switch {
-	case row.Kind == "sibling":
+	case row.Kind == contract.ContribSibling:
 		return row.A == known || row.A == localForm(tagSvc, info.Ideal) || names(info.Aliases)
 	case row.A == tagForm:
 		return slices.ContainsFunc(info.Implications, func(n string) bool { return localForm(tagSvc, n) == row.B })
@@ -446,35 +443,38 @@ func pullWouldAdd(tagSvc func() *tags.Service, tagID int64, info PTRTagInfo, tag
 }
 
 // Each value is a TagPairRow's Value: "kind a b".
-func PairItems(values []string, direction, reason string) []map[string]any {
-	var items []map[string]any
+func PairItems(values []string, direction, reason string) []contract.ContribItem {
+	var items []contract.ContribItem
 	for _, v := range values {
 		parts := strings.SplitN(v, " ", 3)
 		if len(parts) != 3 {
 			continue
 		}
-		if item := pairSendItem(parts[0], direction, parts[1], parts[2], reason); item != nil {
+		if item, ok := pairSendItem(parts[0], direction, parts[1], parts[2], reason); ok {
 			items = append(items, item)
 		}
 	}
 	return items
 }
 
-func pairSendItem(kind, direction, a, b, reason string) map[string]any {
-	suggest, petition := "sibling", "sibling_petition"
-	aKey, bKey := "bad", "good"
-	if kind == "parent" {
-		suggest, petition = "parent", "parent_petition"
-		aKey, bKey = "child", "parent"
+func pairSendItem(kind, direction, a, b, reason string) (contract.ContribItem, bool) {
+	item := contract.ContribItem{Reason: reason}
+	if kind == contract.ContribParent {
+		item.Child, item.Parent = a, b
+	} else {
+		item.Bad, item.Good = a, b
 	}
-	var itemKind string
-	switch direction {
-	case "suggest":
-		itemKind = suggest
-	case "petition":
-		itemKind = petition
+	switch {
+	case direction == contract.PairSuggest && kind == contract.ContribParent:
+		item.Kind = contract.ContribParent
+	case direction == contract.PairPetition && kind == contract.ContribParent:
+		item.Kind = contract.ContribParentPetition
+	case direction == contract.PairSuggest:
+		item.Kind = contract.ContribSibling
+	case direction == contract.PairPetition:
+		item.Kind = contract.ContribSiblingPetition
 	default:
-		return nil
+		return contract.ContribItem{}, false
 	}
-	return map[string]any{"kind": itemKind, aKey: a, bKey: b, "reason": reason}
+	return item, true
 }

@@ -14,7 +14,7 @@ func (h schedHost) View() (config.ScheduleConfig, []string) {
 	h.s.cfgMu.RLock()
 	defer h.s.cfgMu.RUnlock()
 	sched := h.s.cfg.Schedule
-	if h.s.cfg.FindPairedToken(monloader.App) == nil {
+	if h.s.cfg.Auth.Tokens.Paired(monloader.App) == nil {
 		sched.LookupPTR, sched.LookupBooru = false, false
 	}
 	return sched, galleryNames(h.s.cfg.Galleries)

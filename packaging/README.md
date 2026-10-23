@@ -14,4 +14,5 @@
 | `build-installer.sh` | runs ISCC over one staged payload to produce a Windows installer |
 | `flatpak-bundle.sh` | installs the runtime and builds the Flatpak bundle; must run unprivileged |
 | `build-appimage.sh` | builds the bundled AppImage for one target, from the same `tools/` |
+| `appimage-core.sh` | sourced by `build-appimage.sh`: fetches the pinned appimagetool and runtime, adds the desktop entry and icons and packs the AppImage. Kept identical to the sibling app's copy |
 | `build-aur.sh` | stamps the PKGBUILD with the version and the tag tarball's checksum, and generates its `.SRCINFO` |

@@ -6,6 +6,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/searchkw"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -45,7 +46,7 @@ func fastTotalExact(expr Expr) bool {
 		case "cat":
 			return false
 		case "rating":
-			return strings.EqualFold(e.Val, tags.RatingLevels[len(tags.RatingLevels)-1])
+			return strings.EqualFold(e.Val, contract.RatingLevels[len(contract.RatingLevels)-1])
 		}
 		return true
 	}
@@ -88,13 +89,13 @@ func fastCountCeiling(src Source, expr Expr) (int, bool) {
 // extractCeilingShape turns this chain back into one rating_rank comparison,
 // so it must keep excluding every level above the ceiling.
 func ApplyCeiling(expr Expr, level string) Expr {
-	rank := tags.RatingRank(level)
-	if rank < 0 || rank >= len(tags.RatingLevels)-1 {
+	rank := contract.RatingRank(level)
+	if rank < 0 || rank >= len(contract.RatingLevels)-1 {
 		return expr
 	}
 	var ce Expr
-	for i := rank + 1; i < len(tags.RatingLevels); i++ {
-		not := NotExpr{Expr: FilterExpr{Key: "rating", Val: tags.RatingLevels[i]}}
+	for i := rank + 1; i < len(contract.RatingLevels); i++ {
+		not := NotExpr{Expr: FilterExpr{Key: "rating", Val: contract.RatingLevels[i]}}
 		if ce == nil {
 			ce = not
 		} else {
@@ -109,8 +110,8 @@ func ApplyCeiling(expr Expr, level string) Expr {
 
 // HiddenByCeiling counts exactly the images expr matches that level hides.
 func HiddenByCeiling(src Source, expr Expr, level string) (int, error) {
-	rank := tags.RatingRank(level)
-	if rank < 0 || rank >= len(tags.RatingLevels)-1 {
+	rank := contract.RatingRank(level)
+	if rank < 0 || rank >= len(contract.RatingLevels)-1 {
 		return 0, nil
 	}
 	where, args := exactCountWhere(src, expr)
@@ -159,9 +160,9 @@ func extractCeilingShape(expr Expr) (Expr, int, bool) {
 			excluded[level] = true
 		}
 	})
-	top := len(tags.RatingLevels) - 1
+	top := len(contract.RatingLevels) - 1
 	rank := top
-	for rank >= 0 && excluded[tags.RatingLevels[rank]] {
+	for rank >= 0 && excluded[contract.RatingLevels[rank]] {
 		rank--
 	}
 	if rank == top {
@@ -182,7 +183,7 @@ func ratingNegation(expr Expr) (string, bool) {
 func peelCeilingChain(expr Expr, rank int) Expr {
 	switch v := expr.(type) {
 	case NotExpr:
-		if level, ok := ratingNegation(v); ok && tags.RatingRank(level) > rank {
+		if level, ok := ratingNegation(v); ok && contract.RatingRank(level) > rank {
 			return nil
 		}
 		return expr
@@ -372,7 +373,7 @@ func fastCountFilter(src Source, e FilterExpr) (int, bool) {
 // image carrying two ratings only over-counts.
 func fastCountRating(src Source, e FilterExpr) (int, bool) {
 	level := strings.ToLower(e.Val)
-	rank := tags.RatingRank(level)
+	rank := contract.RatingRank(level)
 	if rank < 0 {
 		return 0, true
 	}
@@ -391,7 +392,7 @@ func fastCountRating(src Source, e FilterExpr) (int, bool) {
 	}
 	// Zero and the top level are exact; other levels are bounds and wait
 	// for the threshold.
-	if n == 0 || rank == len(tags.RatingLevels)-1 {
+	if n == 0 || rank == len(contract.RatingLevels)-1 {
 		return n, true
 	}
 	if n < fastApproxThreshold {

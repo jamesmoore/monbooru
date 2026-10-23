@@ -140,7 +140,7 @@ func (s *Server) tagDetailHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setTagNote(w http.ResponseWriter, r *http.Request) {
-	id, ok := imageIDForm(w, r)
+	id, ok := idAndForm(w, r)
 	if !ok {
 		return
 	}

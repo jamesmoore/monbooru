@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/config"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tagger"
 	"github.com/monbooru/monbooru/internal/tags"
@@ -222,13 +223,13 @@ func (s *Server) settingsTaggerConfigGet(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	rows, global, ok := s.thresholdDialogData(name)
+	inst, ok := s.resolveTaggerInstance(name)
 	if !ok {
 		http.Error(w, "tagger not found", http.StatusNotFound)
 		return
 	}
-	galRows, allChecked, _ := s.galleryDialogData(name)
-	inst, _ := s.resolveTaggerInstance(name)
+	rows, global := s.thresholdDialogData(inst)
+	galRows, allChecked := s.galleryDialogData(inst)
 	modelPath := s.modelPath()
 	catIDs, catList := s.categoryChoices()
 	labelCount := 0
@@ -360,15 +361,16 @@ func (s *Server) settingsTaggerLabelsGet(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	s.renderTaggerLabels(w, r, name)
-}
-
-func (s *Server) renderTaggerLabels(w http.ResponseWriter, r *http.Request, name string) {
 	inst, ok := s.resolveTaggerInstance(name)
 	if !ok {
 		http.Error(w, "tagger not found", http.StatusNotFound)
 		return
 	}
+	s.renderTaggerLabels(w, r, inst)
+}
+
+func (s *Server) renderTaggerLabels(w http.ResponseWriter, r *http.Request, inst config.TaggerInstance) {
+	name := inst.Name
 	modelPath := s.modelPath()
 	catIDs, _ := s.categoryChoices()
 	colors := s.categoryColors()
@@ -518,12 +520,13 @@ func (s *Server) settingsTaggerMappingPost(w http.ResponseWriter, r *http.Reques
 		writeInlineFlash(w, "err", errMsg)
 		return
 	}
-	writeFlashOOB(w, "flash-tagger-config-"+name, "", "")
-	s.renderTaggerLabels(w, r, name)
 	inst, ok := s.resolveTaggerInstance(name)
 	if !ok {
+		http.Error(w, "tagger not found", http.StatusNotFound)
 		return
 	}
+	writeFlashOOB(w, "flash-tagger-config-"+name, "", "")
+	s.renderTaggerLabels(w, r, inst)
 	export, _ := taggerExport(modelPath, name, inst)
 	export["OOB"] = true
 	s.renderTemplate(w, "tagger_export_panel", export)
@@ -556,8 +559,8 @@ func (s *Server) applyMappingRule(name, modelPath string, r *http.Request) (errM
 			rename = valid
 		}
 		if target := cmp.Or(rename, source); category == "rating" && !tags.IsCanonicalRating(target) {
-			last := len(tags.RatingLevels) - 1
-			return "A rating label must become " + strings.Join(tags.RatingLevels[:last], ", ") + " or " + tags.RatingLevels[last] + ", not " + target + "."
+			last := len(contract.RatingLevels) - 1
+			return "A rating label must become " + strings.Join(contract.RatingLevels[:last], ", ") + " or " + contract.RatingLevels[last] + ", not " + target + "."
 		}
 		entry = tagger.DispatchEntry{Source: source, Category: category, Name: rename}
 	}
@@ -650,11 +653,8 @@ func (s *Server) resolveTaggerInstance(name string) (config.TaggerInstance, bool
 
 // Every gallery category is listed, so one no tagger reaches yet can be
 // tuned before a rule routes into it.
-func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global float64, ok bool) {
-	inst, ok := s.resolveTaggerInstance(name)
-	if !ok {
-		return nil, 0, false
-	}
+func (s *Server) thresholdDialogData(inst config.TaggerInstance) (rows []thresholdRow, global float64) {
+	name := inst.Name
 	modelPath := s.modelPath()
 	global = inst.ConfidenceThreshold
 
@@ -705,7 +705,7 @@ func (s *Server) thresholdDialogData(name string) (rows []thresholdRow, global f
 		slices.Collect(maps.Keys(inst.PerCategoryTopK)),
 		inst.DisabledCategories,
 	), false)
-	return rows, global, true
+	return rows, global
 }
 
 func formatOverride(m map[string]float64, key string) string {
@@ -734,11 +734,7 @@ func taggerThresholdSummary(global float64, overrides map[string]float64, disabl
 	return out
 }
 
-func (s *Server) galleryDialogData(name string) (rows []taggerGalleryRow, allChecked bool, ok bool) {
-	inst, ok := s.resolveTaggerInstance(name)
-	if !ok {
-		return nil, false, false
-	}
+func (s *Server) galleryDialogData(inst config.TaggerInstance) (rows []taggerGalleryRow, allChecked bool) {
 	galleries := s.galleries()
 	allChecked = inst.Galleries == nil
 	for _, g := range galleries {
@@ -747,7 +743,7 @@ func (s *Server) galleryDialogData(name string) (rows []taggerGalleryRow, allChe
 			Checked: allChecked || slices.Contains(inst.Galleries, g.Name),
 		})
 	}
-	return rows, allChecked, true
+	return rows, allChecked
 }
 
 func catalogEntryByName(modelPath, name string) *tagger.CatalogEntry {
@@ -836,6 +832,9 @@ func (s *Server) settingsTaggerDeletePost(w http.ResponseWriter, r *http.Request
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
 		return
 	}
+	// The deleted tagger's session would otherwise hold its memory until
+	// the idle release.
+	tagger.ReleaseAll()
 	logx.Infof("settings: tagger %q deleted (folder %s removed)", name, dir)
 	w.Header().Set("HX-Refresh", "true")
 	writeInlineFlash(w, "ok", "Tagger "+name+" deleted.")

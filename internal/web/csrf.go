@@ -8,7 +8,7 @@ import (
 
 func parseFormOK(w http.ResponseWriter, r *http.Request) bool {
 	if err := r.ParseForm(); err != nil {
-		flashErr(w, r, "Bad form data: "+err.Error())
+		externalErr(w, r, "Bad form data: "+err.Error(), http.StatusBadRequest)
 		return false
 	}
 	return true
@@ -32,59 +32,19 @@ func requiredFormExternal(w http.ResponseWriter, r *http.Request, field, msg str
 	return v, true
 }
 
-// A page rendered before a restart, or under a session since replaced,
-// holds a token that no longer validates; a browser that says the request
-// comes from this origin is no forgery either way.
 var sameOrigin http.CrossOriginProtection
 
-// Without either header nothing vouches for the request (a script), so it
-// still needs the token.
-func browserSameOrigin(r *http.Request) bool {
-	if r.Header.Get("Sec-Fetch-Site") == "" && r.Header.Get("Origin") == "" {
-		return false
-	}
-	return sameOrigin.Check(r) == nil
-}
+func isPluginMount(r *http.Request) bool { return strings.HasPrefix(r.URL.Path, pluginMountPrefix) }
 
-// /api/v1/ is exempt: its bearer token is the CSRF mitigation.
-func (s *Server) cSRFMiddleware(next http.Handler) http.Handler {
+// A mounted plugin's forms carry no monbooru token, and with login off no
+// session gates the mount either, so the CSRF check lets it by and only its
+// origin is held.
+func pluginMountOrigin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
-			next.ServeHTTP(w, r)
+		if isPluginMount(r) && sameOrigin.Check(r) != nil {
+			http.Error(w, "cross-origin request refused", http.StatusForbidden)
 			return
 		}
-
-		if len(r.URL.Path) >= 8 && r.URL.Path[:8] == "/api/v1/" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// A mounted plugin's forms carry no monbooru token, and with login
-		// off no session gates the mount either.
-		if strings.HasPrefix(r.URL.Path, pluginMountPrefix) {
-			if sameOrigin.Check(r) != nil {
-				http.Error(w, "cross-origin request refused", http.StatusForbidden)
-				return
-			}
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		sessID := sessionFromContext(r.Context())
-
-		// Header first: FormValue parses the body, and on multipart it
-		// drains up to 32 MiB past any handler's MaxBytesReader, so
-		// multipart callers must send the header.
-		token := r.Header.Get("X-CSRF-Token")
-		if token == "" && !isMultipart(r) {
-			token = r.FormValue("_csrf")
-		}
-
-		if !s.sessions.ValidCSRF(sessID, token) && !browserSameOrigin(r) {
-			http.Error(w, "This page's form token is no longer valid. Copy anything unsaved, then reload the page.", http.StatusForbidden)
-			return
-		}
-
 		next.ServeHTTP(w, r)
 	})
 }

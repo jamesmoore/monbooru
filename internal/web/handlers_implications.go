@@ -167,7 +167,7 @@ func (s *Server) removeImplicationDelete(w http.ResponseWriter, r *http.Request)
 	}
 	if err := s.tagSvc().RemoveImplication(parentID, impliedID); err != nil {
 		s.jobs.Fail(err.Error())
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		flashHeaderErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	s.propagateDeclared([]models.Implication{{ParentID: parentID, ImpliedID: impliedID}}, "remove")
@@ -194,7 +194,7 @@ func (s *Server) removeImplicationGroup(w http.ResponseWriter, r *http.Request, 
 	origin, stale := relationGroupFilter(r)
 	edges, err := list(id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		flashHeaderErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if !s.startJob(w, models.JobTypeTag) {
@@ -251,7 +251,7 @@ func (s *Server) runImplicationGroupSweep(edges []models.Implication) {
 	}
 	s.jobs.Finish(nil, cancelled,
 		fmt.Sprintf("implication sweep cancelled (%d/%d)", processed, total),
-		fmt.Sprintf("swept %d removed implication(s)", processed))
+		fmt.Sprintf("swept %d removed implication%s", processed, plural(processed)))
 }
 
 // One job for the whole request: jobs.Start refuses a second, so a job
@@ -292,9 +292,9 @@ func (s *Server) runImplicationEdges(edges []models.Implication, op string) {
 			break
 		}
 	}
-	done := fmt.Sprintf("Implication applied to %d image(s).", len(reached))
+	done := fmt.Sprintf("Implication applied to %d image%s.", len(reached), plural(len(reached)))
 	if op == "remove" {
-		done = fmt.Sprintf("Implication removed from %d image(s).", len(reached))
+		done = fmt.Sprintf("Implication removed from %d image%s.", len(reached), plural(len(reached)))
 	}
 	s.jobs.Finish(nil, cancelled, fmt.Sprintf("%s cancelled (%d/%d)", verb, processed, total), done)
 }

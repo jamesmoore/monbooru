@@ -7,12 +7,13 @@ import (
 
 	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 )
 
 func (s *Server) monloaderStatusHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.pairedWith(monloader.App) {
 		// Stop polling and clear the light once the pairing is gone.
-		_, _ = w.Write([]byte(`<span id="monloader-light"></span>`))
+		_, _ = w.Write([]byte(`<span id="peer-light"></span>`))
 		return
 	}
 	if s.ml.Paused() {
@@ -29,11 +30,21 @@ func (s *Server) monloaderStatusHandler(w http.ResponseWriter, r *http.Request) 
 	if r.FormValue("seen") != seen {
 		w.Header().Set("HX-Trigger", "monloader-status-changed")
 	}
-	s.renderTemplate(w, "partials/monloader_light.html", map[string]any{
-		"MonloaderConn":     st.Conn,
-		"MonloaderVersion":  st.Version,
-		"MonloaderMismatch": st.APIMismatch,
-		"MonloaderSeen":     seen,
-		"MonloaderURL":      s.monloaderWebBase(),
-	})
+	s.renderTemplate(w, "webui/peer_light", s.monloaderLight(st.Conn, st.Version, st.APIMismatch, seen))
+}
+
+func (s *Server) monloaderLight(conn, version, mismatch, seen string) webui.PeerLight {
+	l := webui.PeerLight{
+		Peer: monloader.App, Conn: conn, Version: version, Mismatch: mismatch, Seen: seen,
+		StatusURL: "/internal/monloader-status",
+		PauseURL:  "/internal/monloader/disconnect", ResumeURL: "/internal/monloader/reconnect",
+		CheckNow: true, Paired: true,
+	}
+	if base := s.monloaderWebBase(); base != "" {
+		l.Href = base + "/queue"
+	}
+	if conn == peer.ConnPaused || conn == peer.ConnDown || conn == peer.ConnRejected {
+		l.OffReason = monloaderOffReason(conn)
+	}
+	return l
 }

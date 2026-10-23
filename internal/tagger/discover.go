@@ -117,6 +117,9 @@ func EnabledTaggers(cfg *config.Config) []TaggerStatus { return enabledTaggers(c
 
 func SelectForGallery(cfg *config.Config, gallery, name string) ([]TaggerStatus, error) {
 	enabled := EnabledTaggersForGallery(cfg, gallery)
+	if len(enabled) == 0 {
+		return nil, fmt.Errorf("no enabled tagger applies to gallery %q", gallery)
+	}
 	if name == "" {
 		return enabled, nil
 	}
@@ -141,7 +144,12 @@ func GalleryTaggers(cfg *config.Config, gallery string) (enabled []TaggerStatus,
 		return nil, false, reasonFrom(nil)
 	}
 	all := DiscoverTaggers(cfg)
-	return enabledIn(all, func(t TaggerStatus) bool { return t.AppliesToGallery(gallery) }), len(all) > 0, reasonFrom(all)
+	enabled = enabledIn(all, func(t TaggerStatus) bool { return t.AppliesToGallery(gallery) })
+	reason = reasonFrom(all)
+	if len(enabled) == 0 && reason == "" {
+		reason = fmt.Sprintf("no enabled tagger applies to gallery %q", gallery)
+	}
+	return enabled, len(all) > 0, reason
 }
 
 // The unscoped listing passes no predicate: AppliesToGallery("") is false

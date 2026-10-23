@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -161,7 +162,7 @@ func LookupLocalStatus(tagSvc func() *tags.Service, id int64, tagForm, spelling 
 	return row
 }
 
-const PTRSearchLimit = 20
+const PTRSearchLimit = contract.PTRSearchLimit
 
 // Longest first: an operator's spelling is usually the repository's with
 // something added.

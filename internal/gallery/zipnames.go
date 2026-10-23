@@ -3,6 +3,8 @@ package gallery
 import (
 	"path/filepath"
 	"strings"
+
+	"github.com/monbooru/monbooru/internal/shared/fsx"
 )
 
 // ZipNamer compares names ignoring case: the zip is usually unpacked on a
@@ -20,7 +22,7 @@ func NewZipNamer(reserved ...string) *ZipNamer {
 }
 
 func (z *ZipNamer) Name(path string) string {
-	name := SanitizeFilename(filepath.Base(path))
+	name := fsx.SanitizeFilename(filepath.Base(path))
 	ext := filepath.Ext(name)
 	stem := TruncateFilename(strings.TrimSuffix(name, ext), maxNameBytes)
 	entry := stem + ext

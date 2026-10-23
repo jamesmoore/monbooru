@@ -12,20 +12,24 @@ import (
 	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/peer"
 	"github.com/monbooru/monbooru/internal/plugins"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/shared/pairing"
+	"github.com/monbooru/monbooru/internal/shared/session"
 )
 
 type pluginRowView struct {
-	Name         string
-	Version      string
-	Address      string
-	Conn         string
-	Buttons      []config.PluginButton
-	TokenName    string
-	Scopes       []string
-	Paused       bool
-	Paired       bool
+	Name      string
+	Version   string
+	Address   string
+	Conn      string
+	Buttons   []config.PluginButton
+	TokenName string
+	Scopes    []string
+	Paused    bool
+	Paired    bool
+	// Awaiting is an approval the peer has not collected its token for yet.
+	Awaiting     bool
 	Companion    bool
 	APIURL       string
 	WebURL       string
@@ -87,7 +91,15 @@ func (s *Server) pluginRows() []pluginRowView {
 	rows := make([]pluginRowView, 0, len(managed)+len(paired)+1)
 	rows = append(rows, s.monloaderRow())
 	rows = append(rows, managed...)
-	return append(rows, paired...)
+	rows = append(rows, paired...)
+	for _, req := range s.pairs.ListApproved() {
+		for i := range rows {
+			if rows[i].Name == req.App {
+				rows[i].Awaiting = true
+			}
+		}
+	}
+	return rows
 }
 
 func (s *Server) monloaderRow() pluginRowView {
@@ -110,7 +122,7 @@ func (s *Server) monloaderRow() pluginRowView {
 		Companion:    true,
 		APIURL:       apiURL,
 		WebURL:       webURL,
-		WebURLHint:   "http://localhost:8456",
+		WebURLHint:   "http://localhost:" + contract.PortMonloader,
 		APIURLPinned: apiPinned,
 		WebURLPinned: webPinned,
 	}
@@ -126,7 +138,7 @@ func peerConn(paused bool, probe string) string {
 func (s *Server) pairedTokenInfo(app string) (string, []string) {
 	s.cfgMu.RLock()
 	defer s.cfgMu.RUnlock()
-	if t := s.cfg.FindPairedToken(app); t != nil {
+	if t := s.cfg.Auth.Tokens.Paired(app); t != nil {
 		return t.Name, t.Scopes
 	}
 	return "", nil
@@ -205,7 +217,7 @@ func (s *Server) pluginPairRemove(w http.ResponseWriter, r *http.Request) {
 		notifyErr = s.teardownMonloaderPairing(r)
 	} else {
 		notifyErr = s.teardownPluginPairing(name)
-		logx.Infof("pairing: removed %s pairing from %s", name, clientIP(r))
+		logx.Infof("pairing: removed %s pairing from %s", name, session.ClientIP(r))
 		if p, ok := s.effective(name); ok && p.Installed {
 			if p.Enabled {
 				s.setPluginEnabled(name, false)
@@ -233,7 +245,7 @@ func (s *Server) pluginPause(w http.ResponseWriter, r *http.Request) {
 	if err := s.setPluginPaused(name, paused); err != nil {
 		logx.Errorf("plugins: pause %s: %v", name, err)
 	}
-	logx.Infof("plugins: %s %s from %s", name, map[bool]string{true: "paused", false: "resumed"}[paused], clientIP(r))
+	logx.Infof("plugins: %s %s from %s", name, map[bool]string{true: "paused", false: "resumed"}[paused], session.ClientIP(r))
 	s.renderPluginRows(w, r, false)
 }
 
@@ -244,7 +256,7 @@ func (s *Server) pluginStart(w http.ResponseWriter, r *http.Request) {
 	if p, ok := s.effective(r.PathValue("name")); ok && p.Installed {
 		s.setPluginEnabled(p.Name, true)
 		s.peers.Run(p)
-		logx.Infof("plugins: started %s from %s", p.Name, clientIP(r))
+		logx.Infof("plugins: started %s from %s", p.Name, session.ClientIP(r))
 	}
 	s.renderPluginRows(w, r, false)
 }
@@ -258,7 +270,7 @@ func (s *Server) pluginStop(w http.ResponseWriter, r *http.Request) {
 		s.setPluginEnabled(name, false)
 	}
 	s.peers.Halt(name)
-	logx.Infof("plugins: stopped %s from %s", name, clientIP(r))
+	logx.Infof("plugins: stopped %s from %s", name, session.ClientIP(r))
 	s.renderPluginRows(w, r, false)
 }
 

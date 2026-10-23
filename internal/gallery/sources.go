@@ -8,13 +8,14 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/models"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 const (
-	MaxSourceLabelLen    = 200
-	MaxSourceURLLen      = 2048
-	MaxCommentaryLen     = 10000
-	MaxOriginalLen       = 2048
+	MaxSourceLabelLen    = contract.MaxSourceLabel
+	MaxSourceURLLen      = contract.MaxURL
+	MaxCommentaryLen     = contract.MaxCommentary
+	MaxOriginalLen       = contract.MaxOriginal
 	MaxAnnotationBodyLen = 4000
 )
 
@@ -168,6 +169,23 @@ func MarkSourceExact(database *db.DB, imageID int64, site, postID, md5 string) e
 		`UPDATE image_sources SET similarity = 0, md5 = ?, md5_match = 'match'
 		 WHERE image_id = ? AND site = ? AND post_id = ?`,
 		strings.TrimSpace(md5), imageID, strings.TrimSpace(site), strings.TrimSpace(postID))
+	return err
+}
+
+// MarkSourceRescued keeps the post's md5 on a re-encoded file's origin; the
+// similarity mark waives a verified refresh, and the keep ruling, set after
+// the md5 whose trigger lapses it, stops an upgrade re-rescuing the same bytes.
+func MarkSourceRescued(database *db.DB, imageID int64, site, postID, upstreamMD5 string) error {
+	site, postID = strings.TrimSpace(site), strings.TrimSpace(postID)
+	if _, err := database.Write.Exec(
+		`UPDATE image_sources SET similarity = 100, md5 = ?
+		 WHERE image_id = ? AND site = ? AND post_id = ?`,
+		strings.TrimSpace(upstreamMD5), imageID, site, postID); err != nil {
+		return err
+	}
+	_, err := database.Write.Exec(
+		`UPDATE image_sources SET upgrade_kept = 1 WHERE image_id = ? AND site = ? AND post_id = ?`,
+		imageID, site, postID)
 	return err
 }
 

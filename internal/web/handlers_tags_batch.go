@@ -158,7 +158,7 @@ func (s *Server) runBatchTagCategory(ids []int64, catID int64, merge bool) {
 		return true, nil
 	})
 
-	summary := fmt.Sprintf("moved %d tag(s)", changed-mergedCount)
+	summary := fmt.Sprintf("moved %d tag%s", changed-mergedCount, plural(changed-mergedCount))
 	if mergedCount > 0 {
 		summary += fmt.Sprintf(", merged %d", mergedCount)
 	}
@@ -197,7 +197,7 @@ func (s *Server) runBatchTagAlias(ids []int64, canonID int64) {
 		return true, nil
 	})
 
-	summary := skippedSuffix(fmt.Sprintf("aliased %d tag(s) to %s", aliased, s.qualifiedTagName(canonID)), skipped)
+	summary := skippedSuffix(fmt.Sprintf("aliased %d tag%s to %s", aliased, plural(aliased), s.qualifiedTagName(canonID)), skipped)
 	s.finishTagScopeJob(aliased, reasons, cancelled, "alias", summary)
 }
 
@@ -216,7 +216,7 @@ func (s *Server) runMergeFolded(ids []int64) {
 	for _, e := range res.Refused {
 		reasons.add(e)
 	}
-	summary := skippedSuffix(fmt.Sprintf("merged %d folded tag(s)", res.Merged), res.Skipped)
+	summary := skippedSuffix(fmt.Sprintf("merged %d folded tag%s", res.Merged, plural(res.Merged)), res.Skipped)
 	s.finishTagScopeJob(res.Merged, reasons, res.Cancelled, "folded merge", summary)
 }
 
@@ -289,7 +289,7 @@ func (s *Server) runBatchTagImply(ids []int64, targetID int64, remove bool) {
 	if remove {
 		noun = "removed"
 	}
-	summary := fmt.Sprintf("%s %d implication(s) of %s", noun, changed-reapplied, s.qualifiedTagName(targetID))
+	summary := fmt.Sprintf("%s %d implication%s of %s", noun, changed-reapplied, plural(changed-reapplied), s.qualifiedTagName(targetID))
 	if reapplied > 0 {
 		summary += fmt.Sprintf(", re-applied %d", reapplied)
 	}

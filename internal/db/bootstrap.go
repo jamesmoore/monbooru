@@ -26,22 +26,7 @@ func Bootstrap(db *DB) error {
 		// A fresh library left at marker 0 by a later failure would be refused as too old.
 		b.execTx("bootstrapping schema", schemaSQL+fmt.Sprintf(";\nPRAGMA user_version = %d", MinUpgradeUserVersion))
 	}
-	b.ensureColumn("images", "origin", `ALTER TABLE images ADD COLUMN origin TEXT NOT NULL DEFAULT 'ingest'`)
-	b.ensureColumn("image_tags", "is_implied", `ALTER TABLE image_tags ADD COLUMN is_implied INTEGER NOT NULL DEFAULT 0`)
-	// Rows from before the inbox existed are archived, not dumped into it.
-	b.backfillIfFreshColumn("images", "is_inbox",
-		`ALTER TABLE images ADD COLUMN is_inbox INTEGER NOT NULL DEFAULT 1`,
-		`UPDATE images SET is_inbox = 0`,
-		"backfill is_inbox=0 on upgrade")
 	b.exec("create idx_images_inbox_visible", `CREATE INDEX IF NOT EXISTS idx_images_inbox_visible ON images(is_inbox) WHERE is_missing = 0`)
-	if marker < 14 {
-		// Superseded by idx_image_tags_tag_image, which leads on the same column.
-		b.exec("drop superseded idx_image_tags_tag", `DROP INDEX IF EXISTS idx_image_tags_tag`)
-	}
-	b.ensureColumn("images", "source", `ALTER TABLE images ADD COLUMN source TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("images", "url", `ALTER TABLE images ADD COLUMN url TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("images", "note", `ALTER TABLE images ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("images", "original_source", `ALTER TABLE images ADD COLUMN original_source TEXT NOT NULL DEFAULT ''`)
 	if marker < 15 {
 		// images.source is the primary origin's mirror, read by id only:
 		// the source: filter runs on image_sources.
@@ -49,36 +34,14 @@ func Bootstrap(db *DB) error {
 		b.exec("drop idx_images_source_visible", `DROP INDEX IF EXISTS idx_images_source_visible`)
 		b.exec("drop idx_images_source_nocase_visible", `DROP INDEX IF EXISTS idx_images_source_nocase_visible`)
 	}
-	if marker < 14 {
-		// Older libraries held one origin per image in images.source / url.
-		// The table-wide guard keeps a library that cleared its sources
-		// from being re-seeded.
-		b.exec("seed image_sources from scalar",
-			`INSERT OR IGNORE INTO image_sources (image_id, site, post_id, url)
-			 SELECT id, source, '', url FROM images
-			 WHERE (source != '' OR url != '') AND NOT EXISTS (SELECT 1 FROM image_sources)`)
-	}
-	b.ensureColumn("image_sources", "commentary", `ALTER TABLE image_sources ADD COLUMN commentary TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("image_sources", "commentary_translated", `ALTER TABLE image_sources ADD COLUMN commentary_translated TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("image_sources", "original", `ALTER TABLE image_sources ADD COLUMN original TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("image_sources", "similarity", `ALTER TABLE image_sources ADD COLUMN similarity REAL NOT NULL DEFAULT 0`)
-	b.ensureColumn("image_sources", "parent_url", `ALTER TABLE image_sources ADD COLUMN parent_url TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("image_sources", "md5_match", `ALTER TABLE image_sources ADD COLUMN md5_match TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("image_sources", "upgrade_kept", `ALTER TABLE image_sources ADD COLUMN upgrade_kept INTEGER NOT NULL DEFAULT 0`)
-	b.ensureColumn("image_sources", "post_width", `ALTER TABLE image_sources ADD COLUMN post_width INTEGER NOT NULL DEFAULT 0`)
-	b.ensureColumn("image_sources", "post_height", `ALTER TABLE image_sources ADD COLUMN post_height INTEGER NOT NULL DEFAULT 0`)
-	b.ensureColumn("image_sources", "post_size", `ALTER TABLE image_sources ADD COLUMN post_size INTEGER NOT NULL DEFAULT 0`)
-	b.ensureColumn("image_sources", "post_ext", `ALTER TABLE image_sources ADD COLUMN post_ext TEXT NOT NULL DEFAULT ''`)
 	b.exec("create idx_image_sources_parent_url", `CREATE INDEX IF NOT EXISTS idx_image_sources_parent_url ON image_sources(parent_url) WHERE parent_url != ''`)
 	// Must match upgrade.CandidateWhere, or the planner stops using it.
 	b.exec("create idx_image_sources_upgradable", `CREATE INDEX IF NOT EXISTS idx_image_sources_upgradable ON image_sources(image_id)
 		WHERE url <> '' AND upgrade_kept = 0 AND (md5_match = 'differ' OR (similarity > 0 AND md5_match = ''))`)
-	b.ensureColumn("image_annotations", "manual", `ALTER TABLE image_annotations ADD COLUMN manual INTEGER NOT NULL DEFAULT 0`)
 	b.ensureColumn("images", "page_count", `ALTER TABLE images ADD COLUMN page_count INTEGER`)
 	b.ensureColumn("images", "last_read_page", `ALTER TABLE images ADD COLUMN last_read_page INTEGER`)
-	b.ensureColumn("images", "duration_seconds", `ALTER TABLE images ADD COLUMN duration_seconds REAL`)
 	b.exec("create idx_images_duration_visible", `CREATE INDEX IF NOT EXISTS idx_images_duration_visible ON images(duration_seconds) WHERE is_missing = 0 AND duration_seconds IS NOT NULL`)
-	b.ensureColumn("images", "md5", `ALTER TABLE images ADD COLUMN md5 TEXT NOT NULL DEFAULT ''`)
 	// Not UNIQUE: a crafted md5 collision would abort an ingest.
 	b.exec("create idx_images_md5", `CREATE INDEX IF NOT EXISTS idx_images_md5 ON images(md5) WHERE md5 != ''`)
 	// Triggers, not the write sites: many paths write either digest.
@@ -126,32 +89,10 @@ func Bootstrap(db *DB) error {
 	b.ensureColumn("images", "series_order", `ALTER TABLE images ADD COLUMN series_order INTEGER`)
 	b.exec("create idx_images_series", `CREATE INDEX IF NOT EXISTS idx_images_series ON images(series) WHERE series != ''`)
 	b.exec("create idx_images_series_nocase", `CREATE INDEX IF NOT EXISTS idx_images_series_nocase ON images(series COLLATE NOCASE)`)
-	if marker < 14 {
-		// Older libraries held one collection per image in images.series.
-		b.exec("seed image_collections from series",
-			`INSERT OR IGNORE INTO image_collections (image_id, name, position)
-			 SELECT id, series, series_order FROM images
-			 WHERE series != '' AND NOT EXISTS (SELECT 1 FROM image_collections)`)
-	}
 	// folder: compares NOCASE, which the BINARY idx_images_folder_visible
 	// can't serve; without this the planner walks idx_images_missing and
 	// temp-sorts.
 	b.exec("create idx_images_folder_nocase_visible", `CREATE INDEX IF NOT EXISTS idx_images_folder_nocase_visible ON images(folder_path COLLATE NOCASE) WHERE is_missing = 0`)
-	b.ensureColumn("saved_searches", "sort", `ALTER TABLE saved_searches ADD COLUMN sort TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("saved_searches", "sort_order", `ALTER TABLE saved_searches ADD COLUMN sort_order TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("saved_searches", "seed", `ALTER TABLE saved_searches ADD COLUMN seed TEXT NOT NULL DEFAULT ''`)
-	b.ensureColumn("image_paths", "mtime_unix", `ALTER TABLE image_paths ADD COLUMN mtime_unix INTEGER NOT NULL DEFAULT 0`)
-	// 0 keeps older rows on the seconds comparison, not a full re-hash.
-	b.ensureColumn("image_paths", "mtime_nsec", `ALTER TABLE image_paths ADD COLUMN mtime_nsec INTEGER NOT NULL DEFAULT 0`)
-	b.ensureColumn("images", "phash", `ALTER TABLE images ADD COLUMN phash INTEGER`)
-	// Pairs that predate the tag detector all came from phash.
-	b.ensureColumn("potential_relation_pairs", "source", `ALTER TABLE potential_relation_pairs ADD COLUMN source TEXT NOT NULL DEFAULT 'phash'`)
-	b.ensureColumn("potential_relation_pairs", "score", `ALTER TABLE potential_relation_pairs ADD COLUMN score REAL`)
-	b.backfillIfFreshColumn("potential_relation_pairs", "collection_hidden",
-		`ALTER TABLE potential_relation_pairs ADD COLUMN collection_hidden INTEGER NOT NULL DEFAULT 0`,
-		`UPDATE potential_relation_pairs SET collection_hidden = 1 WHERE `+PairHiddenProbe("a_image_id", "b_image_id"),
-		"backfill potential_relation_pairs.collection_hidden")
-	b.ensureColumn("relation_session", "detector", `ALTER TABLE relation_session ADD COLUMN detector TEXT NOT NULL DEFAULT 'both'`)
 	b.widenDerivativeEdgesKey()
 	// Bulk deletes before the relations hook left groups under two
 	// members, and an import replays whatever the export carried.
@@ -159,7 +100,6 @@ func Bootstrap(db *DB) error {
 		`DELETE FROM dup_groups WHERE (SELECT COUNT(*) FROM dup_group_members m WHERE m.group_id = dup_groups.id) < 2`)
 	b.exec("dissolve degenerate alt groups",
 		`DELETE FROM alt_groups WHERE (SELECT COUNT(*) FROM alt_group_members m WHERE m.group_id = alt_groups.id) < 2`)
-	b.ensureColumn("images", "upload_batch", `ALTER TABLE images ADD COLUMN upload_batch INTEGER`)
 	// 0 = opted out of that backend's scheduled lookup. The PTR flag is
 	// seeded from the single flag it split off.
 	b.ensureColumn("images", "scheduled_lookup", `ALTER TABLE images ADD COLUMN scheduled_lookup INTEGER NOT NULL DEFAULT 1`)
@@ -281,37 +221,11 @@ func Bootstrap(db *DB) error {
 		`ALTER TABLE images ADD COLUMN rating_rank INTEGER NOT NULL DEFAULT -1`,
 		`UPDATE images SET rating_rank = `+ratingRankExpr("images.id")+``,
 		"backfill images.rating_rank")
-	// Older tags take the origin their image_tags attribution implies.
-	b.backfillIfFreshColumn("tags", "origin",
-		`ALTER TABLE tags ADD COLUMN origin TEXT NOT NULL DEFAULT ''`,
-		`UPDATE tags SET origin = COALESCE((
-			SELECT CASE
-				WHEN COUNT(*) = 0 THEN NULL
-				WHEN COUNT(DISTINCT COALESCE(it.tagger_name, '')) = 1
-				     AND MAX(COALESCE(it.tagger_name, '')) <> '' THEN MAX(it.tagger_name)
-				WHEN SUM(it.is_auto = 0) = 0 THEN 'auto'
-				WHEN SUM(it.is_auto = 0 AND COALESCE(it.tagger_name, '') = '') = 0 THEN 'api'
-				ELSE 'user'
-			END
-			FROM image_tags it WHERE it.tag_id = tags.id), '')`,
-		"backfill tags.origin")
-	b.backfillIfFreshColumn("tags", "last_used_at",
-		`ALTER TABLE tags ADD COLUMN last_used_at TEXT`,
-		`UPDATE tags SET last_used_at = (SELECT MAX(it.created_at) FROM image_tags it WHERE it.tag_id = tags.id)`,
-		"backfill tags.last_used_at")
-	b.ensureColumn("tag_implications", "origin",
-		`ALTER TABLE tag_implications ADD COLUMN origin TEXT NOT NULL DEFAULT ''`)
 	// The ComfyTermsVersion its terms were derived under; 0 = never indexed.
 	b.ensureColumn("comfyui_metadata", "terms_version",
 		`ALTER TABLE comfyui_metadata ADD COLUMN terms_version INTEGER NOT NULL DEFAULT 0`)
 	b.exec("create idx_comfyui_metadata_terms_version",
 		`CREATE INDEX IF NOT EXISTS idx_comfyui_metadata_terms_version ON comfyui_metadata(terms_version)`)
-	b.ensureColumn("image_tags", "stale",
-		`ALTER TABLE image_tags ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`)
-	b.ensureColumn("tags", "stale",
-		`ALTER TABLE tags ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`)
-	b.ensureColumn("tag_implications", "stale",
-		`ALTER TABLE tag_implications ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`)
 	b.exec("create idx_image_tags_stale_tag",
 		`CREATE INDEX IF NOT EXISTS idx_image_tags_stale_tag ON image_tags(tag_id, image_id) WHERE stale = 1`)
 	b.exec("create idx_image_tags_stale_image",
@@ -346,6 +260,7 @@ func Bootstrap(db *DB) error {
 	// The PK leads on image_id, so reads keyed by source would scan the table.
 	b.exec("create idx_image_tag_sources_source",
 		`CREATE INDEX IF NOT EXISTS idx_image_tag_sources_source ON image_tag_sources(source, tag_id)`)
+	b.exec("create idx_image_tag_sources_tag", "CREATE INDEX IF NOT EXISTS idx_image_tag_sources_tag ON image_tag_sources(tag_id)")
 	// A trigger, not per-call cleanup: image_tags rows die through too
 	// many paths, FK cascades included.
 	b.exec("create trg_image_tags_sources_ad", `CREATE TRIGGER IF NOT EXISTS trg_image_tags_sources_ad
@@ -375,13 +290,6 @@ func Bootstrap(db *DB) error {
 		BEGIN
 			UPDATE images SET rating_rank = `+ratingRankExpr("OLD.image_id")+` WHERE id = OLD.image_id;
 		END`)
-	// After the rating_rank migration, which its backfill and triggers read.
-	b.backfillIfFreshColumn("potential_relation_pairs", "max_rating_rank",
-		`ALTER TABLE potential_relation_pairs ADD COLUMN max_rating_rank INTEGER NOT NULL DEFAULT -1`,
-		`UPDATE potential_relation_pairs SET max_rating_rank = max(
-			(SELECT rating_rank FROM images WHERE id = a_image_id),
-			(SELECT rating_rank FROM images WHERE id = b_image_id))`,
-		"backfill potential_relation_pairs.max_rating_rank")
 	b.exec("create trg_potential_pairs_rank_ai", `CREATE TRIGGER IF NOT EXISTS trg_potential_pairs_rank_ai
 		AFTER INSERT ON potential_relation_pairs
 		BEGIN

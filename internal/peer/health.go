@@ -4,30 +4,43 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/monbooru/monbooru/internal/shared/contract"
+	"github.com/monbooru/monbooru/internal/shared/webui"
 )
 
 // The connection a probe leaves a peer in; "" is a cold cache.
 const (
-	ConnOK       = "ok"
-	ConnDown     = "down"
-	ConnRejected = "rejected"
-	ConnPaused   = "paused"
+	ConnOK       = webui.ConnOK
+	ConnDown     = webui.ConnDown
+	ConnRejected = webui.ConnRejected
+	ConnPaused   = webui.ConnPaused
 )
 
 // A backstop for callers with an unbounded context: it must stay above every
-// per-call deadline, or it cuts off a send the peer may still commit.
-var Client = &http.Client{Timeout: 15 * time.Second}
+// per-call deadline, or it cuts off a send the peer may still commit. A
+// redirect is not followed, since it could point at any host.
+var Client = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 // A refused request, not a sign the peer is down, so a batch skips the
 // row. It carries the peer's name: a plugin's refusal must not read as
 // monloader's.
-type StatusError struct{ Peer, Status string }
+type StatusError struct{ Peer, Status, Code string }
 
-func (e StatusError) Error() string { return e.Peer + " returned " + e.Status }
+func (e StatusError) Error() string {
+	if e.Code != "" {
+		return e.Peer + " returned " + e.Status + " (" + e.Code + ")"
+	}
+	return e.Peer + " returned " + e.Status
+}
 
 func IsStatusError(err error) bool {
 	var se StatusError
@@ -38,41 +51,25 @@ func IsStatusError(err error) bool {
 // over: a path or field gone, a status code or a vocabulary word changed.
 // MinPeerAPI is the oldest peer API this side still drives.
 const (
-	APIVersion = 2
+	APIVersion = 3
 	MinPeerAPI = 1
 )
 
-type HealthInfo struct {
-	Version    string `json:"version"`
-	API        int    `json:"api"`
-	MinPeerAPI int    `json:"min_peer_api"`
-}
-
-// APIMismatch is empty when the two sides agree, and when the peer
-// predates the field.
-func (h HealthInfo) APIMismatch() string {
-	if h.API == 0 || (h.API >= MinPeerAPI && h.MinPeerAPI <= APIVersion) {
-		return ""
-	}
-	return fmt.Sprintf("api mismatch: it speaks api %d and drives %d or newer, this monbooru speaks %d and drives %d or newer",
-		h.API, h.MinPeerAPI, APIVersion, MinPeerAPI)
-}
-
 // A 200 with any body passes; every field is optional.
-func Health(ctx context.Context, base string) (HealthInfo, bool) {
+func Health(ctx context.Context, base string) (contract.Health, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/health", nil)
 	if err != nil {
-		return HealthInfo{}, false
+		return contract.Health{}, false
 	}
 	resp, err := Client.Do(req)
 	if err != nil {
-		return HealthInfo{}, false
+		return contract.Health{}, false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return HealthInfo{}, false
+		return contract.Health{}, false
 	}
-	var h HealthInfo
+	var h contract.Health
 	_ = json.NewDecoder(resp.Body).Decode(&h)
 	return h, true
 }
@@ -104,7 +101,7 @@ func NotifyTeardown(app, baseURL, token string) error {
 	defer func() { _ = resp.Body.Close() }()
 	// Any 2xx: the teardown is idempotent, so a 204 has done what was asked.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return StatusError{app, resp.Status}
+		return StatusError{Peer: app, Status: resp.Status}
 	}
 	return nil
 }

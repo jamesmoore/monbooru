@@ -8,15 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/shared/desktop"
-
-	"github.com/monbooru/monbooru/internal/procx"
 )
 
 var (
@@ -35,29 +32,13 @@ func resolveTools() {
 }
 
 func resolveTool(name string) string {
-	binary := name
-	if runtime.GOOS == "windows" {
-		binary += ".exe"
-	}
-	if dir := desktop.ExeDir(); dir != "" {
-		if p := filepath.Join(dir, binary); runnable(p) {
-			return p
-		}
+	if p := desktop.BundledTool(name); p != "" {
+		return p
 	}
 	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
 	return ""
-}
-
-// A copy without exec bits, unpacked from a tarball that dropped the
-// modes, must not shadow a working one on PATH.
-func runnable(path string) bool {
-	fi, err := os.Stat(path)
-	if err != nil || fi.IsDir() {
-		return false
-	}
-	return runtime.GOOS == "windows" || fi.Mode()&0o111 != 0
 }
 
 // The size cap bounds bytes, not decode time: a small pathological file
@@ -68,7 +49,7 @@ func runFFmpeg(combinedOutput bool, name string, args ...string) ([]byte, error)
 	ctx, cancel := context.WithTimeout(context.Background(), ffmpegTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	procx.HideConsole(cmd)
+	desktop.HideConsole(cmd)
 	if combinedOutput {
 		return cmd.CombinedOutput()
 	}

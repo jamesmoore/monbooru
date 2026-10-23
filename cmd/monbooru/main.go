@@ -4,8 +4,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -69,7 +71,9 @@ func main() {
 	restartOnExit := false
 	defer func() {
 		if restartOnExit {
-			relaunch()
+			if err := desktop.Relaunch(); err != nil {
+				logx.Errorf("restart: %v", err)
+			}
 		}
 	}()
 
@@ -114,13 +118,20 @@ func main() {
 	logx.Infof("config: bind=%s galleries=%d default=%q models=%s log=%s",
 		cfg.Server.BindAddress, len(cfg.Galleries), cfg.DefaultGallery, cfg.Paths.ModelPath, cfg.Log.Level)
 
+	var ln net.Listener
 	if *desktopMode {
-		if msg, proceed := claimPort(cfg.Server.BindAddress, !*noBrowser); !proceed {
-			if msg != "" {
-				fatalf("%s", msg)
+		ln, err = desktop.Listen(appName, cfg.Server.BindAddress, bindWait)
+		if errors.Is(err, desktop.ErrRunning) {
+			if err := desktop.HandOver(appName, cfg.Server.BindAddress, !*noBrowser); err != nil {
+				logx.Warnf("%v", err)
 			}
 			return
 		}
+		if err != nil {
+			fatalf("%v", err)
+		}
+	} else if ln, err = net.Listen("tcp", cfg.Server.BindAddress); err != nil {
+		fatalf("HTTP server: %v", err)
 	}
 
 	jobManager := jobs.NewManager()
@@ -152,14 +163,18 @@ func main() {
 	srvErr := make(chan error, 1)
 	go func() {
 		logx.Infof("monbooru listening on %s", cfg.Server.BindAddress)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			srvErr <- err
 		}
 	}()
 
 	if *desktopMode {
 		if !*noBrowser {
-			go openWhenServing(cfg.Server.BindAddress)
+			go func() {
+				if err := desktop.OpenWhenServing(appName, cfg.Server.BindAddress, 30*time.Second); err != nil {
+					logx.Warnf("%v", err)
+				}
+			}()
 		}
 		if srv.TrayEnabled() {
 			trayCtx, stopTray := context.WithCancel(context.Background())
@@ -168,28 +183,14 @@ func main() {
 		}
 	}
 
-	// A bind failure comes back through srvErr, not log.Fatalf, so the
-	// deferred srv.Close still runs.
 	select {
 	case <-quit:
 		logx.Infof("shutting down...")
 	case <-srv.QuitRequested():
 		logx.Infof("shutting down on request...")
 	case err := <-srvErr:
-		msg := ""
-		if *desktopMode {
-			// Two launches can both probe an empty port; the one that
-			// lost the bind asks again and finds the winner.
-			if msg = bindFailure(cfg.Server.BindAddress, err, !*noBrowser); msg == "" {
-				logx.Infof("lost the bind to the %s already on %s", appName, cfg.Server.BindAddress)
-				break
-			}
-		}
-		logx.Errorf("FATAL HTTP server: %v", err)
+		reportFatal("HTTP server: " + err.Error())
 		exitCode = 1
-		if msg != "" {
-			reportFatal(msg)
-		}
 	}
 	signal.Stop(quit)
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

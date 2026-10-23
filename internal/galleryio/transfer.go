@@ -47,9 +47,18 @@ func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool)
 	var dstID int64
 	var dstMissing int
 	var dstCanon string
-	lookupErr := dstCx.DB.Read.QueryRow(`SELECT id, is_missing, canonical_path FROM images WHERE sha256 = ?`, sha).Scan(&dstID, &dstMissing, &dstCanon)
+	var dstSize int64
+	lookupErr := dstCx.DB.Read.QueryRow(`SELECT id, is_missing, canonical_path, file_size FROM images WHERE sha256 = ?`, sha).Scan(&dstID, &dstMissing, &dstCanon, &dstSize)
 	if lookupErr != nil && lookupErr != sql.ErrNoRows {
 		return 0, fmt.Errorf("target sha lookup: %w", lookupErr)
+	}
+	// file_size 0 marks a row whose bytes were never read: an import placeholder.
+	markPresent := func() error {
+		if dstSize == 0 {
+			return dstCx.ReadPlaceholder(dstID, dstCanon)
+		}
+		_, err := gallery.SetMissing(dstCx.DB, dstID, false)
+		return err
 	}
 	// The provenance is written outside the landing and the tag service.
 	if err := dstCx.Edit(func(*db.DB) error {
@@ -69,7 +78,7 @@ func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool)
 				if got != sha {
 					return fmt.Errorf("the target's file %q now holds other bytes; sync the target first", dstCanon)
 				}
-				if _, err := gallery.SetMissing(dstCx.DB, dstID, false); err != nil {
+				if err := markPresent(); err != nil {
 					return err
 				}
 			}
@@ -90,7 +99,7 @@ func TransferOneImage(srcCx, dstCx *library.Gallery, id int64, removeAfter bool)
 				if err := gallery.CopyFileContents(canonPath, dstCanon); err != nil {
 					return fmt.Errorf("restore file: %w", err)
 				}
-				if _, err := gallery.SetMissing(dstCx.DB, dstID, false); err != nil {
+				if err := markPresent(); err != nil {
 					return err
 				}
 			}

@@ -2,14 +2,9 @@ package api
 
 import (
 	"net/http"
-)
 
-type galleryListEntry struct {
-	Name   string `json:"name"`
-	Images int    `json:"images"`
-	Tags   int    `json:"tags"`
-	Active bool   `json:"active"`
-}
+	"github.com/monbooru/monbooru/internal/shared/contract"
+)
 
 func (h *Handler) listGalleries(w http.ResponseWriter, r *http.Request) {
 	activeName := ""
@@ -17,7 +12,7 @@ func (h *Handler) listGalleries(w http.ResponseWriter, r *http.Request) {
 		activeName = active.Name
 	}
 	configured := h.cfg().Galleries
-	out := make([]galleryListEntry, 0, len(configured))
+	out := make([]contract.Gallery, 0, len(configured))
 	for _, gc := range configured {
 		g, ok := h.resolver(gc.Name)
 		if !ok {
@@ -26,10 +21,10 @@ func (h *Handler) listGalleries(w http.ResponseWriter, r *http.Request) {
 		images, imagesOK := g.VisibleCount()
 		tags, tagsOK := g.TagCount()
 		if !imagesOK || !tagsOK {
-			apiError(w, http.StatusInternalServerError, "internal_error", "could not count gallery "+gc.Name)
+			contract.WriteError(w, http.StatusInternalServerError, "internal_error", "could not count gallery "+gc.Name)
 			return
 		}
-		out = append(out, galleryListEntry{Name: gc.Name, Images: images, Tags: tags, Active: gc.Name == activeName})
+		out = append(out, contract.Gallery{Name: gc.Name, Images: images, Tags: tags, Active: gc.Name == activeName})
 	}
-	WriteJSON(w, http.StatusOK, out)
+	contract.WriteJSON(w, http.StatusOK, out)
 }

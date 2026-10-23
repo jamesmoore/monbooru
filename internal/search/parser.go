@@ -34,7 +34,8 @@ func (TagExpr) exprNode()    {}
 func (FilterExpr) exprNode() {}
 
 func Parse(query string) Expr {
-	p := &parser{tokens: tokenize(query)}
+	tokens, _ := tokenize(query)
+	p := &parser{tokens: tokens}
 	exprs := p.parseAll()
 	if len(exprs) == 0 {
 		return nil
@@ -60,11 +61,11 @@ type token struct {
 	val  string
 }
 
-func tokenize(query string) []token {
-	var tokens []token
+// open reports a quote the query never closes.
+func tokenize(query string) (tokens []token, open bool) {
 	query = strings.TrimSpace(query)
 	if query == "" {
-		return nil
+		return nil, false
 	}
 
 	i := 0
@@ -87,18 +88,20 @@ func tokenize(query string) []token {
 		}
 
 		j := i
+		closed := true
 		if query[j] == '"' {
-			j = skipQuoted(query, j)
+			j, closed = skipQuoted(query, j)
 		} else {
 			for j < len(query) && query[j] != ' ' && query[j] != '\t' {
 				opensQuote := query[j] == ':' || query[j] == '=' && strings.IndexByte(query[i:j], ':') > 0
 				if opensQuote && j+1 < len(query) && query[j+1] == '"' {
-					j = skipQuoted(query, j+1)
+					j, closed = skipQuoted(query, j+1)
 					break
 				}
 				j++
 			}
 		}
+		open = open || !closed
 		term := query[i:j]
 		i = j
 
@@ -117,11 +120,11 @@ func tokenize(query string) []token {
 
 		tokens = append(tokens, token{kind: tokTag, val: term})
 	}
-	return tokens
+	return tokens, open
 }
 
 // j is the opening quote; the result is the index past the closing one.
-func skipQuoted(query string, j int) int {
+func skipQuoted(query string, j int) (int, bool) {
 	j++
 	for j < len(query) && query[j] != '"' {
 		if query[j] == '\\' && j+1 < len(query) {
@@ -131,9 +134,9 @@ func skipQuoted(query string, j int) int {
 		j++
 	}
 	if j < len(query) {
-		j++
+		return j + 1, true
 	}
-	return j
+	return j, false
 }
 
 type parser struct {
@@ -275,4 +278,25 @@ func QuoteValue(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "\"", "\\\"")
 	return s
+}
+
+var comparisonKeys = map[string]bool{
+	"width": true, "height": true, "pages": true, "size": true, "ratio": true,
+	"tagcount": true, "duration": true, "date": true,
+}
+
+// Unreadable names what in query matches nothing as typed: a quote left
+// open, and a comparison or date filter whose value does not parse.
+func Unreadable(query string) []string {
+	var out []string
+	if _, open := tokenize(query); open {
+		out = append(out, "unterminated quote")
+	}
+	WalkLeaves(Parse(query), func(e Expr) bool {
+		if f, ok := e.(FilterExpr); ok && comparisonKeys[f.Key] && filterBuilders[f.Key](&whereBuilder{}, f) == "1=0" {
+			out = append(out, f.Key+":"+f.Val)
+		}
+		return true
+	})
+	return out
 }

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/monbooru/monbooru/internal/api"
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/jobs"
@@ -19,6 +18,7 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/monloader"
 	"github.com/monbooru/monbooru/internal/search"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -91,7 +91,7 @@ func (s *Server) runBulkDelete(ids []int64) {
 		s.jobs.Update(done, total, "deleting…")
 	})
 	deleted := len(res.Deleted)
-	summary := fmt.Sprintf("Deleted %d image(s)%s.", deleted, keptChanged(res.Changed))
+	summary := fmt.Sprintf("Deleted %d image%s%s.", deleted, plural(deleted), keptChanged(res.Changed))
 	s.jobs.Finish(err, res.Cancelled, fmt.Sprintf("delete cancelled (%d/%d deleted)", deleted, total), summary)
 }
 
@@ -100,7 +100,7 @@ func keptChanged(n int) string {
 	if n == 0 {
 		return ""
 	}
-	return fmt.Sprintf("; kept %d file(s) changed since indexing", n)
+	return fmt.Sprintf("; kept %d file%s changed since indexing", n, plural(n))
 }
 
 func (s *Server) batchPlace(w http.ResponseWriter, r *http.Request) {
@@ -203,15 +203,15 @@ func (s *Server) runBatchPlace(ids []int64, targetFolder *string, folderTmpl, na
 	// Named from what the run did: the folder field opens on {folder}, so
 	// most renames move nothing.
 	_, _, past := placeVerbs(moved > 0, renamed > 0)
-	summary := fmt.Sprintf("%s %d image(s).", titleCase(past), done)
+	summary := fmt.Sprintf("%s %d image%s.", titleCase(past), done, plural(done))
 	if failed > 0 {
-		summary = fmt.Sprintf("%s %d image(s), %d failed.", titleCase(past), done, failed)
+		summary = fmt.Sprintf("%s %d image%s, %d failed.", titleCase(past), done, plural(done), failed)
 	}
 	if suffixed > 0 {
 		summary += fmt.Sprintf(" %d had a taken name and were numbered.", suffixed)
 	}
 	if n := countEmptiedDirs(sources); n > 0 {
-		summary += fmt.Sprintf(" %d folder(s) are now empty.", n)
+		summary += fmt.Sprintf(" %d %s now empty.", n, models.Plural(n, "folder is", "folders are"))
 	}
 	s.jobs.Finish(nil, cancelled, fmt.Sprintf("%s cancelled (%d/%d %s)", verb, done, total, past), summary)
 }
@@ -245,9 +245,9 @@ func (s *Server) runBatchPlaceCheck(ids []int64, targetFolder *string, folderTmp
 		return nil
 	})
 
-	summary := fmt.Sprintf("Checked %d image(s): no name is already taken.", done)
+	summary := fmt.Sprintf("Checked %d image%s: no name is already taken.", done, plural(done))
 	if collisions > 0 {
-		summary = fmt.Sprintf("Checked %d image(s): %d would be numbered, their name is already taken.", done, collisions)
+		summary = fmt.Sprintf("Checked %d image%s: %d would be numbered, their name is already taken.", done, plural(done), collisions)
 	}
 	if failed > 0 {
 		summary += fmt.Sprintf(" %d could not be checked.", failed)
@@ -369,7 +369,7 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 	}
 	res, err := batch(s.jobs.Context(), ids, tagIDs, progress)
 
-	done := fmt.Sprintf("%s %d of %d image(s) (%d row change(s)).", summary, res.Touched, res.Processed, res.Changed)
+	done := fmt.Sprintf("%s %d of %d image%s (%d row change%s).", summary, res.Touched, res.Processed, plural(res.Processed), res.Changed, plural(res.Changed))
 	if note != "" {
 		done += " " + note + "."
 	}
@@ -380,10 +380,10 @@ func (s *Server) runBatchTag(ids []int64, op string, catTags []catTag, note stri
 		done += " " + note + "."
 	}
 	if res.Replaced > 0 {
-		done += fmt.Sprintf(" Replaced the rating on %d image(s).", res.Replaced)
+		done += fmt.Sprintf(" Replaced the rating on %d image%s.", res.Replaced, plural(res.Replaced))
 	}
 	if res.Kept > 0 {
-		done += fmt.Sprintf(" Kept %d row(s) another tag on the image implies.", res.Kept)
+		done += fmt.Sprintf(" Kept %d row%s another tag on the image implies.", res.Kept, plural(res.Kept))
 	}
 	s.jobs.Finish(err, res.Cancelled, fmt.Sprintf("%s cancelled (%d/%d processed)", label, res.Processed, total), done)
 }
@@ -443,9 +443,9 @@ func (s *Server) runBatchStrip(ids []int64, mode, filterName string) {
 	res, err := s.tagSvc().StripTags(s.jobs.Context(), ids, tags.StripSpec{Mode: mode, Name: filterName}, func(done, total int) {
 		s.jobs.Update(done, total, label+"…")
 	})
-	done := fmt.Sprintf("%s %d of %d image(s) (%d row change(s)).", summary, res.Touched, res.Processed, res.Removed)
+	done := fmt.Sprintf("%s %d of %d image%s (%d row change%s).", summary, res.Touched, res.Processed, plural(res.Processed), res.Removed, plural(res.Removed))
 	if res.Kept > 0 {
-		done += fmt.Sprintf(" Kept %d row(s) another tag on the image implies.", res.Kept)
+		done += fmt.Sprintf(" Kept %d row%s another tag on the image implies.", res.Kept, plural(res.Kept))
 	}
 	s.jobs.Finish(err, res.Cancelled, fmt.Sprintf("%s cancelled (%d/%d processed)", label, res.Processed, total), done)
 }
@@ -482,7 +482,7 @@ func (s *Server) runBulkToggle(ids []int64, flag gallery.ImageFlag, progressNoun
 	processed, cancelled, err := jobs.Chunked(ctx, s.jobs, ids, chunkSize, "toggling "+progressNoun, func(chunk []int64) error {
 		return cx.ToggleFlags(chunk, flag)
 	})
-	s.jobs.Finish(err, cancelled, fmt.Sprintf("%s cancelled (%d/%d toggled)", cancelNoun, processed, total), fmt.Sprintf("%s for %d image(s).", successNoun, processed))
+	s.jobs.Finish(err, cancelled, fmt.Sprintf("%s cancelled (%d/%d toggled)", cancelNoun, processed, total), fmt.Sprintf("%s for %d image%s.", successNoun, processed, plural(processed)))
 }
 
 func (s *Server) batchCollection(w http.ResponseWriter, r *http.Request) {
@@ -532,9 +532,9 @@ func (s *Server) runBatchCollection(ids []int64, label, mode string, dissolve bo
 			logx.Debugf("dissolve collection find-relations flag: %v", e)
 		}
 	}
-	done := fmt.Sprintf("Added %d image(s) to collection.", processed)
+	done := fmt.Sprintf("Added %d image%s to collection.", processed, plural(processed))
 	if remove {
-		done = fmt.Sprintf("Removed %d image(s) from collection.", processed)
+		done = fmt.Sprintf("Removed %d image%s from collection.", processed, plural(processed))
 	}
 	s.jobs.Finish(err, cancelled, fmt.Sprintf("collection cancelled (%d/%d processed)", processed, total), done)
 }
@@ -589,7 +589,7 @@ func (s *Server) batchLookupCount(w http.ResponseWriter, r *http.Request) {
 			sourced++
 		}
 	}
-	api.WriteJSON(w, http.StatusOK, map[string]int{"total": len(ids), "sourced": sourced, "unsourced": len(ids) - sourced})
+	contract.WriteJSON(w, http.StatusOK, map[string]int{"total": len(ids), "sourced": sourced, "unsourced": len(ids) - sourced})
 }
 
 func (s *Server) runBatchLookup(opts monloader.BatchLookupOpts, on bool, ids []int64) {
@@ -615,5 +615,5 @@ func (s *Server) runBatchSchedule(ctx context.Context, cx *library.Gallery, on b
 		onOff = "on"
 	}
 	s.jobs.Finish(err, cancelled, fmt.Sprintf("Scheduled lookup cancelled (%d/%d set)", processed, len(ids)),
-		fmt.Sprintf("Scheduled lookup turned %s for %d image(s).", onOff, processed))
+		fmt.Sprintf("Scheduled lookup turned %s for %d image%s.", onOff, processed, plural(processed)))
 }

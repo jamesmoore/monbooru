@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"encoding/xml"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/models"
@@ -12,19 +13,20 @@ import (
 const ComicInfoMaxRawXML = 64 * 1024
 
 // No Pages element: images.page_count, counted from the archive, is the
-// authority.
+// authority. The numbers are strings: encoding/xml stops at the first one
+// that does not parse, dropping every element after it.
 type comicInfoXML struct {
 	XMLName         xml.Name `xml:"ComicInfo"`
 	Title           string   `xml:"Title,omitempty"`
 	Series          string   `xml:"Series,omitempty"`
 	Number          string   `xml:"Number,omitempty"`
 	Volume          string   `xml:"Volume,omitempty"`
-	Count           *int     `xml:"Count,omitempty"`
+	Count           string   `xml:"Count,omitempty"`
 	Summary         string   `xml:"Summary,omitempty"`
 	Notes           string   `xml:"Notes,omitempty"`
-	Year            *int     `xml:"Year,omitempty"`
-	Month           *int     `xml:"Month,omitempty"`
-	Day             *int     `xml:"Day,omitempty"`
+	Year            string   `xml:"Year,omitempty"`
+	Month           string   `xml:"Month,omitempty"`
+	Day             string   `xml:"Day,omitempty"`
 	Writer          string   `xml:"Writer,omitempty"`
 	Penciller       string   `xml:"Penciller,omitempty"`
 	Inker           string   `xml:"Inker,omitempty"`
@@ -40,13 +42,13 @@ type comicInfoXML struct {
 	Format          string   `xml:"Format,omitempty"`
 	Manga           string   `xml:"Manga,omitempty"`
 	AgeRating       string   `xml:"AgeRating,omitempty"`
-	CommunityRating *float64 `xml:"CommunityRating,omitempty"`
-	PageCount       *int     `xml:"PageCount,omitempty"`
+	CommunityRating string   `xml:"CommunityRating,omitempty"`
+	PageCount       string   `xml:"PageCount,omitempty"`
 }
 
 // MarshalComicInfo writes no XML declaration, as most archivers do.
 func MarshalComicInfo(title string, pageCount int) ([]byte, error) {
-	doc := comicInfoXML{Title: title, PageCount: &pageCount}
+	doc := comicInfoXML{Title: title, PageCount: strconv.Itoa(pageCount)}
 	return xml.MarshalIndent(doc, "", "  ")
 }
 
@@ -90,12 +92,12 @@ func ParseComicInfo(zr *zip.Reader) (*models.MangaMetadata, error) {
 		Series:          strings.TrimSpace(doc.Series),
 		Number:          strings.TrimSpace(doc.Number),
 		Volume:          strings.TrimSpace(doc.Volume),
-		Count:           doc.Count,
+		Count:           comicInt(doc.Count),
 		Summary:         strings.TrimSpace(doc.Summary),
 		Notes:           strings.TrimSpace(doc.Notes),
-		Year:            doc.Year,
-		Month:           doc.Month,
-		Day:             doc.Day,
+		Year:            comicInt(doc.Year),
+		Month:           comicInt(doc.Month),
+		Day:             comicInt(doc.Day),
 		Writer:          strings.TrimSpace(doc.Writer),
 		Penciller:       strings.TrimSpace(doc.Penciller),
 		Inker:           strings.TrimSpace(doc.Inker),
@@ -111,8 +113,25 @@ func ParseComicInfo(zr *zip.Reader) (*models.MangaMetadata, error) {
 		Format:          strings.TrimSpace(doc.Format),
 		Manga:           strings.TrimSpace(doc.Manga),
 		AgeRating:       strings.TrimSpace(doc.AgeRating),
-		CommunityRating: doc.CommunityRating,
-		XMLPageCount:    doc.PageCount,
+		CommunityRating: comicFloat(doc.CommunityRating),
+		XMLPageCount:    comicInt(doc.PageCount),
 		RawXML:          string(body),
 	}, nil
+}
+
+func comicInt(s string) *int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return nil
+	}
+	return &n
+}
+
+// A decimal comma, as a European locale writes 4,5, reads as 4.5.
+func comicFloat(s string) *float64 {
+	f, err := strconv.ParseFloat(strings.Replace(strings.TrimSpace(s), ",", ".", 1), 64)
+	if err != nil {
+		return nil
+	}
+	return &f
 }

@@ -4,8 +4,8 @@
   <div class="pairing-pending">
   <p class="pairing-pending-msg">An app is requesting to pair. Approve or deny below. A <strong>re-pair</strong> replaces the credentials the app already holds here.</p>
   <div class="table-scroll">
-  <table class="gallery-table">
-    <thead><tr><th>App</th><th>Source</th><th>Scopes</th><th>Buttons</th><th>Approve</th><th>Deny</th></tr></thead>
+  <table class="data-table">
+    <thead><tr><th>App</th><th>Source</th><th>Scopes</th><th>Buttons</th><th class="cell-action">Approve</th><th class="cell-action">Deny</th></tr></thead>
     <tbody>
       {{range .Pending}}
       <tr>
@@ -18,12 +18,12 @@
           {{if not .Buttons}}<span class="status-dim">none</span>{{end}}
           {{if .SessionNote}}<div class="field-hint">Its open pages run with your session and can do anything you can do here, whatever its scopes.</div>{{end}}
         </td>
-        <td>
+        <td class="cell-action">
           <form hx-post="/settings/plugins/pair/{{.ID}}/approve" hx-target="#plugin-pairing" hx-swap="outerHTML" style="display:inline">
             <button type="submit" class="btn-sm btn-success">Approve</button>
           </form>
         </td>
-        <td>
+        <td class="cell-action">
           <form hx-post="/settings/plugins/pair/{{.ID}}/deny" hx-target="#plugin-pairing" hx-swap="outerHTML" style="display:inline">
             <button type="submit" class="btn-sm">Deny</button>
           </form>

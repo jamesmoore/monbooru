@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 )
 
 // App is the peer's name in pairing records and error text.
@@ -44,10 +45,42 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte) (*htt
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	return peer.Client.Do(req)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = http.MaxBytesReader(nil, resp.Body, maxResponseBytes)
+	return resp, nil
 }
 
-func (c *Client) Post(ctx context.Context, path string, payload map[string]any) (*http.Response, error) {
+// A followed redirect would re-send a POST as a GET and carry the token along.
+var httpClient = &http.Client{
+	Timeout: peer.Client.Timeout,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+const maxResponseBytes = 16 << 20
+
+// A monloader whose first-run setup is not done answers every /api/v1 call
+// 409 setup_required, which is no PTR or job refusal.
+func setupRequired(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusConflict {
+		return false
+	}
+	var e contract.Error
+	_ = json.NewDecoder(resp.Body).Decode(&e)
+	return e.Code == contract.CodeSetupRequired
+}
+
+func refused(resp *http.Response) error {
+	var e contract.Error
+	_ = json.NewDecoder(resp.Body).Decode(&e)
+	return peer.StatusError{Peer: App, Status: resp.Status, Code: e.Code}
+}
+
+func (c *Client) Post(ctx context.Context, path string, payload any) (*http.Response, error) {
 	body, _ := json.Marshal(payload)
 	return c.Do(ctx, http.MethodPost, path, body)
 }

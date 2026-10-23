@@ -81,11 +81,11 @@ func ApplyReplacedFile(h Handle, imageID int64, stagedPath, newSHA, newMD5, newT
 	}
 
 	commit := func(tx *sql.Tx) error {
-		// phash goes with the old bytes: the backfill revisits a NULL
-		// phash, never a stale one.
+		// phash and the auto-tag stamp go with the old bytes: the backfill
+		// and the nightly auto-tag revisit a NULL, never a stale one.
 		if _, err := tx.Exec(
 			`UPDATE images SET sha256 = ?, md5 = ?, canonical_path = ?, file_type = ?, file_size = ?,
-			        width = ?, height = ?, source_type = ?, phash = NULL WHERE id = ?`,
+			        width = ?, height = ?, source_type = ?, phash = NULL, auto_tagged_at = NULL WHERE id = ?`,
 			newSHA, newMD5, newPath, newType, fi.Size(), newW, newH, sourceType, imageID,
 		); err != nil {
 			return fmt.Errorf("update images row: %w", err)

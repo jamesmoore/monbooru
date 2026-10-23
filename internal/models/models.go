@@ -370,9 +370,9 @@ type JobState struct {
 	FinishedAt *time.Time
 	Summary    string
 	Error      string
-	// WatcherNotices counts watcher ingests and removals while a job runs;
-	// the client refreshes on it without touching the progress line.
-	WatcherNotices int
+	// Changes counts the gallery changes a sync or the watcher made while a
+	// job runs; the client refreshes on it without touching the progress line.
+	Changes int
 	// The galleries the job writes to; none recorded stands for all of them.
 	Galleries []string
 }
@@ -417,4 +417,11 @@ func ScanImageRow(row RowScanner) (Image, error) {
 	}
 	img.IngestedAt, _ = time.Parse(time.RFC3339, ingestedAt)
 	return img, nil
+}
+
+func Plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

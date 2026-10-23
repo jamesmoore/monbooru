@@ -9,7 +9,9 @@ import (
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/library"
 	"github.com/monbooru/monbooru/internal/lookup"
+	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/peer"
+	"github.com/monbooru/monbooru/internal/shared/contract"
 	"github.com/monbooru/monbooru/internal/shared/logx"
 )
 
@@ -104,7 +106,7 @@ func (l *Link) BatchLookup(ctx context.Context, cx *library.Gallery, opts BatchL
 		}
 	}
 	if opts.Mode == "refresh" {
-		l.jobs.Complete(fmt.Sprintf("Queued %d source fetch(es) on monloader; skipped %d without a fetchable source.", enqueued, skipped))
+		l.jobs.Complete(fmt.Sprintf("Queued %d source %s on monloader; skipped %d without a fetchable source.", enqueued, models.Plural(enqueued, "fetch", "fetches"), skipped))
 		return
 	}
 	parts := []string{}
@@ -120,7 +122,7 @@ func (l *Link) BatchLookup(ctx context.Context, cx *library.Gallery, opts BatchL
 	if skipped > 0 {
 		parts = append(parts, fmt.Sprintf("%d skipped", skipped))
 	}
-	l.jobs.Complete(fmt.Sprintf("Looked up %d image(s): %s.", total, strings.Join(parts, ", ")))
+	l.jobs.Complete(fmt.Sprintf("Looked up %d %s: %s.", total, models.Plural(total, "image", "images"), strings.Join(parts, ", ")))
 }
 
 func unsourcedOnly(cx *library.Gallery, ids []int64) []int64 {
@@ -146,14 +148,14 @@ func (l *Link) batchPTRLookup(ctx context.Context, cx *library.Gallery, ids []in
 	for start := 0; start < len(ids) && ctx.Err() == nil; start += ptrLookupChunk {
 		chunk := ids[start:min(start+ptrLookupChunk, len(ids))]
 		placeholders, args := db.InPlaceholders(chunk)
-		hashes, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(v *ptrLookupImage) []any {
+		hashes, err := db.QueryAll(cx.DB.Read, db.ScanRow(func(v *contract.PTRLookupImage) []any {
 			return []any{&v.ImageID, &v.SHA256}
 		}), `SELECT id, sha256 FROM images WHERE id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return matched, err
 		}
 		byHash := make(map[string]int64, len(hashes))
-		images := make([]ptrLookupImage, 0, len(hashes))
+		images := make([]contract.PTRLookupImage, 0, len(hashes))
 		for _, h := range hashes {
 			byHash[h.SHA256] = h.ImageID
 			images = append(images, h)

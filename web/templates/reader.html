@@ -1,8 +1,9 @@
 {{define "reader.html"}}
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-app="monbooru">
 <head>
 {{template "partials/head.html" .}}
+  <script src="/static/shared/base.js" defer></script>
   <script src="/static/main.js" defer></script>
   {{if .NextPage}}
   <link rel="prefetch" href="/images/{{.Image.ID}}/page/{{.NextPage}}">

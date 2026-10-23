@@ -18,6 +18,7 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/relations"
 	"github.com/monbooru/monbooru/internal/shared/logx"
+	"github.com/monbooru/monbooru/internal/shared/session"
 )
 
 type relatedTile struct {
@@ -55,7 +56,7 @@ func (s *Server) relatedEntriesGet(w http.ResponseWriter, r *http.Request) {
 		"Tiles":         tiles,
 		"Collection":    siblings,
 		"ImagePaths":    paths,
-		"CSRFToken":     s.sessions.CSRFToken(sessionFromContext(r.Context())),
+		"CSRFToken":     s.sessions.CSRFToken(session.FromContext(r.Context())),
 		"ActiveGallery": s.activeGallery(),
 		"BackQS":        back.QueryString("?"),
 		"BackKVQS":      back.QueryString("&"),
@@ -489,7 +490,7 @@ func reviewAgainPost(w http.ResponseWriter, r *http.Request, cx *library.Gallery
 			return
 		}
 		if n != 2 {
-			flashStatus(w, http.StatusBadRequest, "Group must have exactly two members.")
+			flashStatus(w, http.StatusOK, "Group must have exactly two members.")
 			return
 		}
 		a, b = ar, br
@@ -752,7 +753,7 @@ func (s *Server) copyTagsToOriginalPost(w http.ResponseWriter, r *http.Request) 
 		writeRelationError(w, err)
 		return
 	}
-	writeInlineFlash(w, "ok", fmt.Sprintf("Copied %d tag(s) to the original.", added))
+	writeInlineFlash(w, "ok", fmt.Sprintf("Copied %d tag%s to the original.", added, plural(added)))
 }
 
 func parseRelationPair(w http.ResponseWriter, r *http.Request) (int64, int64, bool) {
